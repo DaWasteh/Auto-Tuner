@@ -1,0 +1,67 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+wheels/
+pip-wheel-metadata/
+.installed.cfg
+MANIFEST
+
+# =============================================================================
+# Virtual environments
+# =============================================================================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# =============================================================================
+# Tooling caches
+# =============================================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# =============================================================================
+# IDE / editor
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# AutoTuner-specific: don't commit local user paths or model files
+# =============================================================================
+# If a contributor happens to drop models into the repo dir for testing,
+# don't accidentally commit them — GGUFs are huge and licensed.
+*.gguf
+models/
+local-settings/
+
+# llama.cpp / forks people might symlink or clone alongside auto_tuner
+llama.cpp/
+1bllama.cpp/
+BitNet/
+
+# Local environment files
+.env
+.env.local
+*.local

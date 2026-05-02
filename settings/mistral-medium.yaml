@@ -1,0 +1,23 @@
+# Mistral Medium 3.5 (128B class, dense).
+display_name: "Mistral Medium 3.x"
+patterns:
+  - mistral-medium
+
+# Native 128k. With a 128B model and tight memory the tuner will
+# usually clamp this hard.
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.3
+  top_k: 40
+  top_p: 0.9
+  min_p: 0.05
+  repeat_penalty: 1.05
+
+chat_template: mistral
+
+notes: >
+  At Q3_XXS this model is ~50 GB on disk; expect mostly-CPU inference
+  unless you have 64 GB+ of VRAM. mlock is enabled automatically when
+  the model is CPU-resident and you have enough RAM headroom.

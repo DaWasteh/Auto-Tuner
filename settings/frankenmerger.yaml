@@ -1,0 +1,27 @@
+# Frankenmerger / community merges. These are "creative" finetunes
+# that often share base architectures with Llama / Phi / Qwen but
+# benefit from looser sampling than their parents.
+display_name: "Frankenmerger / community merge"
+patterns:
+  - archon
+  - eclectic-maid
+  - voldemort
+  - tutorai
+  - nsfw-merge
+  - frankenmerg
+
+max_context: 16384
+recommended_kv_quant: q8_0
+
+sampling:
+  # Higher temperature + repeat penalty: merges tend to loop more
+  # easily and produce more varied output when nudged.
+  temperature: 0.85
+  top_k: 50
+  top_p: 0.95
+  min_p: 0.03
+  repeat_penalty: 1.1
+
+notes: >
+  Merges often have inconsistent native context limits. 16k is a safe
+  default; raise max_context per-merge if you know it tolerates more.

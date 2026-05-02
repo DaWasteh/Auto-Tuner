@@ -1,0 +1,29 @@
+# Ternary-Bonsai-8B (BitNet, 1.58-bit). Needs a llama.cpp build with
+# BitNet kernels — typically the `1bllama.cpp` fork rather than mainline.
+# This pattern is more specific than `bonsai`, so it wins the longest-
+# match rule and overrides bonsai.yaml for Ternary-Bonsai files.
+display_name: "Ternary-Bonsai 8B (BitNet, 1bllama)"
+patterns:
+  - ternary-bonsai
+
+max_context: 65536
+recommended_kv_quant: q8_0
+
+# Tell the auto-tuner to use the BitNet-aware server binary. Just a name
+# means "find it via PATH or in a sibling 1bllama.cpp/ checkout".
+# Override per-machine via LLAMA_SERVER if the binary lives elsewhere.
+server_binary: "1bllama.cpp/build/bin/Release/llama-server.exe"
+
+sampling:
+  temperature: 0.7
+  top_k: 40
+  top_p: 0.9
+  min_p: 0.05
+  repeat_penalty: 1.05
+
+notes: >
+  Ternary BitNet model — extremely small on disk (~2 GB) and CPU-friendly
+  thanks to ternary {-1, 0, +1} weights. Mainline llama.cpp can sometimes
+  load it but performs poorly; the 1bllama.cpp fork has the optimized
+  kernels. If the launch fails, point --server at your 1bllama build
+  manually or set the LLAMA_SERVER env var.

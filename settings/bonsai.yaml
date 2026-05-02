@@ -1,0 +1,21 @@
+# PrismML Bonsai 8B and the Ternary BitNet variant.
+display_name: "Bonsai 8B (PrismML)"
+patterns:
+  - bonsai
+
+# Bonsai uses 8k native context.
+max_context: 8192
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.7
+  top_k: 40
+  top_p: 0.9
+  min_p: 0.05
+  repeat_penalty: 1.05
+
+notes: >
+  The Ternary-Bonsai-8B-Q2_0 variant is a 1.58-bit BitNet model — tiny
+  on disk (~2 GB) and very fast on CPU thanks to ternary weights. The
+  standard Bonsai-8B.gguf is the unquantized BF16 reference, which
+  benefits from full GPU offload if it fits.
