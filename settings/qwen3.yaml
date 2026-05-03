@@ -4,7 +4,7 @@ patterns:
   - qwen3.5
   - qwen3.6
 
-max_context: 131072
+max_context: 193536
 recommended_kv_quant: q8_0
 
 sampling:
@@ -13,8 +13,6 @@ sampling:
   top_p: 0.8
   min_p: 0.0
   repeat_penalty: 1.05
-
-chat_template: "qwen"  # Qwen nutzt eigenes Template
 
 notes: >
   Für "Thinking Mode" temperature auf ~0.6 und top_p auf ~0.95 senken.

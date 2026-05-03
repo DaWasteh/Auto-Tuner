@@ -12,7 +12,5 @@ sampling:
   min_p: 0.05
   repeat_penalty: 1.05
 
-chat_template: "mistral"  # Mistral-Modelle nutzen oft "mistral"
-
 notes: >
   Optimiert für Code-Completion (Cline, Aider, VS Code).

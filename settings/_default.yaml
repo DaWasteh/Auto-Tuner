@@ -11,7 +11,5 @@ sampling:
   min_p: 0.05
   repeat_penalty: 1.05
 
-chat_template: "llama-2"  # Standard-Template für viele Modelle
-
 notes: >
   Fallback-Profil. Falls kein spezifisches Profil passt, wird dieses verwendet.

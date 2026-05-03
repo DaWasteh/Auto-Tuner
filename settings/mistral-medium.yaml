@@ -12,7 +12,5 @@ sampling:
   min_p: 0.05
   repeat_penalty: 1.05
 
-chat_template: "mistral"  # Mistral-Modelle nutzen "mistral"
-
 notes: >
   Benötigt viel VRAM (64 GB+ empfohlen).

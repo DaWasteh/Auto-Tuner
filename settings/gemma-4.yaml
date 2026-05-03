@@ -13,7 +13,5 @@ sampling:
   min_p: 0.0
   repeat_penalty: 1.0  # Gemma reagiert schlecht auf >1.0
 
-chat_template: "gemma"  # Google nutzt eigenes Template
-
 notes: >
   Gemma ist empfindlich gegenüber repeat_penalty > 1.0.

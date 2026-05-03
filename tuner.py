@@ -256,10 +256,13 @@ def compute_config(
         batch_threads = min(logical, 64)
 
     # ---- (4b) Batch
-    if model.size_gb > 30 or ctx > 32768:
+    # True giants stay conservative to avoid prefill OOM. Mid-size / long-ctx
+    # gets a healthier batch (the v1 numbers were way too small for prefill
+    # throughput on a 16+ GB GPU).
+    if model.size_gb > 30:
         batch, ubatch = 512, 128
-    elif model.size_gb > 10:
-        batch, ubatch = 1024, 256
+    elif ctx > 32768 or model.size_gb > 10:
+        batch, ubatch = 1024, 512
     else:
         batch, ubatch = 2048, 512
 
@@ -295,6 +298,7 @@ def compute_config(
         "top_p": float(sd.get("top_p", 0.9)),
         "min_p": float(sd.get("min_p", 0.05)),
         "repeat_penalty": float(sd.get("repeat_penalty", 1.05)),
+        "presence_penalty": float(sd.get("presence_penalty", 0.0)),
     }
 
     return TunedConfig(
@@ -368,9 +372,11 @@ def build_command(
         "--min-p", str(s["min_p"]),
         "--repeat-penalty", str(s["repeat_penalty"]),
     ]
-
-    if profile.chat_template:
-        cmd += ["--chat-template", profile.chat_template]
+    # Only emit presence_penalty when it's actually non-zero — llama-server
+    # defaults to 0.0 already, so emitting it everywhere just bloats the CLI.
+    pp = s.get("presence_penalty", 0.0)
+    if pp:
+        cmd += ["--presence-penalty", str(pp)]
 
     if model.mmproj is not None:
         cmd += ["--mmproj", str(model.mmproj)]

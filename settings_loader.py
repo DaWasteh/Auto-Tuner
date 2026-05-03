@@ -20,7 +20,6 @@ class ModelProfile:
     patterns: List[str] = field(default_factory=list)
     max_context: int = 8192
     sampling: Dict[str, Any] = field(default_factory=dict)
-    chat_template: Optional[str] = None
     recommended_kv_quant: str = "q8_0"
     extra_args: List[str] = field(default_factory=list)
     notes: str = ""
@@ -58,7 +57,6 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
             patterns=[str(p).lower() for p in (data.get("patterns") or [])],
             max_context=int(data.get("max_context", 8192)),
             sampling=sampling,
-            chat_template=data.get("chat_template"),
             recommended_kv_quant=str(data.get("recommended_kv_quant", "q8_0")),
             extra_args=[str(x) for x in extra],
             notes=str(data.get("notes", "") or ""),

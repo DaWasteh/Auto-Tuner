@@ -17,7 +17,5 @@ sampling:
   min_p: 0.03
   repeat_penalty: 1.1
 
-chat_template: "llama-2"  # Viele Merges basieren auf Llama
-
 notes: >
   Merges haben oft inkonsistente Context-Limits.

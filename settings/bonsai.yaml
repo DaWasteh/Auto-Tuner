@@ -14,7 +14,5 @@ sampling:
   min_p: 0.05
   repeat_penalty: 1.05
 
-chat_template: "llama-2"  # Bonsai nutzt oft Llama-2-Templates
-
 notes: >
   Standard-Bonsai-8B oder Ternary-Bonsai (BitNet).
