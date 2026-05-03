@@ -223,7 +223,7 @@ def _candidate_search_roots() -> List[Path]:
         "ml/llama.cpp",
     )
     for base in bases:
-        chain = [base, *base.parents[:5]]   # base + up to 5 parents
+        chain = [base, *list(base.parents)[:5]]   # base + up to 5 parents
         for p in chain:
             for sub in common_subs:
                 add(p / sub)
@@ -284,7 +284,7 @@ def _resolve_server_binary(user_value: str) -> str:
             anchors.append(ra)
 
         for base in (Path(__file__).resolve().parent, Path.cwd()):
-            chain = [base, *base.parents[:5]]
+            chain = [base, *list(base.parents)[:5]]
             for a in chain:
                 add_anchor(a)
 
@@ -334,7 +334,7 @@ def _print_client_settings(host: str, port: int, ctx: int,
     print("  Client settings (Roo-Code, Continue, Cline, Open WebUI, …)")
     print(_BAR)
     print(f"    Base URL          : {base_url}")
-    print( "    API key           : sk-no-key   (any non-empty string works)")
+    print("    API key           : sk-no-key   (any non-empty string works)")
     print(f"    Model name        : {model.name}")
     print(f"    Context window    : {ctx:,} tokens   ← set this in your client")
     print(_BAR)
