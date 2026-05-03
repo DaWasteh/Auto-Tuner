@@ -1,25 +1,18 @@
-# Devstral — Mistral's coding-focused 24B model.
 display_name: "Devstral (Mistral, code)"
 patterns:
   - devstral
 
-# Devstral 2 (-2- in the filename) supports 256k context.
-# The auto-tuner will only use as much as fits in free RAM/VRAM.
 max_context: 262144
 recommended_kv_quant: q8_0
 
 sampling:
-  # Low temperature for deterministic code completion.
-  temperature: 0.15
+  temperature: 0.15  # Niedrig für deterministische Code-Completion
   top_k: 40
   top_p: 0.9
   min_p: 0.05
   repeat_penalty: 1.05
 
-chat_template: mistral
+chat_template: "mistral"  # Mistral-Modelle nutzen oft "mistral"
 
 notes: >
-  Tuned for coding agents (Cline, Aider, Continue, VS Code). With
-  20 GB+ of free RAM you can comfortably push the context past 128k
-  for repo-scale tasks. Pair with the matching mmproj for vision-aware
-  pull-request diffs.
+  Optimiert für Code-Completion (Cline, Aider, VS Code).

@@ -1,4 +1,3 @@
-# Gemma 4 family — covers Gemma-4-E2B, E4B, 26B-A4B (MoE), 31B.
 display_name: "Gemma 4 (Google)"
 patterns:
   - gemma-4
@@ -8,16 +7,13 @@ max_context: 131072
 recommended_kv_quant: q8_0
 
 sampling:
-  # Gemma is sensitive to repetition penalty — keep it at 1.0.
   temperature: 1.0
   top_k: 64
   top_p: 0.95
   min_p: 0.0
-  repeat_penalty: 1.0
+  repeat_penalty: 1.0  # Gemma reagiert schlecht auf >1.0
 
-chat_template: gemma
+chat_template: "gemma"  # Google nutzt eigenes Template
 
 notes: >
-  Gemma reacts badly to repeat_penalty > 1.0 and to min_p > 0.
-  The E2B/E4B sub-billion "effective" sizes are tiny and run on CPU
-  comfortably; the 26B MoE and 31B dense models benefit from GPU offload.
+  Gemma ist empfindlich gegenüber repeat_penalty > 1.0.

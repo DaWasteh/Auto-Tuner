@@ -33,12 +33,10 @@ from scanner import scan_models, group_entries, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import build_command, compute_config, TunedConfig
 
-
 # ---------------------------------------------------------------------------
 # Pretty-printing helpers
 
 _BAR = "─" * 64
-
 
 def _print_banner() -> None:
     print()
@@ -46,14 +44,11 @@ def _print_banner() -> None:
     print("  AutoTuner for llama.cpp  —  interactive launcher")
     print(_BAR)
 
-
 def _print_system(info: SystemInfo) -> None:
     print(format_system(info))
 
-
 def _vision_marker(entry: ModelEntry) -> str:
     return " 👁" if entry.has_vision else "  "
-
 
 def _print_menu(groups: dict) -> List[ModelEntry]:
     """Print grouped model menu and return a flat list in display order."""
@@ -77,7 +72,6 @@ def _print_menu(groups: dict) -> List[ModelEntry]:
             idx += 1
     print()
     return flat
-
 
 def _print_config(model: ModelEntry, profile: ModelProfile,
                   cfg: TunedConfig, system: SystemInfo) -> None:
@@ -126,40 +120,8 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
     print(f"    KV cache      ~ {cfg.estimated_kv_gb:5.1f} GB")
     print(_BAR)
 
-
 # ---------------------------------------------------------------------------
 # Selection
-
-def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> Optional[ModelEntry]:
-    if cli_query:
-        q = cli_query.lower()
-        matches = [e for e in flat if q in e.name.lower()]
-        if not matches:
-            print(f"[AutoTuner] No model matched --model '{cli_query}'.")
-            return None
-        if len(matches) > 1:
-            print(f"[AutoTuner] '{cli_query}' is ambiguous — matches:")
-            for e in matches:
-                print(f"    - {e.name}")
-            return None
-        return matches[0]
-
-    while True:
-        try:
-            raw = input(f"Select a model [1-{len(flat)}, q to quit]: ").strip()
-        except EOFError:
-            return None
-        if raw.lower() in ("q", "quit", "exit"):
-            return None
-        if not raw.isdigit():
-            print("  please enter a number.")
-            continue
-        n = int(raw)
-        if not 1 <= n <= len(flat):
-            print(f"  number must be between 1 and {len(flat)}.")
-            continue
-        return flat[n - 1]
-
 
 def _confirm(prompt: str, default_yes: bool = True) -> bool:
     suffix = "[Y/n]" if default_yes else "[y/N]"
@@ -171,22 +133,71 @@ def _confirm(prompt: str, default_yes: bool = True) -> bool:
         return default_yes
     return raw in ("y", "yes", "j", "ja")
 
+def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> Optional[ModelEntry]:
+    if cli_query:
+        # Check if the query ends with --novision
+        novision = False
+        if cli_query.lower().endswith("--novision"):
+            cli_query = cli_query[:-len("--novision")].strip()
+            novision = True
+
+        q = cli_query.lower()
+        matches = [e for e in flat if q in e.name.lower()]
+        if not matches:
+            print(f"[AutoTuner] No model matched --model '{cli_query}'.")
+            return None
+        if len(matches) > 1:
+            print(f"[AutoTuner] '{cli_query}' is ambiguous — matches:")
+            for e in matches:
+                print(f"    - {e.name}")
+            return None
+
+        model = matches[0]
+        if novision and model.mmproj is not None:
+            print(f"[AutoTuner] Vision disabled per --novision (ignoring {model.mmproj.name})")
+            model.mmproj = None
+        return model
+
+    while True:
+        try:
+            raw = input(f"Select a model [1-{len(flat)}, q to quit]: ").strip()
+        except EOFError:
+            return None
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+
+        # Support "--novision" suffix (e.g., "18 --novision")
+        novision = False
+        parsed = raw
+        if raw.lower().endswith("--novision"):
+            parsed = raw[:raw.lower().rfind("--novision")].strip()
+            novision = True
+
+        if not parsed.isdigit():
+            print("  please enter a number (optionally followed by ' --novision').")
+            continue
+        n = int(parsed)
+        if not 1 <= n <= len(flat):
+            print(f"  number must be between 1 and {len(flat)}.")
+            continue
+        model = flat[n - 1]
+        if novision and model.mmproj is not None:
+            print(f"[AutoTuner] Vision disabled per '--novision' suffix (ignoring {model.mmproj.name})")
+            model.mmproj = None
+        return model
 
 # ---------------------------------------------------------------------------
 # llama-server discovery
 
-# Common subpaths within a llama.cpp checkout where the server binary
-# lives after a normal cmake build. Order matters — most specific first.
 _SERVER_SUBPATHS = [
-    "build/bin/Release/llama-server.exe",   # MSVC multi-config Release
-    "build/bin/Debug/llama-server.exe",     # MSVC multi-config Debug
-    "build/bin/llama-server.exe",           # Windows single-config / MinGW
-    "build/bin/llama-server",               # Linux / macOS
-    "build/llama-server",                   # rare: top-level build/
-    "llama-server.exe",                     # already inside the bin dir
+    "build/bin/Release/llama-server.exe",
+    "build/bin/Debug/llama-server.exe",
+    "build/bin/llama-server.exe",
+    "build/bin/llama-server",
+    "build/llama-server",
+    "llama-server.exe",
     "llama-server",
 ]
-
 
 def _candidate_search_roots() -> List[Path]:
     """Folders to look in for a llama.cpp / 1bllama.cpp checkout."""
@@ -203,18 +214,13 @@ def _candidate_search_roots() -> List[Path]:
         seen.add(rp)
         roots.append(rp)
 
-    # 1. Explicit env override
     env_dir = os.environ.get("LLAMA_CPP_DIR")
     if env_dir:
         add(env_dir)
-        # Also try sibling folder for 1bllama, since people typically
-        # park them next to each other (e.g. C:\LAB\ai-local\{llama,1bllama}.cpp)
         parent = Path(env_dir).expanduser()
         add(parent.parent / "1bllama.cpp")
         add(parent.parent / "BitNet")
 
-    # 2. Walk upward from script + cwd, looking for llama.cpp checkouts
-    #    in common locations.
     bases = [Path(__file__).resolve().parent, Path.cwd()]
     common_subs = (
         "llama.cpp", "1bllama.cpp", "BitNet",
@@ -223,25 +229,14 @@ def _candidate_search_roots() -> List[Path]:
         "ml/llama.cpp",
     )
     for base in bases:
-        chain = [base, *list(base.parents)[:5]]   # base + up to 5 parents
+        chain = [base, *list(base.parents)[:5]]
         for p in chain:
             for sub in common_subs:
                 add(p / sub)
     return roots
 
-
 def _resolve_server_binary(user_value: str) -> str:
-    """Turn a user-provided server name/path into something runnable.
-
-    Resolution order:
-      1. If it's an absolute existing file path → use as-is.
-      2. If it contains a separator → treat as a relative path; try it
-         against the script dir, cwd, and each parent up to 4 levels.
-      3. If it's just a name and `shutil.which` finds it on PATH → use that.
-      4. Search known build subpaths inside candidate roots
-         (LLAMA_CPP_DIR, sibling `llama.cpp/`, `../ai-local/llama.cpp/`, …).
-      5. Fall back to the original value (caller will see the launch error).
-    """
+    """Turn a user-provided server name/path into something runnable."""
     p = Path(user_value).expanduser()
     if p.is_absolute() and p.is_file():
         return str(p)
@@ -249,18 +244,11 @@ def _resolve_server_binary(user_value: str) -> str:
     has_sep = (os.sep in user_value
                or (os.altsep is not None and os.altsep in user_value))
 
-    # Case: relative path with directory components, e.g. coming from a
-    # YAML profile like "1bllama.cpp/build/bin/Release/llama-server.exe".
-    # The first path component is treated as a "fork name" hint — if it
-    # matches a folder in our candidate roots, use that root specifically.
-    # This is what makes Bonsai-Ternary correctly resolve to the 1bllama
-    # fork instead of the regular llama.cpp checkout sitting next to it.
     if has_sep and not p.is_absolute():
         parts = list(p.parts)
         fork_name = parts[0].lower() if parts else ""
         inner = Path(*parts[1:]) if len(parts) > 1 else None
 
-        # 1) Match the fork name against candidate roots first (most reliable)
         if inner is not None and fork_name:
             for root in _candidate_search_roots():
                 if root.name.lower() == fork_name:
@@ -268,8 +256,6 @@ def _resolve_server_binary(user_value: str) -> str:
                     if candidate.is_file():
                         return str(candidate)
 
-        # 2) Fallback: anchor the entire relative path against each
-        #    ancestor of script dir / cwd (handles non-standard layouts).
         anchors: List[Path] = []
         seen: set = set()
 
@@ -293,13 +279,11 @@ def _resolve_server_binary(user_value: str) -> str:
             if candidate.is_file():
                 return str(candidate)
 
-    # Plain name with no separator → PATH lookup.
     if not has_sep:
         which = shutil.which(user_value)
         if which:
             return which
 
-    # Fallback: search known build subpaths in candidate llama.cpp roots.
     name = Path(user_value).name or "llama-server"
     if name in ("llama-server", "llama-server.exe"):
         candidate_subpaths = list(_SERVER_SUBPATHS)
@@ -320,14 +304,12 @@ def _resolve_server_binary(user_value: str) -> str:
 
     return user_value
 
-
 # ---------------------------------------------------------------------------
 # Client settings hint
 
 def _print_client_settings(host: str, port: int, ctx: int,
                            model: ModelEntry) -> None:
-    """Print a copy-pasteable block for OpenAI-API clients
-    (Roo-Code, Continue, Cline, Open WebUI, etc.)."""
+    """Print a copy-pasteable block for OpenAI-API clients."""
     base_url = f"http://{host}:{port}/v1"
     print()
     print(_BAR)
@@ -338,7 +320,6 @@ def _print_client_settings(host: str, port: int, ctx: int,
     print(f"    Model name        : {model.name}")
     print(f"    Context window    : {ctx:,} tokens   ← set this in your client")
     print(_BAR)
-
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -375,6 +356,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Print the command but don't start the server")
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the launch confirmation prompt")
+    p.add_argument("--novision", action="store_true",
+                   help="Disable vision (mmproj) even if available")
     p.add_argument(
         "--",
         dest="passthrough",
@@ -382,7 +365,6 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Extra arguments after `--` are forwarded to llama-server",
     )
     return p.parse_args(argv)
-
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
@@ -415,11 +397,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[AutoTuner] No model selected — exiting.")
         return 0
 
+    # Apply --novision flag if set
+    if args.novision and model.mmproj is not None:
+        print(f"[AutoTuner] Vision disabled per --novision (ignoring {model.mmproj.name})")
+        model.mmproj = None
+
     profile = match_profile(model.name, profiles)
     cfg = compute_config(model, system, profile, user_ctx=args.ctx)
     _print_config(model, profile, cfg, system)
 
-    # Per-profile server override (e.g. Bonsai-Ternary uses 1bllama-server)
     raw_server = profile.server_binary or args.server
     server = _resolve_server_binary(raw_server)
     if server != raw_server:
@@ -455,7 +441,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"\n[AutoTuner] Web UI will be available at "
           f"http://{args.host}:{args.port}\n")
     return launch(cmd)
-
 
 if __name__ == "__main__":
     sys.exit(main())

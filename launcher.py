@@ -22,25 +22,28 @@ import sys
 import time
 from typing import List
 
-
 # Time to wait between SIGTERM and SIGKILL
 _GRACEFUL_TIMEOUT_SECONDS = 10
-
 
 def _is_windows() -> bool:
     return os.name == "nt"
 
-
 def _spawn(cmd: List[str]) -> subprocess.Popen:
     """Start the child process detached enough that we can signal its group."""
     if _is_windows():
-        # CREATE_NEW_PROCESS_GROUP = 0x00000200
-        # Required for sending CTRL_BREAK_EVENT to a child on Windows.
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         return subprocess.Popen(cmd, creationflags=flags)
-    # Unix: put the child in its own session/process group.
     return subprocess.Popen(cmd, start_new_session=True)
 
+def _confirm(prompt: str, default_yes: bool = True) -> bool:
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        raw = input(f"{prompt} {suffix} ").strip().lower()
+    except EOFError:
+        return default_yes
+    if not raw:
+        return default_yes
+    return raw in ("y", "yes", "j", "ja")
 
 def _terminate(proc: subprocess.Popen) -> None:
     """Politely ask the child (and its descendants) to exit."""
@@ -48,15 +51,12 @@ def _terminate(proc: subprocess.Popen) -> None:
         return
     try:
         if _is_windows():
-            # CTRL_BREAK_EVENT can be sent to a process group on Windows.
             proc.send_signal(signal.CTRL_BREAK_EVENT)
         else:
-            # Send SIGTERM to the whole group so child threads/forks die too.
-            os.killpg(proc.pid, signal.SIGTERM)
+            # On Unix, send SIGTERM to the process group
+            os.kill(-proc.pid, signal.SIGTERM)
     except (ProcessLookupError, OSError):
-        # Already gone — fine.
         pass
-
 
 def _force_kill(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
@@ -65,10 +65,18 @@ def _force_kill(proc: subprocess.Popen) -> None:
         if _is_windows():
             proc.kill()
         else:
-            os.killpg(proc.pid, signal.SIGKILL)
+            # On Unix, send SIGKILL to the process group
+            os.kill(-proc.pid, getattr(signal, 'SIGKILL', 9))
     except (ProcessLookupError, OSError):
         pass
 
+def _quote(arg: str) -> str:
+    """Best-effort shell quoting for the command echo (display only)."""
+    if not arg:
+        return '""'
+    if any(c in arg for c in (" ", "\t", '"', "'")):
+        return '"' + arg.replace('"', '\\"') + '"'
+    return arg
 
 def launch(cmd: List[str]) -> int:
     """Run llama-server until it exits or until the user presses Ctrl+C.
@@ -94,8 +102,8 @@ def launch(cmd: List[str]) -> int:
     try:
         return proc.wait()
     except KeyboardInterrupt:
-        print("\n[AutoTuner] Ctrl+C received — stopping llama-server...",
-              flush=True)
+        # Immediate exit on Ctrl+C — no confirmation prompt
+        print("[AutoTuner] Stopping llama-server...", flush=True)
         _terminate(proc)
 
         # Give it a chance to flush logs / close ports cleanly.
@@ -113,12 +121,3 @@ def launch(cmd: List[str]) -> int:
         except subprocess.TimeoutExpired:
             pass
         return 130
-
-
-def _quote(arg: str) -> str:
-    """Best-effort shell quoting for the command echo (display only)."""
-    if not arg:
-        return '""'
-    if any(c in arg for c in (" ", "\t", '"', "'")):
-        return '"' + arg.replace('"', '\\"') + '"'
-    return arg

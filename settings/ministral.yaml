@@ -1,6 +1,3 @@
-# Ministral 3 — Mistral AI's small reasoning model (14B).
-# NB: "ministral" does not contain "mistral" as a substring
-# (m-i-n-i-s-t-r-a-l), so this pattern is unambiguous.
 display_name: "Ministral (Mistral, reasoning)"
 patterns:
   - ministral
@@ -9,15 +6,13 @@ max_context: 131072
 recommended_kv_quant: q8_0
 
 sampling:
-  # Reasoning model — slightly higher temperature, longer chains.
-  temperature: 0.6
+  temperature: 0.6  # Höher für Reasoning
   top_k: 40
   top_p: 0.95
   min_p: 0.05
   repeat_penalty: 1.05
 
-chat_template: mistral
+chat_template: "mistral"  # Mistral-Modelle nutzen "mistral"
 
 notes: >
-  Designed for chain-of-thought style reasoning. Q6_K runs comfortably
-  on a single 16 GB GPU.
+  Optimiert für Chain-of-Thought-Reasoning.

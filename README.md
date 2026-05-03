@@ -46,6 +46,16 @@ Select a model [1-12, q to quit]:
   match picks the most specific one).
 - **Reads GGUF metadata** — pulls `n_layers` and `context_length`
   straight from the file so partial GPU offload (`-ngl`) is exact.
+  
+### Vision control
+
+You can disable vision (mmproj) support in two ways:
+
+1. **Command-line flag**:
+
+   ```bash
+   python auto_tuner.py --model "Qwen3.6" --novision
+   ```
 
 ## Installation
 

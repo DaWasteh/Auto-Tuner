@@ -1,11 +1,11 @@
-# PrismML Bonsai 8B and the Ternary BitNet variant.
 display_name: "Bonsai 8B (PrismML)"
 patterns:
   - bonsai
 
-# Bonsai uses 8k native context.
 max_context: 8192
 recommended_kv_quant: q8_0
+
+server_binary: "1bllama.cpp/build/bin/Release/llama-server.exe"
 
 sampling:
   temperature: 0.7
@@ -14,8 +14,7 @@ sampling:
   min_p: 0.05
   repeat_penalty: 1.05
 
+chat_template: "llama-2"  # Bonsai nutzt oft Llama-2-Templates
+
 notes: >
-  The Ternary-Bonsai-8B-Q2_0 variant is a 1.58-bit BitNet model — tiny
-  on disk (~2 GB) and very fast on CPU thanks to ternary weights. The
-  standard Bonsai-8B.gguf is the unquantized BF16 reference, which
-  benefits from full GPU offload if it fits.
+  Standard-Bonsai-8B oder Ternary-Bonsai (BitNet).

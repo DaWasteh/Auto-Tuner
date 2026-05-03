@@ -1,5 +1,3 @@
-# Fallback profile — used when no other YAML matches the model filename.
-# Profiles with empty `patterns:` are treated as the fallback.
 display_name: "Generic / fallback"
 patterns: []
 
@@ -13,6 +11,7 @@ sampling:
   min_p: 0.05
   repeat_penalty: 1.05
 
+chat_template: "llama-2"  # Standard-Template für viele Modelle
+
 notes: >
-  Conservative defaults. Add a YAML file for your model family to get
-  better sampling and a higher max_context.
+  Fallback-Profil. Falls kein spezifisches Profil passt, wird dieses verwendet.
