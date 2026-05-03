@@ -46,9 +46,6 @@ Select a model [1-12, q to quit]:
   match picks the most specific one).
 - **Reads GGUF metadata** — pulls `n_layers` and `context_length`
   straight from the file so partial GPU offload (`-ngl`) is exact.
-- **Ctrl+C actually works** — the v1 bug where Windows users couldn't
-  stop the server is fixed: SIGINT is forwarded to the child process
-  group on both Windows (CTRL_BREAK_EVENT) and Unix (SIGTERM → SIGKILL).
 
 ## Installation
 
