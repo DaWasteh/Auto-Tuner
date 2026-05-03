@@ -87,7 +87,7 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
           + (f"  ({profile.source_file})" if profile.source_file else ""))
     if profile.notes:
         print(f"Notes:    {profile.notes}")
-    if model.has_vision:
+    if model.mmproj is not None:
         print(f"Vision:   {model.mmproj.name}")
     print(_BAR)
 
@@ -334,7 +334,7 @@ def _print_client_settings(host: str, port: int, ctx: int,
     print("  Client settings (Roo-Code, Continue, Cline, Open WebUI, …)")
     print(_BAR)
     print(f"    Base URL          : {base_url}")
-    print(f"    API key           : sk-no-key   (any non-empty string works)")
+    print( "    API key           : sk-no-key   (any non-empty string works)")
     print(f"    Model name        : {model.name}")
     print(f"    Context window    : {ctx:,} tokens   ← set this in your client")
     print(_BAR)

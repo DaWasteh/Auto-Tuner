@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 # Make the project root importable when tests are run from the repo root
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from hardware import GPUInfo, SystemInfo, detect_system, format_system  # noqa: E402
@@ -132,12 +132,15 @@ def test_scanner_pairs_mmproj_by_size(tmp_path):
     entries = scan_models(tmp_path)
     by_name = {e.name: e for e in entries}
 
-    assert by_name["Qwen3.5-0.8B-Q8_0"].mmproj.name \
-        == "mmproj-Qwen3.5-0.8B-BF16.gguf"
-    assert by_name["Qwen3.5-2B-Q8_0"].mmproj.name \
-        == "mmproj-Qwen3.5-2B-BF16.gguf"
-    assert by_name["Qwen3.5-9B-Q8_0"].mmproj.name \
-        == "mmproj-Qwen3.5-9B-BF16.gguf"
+    expected = [
+        ("Qwen3.5-0.8B-Q8_0", "mmproj-Qwen3.5-0.8B-BF16.gguf"),
+        ("Qwen3.5-2B-Q8_0",   "mmproj-Qwen3.5-2B-BF16.gguf"),
+        ("Qwen3.5-9B-Q8_0",   "mmproj-Qwen3.5-9B-BF16.gguf"),
+    ]
+    for stem, expected_name in expected:
+        mmproj = by_name[stem].mmproj
+        assert mmproj is not None, f"{stem} should have been paired with an mmproj"
+        assert mmproj.name == expected_name
 
 
 def test_scanner_skips_mmproj_from_main_list(tmp_path):
@@ -165,7 +168,8 @@ def test_group_entries_buckets_by_folder(tmp_path):
 # ---------------------------------------------------------------------------
 # Tuner
 
-def _fake_system(ram_total=64, ram_free=48, vram_total=24, vram_free=22):
+def _fake_system(ram_total: float = 64, ram_free: float = 48,
+                 vram_total: float = 24, vram_free: float = 22):
     """Build a synthetic SystemInfo for tuner tests."""
     return SystemInfo(
         os_name="Linux test",
@@ -406,5 +410,6 @@ def test_ternary_bonsai_pattern_beats_regular_bonsai():
     BitNet profile, not the generic Bonsai one."""
     profiles = load_profiles(SETTINGS_DIR)
     p = match_profile("Ternary-Bonsai-8B-Q2_0", profiles)
+    assert p.source_file is not None, "matched profile must come from a YAML file"
     assert "ternary" in (p.display_name + " " + p.source_file).lower()
     assert p.server_binary, "Ternary profile must override the server"
