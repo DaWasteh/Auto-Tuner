@@ -389,58 +389,104 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[AutoTuner] Loaded {len(profiles)} profile(s) from "
           f"{args.settings_path}")
 
-    groups = group_entries(entries)
-    flat = _print_menu(groups)
+    # Main loop: pick model → launch → on stop, ask whether to pick another.
+    # This avoids the cmd.exe "Batchvorgang abbrechen?" prompt the user gets
+    # when the script exits after Ctrl+C inside a .bat wrapper, and lets
+    # them switch models without restarting the whole tool.
+    first_iteration = True
+    last_exit_code = 0
 
-    model = _pick_model(flat, args.model)
-    if model is None:
-        print("[AutoTuner] No model selected — exiting.")
-        return 0
+    while True:
+        # On every iteration after the first, re-detect the system so the
+        # auto-tuner sees the RAM/VRAM that was just freed by the previous
+        # llama-server, and clear any one-shot CLI selectors.
+        if not first_iteration:
+            print()
+            system = detect_system()
+            _print_system(system)
+            args.model = None  # force the menu to show again
+            args.ctx = None    # don't keep an override meant for the prev model
 
-    # Apply --novision flag if set
-    if args.novision and model.mmproj is not None:
-        print(f"[AutoTuner] Vision disabled per --novision (ignoring {model.mmproj.name})")
-        model.mmproj = None
+        groups = group_entries(entries)
+        flat = _print_menu(groups)
 
-    profile = match_profile(model.name, profiles)
-    cfg = compute_config(model, system, profile, user_ctx=args.ctx)
-    _print_config(model, profile, cfg, system)
+        try:
+            model = _pick_model(flat, args.model)
+        except KeyboardInterrupt:
+            print("\n[AutoTuner] Aborted by user.")
+            return 0
 
-    raw_server = profile.server_binary or args.server
-    server = _resolve_server_binary(raw_server)
-    if server != raw_server:
-        print(f"[AutoTuner] Found server binary: {server}")
-    elif not Path(server).is_file() and not shutil.which(server):
-        print(f"[AutoTuner] Warning: server binary '{server}' not found.")
-        print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
-        print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
+        if model is None:
+            print("[AutoTuner] No model selected — exiting.")
+            return last_exit_code if first_iteration else 0
 
-    extra = args.passthrough or []
-    cmd = build_command(
-        model=model,
-        config=cfg,
-        profile=profile,
-        server_binary=server,
-        host=args.host,
-        port=args.port,
-        extra_args=extra,
-    )
+        # Apply --novision flag if set
+        if args.novision and model.mmproj is not None:
+            print(f"[AutoTuner] Vision disabled per --novision (ignoring {model.mmproj.name})")
+            model.mmproj = None
 
-    if args.dry_run:
-        print("[AutoTuner] --dry-run — not starting the server.")
-        print("Command:")
-        print("  " + " ".join(cmd))
+        profile = match_profile(model.name, profiles)
+        cfg = compute_config(model, system, profile, user_ctx=args.ctx)
+        _print_config(model, profile, cfg, system)
+
+        raw_server = profile.server_binary or args.server
+        server = _resolve_server_binary(raw_server)
+        if server != raw_server:
+            print(f"[AutoTuner] Found server binary: {server}")
+        elif not Path(server).is_file() and not shutil.which(server):
+            print(f"[AutoTuner] Warning: server binary '{server}' not found.")
+            print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
+            print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
+
+        extra = args.passthrough or []
+        cmd = build_command(
+            model=model,
+            config=cfg,
+            profile=profile,
+            server_binary=server,
+            host=args.host,
+            port=args.port,
+            extra_args=extra,
+        )
+
+        if args.dry_run:
+            print("[AutoTuner] --dry-run — not starting the server.")
+            print("Command:")
+            print("  " + " ".join(cmd))
+            _print_client_settings(args.host, args.port, cfg.ctx, model)
+            return 0
+
+        try:
+            launch_now = args.yes or _confirm("Launch llama-server now?")
+        except KeyboardInterrupt:
+            print("\n[AutoTuner] Aborted by user.")
+            return 0
+
+        if not launch_now:
+            print("[AutoTuner] Launch skipped — back to the model menu.")
+            first_iteration = False
+            continue
+
         _print_client_settings(args.host, args.port, cfg.ctx, model)
-        return 0
+        print(f"\n[AutoTuner] Web UI will be available at "
+              f"http://{args.host}:{args.port}\n")
+        last_exit_code = launch(cmd)
 
-    if not args.yes and not _confirm("Launch llama-server now?"):
-        print("[AutoTuner] Aborted by user.")
-        return 0
+        # Server has stopped (Ctrl+C, crash, or normal exit). Offer to pick
+        # another model instead of falling through and exiting.
+        print()
+        try:
+            keep_going = _confirm("Server stopped. Pick another model?",
+                                  default_yes=True)
+        except KeyboardInterrupt:
+            print("\n[AutoTuner] Goodbye.")
+            return 0
 
-    _print_client_settings(args.host, args.port, cfg.ctx, model)
-    print(f"\n[AutoTuner] Web UI will be available at "
-          f"http://{args.host}:{args.port}\n")
-    return launch(cmd)
+        if not keep_going:
+            print("[AutoTuner] Goodbye.")
+            return 0
+
+        first_iteration = False
 
 if __name__ == "__main__":
     sys.exit(main())
