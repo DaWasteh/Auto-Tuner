@@ -1,0 +1,42 @@
+display_name: "Nemotron 3 Nano Omni Reasoning (NVIDIA)"
+patterns:
+  - nemotron-3-nano-omni
+  - nemotron-3-nano
+
+# Native bis 1M, aber 256k ist der praktische Default in den Unsloth-
+# Beispielen - alles darüber wird auf Consumer-Hardware schnell zum
+# OOM-Risiko, weil multimodale Inputs (Bild/Audio-Tokens) den KV-Cache
+# zusätzlich aufblähen.
+max_context: 262144
+recommended_kv_quant: q8_0
+
+sampling:
+  # NVIDIA-Empfehlung aus generation_config.json fuer Reasoning ON.
+  # Greedy (temp=0.0) funktioniert auch, ist aber laut Modell-Card
+  # leicht schwächer bei harten Reasoning-Tasks.
+  temperature: 0.6
+  top_k: 40
+  top_p: 0.95
+  min_p: 0.0
+  repeat_penalty: 1.05
+
+extra_args:
+  # --jinja: nutzt das eingebettete Chat-Template korrekt; wichtig damit
+  # llama-server die <think>-Blöcke ins reasoning_content-Feld trennt
+  # (statt sie im content stehen zu lassen). Braucht eine recht aktuelle
+  # llama.cpp-Version (>= b7400 ungefähr).
+  - --jinja
+  # --no-context-shift: empfohlen für Hybrid-Mamba/Transformer-Modelle,
+  # damit bei vollem Kontext nicht stillschweigend rausgerollt wird.
+  - --no-context-shift
+
+notes: >
+  Hybrid Mamba2-Transformer MoE, 30B Total / ~3B Active.
+  Multimodal: Text + Bild + Audio + Video (über mmproj).
+  Reasoning-Variante mit nativen <think>/</think>-Tokens (12/13).
+  ACHTUNG: NICHT mit CUDA 13.2 verwenden - produziert Gibberish-Output.
+  NVIDIA arbeitet am Fix; bis dahin CUDA 12.9 oder 13.0 nutzen.
+  Tipp: Wer Thinking explizit erzwingen oder abschalten will, kann beim
+  Start anhängen:
+    -- --chat-template-kwargs '{"enable_thinking":true}'
+    -- --chat-template-kwargs '{"enable_thinking":false}'

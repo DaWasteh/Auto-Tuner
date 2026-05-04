@@ -4,15 +4,29 @@ patterns:
   - qwen3.5
   - qwen3.6
 
-max_context: 193536
+# Qwen3.5/3.6 nativ 262144 (256k), erweiterbar via YaRN bis 1M.
+# Original Qwen3 hat nur 32k - wird automatisch via GGUF-Metadata
+# (native_context) heruntergeregelt, daher hier den größten Wert.
+max_context: 262144
 recommended_kv_quant: q8_0
 
 sampling:
-  temperature: 0.7
+  # Qwen3.5/3.6 Default ist Thinking-Modus, daher die "Thinking general"-
+  # Werte aus den offiziellen Modell-Cards. Bei Coding-Tasks kann
+  # temperature=0.6 mit presence_penalty=0.0 sinnvoller sein.
+  temperature: 1.0
   top_k: 20
-  top_p: 0.8
+  top_p: 0.95
   min_p: 0.0
-  repeat_penalty: 1.05
+  repeat_penalty: 1.0     # Qwen empfiehlt explizit 1.0
+  presence_penalty: 1.5   # Stattdessen presence_penalty gegen Repetition
 
 notes: >
-  Für "Thinking Mode" temperature auf ~0.6 und top_p auf ~0.95 senken.
+  Qwen3.5/3.6 sind Thinking-by-default Vision-Language-Modelle mit 256k
+  Kontext (erweiterbar bis 1M via YaRN). Original Qwen3 hat nur 32k -
+  wird automatisch über GGUF-native_context begrenzt.
+  Für reine Coding-Tasks: `-- --temp 0.6 --presence-penalty 0` anhängen.
+  Tipp: `--jinja` als Extra-Arg beim Start aktiviert die saubere
+  Trennung von <think>-Blöcken ins reasoning_content-API-Feld
+  (statt sie inline im content zu lassen):
+    -- --jinja
