@@ -64,10 +64,10 @@ def test_all_profiles_load():
     ("Gemma-4-26B-A4B-IQ3_M",                 "Gemma 4 (Google)"),
     ("gemma-4-E2B-it-BF16",                   "Gemma 4 (Google)"),
     ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
-    ("Ministral-3-14B-Reasoning-2512-Q6_K",   "Ministral (Mistral, reasoning)"),
+    ("Ministral-3-14B-Reasoning-2512-Q6_K",   "Ministral 3 (Mistral, reasoning)"),
     ("Mistral-Medium-3.5-128B-UD-IQ3_XXS",    "Mistral Medium 3.x"),
-    ("Bonsai-8B",                             "Bonsai 8B (PrismML)"),
-    ("Ternary-Bonsai-8B-Q2_0",                "Ternary-Bonsai 8B (BitNet, 1bllama)"),
+    ("Bonsai-8B",                             "Bonsai 8B (PrismML, 1-bit)"),
+    ("Ternary-Bonsai-8B-Q2_0",                "Ternary-Bonsai (PrismML, 1.58-bit)"),
     ("Archon-14B.Q6_K",                       "Frankenmerger / community merge"),
     ("voldemort-10b-dpo.Q8_0",                "Frankenmerger / community merge"),
     ("Some-Random-LLM.gguf",                  "Generic / fallback"),
@@ -84,7 +84,7 @@ def test_ministral_does_not_collide_with_mistral_medium():
     """The ministral pattern has no overlap with mistral-medium."""
     profiles = load_profiles(SETTINGS_DIR)
     assert match_profile("Ministral-3-14B", profiles).display_name \
-        == "Ministral (Mistral, reasoning)"
+        == "Ministral 3 (Mistral, reasoning)"
     assert match_profile("Mistral-Medium-3.5-128B", profiles).display_name \
         == "Mistral Medium 3.x"
 
