@@ -28,7 +28,8 @@ extra_args:
   -- --jinja
   # --no-context-shift: empfohlen für Hybrid-Mamba/Transformer-Modelle,
   # damit bei vollem Kontext nicht stillschweigend rausgerollt wird.
-  # -- --no-context-shift
+  -- --no-context-shift
+  
 notes: >
   Hybrid Mamba2-Transformer MoE, 30B Total / ~3B Active.
   Multimodal: Text + Bild + Audio + Video (über mmproj).

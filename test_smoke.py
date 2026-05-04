@@ -53,10 +53,9 @@ def test_all_profiles_load():
     assert len(profiles) >= 8, "expected the 8 shipped YAML profiles"
     files = {p.source_file for p in profiles}
     assert "_default.yaml" in files
-    assert "qwen3.yaml" in files
+    assert "qwen2_5-3.yaml" in files
     assert "gemma-4.yaml" in files
     assert "devstral.yaml" in files
-
 
 @pytest.mark.parametrize("filename, expected_display", [
     ("Qwen3.5-9B-Q8_0",                       "Qwen3 (Alibaba)"),
