@@ -25,11 +25,10 @@ extra_args:
   # llama-server die <think>-Blöcke ins reasoning_content-Feld trennt
   # (statt sie im content stehen zu lassen). Braucht eine recht aktuelle
   # llama.cpp-Version (>= b7400 ungefähr).
-  - --jinja
+  -- --jinja
   # --no-context-shift: empfohlen für Hybrid-Mamba/Transformer-Modelle,
   # damit bei vollem Kontext nicht stillschweigend rausgerollt wird.
-  - --no-context-shift
-
+  -- --no-context-shift
 notes: >
   Hybrid Mamba2-Transformer MoE, 30B Total / ~3B Active.
   Multimodal: Text + Bild + Audio + Video (über mmproj).
