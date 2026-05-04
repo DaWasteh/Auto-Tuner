@@ -1,6 +1,5 @@
 display_name: "Qwen3 (Alibaba)"
 patterns:
-  - qwen3
   - qwen3.5
   - qwen3.6
 

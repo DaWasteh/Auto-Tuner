@@ -1,0 +1,17 @@
+display_name: "Command R / R+ (Cohere)"
+patterns:
+  - command-r
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.3
+  top_k: 40
+  top_p: 0.9
+  min_p: 0.05
+  repeat_penalty: 1.0
+
+notes: >
+  Spezialisiert auf RAG und Tool-Calling. Niedrige Temperature 
+  hilft bei der Zitierung von Quellen aus Dokumenten.

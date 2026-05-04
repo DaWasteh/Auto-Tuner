@@ -1,0 +1,18 @@
+display_name: "Llama 3.x / 4 (Meta)"
+patterns:
+  - llama-3
+  - llama-4
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.75
+  top_k: 40
+  top_p: 0.95
+  min_p: 0.05
+  repeat_penalty: 1.05
+
+notes: >
+  Standard-Profile für Metas Llama-Serie. Llama 3.1+ unterstützt nativ 128k Kontext. 
+  Bei Llama 4 ggf. auf offizielle Sampling-Empfehlungen prüfen.

@@ -1,0 +1,18 @@
+display_name: "Phi-4 / 3.5 (Microsoft)"
+patterns:
+  - phi-4
+  - phi-3.5
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.0
+  top_k: 0
+  top_p: 1.0
+  min_p: 0.0
+  repeat_penalty: 1.0
+
+notes: >
+  Kleines, aber extrem mächtiges Modell. Läuft am stabilsten mit 
+  Greedy-Decoding (Temp 0) für logische Aufgaben.

@@ -1,0 +1,22 @@
+display_name: "DeepSeek (V3 / R1 Reasoning)"
+patterns:
+  - deepseek-v3
+  - deepseek-r1
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.6
+  top_k: 50
+  top_p: 0.95
+  min_p: 0.05
+  repeat_penalty: 1.0
+
+extra_args:
+    -- --jinja
+
+notes: >
+  DeepSeek-V3 (MoE) oder R1 (Reasoning). 
+  Die R1-Modelle nutzen <think>-Tags für Chain-of-Thought. 
+  Dank --jinja werden diese korrekt im Interface getrennt.

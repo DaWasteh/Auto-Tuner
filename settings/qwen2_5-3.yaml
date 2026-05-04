@@ -1,0 +1,19 @@
+display_name: "Qwen 2.5 / 3 (Alibaba)"
+patterns:
+  - qwen-2.5
+  - qwen-3
+  - qwen2.5
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  temperature: 0.7
+  top_k: 40
+  top_p: 0.9
+  min_p: 0.05
+  repeat_penalty: 1.05
+
+notes: >
+  Hervorragendes Allround-Modell. Die Coder-Varianten können auch 
+  mit niedrigerer Temperature (0.1 - 0.2) betrieben werden.
