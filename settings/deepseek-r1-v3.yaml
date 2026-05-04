@@ -1,22 +1,32 @@
-display_name: "DeepSeek (V3 / R1 Reasoning)"
+display_name: "DeepSeek (V3.2 / R1 Reasoning)"
 patterns:
   - deepseek-v3
   - deepseek-r1
+  - deepseek-v3.2
 
+# V3.1-Terminus / V3.2 wurden auf 128k erweitert (vorher 64k).
+# DSA (DeepSeek Sparse Attention) hilft bei Long-Context.
 max_context: 131072
 recommended_kv_quant: q8_0
 
 sampling:
-  temperature: 0.6
+  # Offizielle DeepSeek-Empfehlung für lokales Deployment (V3.2 HF Card):
+  # "We recommend setting the sampling parameters to temperature = 1.0,
+  # top_p = 0.95." Niedrigere temp (~0.6) funktioniert auch, kann aber
+  # Reasoning-Qualität reduzieren.
+  temperature: 1.0
   top_k: 50
   top_p: 0.95
   min_p: 0.05
   repeat_penalty: 1.0
 
 extra_args:
-    -- --jinja
+  # Ohne --jinja landen die <think>-Blöcke der R1-Modelle im content-Feld
+  # statt sauber als reasoning_content getrennt zu werden.
+  - --jinja
 
 notes: >
-  DeepSeek-V3 (MoE) oder R1 (Reasoning). 
-  Die R1-Modelle nutzen <think>-Tags für Chain-of-Thought. 
-  Dank --jinja werden diese korrekt im Interface getrennt.
+  DeepSeek-V3.2 (671B MoE / 37B aktiv) mit DSA für effiziente long-context
+  attention, oder R1 (Reasoning). Die R1- und V3.2-Modelle nutzen
+  <think>-Tags für Chain-of-Thought.
+  ACHTUNG: Speciale-Variante (V3.2-Speciale) unterstützt KEIN Tool-Calling.

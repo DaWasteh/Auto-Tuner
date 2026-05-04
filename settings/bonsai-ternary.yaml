@@ -1,18 +1,26 @@
-display_name: "Ternary-Bonsai 8B (BitNet, 1bllama)"
+display_name: "Ternary-Bonsai (PrismML, 1.58-bit)"
 patterns:
   - ternary-bonsai
 
+# Wie Bonsai 8B - 64k ist eine vernünftige Obergrenze.
 max_context: 65536
 recommended_kv_quant: q8_0
 
+# Braucht ebenfalls den PrismML-Fork - Q2_0 Format packt die 1.58-bit
+# Ternary-Gewichte hardware-freundlich in 2 bits.
 server_binary: "1bllama.cpp/build/bin/Release/llama-server.exe"
 
 sampling:
-  temperature: 0.7
-  top_k: 40
-  top_p: 0.9
+  # Gleiche Empfehlung wie Bonsai 8B.
+  temperature: 0.5
+  top_k: 20
+  top_p: 0.85
   min_p: 0.05
   repeat_penalty: 1.05
 
 notes: >
-  Benötigt 1bllama.cpp für optimierte BitNet-Kerne.
+  Ternary-Bonsai (8B/4B/1.7B) - Gewichte in {-1, 0, +1} (1.58 bits/weight).
+  Zwischen 1-bit Bonsai und full-precision: ~9x kleiner, 5x schneller,
+  besser auf Benchmarks als 1-bit Bonsai (avg +5 Punkte).
+  Q2_0 ist die eingesetzte Speicher-Form (2-bit aligned für Metal/CUDA).
+  Braucht den PrismML 1bllama.cpp-Fork für optimierte BitNet-Kerne.

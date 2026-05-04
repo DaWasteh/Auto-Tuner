@@ -1,16 +1,28 @@
-display_name: "Ministral (Mistral, reasoning)"
+display_name: "Ministral 3 (Mistral, reasoning)"
 patterns:
   - ministral
 
-max_context: 131072
+# Mistral docs: Ministral 3 (3B/8B/14B) hat 256k Kontext, alle Varianten.
+# vLLM-Default ist 262144. Vorher stand hier 131072 - das war zu niedrig.
+max_context: 262144
 recommended_kv_quant: q8_0
 
 sampling:
-  temperature: 0.6  # Höher für Reasoning
+  # Mistral's offizielle Empfehlung für die Reasoning-Variante:
+  # "Use a temperature of 1 for most environments" (HF GGUF Card).
+  # Für die Instruct-Variante würde Mistral <0.1 empfehlen - falls dein
+  # Model-Filename "Instruct" enthält statt "Reasoning", per CLI
+  # überschreiben:  -- --temp 0.0
+  temperature: 1.0
   top_k: 40
   top_p: 0.95
   min_p: 0.05
-  repeat_penalty: 1.05
+  repeat_penalty: 1.0
 
 notes: >
-  Optimiert für Chain-of-Thought-Reasoning.
+  Ministral 3 (3B/8B/14B), Mistrals Edge-Familie, alle mit Vision (mmproj).
+  14B Reasoning ist vergleichbar mit Mistral Small 3.2 24B in Reasoning-
+  Benchmarks (85% AIME '25). Architektur teilt RoPE-Scaling mit Devstral
+  Small 2 / Llama 4. Apache 2.0.
+  Hinweis: Pattern matched auch "Instruct"-Varianten - dort temp via CLI
+  auf <=0.1 senken für Production/Daily-Driver.

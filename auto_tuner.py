@@ -344,6 +344,15 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Path to the llama-server binary "
              "(default: llama-server, env LLAMA_SERVER)",
     )
+    p.add_argument(
+        "--llama-cpp-dir",
+        default=os.environ.get("LLAMA_CPP_DIR"),
+        help="Path to your llama.cpp checkout (env LLAMA_CPP_DIR). "
+             "1bllama.cpp/BitNet are searched in the same parent folder. "
+             "Useful when llama.cpp lives outside the standard search paths "
+             "(e.g. C:\\LAB\\ai-local\\llama.cpp).",
+    )
+
     p.add_argument("--host", default="127.0.0.1",
                    help="Server bind host (default: 127.0.0.1)")
     p.add_argument("--port", type=int, default=8080,
@@ -368,6 +377,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    if args.llama_cpp_dir:
+        # The existing _candidate_search_roots() already honors LLAMA_CPP_DIR
+        # and looks for sibling 1bllama.cpp / BitNet folders next to it.
+        # Setting it here is process-local and does not affect the parent shell.
+        os.environ["LLAMA_CPP_DIR"] = args.llama_cpp_dir
 
     _print_banner()
     system = detect_system()

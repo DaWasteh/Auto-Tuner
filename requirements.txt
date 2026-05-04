@@ -1,2 +1,6 @@
 psutil>=5.9
 PyYAML>=6.0
+
+# dev / type-checking only
+types-psutil; extra == "dev"
+types-PyYAML; extra == "dev"

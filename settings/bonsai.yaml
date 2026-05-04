@@ -1,18 +1,31 @@
-display_name: "Bonsai 8B (PrismML)"
+display_name: "Bonsai 8B (PrismML, 1-bit)"
 patterns:
   - bonsai
 
-max_context: 8192
+# PrismML's Demo-Repo nennt 8k/32k/64k als realistische Kontextgrößen.
+# Bei 1-bit Modellen ist VRAM nicht das Problem, aber das Modell ist
+# nicht für extrem-long-context trainiert.
+max_context: 65536
 recommended_kv_quant: q8_0
 
+# Bonsai 8B (1-bit) braucht den PrismML-Fork mit 1-bit Kerneln.
+# Q1_0 Support ist in Upstream llama.cpp gemerged (ab ca. 2026), aber
+# weitere Backends (optimierte x86 CPU, AMD) sind noch im Fork.
 server_binary: "1bllama.cpp/build/bin/Release/llama-server.exe"
 
 sampling:
-  temperature: 0.7
-  top_k: 40
-  top_p: 0.9
+  # PrismML's eigenes README-Beispiel zeigt:
+  # llama-cli -m Bonsai-8B-Q1_0.gguf --temp 0.5 --top-p 0.85 --top-k 20
+  temperature: 0.5
+  top_k: 20
+  top_p: 0.85
   min_p: 0.05
   repeat_penalty: 1.05
 
 notes: >
-  Standard-Bonsai-8B oder Ternary-Bonsai (BitNet).
+  PrismML Bonsai 8B - das erste kommerziell tragfähige 1-bit LLM (Q1_0 GGUF,
+  ~1.15 GB). Konkurrenzfähig mit full-precision 8B Modellen, dabei 14x
+  kleiner und 8x schneller auf Edge-Hardware.
+  Braucht den PrismML-Fork von llama.cpp (1bllama.cpp), nicht Mainline.
+  Q1_0 Quant ist in Upstream gemerged für CPU/Metal/CUDA/Vulkan, aber für
+  AMD ROCm + optimierte x86 Pfade braucht man noch den Fork.
