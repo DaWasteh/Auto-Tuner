@@ -1,0 +1,47 @@
+display_name: "SenseNova U1 (SenseTime, native multimodal)"
+patterns:
+  - sensenova-u1
+  - sensenova_u1
+
+# Native context steht im GGUF-Header und wird von AutoTuner automatisch
+# auf min(max_context, native_context) begrenzt. SenseNova hat keine
+# offizielle Kontext-Längen-Angabe publiziert - 128k als oberer Cap,
+# der echte Wert kommt aus den GGUF-Metadaten.
+max_context: 131072
+recommended_kv_quant: q8_0
+
+sampling:
+  # SenseNova hat keine offiziellen Sampling-Defaults für lokale Inferenz
+  # veröffentlicht (das HF-Repo zeigt nur VQA-Beispiele ohne CLI-Parameter).
+  # Moderate Werte für ein gemischtes Verstehens- + Generations-Modell.
+  temperature: 0.7
+  top_k: 40
+  top_p: 0.9
+  min_p: 0.05
+  repeat_penalty: 1.05
+
+notes: >
+  SenseNova U1 8B MoT (SenseTime, Release 27.04.2026) - native multimodales,
+  monolithisches Modell mit NEO-Unify-Architektur. Vision ist nativ in den
+  Transformer-Gewichten integriert: KEIN separater Visual Encoder, KEINE VAE,
+  KEIN mmproj-File noetig. Das eine GGUF kann Bilder verstehen UND generieren.
+
+  Groessenhinweis: ~16 GB bei Q6_K wirkt fuers 8B-Branding viel - typisches
+  8B Q6_K liegt bei ~6.6 GB. Der Ueberhang sind die unifizierten Pfade fuer
+  Image-Generation (anstelle einer separaten VAE / eines Decoders). Die
+  KV-Cache-Schaetzung mit ~8B passt fuer die Sprach-Attention trotzdem.
+
+  Bekannte Varianten (alle matchen das gleiche Profil):
+    - SenseNova-U1-8B-MoT          : Final mit T2I-RL trainiert
+    - SenseNova-U1-8B-MoT-SFT      : SFT-only-Stand vor RL
+    - SenseNova-U1-8B-MoT-8step    : Step-distilled (Generation-fokussiert)
+    - SenseNova-U1-8B-MoT-SFT-fm   : SFT + Final-Merge
+
+  Vorsicht: Sehr neu und ungewoehnliche Architektur. Image-Understanding
+  (image -> text) sollte mit aktueller llama.cpp laufen; Image-Generation
+  (text -> image) ist je nach Build moeglicherweise noch nicht verdrahtet -
+  in dem Fall auf SenseNova-Skills (uv-basiert) ausweichen.
+
+  KEIN MoE-Routing (trotz dem "MoT" im Namen, das hier nicht "Mixture of
+  Experts" heisst, sondern auf die unifizierte Architektur verweist) -
+  also auch kein --n-cpu-moe noetig.
