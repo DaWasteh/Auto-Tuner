@@ -3,6 +3,7 @@ patterns:
   - qwen-2.5
   - qwen-3
   - qwen2.5
+  - qwen3-coder
 
 max_context: 131072
 recommended_kv_quant: q8_0

@@ -2,6 +2,7 @@ display_name: "SenseNova U1 (SenseTime, native multimodal)"
 patterns:
   - sensenova-u1
   - sensenova_u1
+  - sensenova
 
 # Native context steht im GGUF-Header und wird von AutoTuner automatisch
 # auf min(max_context, native_context) begrenzt. SenseNova hat keine
