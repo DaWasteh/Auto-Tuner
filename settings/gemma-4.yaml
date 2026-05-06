@@ -17,6 +17,9 @@ sampling:
   min_p: 0.0
   repeat_penalty: 1.0  # Gemma reagiert schlecht auf >1.0
 
+# Draft model configuration for improved performance
+draft_max: 16384
+
 notes: >
   Gemma ist empfindlich gegenüber repeat_penalty > 1.0.
   E2B/E4B = multimodal (Text+Bild+Audio), 26B-A4B + 31B = Text+Bild.

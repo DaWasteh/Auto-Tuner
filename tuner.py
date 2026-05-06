@@ -19,15 +19,15 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Tunables. Kept at module scope so tests / callers can override them.
-
-DEFAULT_VRAM_SAFETY_GB = 1.5
-DEFAULT_RAM_SAFETY_GB = 4.0
-
+ 
+DEFAULT_VRAM_SAFETY_GB = 0.5
+DEFAULT_RAM_SAFETY_GB = 2.0
+ 
 # MoE-specific knobs. AMD/Vulkan crashes near the VRAM ceiling, so we
 # leave more slack for the allocator.
-MOE_VRAM_SAFETY_GB = 2.5
+MOE_VRAM_SAFETY_GB = 1.5
 MOE_PLACEMENT_CTX_TARGET = 32768
-MOE_KV_RESERVE_FRAC = 0.30
+MOE_KV_RESERVE_FRAC = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ def _decide_offload(
         ngl = int(usable / per_layer_gb)
         ngl = max(0, min(n_layers, ngl))
         model_vram = ngl * per_layer_gb
-        residual_overhead = model_size_gb * 0.03
+        residual_overhead = model_size_gb * 0.02  # Reduced overhead
         model_ram = (n_layers - ngl) * per_layer_gb + residual_overhead
         return ngl, model_vram, model_ram, False
 
@@ -188,7 +188,7 @@ def _decide_moe_offload(
     kv_reserve_gb = (placement_ctx * base_kv_mb * 0.55) / 1024
     kv_reserve_gb = min(kv_reserve_gb, free_vram_gb * MOE_KV_RESERVE_FRAC)
 
-    shared_overhead_gb = model_size_gb * 0.10
+    shared_overhead_gb = model_size_gb * 0.08  # Reduced overhead for MoE models
     per_layer_expert_gb = max(0.001,
                               (model_size_gb - shared_overhead_gb) / n_layers)
 
@@ -243,6 +243,7 @@ def compute_config(
     model: ModelEntry,
     system: SystemInfo,
     profile: ModelProfile,
+    draft_model: Optional[ModelEntry] = None,
     user_ctx: Optional[int] = None,
     ram_safety_gb: float = DEFAULT_RAM_SAFETY_GB,
     vram_safety_gb: float = DEFAULT_VRAM_SAFETY_GB,
@@ -315,11 +316,14 @@ def compute_config(
     if user_ctx is not None:
         ctx = user_ctx
     else:
+        # Use a more realistic calculation with higher tolerance for VRAM usage
         if actual_per_tok_mb > 0:
-            max_fit_ctx = int((kv_budget_gb * 1024 * 0.92) / actual_per_tok_mb)
+            # Allow for 95% of the budget to be used instead of 92%
+            max_fit_ctx = int((kv_budget_gb * 1024 * 0.95) / actual_per_tok_mb)
         else:
             max_fit_ctx = profile_max
-        ctx = min(profile_max, max_fit_ctx)
+        # Allow context length to exceed profile_max when there's sufficient memory
+        ctx = min(max_fit_ctx, profile_max * 2)  # Up to 2x the profile max if memory allows
 
     ctx = max(2048, (ctx // 1024) * 1024)
     estimated_kv_gb = (ctx * actual_per_tok_mb) / 1024
@@ -447,6 +451,7 @@ def build_command(
     model: ModelEntry,
     config: TunedConfig,
     profile: ModelProfile,
+    draft_model: Optional[ModelEntry] = None,
     server_binary: str = "llama-server",
     host: str = "127.0.0.1",
     port: int = 8080,
@@ -466,6 +471,16 @@ def build_command(
         "--host", host,
         "--port", str(port),
     ]
+
+    # Add draft model if provided
+    if draft_model is not None:
+        cmd += ["--spec-draft-n-max", str(draft_model.path)]
+        # Use draft model's context length if available, otherwise use main model's
+        if hasattr(draft_model, 'native_context') and draft_model.native_context > 0:
+            cmd += ["--spec-ngram-mod-n-max", str(draft_model.native_context)]
+        elif hasattr(profile, 'draft_max') and profile.draft_max > 0:
+            # Use the draft max context from the profile if available
+            cmd += ["--spec-ngram-mod-n-max", str(profile.draft_max)]
 
     if config.flash_attn:
         cmd += ["-fa", "on"]

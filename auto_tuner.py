@@ -440,7 +440,40 @@ def main(argv: Optional[List[str]] = None) -> int:
             model.mmproj = None
 
         profile = match_profile(model.name, profiles)
-        cfg = compute_config(model, system, profile, user_ctx=args.ctx)
+        # Try to find a draft model for this family if available
+        draft_model = None
+        # Look for a smaller model that could serve as draft model based on the same family
+        # Only look for models with "assistant" in name (smaller, faster draft models)
+        draft_candidates = [e for e in entries if profile.display_name.lower() in e.name.lower() and "assistant" in e.name.lower()]
+        if draft_candidates:
+            # Find the smallest model that's still larger than the minimum required size (or just any small one)
+            # But make sure it matches the main model type (e.g., 31B assistant for 31B model)
+            matching_type_drafts = [e for e in draft_candidates if "31b" in model.name.lower() and "31b" in e.name.lower()]
+            if not matching_type_drafts:
+                # If no matching type found, try to find any assistant model
+                matching_type_drafts = [e for e in draft_candidates if "assistant" in e.name.lower()]
+            if matching_type_drafts:
+                draft_model = min(matching_type_drafts, key=lambda x: x.size_gb)
+                print(f"[AutoTuner] Found draft model: {draft_model.name}")
+        elif profile.draft_max > 0:
+            # If no draft model found but draft_max is set in profile, try to find a suitable one
+            # Look for any "assistant" model that's smaller than the main model
+            small_draft_candidates = [e for e in entries if "assistant" in e.name.lower() and e.size_gb < model.size_gb]
+            if small_draft_candidates:
+                # Filter for matching types (assistant models)
+                assistant_drafts = [e for e in small_draft_candidates if "31b" in model.name.lower() and "31b" in e.name.lower()]
+                if not assistant_drafts:
+                    # If no matching type found, just take any assistant model
+                    assistant_drafts = [e for e in small_draft_candidates if "assistant" in e.name.lower()]
+                if assistant_drafts:
+                    draft_model = min(assistant_drafts, key=lambda x: x.size_gb)
+                    print(f"[AutoTuner] Found draft model (based on draft_max): {draft_model.name}")
+                else:
+                    # If no assistant found, just take the smallest one
+                    draft_model = min(small_draft_candidates, key=lambda x: x.size_gb)
+                    print(f"[AutoTuner] Found draft model (based on draft_max): {draft_model.name}")
+
+        cfg = compute_config(model, system, profile, draft_model=draft_model, user_ctx=args.ctx)
         _print_config(model, profile, cfg, system)
 
         raw_server = profile.server_binary or args.server
@@ -457,6 +490,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             model=model,
             config=cfg,
             profile=profile,
+            draft_model=draft_model,
             server_binary=server,
             host=args.host,
             port=args.port,

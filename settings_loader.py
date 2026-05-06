@@ -27,6 +27,7 @@ class ModelProfile:
     # Optional: override the llama-server binary for this model family.
     # Used e.g. by Ternary-Bonsai (BitNet) to invoke a 1bllama build.
     server_binary: Optional[str] = None
+    draft_max: int = 16
 
 
 def load_profiles(settings_dir: Path) -> List[ModelProfile]:
