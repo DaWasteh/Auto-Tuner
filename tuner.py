@@ -5,6 +5,9 @@ import platform
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from hardware import SystemInfo
+from scanner import ModelEntry
+from settings_loader import ModelProfile
 
 ctypes: Any = None
 try:
@@ -12,10 +15,6 @@ try:
     ctypes = _ctypes
 except ImportError:
     pass
-
-from hardware import SystemInfo
-from scanner import ModelEntry
-from settings_loader import ModelProfile
 
 
 # ---------------------------------------------------------------------------
