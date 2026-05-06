@@ -444,14 +444,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         draft_model = None
         # Look for a smaller model that could serve as draft model based on the same family
         # Only look for models with "assistant" in name (smaller, faster draft models)
-        draft_candidates = [e for e in entries if profile.display_name.lower() in e.name.lower() and "assistant" in e.name.lower()]
+        # First try to match by family name pattern
+        family_match = profile.display_name.lower()
+        draft_candidates = [e for e in entries if "assistant" in e.name.lower() and family_match in e.name.lower()]
+        if not draft_candidates:
+            # If no family match found, look for any assistant model
+            draft_candidates = [e for e in entries if "assistant" in e.name.lower()]
+        
         if draft_candidates:
             # Find the smallest model that's still larger than the minimum required size (or just any small one)
-            # But make sure it matches the main model type (e.g., 31B assistant for 31B model)
-            matching_type_drafts = [e for e in draft_candidates if "31b" in model.name.lower() and "31b" in e.name.lower()]
-            if not matching_type_drafts:
-                # If no matching type found, try to find any assistant model
-                matching_type_drafts = [e for e in draft_candidates if "assistant" in e.name.lower()]
+            # But make sure it matches the main model type
+            matching_type_drafts = []
+            
+            # For Qwen models, check for family match
+            if "qwen" in model.name.lower():
+                matching_type_drafts = [e for e in draft_candidates if "qwen" in e.name.lower()]
+            elif "gemma" in model.name.lower():
+                matching_type_drafts = [e for e in draft_candidates if "gemma" in e.name.lower()]
+            elif "phi" in model.name.lower():
+                matching_type_drafts = [e for e in draft_candidates if "phi" in e.name.lower()]
+            else:
+                # Default to all candidates
+                matching_type_drafts = draft_candidates
+            
             if matching_type_drafts:
                 draft_model = min(matching_type_drafts, key=lambda x: x.size_gb)
                 print(f"[AutoTuner] Found draft model: {draft_model.name}")
@@ -461,15 +476,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             small_draft_candidates = [e for e in entries if "assistant" in e.name.lower() and e.size_gb < model.size_gb]
             if small_draft_candidates:
                 # Filter for matching types (assistant models)
-                assistant_drafts = [e for e in small_draft_candidates if "31b" in model.name.lower() and "31b" in e.name.lower()]
-                if not assistant_drafts:
-                    # If no matching type found, just take any assistant model
+                assistant_drafts = []
+                
+                # For Qwen models, check for family match
+                if "qwen" in model.name.lower():
+                    assistant_drafts = [e for e in small_draft_candidates if "qwen" in e.name.lower()]
+                elif "gemma" in model.name.lower():
+                    assistant_drafts = [e for e in small_draft_candidates if "gemma" in e.name.lower()]
+                elif "phi" in model.name.lower():
+                    assistant_drafts = [e for e in small_draft_candidates if "phi" in e.name.lower()]
+                else:
+                    # Default to all candidates
                     assistant_drafts = [e for e in small_draft_candidates if "assistant" in e.name.lower()]
+                
                 if assistant_drafts:
                     draft_model = min(assistant_drafts, key=lambda x: x.size_gb)
                     print(f"[AutoTuner] Found draft model (based on draft_max): {draft_model.name}")
                 else:
-                    # If no assistant found, just take the smallest one
+                    # If no matching type found, just take the smallest one
                     draft_model = min(small_draft_candidates, key=lambda x: x.size_gb)
                     print(f"[AutoTuner] Found draft model (based on draft_max): {draft_model.name}")
 
