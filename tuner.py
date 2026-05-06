@@ -1,24 +1,17 @@
-"""Compute an optimal llama-server configuration for a given model
-on the detected hardware, then build the command line.
-
-v3 changes vs v2:
-  * MoE-aware KV budget: when --n-cpu-moe is active, attention + KV live
-    on the GPU. The KV budget must therefore be VRAM-only — counting
-    free RAM (as v2 did, by accident) makes the tuner pick a context
-    that overflows VRAM and crashes Vulkan with `GGML_ASSERT(addr)`.
-  * More conservative placement for MoE: AMD/Vulkan is sensitive when
-    VRAM is packed close to the limit, and the placement-time KV
-    reserve was sized against the full profile_max context (often
-    256k+), which is unrealistic on a 16 GB GPU. Now: bump the safety
-    margin to 2.5 GB and size KV reserve for a sensible 32k target —
-    the user can still go higher with --ctx, but won't be silently
-    over-committed.
-"""
 from __future__ import annotations
 
 import re
+import platform
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+ctypes: Any = None
+try:
+    import ctypes as _ctypes
+    ctypes = _ctypes
+except ImportError:
+    pass
 
 from hardware import SystemInfo
 from scanner import ModelEntry
@@ -32,10 +25,7 @@ DEFAULT_VRAM_SAFETY_GB = 1.5
 DEFAULT_RAM_SAFETY_GB = 4.0
 
 # MoE-specific knobs. AMD/Vulkan crashes near the VRAM ceiling, so we
-# leave more slack for the allocator. The placement-time KV reserve is
-# sized against this target context, NOT the profile's max_context, so
-# we don't pack experts based on a 256k-token assumption that nobody
-# actually uses for a 35B model on a 16 GB card.
+# leave more slack for the allocator.
 MOE_VRAM_SAFETY_GB = 2.5
 MOE_PLACEMENT_CTX_TARGET = 32768
 MOE_KV_RESERVE_FRAC = 0.30
@@ -145,7 +135,6 @@ class TunedConfig:
     estimated_kv_gb: float = 0.0
     full_offload: bool = False
 
-    # Optional warning (e.g. "VRAM tight, consider lowering --ctx").
     warning: Optional[str] = None
 
 
@@ -159,7 +148,6 @@ def _decide_offload(
     has_gpu: bool,
     vram_headroom_gb: float = DEFAULT_VRAM_SAFETY_GB,
 ) -> Tuple[int, float, float, bool]:
-    """Dense-model placement: returns (ngl, model_vram, model_ram, full)."""
     if not has_gpu or free_vram_gb < 1.0:
         return 0, 0.0, model_size_gb, False
 
@@ -195,17 +183,6 @@ def _decide_moe_offload(
     target_ctx: int,
     ram_safety_gb: float = DEFAULT_RAM_SAFETY_GB,
 ) -> Tuple[int, Optional[int], float, float, bool]:
-    """MoE placement using --n-cpu-moe. Returns
-    (ngl, n_cpu_moe, model_vram_gb, model_ram_gb, full_offload).
-
-    KV cache also lives on GPU with this strategy. Sizing the placement
-    KV reserve against `target_ctx` (which can be 256k from a permissive
-    profile) packs experts way too sparsely on a 16 GB card, or — worse —
-    leaves no room for the actual KV at runtime. We size the reserve
-    against a realistic working context (MOE_PLACEMENT_CTX_TARGET), and
-    clamp by MOE_KV_RESERVE_FRAC so a single huge model can't accidentally
-    block all KV space.
-    """
     base_kv_mb = kv_per_token_mb_f16(params_billion)
 
     placement_ctx = min(target_ctx, MOE_PLACEMENT_CTX_TARGET)
@@ -243,7 +220,6 @@ def _pick_kv_quant(
     base_kv_per_token_mb: float,
     kv_budget_gb: float,
 ) -> Tuple[str, str]:
-    """Pick the best-quality KV cache quant that fits the target context."""
     order = ["q8_0", "q5_0", "q4_0"]
     rec = profile_recommended.lower()
     if rec in order:
@@ -314,25 +290,16 @@ def compute_config(
         )
 
     # ---- (2) Remaining KV budget
-    # The MoE case is the subtle one: with --n-cpu-moe, attention + KV
-    # cache live on the GPU. RAM does NOT contribute to the KV budget,
-    # even though the offloaded experts sit there. Counting RAM here (the
-    # v2 bug) made the tuner pick contexts of 100k+ tokens that produced
-    # 25+ GB of would-be KV — far past what a 16 GB GPU can hold —
-    # leading to GGML_ASSERT crashes during model load on Vulkan/AMD.
     effective_vram_safety = (MOE_VRAM_SAFETY_GB if n_cpu_moe is not None
                              else vram_safety_gb)
     free_vram_after = max(0.0, free_vram - effective_vram_safety - model_vram)
     free_ram_after = max(0.0, system.free_ram_gb - ram_safety_gb - model_ram)
 
     if n_cpu_moe is not None:
-        # MoE expert offload: KV is GPU-only.
         kv_budget_gb = free_vram_after
     elif full_off:
-        # Dense, fully on GPU: KV is GPU-only.
         kv_budget_gb = free_vram_after
     else:
-        # Dense hybrid or CPU-only: KV is split / on CPU.
         kv_budget_gb = free_vram_after + free_ram_after
 
     # ---- (3) Context + KV quant
@@ -358,7 +325,7 @@ def compute_config(
     ctx = max(2048, (ctx // 1024) * 1024)
     estimated_kv_gb = (ctx * actual_per_tok_mb) / 1024
 
-    # ---- (3b) Sanity check: did user_ctx push us into VRAM overcommit?
+    # ---- (3b) VRAM Overcommit Warning
     warning: Optional[str] = None
     if n_cpu_moe is not None or full_off:
         gpu_total = model_vram + estimated_kv_gb + effective_vram_safety
@@ -367,8 +334,7 @@ def compute_config(
                 f"VRAM budget tight: model {model_vram:.1f} GB + KV "
                 f"{estimated_kv_gb:.1f} GB + safety "
                 f"{effective_vram_safety:.1f} GB ≈ {gpu_total:.1f} GB of "
-                f"{free_vram:.1f} GB free. If launch fails with "
-                f"GGML_ASSERT(addr), re-run with a smaller --ctx."
+                f"{free_vram:.1f} GB free."
             )
 
     # ---- (4) Threads
@@ -395,13 +361,32 @@ def compute_config(
     else:
         batch, ubatch = 2048, 512
 
-    # ---- (4c) mlock + no_mmap (paired)
+    # ---- (4c) mlock + no_mmap (Windows Admin Check)
     ram_resident_gb = model_ram
+    
+    is_windows = platform.system() == "Windows"
+    is_admin = False
+    if is_windows:
+        if ctypes:
+            try:
+                is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            except Exception:
+                is_admin = False
+    else:
+        # Auf Linux/Mac prüfen wir auf Root
+        try:
+            # Benutze getattr, damit Pylance nicht direkt nach dem Attribut sucht
+            getuid = getattr(os, "getuid", None)
+            is_admin = getuid() == 0 if getuid else True
+        except Exception:
+            is_admin = True
+
     mlock = (
         not full_off
         and system.total_ram_gb > 32
         and ram_resident_gb > 0
         and ram_resident_gb < (system.free_ram_gb - 8)
+        and (not is_windows or is_admin) # <--- FIX: Nur mlock wenn Admin auf Windows
     )
     no_mmap = mlock
 
@@ -458,9 +443,6 @@ def compute_config(
         warning=warning,
     )
 
-
-# ---------------------------------------------------------------------------
-# Build command
 
 def build_command(
     model: ModelEntry,
