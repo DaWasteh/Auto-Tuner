@@ -8,7 +8,7 @@ recommended_kv_quant: q8_0
 
 # Braucht ebenfalls den PrismML-Fork - Q2_0 Format packt die 1.58-bit
 # Ternary-Gewichte hardware-freundlich in 2 bits.
-server_binary: "1bllama.cpp/build/bin/Release/llama-server.exe"
+server_binary: "1b_llama.cpp/build/bin/Release/llama-server.exe"
 
 sampling:
   # Gleiche Empfehlung wie Bonsai 8B.

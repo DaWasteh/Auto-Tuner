@@ -9,6 +9,9 @@ patterns:
 max_context: 262144
 recommended_kv_quant: q8_0
 
+# Zwingend erforderlich für MTP-Support (gemma4_mtp Architektur)
+server_binary: "ik_llama.cpp/build/bin/Release/llama-server.exe"
+
 sampling:
   # Google's offizielle Empfehlung über alle Größen hinweg.
   temperature: 1.0
@@ -17,8 +20,12 @@ sampling:
   min_p: 0.0
   repeat_penalty: 1.0  # Gemma reagiert schlecht auf >1.0
 
-# Draft model configuration for improved performance
-draft_max: 16384
+# MTP (Multi-Token Prediction) draft model configuration
+# Gemma 4 uses assistant models for speculative decoding via MTP.
+# draft_max = number of MTP tokens to predict per step (default: 3)
+# draft_p_min = minimum probability threshold for accepting draft tokens
+draft_max: 3
+draft_p_min: 0.0
 
 notes: >
   Gemma ist empfindlich gegenüber repeat_penalty > 1.0.

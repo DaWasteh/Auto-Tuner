@@ -472,15 +472,18 @@ def build_command(
         "--port", str(port),
     ]
 
-    # Add draft model if provided
+    # Add draft model if provided (MTP speculative decoding)
+    # NOTE: -md MUST come BEFORE --spec-type because llama-server parses
+    # arguments left-to-right. If --spec-type is seen before -md, the server
+    # thinks no draft model was given and aborts with:
+    #   "unknown speculative decoding type without draft model"
     if draft_model is not None:
-        cmd += ["--spec-draft-n-max", str(draft_model.path)]
-        # Use draft model's context length if available, otherwise use main model's
-        if hasattr(draft_model, 'native_context') and draft_model.native_context > 0:
-            cmd += ["--spec-ngram-mod-n-max", str(draft_model.native_context)]
-        elif hasattr(profile, 'draft_max') and profile.draft_max > 0:
-            # Use the draft max context from the profile if available
-            cmd += ["--spec-ngram-mod-n-max", str(profile.draft_max)]
+        draft_val = getattr(profile, 'draft_max', 0) or 3
+        cmd += ["-md", str(draft_model.path)]
+        cmd += ["--spec-type", "mtp"]  # Erforderlich für ik_llama.cpp
+        cmd += ["-ngld", "99"]
+        cmd += ["--draft-max", str(draft_val)] # Dieser Fork nutzt oft wieder --draft-max
+        cmd += ["--draft-p-min", str(getattr(profile, 'draft_p_min', 0.0) or 0.0)]
 
     if config.flash_attn:
         cmd += ["-fa", "on"]

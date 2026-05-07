@@ -440,68 +440,65 @@ def main(argv: Optional[List[str]] = None) -> int:
             model.mmproj = None
 
         profile = match_profile(model.name, profiles)
-        # Try to find a draft model for this family if available
-        draft_model = None
-        # Look for a smaller model that could serve as draft model based on the same family
-        # Only look for models with "assistant" in name (smaller, faster draft models)
-        # First try to match by family name pattern
-        family_match = profile.display_name.lower()
-        draft_candidates = [e for e in entries if "assistant" in e.name.lower() and family_match in e.name.lower()]
-        if not draft_candidates:
-            # If no family match found, look for any assistant model
-            draft_candidates = [e for e in entries if "assistant" in e.name.lower()]
         
-        if draft_candidates:
-            # Find the smallest model that's still larger than the minimum required size (or just any small one)
-            # But make sure it matches the main model type
-            matching_type_drafts = []
-            
-            # For Qwen models, check for family match
-            if "qwen" in model.name.lower():
-                matching_type_drafts = [e for e in draft_candidates if "qwen" in e.name.lower()]
-            elif "gemma" in model.name.lower():
-                matching_type_drafts = [e for e in draft_candidates if "gemma" in e.name.lower()]
-            elif "phi" in model.name.lower():
-                matching_type_drafts = [e for e in draft_candidates if "phi" in e.name.lower()]
-            else:
-                # Default to all candidates
-                matching_type_drafts = draft_candidates
-            
-            if matching_type_drafts:
-                draft_model = min(matching_type_drafts, key=lambda x: x.size_gb)
-                print(f"[AutoTuner] Found draft model: {draft_model.name}")
-        elif profile.draft_max > 0:
-            # If no draft model found but draft_max is set in profile, try to find a suitable one
-            # Look for any "assistant" model that's smaller than the main model
-            small_draft_candidates = [e for e in entries if "assistant" in e.name.lower() and e.size_gb < model.size_gb]
-            if small_draft_candidates:
-                # Filter for matching types (assistant models)
-                assistant_drafts = []
-                
-                # For Qwen models, check for family match
-                if "qwen" in model.name.lower():
-                    assistant_drafts = [e for e in small_draft_candidates if "qwen" in e.name.lower()]
-                elif "gemma" in model.name.lower():
-                    assistant_drafts = [e for e in small_draft_candidates if "gemma" in e.name.lower()]
-                elif "phi" in model.name.lower():
-                    assistant_drafts = [e for e in small_draft_candidates if "phi" in e.name.lower()]
-                else:
-                    # Default to all candidates
-                    assistant_drafts = [e for e in small_draft_candidates if "assistant" in e.name.lower()]
-                
-                if assistant_drafts:
-                    draft_model = min(assistant_drafts, key=lambda x: x.size_gb)
-                    print(f"[AutoTuner] Found draft model (based on draft_max): {draft_model.name}")
-                else:
-                    # If no matching type found, just take the smallest one
-                    draft_model = min(small_draft_candidates, key=lambda x: x.size_gb)
-                    print(f"[AutoTuner] Found draft model (based on draft_max): {draft_model.name}")
+        # Try to find a draft model for this family if available.
+        # Strategy: strip the quant suffix from the main model name, then look
+        # for an assistant model that shares the same base prefix.
+        #   e.g. "gemma-4-31B-it-Q3_K_S" -> base "gemma-4-31b-it"
+        #        -> matches "gemma-4-31B-it-assistant-Q8_0"
+        draft_model = None
+        if profile.draft_max > 0:
+            import re as _re
+            main_name_lower = model.name.lower()
 
+            # Strip quant suffix (Q3_K_S, Q8_0, BF16, F16, IQ2_XXS, etc.)
+            base_name = _re.sub(
+                r"[-_]?(?:q\d+(?:_+[a-z]+)+|iq\d+_+[a-z]+|tf\d+|bf16|f16|f32)$",
+                "", main_name_lower
+            ).strip("-_")
+
+            # Look for assistant model with matching base prefix
+            exact_drafts = [
+                e for e in entries
+                if "assistant" in e.name.lower()
+                and e.name.lower().startswith(base_name)
+            ]
+            if exact_drafts:
+                draft_model = min(exact_drafts, key=lambda x: x.size_gb)
+                print(f"[AutoTuner] Found draft model: {draft_model.name}")
+
+            if draft_model is None:
+                # Fallback: try to find a draft model from the same family.
+                # Only use draft models that share the same architectural prefix
+                # (e.g., qwen assistant for qwen main, gemma for gemma).
+                # Do NOT fall back to arbitrary assistant models — speculative
+                # decoding requires architecturally compatible draft models.
+                draft_candidates = [
+                    e for e in entries
+                    if "assistant" in e.name.lower() and e.size_gb < model.size_gb
+                ]
+                if draft_candidates:
+                    matching_type_drafts = []
+                    if "qwen" in main_name_lower:
+                        matching_type_drafts = [e for e in draft_candidates if "qwen" in e.name.lower()]
+                    elif "gemma" in main_name_lower:
+                        matching_type_drafts = [e for e in draft_candidates if "gemma" in e.name.lower()]
+                    elif "phi" in main_name_lower:
+                        matching_type_drafts = [e for e in draft_candidates if "phi" in e.name.lower()]
+                    # No else fallback — using an architecturally incompatible
+                    # draft model causes llama-server to crash on startup.
+
+                    if matching_type_drafts:
+                        draft_model = min(matching_type_drafts, key=lambda x: x.size_gb)
+                        print(f"[AutoTuner] Found draft model: {draft_model.name}")
         cfg = compute_config(model, system, profile, draft_model=draft_model, user_ctx=args.ctx)
         _print_config(model, profile, cfg, system)
 
         raw_server = profile.server_binary or args.server
-        server = _resolve_server_binary(raw_server)
+        # --- FIX START: Profil-Binary bevorzugen ---
+        effective_server = profile.server_binary if (profile and profile.server_binary) else args.llama_server
+        server = _resolve_server_binary(effective_server)
+        # --- FIX END ---
         if server != raw_server:
             print(f"[AutoTuner] Found server binary: {server}")
         elif not Path(server).is_file() and not shutil.which(server):

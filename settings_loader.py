@@ -28,6 +28,7 @@ class ModelProfile:
     # Used e.g. by Ternary-Bonsai (BitNet) to invoke a 1bllama build.
     server_binary: Optional[str] = None
     draft_max: int = 16
+    draft_p_min: float = 0.0
 
 
 def load_profiles(settings_dir: Path) -> List[ModelProfile]:
@@ -64,6 +65,8 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
             source_file=yml.name,
             server_binary=(str(data["server_binary"])
                            if data.get("server_binary") else None),
+            draft_max=int(data.get("draft_max", 16)),
+            draft_p_min=float(data.get("draft_p_min", 0.0)),
         ))
     return profiles
 
