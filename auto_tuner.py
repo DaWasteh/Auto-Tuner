@@ -10,7 +10,7 @@ Workflow:
 
 Usage:
   python auto_tuner.py
-  python auto_tuner.py --models-path D:/models --port 8080
+  python auto_tuner.py --models-path D:/models --port 1234
   python auto_tuner.py --model Devstral --dry-run
 
 Environment variables:
@@ -37,6 +37,12 @@ from tuner import build_command, compute_config, TunedConfig
 # Pretty-printing helpers
 
 _BAR = "─" * 64
+_DEBUG_MODE = False
+
+def _debug_print(*args, **kwargs) -> None:
+    """Print debug messages only if debugging mode is enabled."""
+    if _DEBUG_MODE:
+        print("[DEBUG]", *args, **kwargs)
 
 def _print_banner() -> None:
     print()
@@ -256,7 +262,7 @@ def _candidate_search_roots() -> List[Path]:
     def add(p):
         try:
             rp = Path(p).expanduser().resolve()
-            print(f"[DEBUG] Checking path: {rp}")
+            _debug_print(f"Checking path: {rp}")
         except (OSError, RuntimeError):
             return
         if rp in seen or not rp.exists():
@@ -265,7 +271,7 @@ def _candidate_search_roots() -> List[Path]:
         roots.append(rp)
 
     env_dir = os.environ.get("LLAMA_CPP_DIR")
-    print(f"[DEBUG] LLAMA_CPP_DIR: {env_dir}")
+    _debug_print(f"LLAMA_CPP_DIR: {env_dir}")
     if env_dir:
         add(env_dir)
         parent = Path(env_dir).expanduser()
@@ -310,14 +316,14 @@ def _resolve_server_binary(user_value: str) -> str:
                     # First try the direct path (e.g. fork/llama-server)
                     candidate = root / inner
                     if candidate.is_file():
-                        print(f"[DEBUG] Found candidate: {candidate}")
+                        _debug_print(f"Found candidate: {candidate}")
                         return str(candidate)
                     # Then try build subpaths inside the matched fork directory.
                     binary_name = Path(inner).name  # e.g. "llama-server"
                     for sub in _SERVER_SUBPATHS:
                         candidate = root / sub
                         if candidate.is_file():
-                            print(f"[DEBUG] Found candidate in fork subpath: {candidate}")
+                            _debug_print(f"Found candidate in fork subpath: {candidate}")
                             return str(candidate)
 
         anchors: List[Path] = []
@@ -326,7 +332,7 @@ def _resolve_server_binary(user_value: str) -> str:
         def add_anchor(a: Path):
             try:
                 ra = a.resolve()
-                print(f"[DEBUG] Adding anchor: {ra}")
+                _debug_print(f"Adding anchor: {ra}")
             except (OSError, RuntimeError):
                 return
             if ra in seen:
@@ -342,7 +348,7 @@ def _resolve_server_binary(user_value: str) -> str:
         for a in anchors:
             candidate = a / p
             if candidate.is_file():
-                print(f"[DEBUG] Found candidate in anchors: {candidate}")
+                _debug_print(f"Found candidate in anchors: {candidate}")
                 return str(candidate)
 
     if not has_sep:
@@ -366,10 +372,10 @@ def _resolve_server_binary(user_value: str) -> str:
         for sub in candidate_subpaths:
             candidate = root / sub
             if candidate.is_file():
-                print(f"[DEBUG] Found candidate in subpaths: {candidate}")
+                _debug_print(f"Found candidate in subpaths: {candidate}")
                 return str(candidate)
 
-    print(f"[DEBUG] Defaulting to user value: {user_value}")
+    _debug_print(f"Defaulting to user value: {user_value}")
     return user_value
 
 
@@ -424,8 +430,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
     p.add_argument("--host", default="127.0.0.1",
                    help="Server bind host (default: 127.0.0.1)")
-    p.add_argument("--port", type=int, default=8080,
-                   help="Server port (default: 8080)")
+    p.add_argument("--port", type=int, default=1234,
+                   help="Server port (default: 1234)")
     p.add_argument("--ctx", type=int, default=None,
                    help="Override context length (otherwise auto-tuned)")
     p.add_argument("--model", default=None,
@@ -457,6 +463,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["LLAMA_CPP_DIR"] = args.llama_cpp_dir
 
     _print_banner()
+
+    # --- Debugging Mode Selection ---
+    global _DEBUG_MODE
+    print("\n" + "="*40)
+    print("  DEBUGGING MODE SELECTION")
+    print("="*40)
+    print("  1. Debugging OFF")
+    print("  2. Debugging ON")
+    print("-" * 40)
+
+    debug_choice = input("Select mode [1/2] (default 1): ").strip()
+    if debug_choice == "2":
+        _DEBUG_MODE = True
+        print("[AutoTuner] Debugging mode enabled.")
+    else:
+        print("[AutoTuner] Debugging mode disabled.")
+    print("="*40 + "\n")
 
     # --- Turbo-Quant Selection ---
     use_turbo = False
@@ -623,27 +646,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             """Wähle die passende llama-server Binary basierend auf YAML-Setting + Features.
 
             Priorität:
-            1. server_binary aus settings/*.yaml (direkter Pfad oder Fork-Name)
-            2. Spezialfall: Gemma 4 mit Draft → ik_llama.cpp (MTP-Support)
+            1. Spezialfall: Gemma 4 (MTP-Support)
+            2. server_binary aus settings/*.yaml (wenn vorhanden)
             3. Fallback: Standard llama-server
             """
-            # 1. ZUERST: server_binary aus YAML verwenden (wenn vorhanden)
-            if profile.server_binary:
-                resolved = _resolve_server_binary(profile.server_binary)
-                return resolved
-
-            # 2. Spezialfall: Gemma 4 ohne YAML-Einstellung
-            #    → abhängig von Draft-Entscheidung
+            # 1. Spezialfall: Gemma 4 (MTP-Support)
             if "gemma-4" in model_name.lower() or "gemma4" in model_name.lower():
                 if use_draft_flag:
-                    # Mit Draft → ik_llama.cpp (MTP-Support)
-                    return _resolve_server_binary("ik_llama.cpp/llama-server")
+                    # Mit Draft → Entweder aus YAML oder ik_llama.cpp
+                    return profile.server_binary if profile.server_binary else "ik_llama.cpp/llama-server"
                 else:
-                    # Ohne Draft → Standard llama.cpp
-                    return _resolve_server_binary("llama.cpp/llama-server")
+                    # Ohne Draft → Immer Standard llama.cpp
+                    return "llama.cpp/llama-server"
+
+            # 2. ZUERST: server_binary aus YAML verwenden (wenn vorhanden)
+            if profile.server_binary:
+                return profile.server_binary
 
             # 3. Fallback: Standard
-            return _resolve_server_binary(args.server)
+            return args.server
         
         if use_turbo:
             # Override server for Turbo-Quant
@@ -664,9 +685,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"[AutoTuner] Found server binary: {server}")
             elif not Path(server).is_file() and not shutil.which(server):
                 print(f"[AutoTuner] Warning: server binary '{server}' not found.")
-            print(f"[AutoTuner] Warning: server binary '{server}' not found.")
-            print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
-            print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
+                print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
+                print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
 
         extra = args.passthrough or []
         cmd = build_command(

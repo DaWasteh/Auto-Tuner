@@ -451,7 +451,7 @@ def build_command(
     draft_model: Optional[ModelEntry] = None,
     server_binary: str = "llama-server",
     host: str = "127.0.0.1",
-    port: int = 8080,
+    port: int = 1234,
     extra_args: Optional[List[str]] = None,
     use_thinking: bool = False,
 ) -> List[str]:

@@ -10,22 +10,95 @@ the RAM/VRAM you actually have free — without manual edits.
   AutoTuner for llama.cpp  —  interactive launcher
 ────────────────────────────────────────────────────────────────
 
-  CPU     : Intel Core Ultra 9 285K  (24 cores / 8 P-Cores, 16 E-Cores)
-  RAM     : 47,4 GB total, 37.4 GB free
-  GPU(s)  : 1 × AMD Radeon RX 9070 XT (16.0 GB, 13.1 GB free)
+========================================
+  DEBUGGING MODE SELECTION
+========================================
+  1. Debugging OFF
+  2. Debugging ON
+----------------------------------------
+Select mode [1/2] (default 1):
+[AutoTuner] Debugging mode disabled.
+========================================
+
+
+========================================
+  QUANTIZATION MODE SELECTION
+========================================
+  1. Standard-Quant (llama.cpp)
+  2. Turbo-Quant (tq_llama.cpp)
+----------------------------------------
+Select mode [1/2] (default 1):
+[AutoTuner] Standard-Quant mode selected.
+========================================
+
+OS:   Windows 11
+CPU:  Intel(R) Core(TM) Ultra 9 285K (24C/24T)
+RAM:  47.4 GB total, 18.1 GB free
+GPU1: [amd] AMD Radeon RX 9070 XT (15.9 GB total, 15.1 GB free)
+      (ignored: [intel] Intel(R) Graphics, 2.0 GB — too small or auxiliary)
+
+[AutoTuner] Scanning models in: C:\LAB\ai-local\models
+[AutoTuner] Loaded 17 profile(s) from C:\GitHub\Auto Tuner\settings
 
 Available models:
 ────────────────────────────────────────────────────────────────
+  ...
 
   [Alibaba/Qwen3.6]
-     1.  👁 Qwen3.6-27B-UD-Q3_K_XL                          12.5 GB  (128k native)
-     2.  👁 Qwen3.6-35B-A3B-UD-IQ3_S                        14.8 GB  (128k native)
+    7.  👁 Qwen3.6-27B-UD-Q3_K_XL                                   13.5 GB  (256k native)
+    8.  👁 Qwen3.6-35B-A3B-UD-IQ3_S                                 12.7 GB  (256k native)
 
-  [Mistral AI]
-     3.  👁 Devstral-Small-2-24B-Instruct-2512-IQ4_XS       12.1 GB  (256k native)
-     ...
+  [Frankenmerger]
+    9.    Archon-14B.Q6_K                                          11.3 GB  (40k native)
+  ...
 
-Select a model [1-12, q to quit]:
+  [Google]
+  ...
+    16.  👁 gemma-4-E2B-it-assistant-Q8_0                             0.1 GB  (128k native)
+    17.  👁 gemma-4-E2B-it-BF16                                       8.7 GB  (128k native)
+  ...
+
+  [IBM]
+    21.    granite-4.1-30b-IQ4_XS                                   14.4 GB  (128k native)
+    22.    granite-4.1-3b-UD-Q8_K_XL                                 4.0 GB  (128k native)
+  ...
+
+  [Mistral AI/Mistral-Medium]
+    36.  👁 Mistral-Medium-3.5-128B-UD-IQ3_XXS                       45.9 GB  (256k native)
+
+  [NVIDIA]
+    37.  👁 NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ4_XS  18.2 GB  (1024k native)
+
+  [PrismML]
+    38.    Bonsai-8B                                                 1.1 GB  (64k native)
+  ...
+
+Select a model [1-40, q to quit]: 15
+[AutoTuner] Found draft model: gemma-4-26B-A4B-it-assistant-Q8_0
+Vision aktivieren? (mmproj-gemma-4-26B-A4B-it-BF16.gguf) [Y/n] y
+Draft-Modell aktivieren? (gemma-4-26B-A4B-it-assistant-Q8_0) [Y/n] y
+Thinking/Reasoning aktivieren? (<|think|> / <|reserved_special_token>) [Y/n] y
+────────────────────────────────────────────────────────────────
+Model:    gemma-4-26B-A4B-it-UD-IQ4_XS
+Profile:  Gemma 4 (Google)  (gemma-4.yaml)
+Notes:    Gemma ist empfindlich gegenüber repeat_penalty > 1.0. E2B/E4B = multimodal (Text+Bild+Audio), 26B-A4B + 31B = Text+Bild. Thinking-Modus aktivierbar durch <|think|> am Anfang des System-Prompts. Tipp: Manche Community-Tests zeigen, dass Gemma 4 für Coding sogar mit temp=1.5 besser performt - bei Bedarf mit `-- --temp 1.5` überschreiben.
+Vision:   mmproj-gemma-4-26B-A4B-it-BF16.gguf
+────────────────────────────────────────────────────────────────
+  Placement       : GPU full offload (ngl=all of 60)
+  Context         : 111,616 tokens
+  KV cache quant  : K=q4_0  V=q4_0
+  Threads         : 8 (batch: 16)
+  Batch / ubatch  : 1024 / 512
+  Flash attention : on
+  Sampling        : temp=1.0 top_k=64 top_p=0.95 min_p=0.0 rep=1.0
+
+  Memory estimate:
+    model on GPU  ~  12.3 GB    (free VRAM:   15.1 GB)
+    model on CPU  ~   0.0 GB    (free RAM:    18.1 GB)
+    KV cache      ~  17.4 GB
+────────────────────────────────────────────────────────────────
+[AutoTuner] Found server binary: C:\LAB\ai-local\ik_llama.cpp\build\bin\Release\llama-server.exe
+Launch llama-server now? [Y/n]
 ```
 
 ## Features
@@ -65,9 +138,7 @@ cd llama-cpp-auto-tuner
 pip install -r requirements.txt
 ```
 
-You also need a working `llama-server` binary from
-[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) somewhere
-on your `PATH` (or pass `--server /path/to/llama-server`).
+You also need a working `llama-server` binary. The tuner automatically discovers binaries in common local setups (like `C:\LAB\ai-local\`), or you can specify one via `--server`.
 
 ## Usage
 
@@ -88,7 +159,7 @@ python auto_tuner.py
 Pick a model from the menu. Once it's running, point your client at:
 
 ```
-http://127.0.0.1:8080
+http://127.0.0.1:1234
 ```
 
 Works with the built-in **llama.cpp Web UI**, **VS Code** extensions
@@ -102,7 +173,7 @@ like Continue / Cline, **Open WebUI**, or any OpenAI-API client.
 | `--settings-path PATH` | Folder with YAML profiles (default `./settings`) |
 | `--server PATH` | Path to `llama-server` (default looks on `$PATH`, env `LLAMA_SERVER`) |
 | `--host HOST` | Bind address (default `127.0.0.1`) |
-| `--port N` | Server port (default `8080`) |
+| `--port N` | Server port (default `1234`) |
 | `--ctx N` | Override the auto-tuned context length |
 | `--model SUBSTR` | Skip the menu, pick a model by name substring |
 | `--dry-run` | Print the command, don't start the server |
@@ -119,30 +190,37 @@ like Continue / Cline, **Open WebUI**, or any OpenAI-API client.
 
 ### Server binary auto-discovery
 
-If `--server` isn't passed and the binary isn't on `PATH`, the auto-tuner
-walks upward from the script directory and `cwd`, looking for common
-layouts:
+The tuner automatically searches for binaries in common local layouts.
+If you have a workspace like this, it "Just Works" without any flags:
 
 ```
-<root>/llama.cpp/build/bin/Release/llama-server.exe   (Windows MSVC)
-<root>/llama.cpp/build/bin/llama-server               (Linux / macOS)
-<root>/ai-local/llama.cpp/build/bin/...               (common dev-workspace layout)
-<root>/1bllama.cpp/build/bin/...                      (BitNet fork, used by Ternary-Bonsai)
-```
-
-So if your tree looks like this:
-
-```
+C:\GitHub\
+└── Auto Tuner\         ← clone of this repo
 C:\LAB\
-├── Auto Tuner\         ← clone of this repo
 └── ai-local\
-    ├── llama.cpp\      ← your build
-    ├── models\         ← your models (with mmproj if available)
-    └── 1bllama.cpp\    ← BitNet fork (only needed for Ternary-Bonsai)
+    ├── llama.cpp\      ← standard build
+    ├── tq_llama.cpp\   ← Turbo-Quant build
+    ├── ik_llama.cpp\   ← Gemma 4 (MTP) build
+    ├── 1b_llama.cpp\   ← BitNet fork (Ternary-Bonsai)
+    └── models\         ← your models
 ```
 
-…then `python auto_tuner.py` Just Works without any flags. No models or
-binaries need to be copied into the repo.
+It looks for `llama-server` inside these directories (including `build/bin/...` subpaths).
+
+#### Quantization Modes
+
+When you start the tuner, you can choose between:
+
+1.  **Standard-Quant**: Uses standard `llama.cpp` binaries.
+2.  **Turbo-Quant**: Uses the `tq_llama.cpp` binary for faster inference.
+
+#### Specialized Binary Logic
+
+The tuner intelligently selects the best binary based on your model and settings:
+- **Gemma 4 (with Draft)** $\rightarrow$ uses `ik_llama.cpp` (MTP support).
+- **Gemma 4 (without Draft)** $\rightarrow$ uses standard `llama.cpp`.
+- **Ternary-Bonsai** $\rightarrow$ uses `1b_llama.cpp`.
+- **Turbo-Quant Mode** $\rightarrow$ uses `tq_llama.cpp`.
 
 Example — run Devstral, override context, and pass an extra flag:
 
@@ -211,15 +289,13 @@ auto_tuner/
 ├── settings_loader.py   # YAML profile loader and matcher
 ├── tuner.py             # config calculation + llama-server command builder
 ├── launcher.py          # subprocess + Ctrl+C handling (Windows + Unix)
+...
 ├── settings/
 │   ├── _default.yaml
-│   ├── qwen3.yaml
-│   ├── gemma-4.yaml
-│   ├── devstral.yaml
+│   ...
 │   ├── ministral.yaml
-│   ├── mistral-medium.yaml
 │   ├── bonsai.yaml
-│   └── frankenmerger.yaml
+│   ...
 ├── requirements.txt
 └── README.md
 ```

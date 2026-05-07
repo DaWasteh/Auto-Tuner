@@ -367,7 +367,7 @@ def test_resolver_distinguishes_between_llama_and_1b_llama(tmp_path,
     fork's directory name. The resolver must respect that and pick the
     1b_llama.cpp checkout, not the regular one sitting next to it."""
     from auto_tuner import _resolve_server_binary
-
+    
     auto_dir = tmp_path / "Auto Tuner"
     auto_dir.mkdir()
     regular = (tmp_path / "ai-local" / "llama.cpp" / "build" / "bin"
@@ -389,6 +389,25 @@ def test_resolver_distinguishes_between_llama_and_1b_llama(tmp_path,
     res2 = _resolve_server_binary(
         "1b_llama.cpp/build/bin/Release/llama-server.exe")
     assert Path(res2).resolve() == bitnet.resolve()
+
+def test_turbo_quant_mode_selection(tmp_path, monkeypatch):
+    """Test that the turbo mode selection logic works (mocking input)."""
+    from auto_tuner import main
+    import sys
+    from unittest.mock import patch
+
+    # Mocking sys.argv to avoid command line arguments
+    sys.argv = ["auto_tuner.py"]
+    
+    # We can't easily test the interactive input in a pure unit test
+    # without complex mocking, but we can verify the logic if we
+    # were to refactor main. For now, we ensure no crashes occur
+    # when simulating different inputs.
+    with patch('builtins.input', side_effect=["2", KeyboardInterrupt]):
+        try:
+            main([])
+        except (KeyboardInterrupt, SystemExit):
+            pass # Expected behavior for testing exit
 
 
 # ---------------------------------------------------------------------------
