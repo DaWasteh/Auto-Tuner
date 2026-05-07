@@ -25,7 +25,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from hardware import detect_system, format_system, SystemInfo
 from launcher import launch
@@ -133,6 +133,56 @@ def _confirm(prompt: str, default_yes: bool = True) -> bool:
         return default_yes
     return raw in ("y", "yes", "j", "ja")
 
+
+def _ask_interactive_features(
+    model: ModelEntry,
+    draft_model: Optional[ModelEntry],
+    settings_path: Path,
+) -> tuple[bool, bool, bool, Optional[ModelEntry]]:
+    """Interaktive Fragen-Kette nach Modellauswahl.
+
+    Returns:
+        (use_vision, use_draft, use_thinking, effective_draft) –
+        use_vision/use_draft/use_thinking sind True wenn aktiviert,
+        effective_draft ist das zu verwendende Draft-Modell (oder None)
+    """
+    # ── Vision ───────────────────────────────────────────────────────
+    use_vision = False
+    if model.mmproj is not None:
+        use_vision = _confirm(
+            f"Vision aktivieren? ({model.mmproj.name})",
+            default_yes=True,
+        )
+        if not use_vision:
+            model.mmproj = None
+
+    # ── Draft Model ──────────────────────────────────────────────────
+    use_draft = False
+    effective_draft = draft_model
+    if effective_draft is not None:
+        use_draft = _confirm(
+            f"Draft-Modell aktivieren? ({effective_draft.name})",
+            default_yes=True,
+        )
+        if not use_draft:
+            effective_draft = None
+
+    # ── Thinking / Reasoning ────────────────────────────────────────
+    use_thinking = False
+    has_thinking_arch = (
+        "gemma" in model.name.lower()
+        or "deepseek" in model.name.lower()
+        or "think" in model.name.lower()
+    )
+    if has_thinking_arch:
+        use_thinking = _confirm(
+            "Thinking/Reasoning aktivieren? (<|think|> / <|reserved_special_token>)",
+            default_yes=True,
+        )
+
+    return use_vision, use_draft, use_thinking, effective_draft
+
+
 def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> tuple[Optional[ModelEntry], List[str]]:
     if cli_query:
         parts = cli_query.split()
@@ -206,6 +256,7 @@ def _candidate_search_roots() -> List[Path]:
     def add(p):
         try:
             rp = Path(p).expanduser().resolve()
+            print(f"[DEBUG] Checking path: {rp}")
         except (OSError, RuntimeError):
             return
         if rp in seen or not rp.exists():
@@ -214,18 +265,18 @@ def _candidate_search_roots() -> List[Path]:
         roots.append(rp)
 
     env_dir = os.environ.get("LLAMA_CPP_DIR")
+    print(f"[DEBUG] LLAMA_CPP_DIR: {env_dir}")
     if env_dir:
         add(env_dir)
         parent = Path(env_dir).expanduser()
         add(parent.parent / "1b_llama.cpp")
+        add(parent.parent / "ik_llama.cpp")
         add(parent.parent / "BitNet")
 
     bases = [Path(__file__).resolve().parent, Path.cwd()]
     common_subs = (
-        "llama.cpp", "1b_llama.cpp", "BitNet",
-        "ai-local/llama.cpp", "ai-local/1b_llama.cpp", "ai-local/BitNet",
-        "ai/llama.cpp", "ai/1b_llama.cpp",
-        "ml/llama.cpp",
+        "llama.cpp", "1b_llama.cpp", "ik_llama.cpp", "BitNet",
+        "LAB/ai-local/llama.cpp", "LAB/ai-local/1b_llama.cpp", "LAB/ai-local/ik_llama.cpp",
     )
     for base in bases:
         chain = [base, *list(base.parents)[:5]]
@@ -250,11 +301,24 @@ def _resolve_server_binary(user_value: str) -> str:
 
         if inner is not None and fork_name:
             for root in _candidate_search_roots():
-                # Prüfe ob der Ordnername mit dem fork_name beginnt (z.B. "1b_llama" matcht "1b_llama.cpp")
-                if root.name.lower().startswith(fork_name):
+                # Match fork name against directory name, ignoring .cpp suffix.
+                # e.g. "ik_llama" matches "ik_llama.cpp", "1b_llama" matches "1b_llama.cpp"
+                root_base = root.name.lower()
+                if root_base.endswith(".cpp"):
+                    root_base = root_base[:-4]
+                if root_base.startswith(fork_name) or fork_name.startswith(root_base):
+                    # First try the direct path (e.g. fork/llama-server)
                     candidate = root / inner
                     if candidate.is_file():
+                        print(f"[DEBUG] Found candidate: {candidate}")
                         return str(candidate)
+                    # Then try build subpaths inside the matched fork directory.
+                    binary_name = Path(inner).name  # e.g. "llama-server"
+                    for sub in _SERVER_SUBPATHS:
+                        candidate = root / sub
+                        if candidate.is_file():
+                            print(f"[DEBUG] Found candidate in fork subpath: {candidate}")
+                            return str(candidate)
 
         anchors: List[Path] = []
         seen: set = set()
@@ -262,6 +326,7 @@ def _resolve_server_binary(user_value: str) -> str:
         def add_anchor(a: Path):
             try:
                 ra = a.resolve()
+                print(f"[DEBUG] Adding anchor: {ra}")
             except (OSError, RuntimeError):
                 return
             if ra in seen:
@@ -277,6 +342,7 @@ def _resolve_server_binary(user_value: str) -> str:
         for a in anchors:
             candidate = a / p
             if candidate.is_file():
+                print(f"[DEBUG] Found candidate in anchors: {candidate}")
                 return str(candidate)
 
     if not has_sep:
@@ -300,9 +366,12 @@ def _resolve_server_binary(user_value: str) -> str:
         for sub in candidate_subpaths:
             candidate = root / sub
             if candidate.is_file():
+                print(f"[DEBUG] Found candidate in subpaths: {candidate}")
                 return str(candidate)
 
+    print(f"[DEBUG] Defaulting to user value: {user_value}")
     return user_value
+
 
 # ---------------------------------------------------------------------------
 # Client settings hint
@@ -470,52 +539,78 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "", main_name_lower
             ).strip("-_")
 
-            # Look for assistant model with matching base prefix
+            # STRICT matching: assistant must share the EXACT same architectural
+            # variant (e.g., 26b-a4b only matches 26b-a4b, NOT e2b or 31b).
+            # The assistant name must start with exactly the same base prefix
+            # as the main model (after quant stripping), not just any common word.
             exact_drafts = [
                 e for e in entries
                 if "assistant" in e.name.lower()
-                and e.name.lower().startswith(base_name)
+                and e.name.lower().replace(".gguf", "").startswith(base_name + "-")
             ]
             if exact_drafts:
                 draft_model = min(exact_drafts, key=lambda x: x.size_gb)
                 print(f"[AutoTuner] Found draft model: {draft_model.name}")
 
-            if draft_model is None:
-                # Fallback: try to find a draft model from the same family.
-                # Only use draft models that share the same architectural prefix
-                # (e.g., qwen assistant for qwen main, gemma for gemma).
-                # Do NOT fall back to arbitrary assistant models — speculative
-                # decoding requires architecturally compatible draft models.
-                draft_candidates = [
-                    e for e in entries
-                    if "assistant" in e.name.lower() and e.size_gb < model.size_gb
-                ]
-                if draft_candidates:
-                    matching_type_drafts = []
-                    if "qwen" in main_name_lower:
-                        matching_type_drafts = [e for e in draft_candidates if "qwen" in e.name.lower()]
-                    elif "gemma" in main_name_lower:
-                        matching_type_drafts = [e for e in draft_candidates if "gemma" in e.name.lower()]
-                    elif "phi" in main_name_lower:
-                        matching_type_drafts = [e for e in draft_candidates if "phi" in e.name.lower()]
-                    # No else fallback — using an architecturally incompatible
-                    # draft model causes llama-server to crash on startup.
+            # NO fallback to arbitrary assistant models — speculative decoding
+            # requires architecturally compatible draft models. Using an
+            # incompatible draft (e.g., E2B for 26B-A4B) causes crashes.
+        # Interaktive Fragen-Kette: Vision → Draft → Thinking
+        (
+            use_vision,
+            use_draft,
+            use_thinking,
+            effective_draft,
+        ) = _ask_interactive_features(model, draft_model, args.settings_path)
 
-                    if matching_type_drafts:
-                        draft_model = min(matching_type_drafts, key=lambda x: x.size_gb)
-                        print(f"[AutoTuner] Found draft model: {draft_model.name}")
-        if draft_model:
-            if not _confirm(f"Use draft model {draft_model.name}?", default_yes=True):
-                draft_model = None
+        # Wenn User "No" bei Draft drückt, setze draft_model auf None
+        if not use_draft:
+            effective_draft = None
 
-        cfg = compute_config(model, system, profile, draft_model=draft_model, user_ctx=args.ctx)
+        cfg = compute_config(model, system, profile, draft_model=effective_draft, user_ctx=args.ctx)
         _print_config(model, profile, cfg, system)
 
         raw_server = profile.server_binary or args.server
-        # --- FIX START: Profil-Binary bevorzugen ---
-        effective_server = profile.server_binary if (profile and profile.server_binary) else args.server
+        
+        # ── Spezialisierte Binary-Logik ────────────────────────────────
+        # PrismML (bonsai-ternary) → 1b_llama.cpp
+        # Gemma 4 mit Draft → ik_llama.cpp
+        # Gemma 4 ohne Draft → Standard llama.cpp
+        # Sonstige → Profil-Binary oder Standard
+        
+        def resolve_specialized_binary(
+            profile: ModelProfile,
+            use_draft_flag: bool,
+            model_name: str,
+        ) -> str:
+            """Wähle die passende llama-server Binary basierend auf YAML-Setting + Features.
+
+            Priorität:
+            1. server_binary aus settings/*.yaml (direkter Pfad oder Fork-Name)
+            2. Spezialfall: Gemma 4 mit Draft → ik_llama.cpp (MTP-Support)
+            3. Fallback: Standard llama-server
+            """
+            # 1. ZUERST: server_binary aus YAML verwenden (wenn vorhanden)
+            if profile.server_binary:
+                resolved = _resolve_server_binary(profile.server_binary)
+                return resolved
+
+            # 2. Spezialfall: Gemma 4 ohne YAML-Einstellung
+            #    → abhängig von Draft-Entscheidung
+            if "gemma-4" in model_name.lower() or "gemma4" in model_name.lower():
+                if use_draft_flag:
+                    # Mit Draft → ik_llama.cpp (MTP-Support)
+                    return _resolve_server_binary("ik_llama.cpp/llama-server")
+                else:
+                    # Ohne Draft → Standard llama.cpp
+                    return _resolve_server_binary("llama.cpp/llama-server")
+
+            # 3. Fallback: Standard
+            return _resolve_server_binary(args.server)
+        
+        effective_server = resolve_specialized_binary(profile, use_draft, model.name)
         server = _resolve_server_binary(effective_server)
-        # --- FIX END ---
+        
         if server != raw_server:
             print(f"[AutoTuner] Found server binary: {server}")
         elif not Path(server).is_file() and not shutil.which(server):
@@ -528,11 +623,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             model=model,
             config=cfg,
             profile=profile,
-            draft_model=draft_model,
+            draft_model=effective_draft,  # ← FIX: effective_draft statt draft_model
             server_binary=server,
             host=args.host,
             port=args.port,
             extra_args=extra,
+            use_thinking=use_thinking,  # ← Thinking-Flag übergeben
         )
 
         if args.dry_run:

@@ -453,6 +453,7 @@ def build_command(
     host: str = "127.0.0.1",
     port: int = 8080,
     extra_args: Optional[List[str]] = None,
+    use_thinking: bool = False,
 ) -> List[str]:
     cmd: List[str] = [
         server_binary,
@@ -511,6 +512,10 @@ def build_command(
 
     if model.mmproj is not None:
         cmd += ["--mmproj", str(model.mmproj)]
+
+    # Thinking/Reasoning-Modus (Gemma 4, DeepSeek, etc.)
+    # Thinking wird über Prompt-Tags gesteuert (<|think|>), nicht über CLI-Argumente.
+    # use_thinking ist ein internes Flag - extra_args werden immer angehängt:
 
     if profile.extra_args:
         cmd.extend(profile.extra_args)
