@@ -457,6 +457,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["LLAMA_CPP_DIR"] = args.llama_cpp_dir
 
     _print_banner()
+
+    # --- Turbo-Quant Selection ---
+    use_turbo = False
+    print("\n" + "="*40)
+    print("  QUANTIZATION MODE SELECTION")
+    print("="*40)
+    print("  1. Standard-Quant (llama.cpp)")
+    print("  2. Turbo-Quant (tq_llama.cpp)")
+    print("-" * 40)
+    
+    choice = input("Select mode [1/2] (default 1): ").strip()
+    if choice == "2":
+        use_turbo = True
+        print("[AutoTuner] Turbo-Quant mode selected.")
+    else:
+        print("[AutoTuner] Standard-Quant mode selected.")
+    print("="*40 + "\n")
+
     system = detect_system()
     _print_system(system)
 
@@ -523,6 +541,25 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         profile = match_profile(model.name, profiles)
         
+        # Handle Turbo-Quant binary override
+        if use_turbo:
+            # We force the server binary to be the one from tq_llama.cpp
+            # The user provided path: C:\LAB\ai-local\tq_llama.cpp
+            # Assuming it's a directory containing the binary, or the binary itself.
+            # Usually, these are directories with a 'llama-server' inside.
+            # If it's the binary itself, we use it directly.
+            tq_path = Path(r"C:\LAB\ai-local\tq_llama.cpp")
+            if tq_path.is_dir():
+                # Try to find llama-server inside
+                potential_binary = tq_path / "llama-server.exe"
+                if potential_binary.exists():
+                    server = str(potential_binary)
+                else:
+                    # Fallback to what we found or just use the path if it's a binary
+                    server = str(tq_path)
+            else:
+                server = str(tq_path)
+
         # Try to find a draft model for this family if available.
         # Strategy: strip the quant suffix from the main model name, then look
         # for an assistant model that shares the same base prefix.
@@ -608,12 +645,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             # 3. Fallback: Standard
             return _resolve_server_binary(args.server)
         
-        effective_server = resolve_specialized_binary(profile, use_draft, model.name)
-        server = _resolve_server_binary(effective_server)
-        
-        if server != raw_server:
-            print(f"[AutoTuner] Found server binary: {server}")
-        elif not Path(server).is_file() and not shutil.which(server):
+        if use_turbo:
+            # Override server for Turbo-Quant
+            tq_path = Path(r"C:\LAB\ai-local\tq_llama.cpp")
+            if tq_path.is_dir():
+                potential_binary = tq_path / "llama-server.exe"
+                if potential_binary.exists():
+                    server = str(potential_binary)
+                else:
+                    server = str(tq_path)
+            else:
+                server = str(tq_path)
+            print(f"[AutoTuner] Using Turbo-Quant binary: {server}")
+        else:
+            effective_server = resolve_specialized_binary(profile, use_draft, model.name)
+            server = _resolve_server_binary(effective_server)
+            if server != raw_server:
+                print(f"[AutoTuner] Found server binary: {server}")
+            elif not Path(server).is_file() and not shutil.which(server):
+                print(f"[AutoTuner] Warning: server binary '{server}' not found.")
             print(f"[AutoTuner] Warning: server binary '{server}' not found.")
             print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
             print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
@@ -652,6 +702,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         _print_client_settings(args.host, args.port, cfg.ctx, model)
         print(f"\n[AutoTuner] Web UI will be available at "
               f"http://{args.host}:{args.port}\n")
+        
+        # If Turbo-Quant is selected, we need to ensure the command uses the correct binary.
+        # However, the 'launch' function in launcher.py handles the execution.
+        # We must ensure 'cmd' contains the correct binary if use_turbo is True.
+        # Since build_command already returns the command list, we check if it's correct.
+        
+        # Note: The user wants to use tq_llama.cpp.
+        # If use_turbo is true, we should ensure the binary in 'cmd' is the one from C:\LAB\ai-local\tq_llama.cpp
+        # This is handled by the fact that build_command uses 'server_binary'.
+        # We will pass the correct binary to build_command if use_turbo is selected.
+        
         last_exit_code = launch(cmd)
 
         # Server has stopped (Ctrl+C, crash, or normal exit). Offer to pick
