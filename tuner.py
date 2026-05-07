@@ -295,12 +295,9 @@ def compute_config(
     free_vram_after = max(0.0, free_vram - effective_vram_safety - model_vram)
     free_ram_after = max(0.0, system.free_ram_gb - ram_safety_gb - model_ram)
 
-    if n_cpu_moe is not None:
-        kv_budget_gb = free_vram_after
-    elif full_off:
-        kv_budget_gb = free_vram_after
-    else:
-        kv_budget_gb = free_vram_after + free_ram_after
+    # Allow KV cache to use both VRAM and RAM regardless of offload status
+    # to prevent artificial context capping during full GPU offload.
+    kv_budget_gb = free_vram_after + free_ram_after
 
     # ---- (3) Context + KV quant
     base_kv_mb = kv_per_token_mb_f16(params_b)

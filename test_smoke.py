@@ -361,18 +361,18 @@ def test_resolver_finds_binary_in_sibling_llama_cpp(tmp_path, monkeypatch):
         f"expected {server}, got {resolved}")
 
 
-def test_resolver_distinguishes_between_llama_and_1bllama(tmp_path,
+def test_resolver_distinguishes_between_llama_and_1b_llama(tmp_path,
                                                           monkeypatch):
     """The Bonsai-Ternary profile uses a relative path starting with the
     fork's directory name. The resolver must respect that and pick the
-    1bllama.cpp checkout, not the regular one sitting next to it."""
+    1b_llama.cpp checkout, not the regular one sitting next to it."""
     from auto_tuner import _resolve_server_binary
 
     auto_dir = tmp_path / "Auto Tuner"
     auto_dir.mkdir()
     regular = (tmp_path / "ai-local" / "llama.cpp" / "build" / "bin"
                / "Release" / "llama-server.exe")
-    bitnet = (tmp_path / "ai-local" / "1bllama.cpp" / "build" / "bin"
+    bitnet = (tmp_path / "ai-local" / "1b_llama.cpp" / "build" / "bin"
               / "Release" / "llama-server.exe")
     for s in (regular, bitnet):
         s.parent.mkdir(parents=True)
@@ -387,7 +387,7 @@ def test_resolver_distinguishes_between_llama_and_1bllama(tmp_path,
 
     # Profile-style relative path must hit the BitNet fork
     res2 = _resolve_server_binary(
-        "1bllama.cpp/build/bin/Release/llama-server.exe")
+        "1b_llama.cpp/build/bin/Release/llama-server.exe")
     assert Path(res2).resolve() == bitnet.resolve()
 
 
@@ -401,7 +401,7 @@ def test_profile_supports_server_binary_field():
     assert "bonsai-ternary.yaml" in by_name
     p = by_name["bonsai-ternary.yaml"]
     assert p.server_binary, "Bonsai-Ternary profile must set server_binary"
-    assert "1bllama" in p.server_binary.lower()
+    assert "1b_llama" in p.server_binary.lower()
 
 
 def test_ternary_bonsai_pattern_beats_regular_bonsai():

@@ -133,58 +133,57 @@ def _confirm(prompt: str, default_yes: bool = True) -> bool:
         return default_yes
     return raw in ("y", "yes", "j", "ja")
 
-def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> Optional[ModelEntry]:
+def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> tuple[Optional[ModelEntry], List[str]]:
     if cli_query:
-        # Check if the query ends with --novision
-        novision = False
-        if cli_query.lower().endswith("--novision"):
-            cli_query = cli_query[:-len("--novision")].strip()
-            novision = True
+        parts = cli_query.split()
+        query_parts = []
+        flags = []
+        for p in parts:
+            if p.startswith('--') or p.lower() in ('novision', 'nodraft', 'nothinking'):
+                flags.append(p.lower().lstrip('-'))
+            else:
+                query_parts.append(p)
 
-        q = cli_query.lower()
+        q = " ".join(query_parts).lower()
         matches = [e for e in flat if q in e.name.lower()]
         if not matches:
             print(f"[AutoTuner] No model matched --model '{cli_query}'.")
-            return None
+            return None, []
         if len(matches) > 1:
             print(f"[AutoTuner] '{cli_query}' is ambiguous — matches:")
             for e in matches:
                 print(f"    - {e.name}")
-            return None
+            return None, []
 
-        model = matches[0]
-        if novision and model.mmproj is not None:
-            print(f"[AutoTuner] Vision disabled per --novision (ignoring {model.mmproj.name})")
-            model.mmproj = None
-        return model
+        return matches[0], flags
 
     while True:
         try:
             raw = input(f"Select a model [1-{len(flat)}, q to quit]: ").strip()
         except EOFError:
-            return None
+            return None, []
         if raw.lower() in ("q", "quit", "exit"):
-            return None
+            return None, []
 
-        # Support "--novision" suffix (e.g., "18 --novision")
-        novision = False
-        parsed = raw
-        if raw.lower().endswith("--novision"):
-            parsed = raw[:raw.lower().rfind("--novision")].strip()
-            novision = True
+        parts = raw.split()
+        model_idx_str = None
+        flags = []
+        for p in parts:
+            if p.startswith('--') or p.lower() in ('novision', 'nodraft', 'nothinking'):
+                flags.append(p.lower().lstrip('-'))
+            elif model_idx_str is None and p.isdigit():
+                model_idx_str = p
+            else:
+                flags.append(p.lower().lstrip('-'))
 
-        if not parsed.isdigit():
-            print("  please enter a number (optionally followed by ' --novision').")
+        if model_idx_str is None:
+            print("  please enter a number (optionally followed by flags like '--novision').")
             continue
-        n = int(parsed)
+        n = int(model_idx_str)
         if not 1 <= n <= len(flat):
             print(f"  number must be between 1 and {len(flat)}.")
             continue
-        model = flat[n - 1]
-        if novision and model.mmproj is not None:
-            print(f"[AutoTuner] Vision disabled per '--novision' suffix (ignoring {model.mmproj.name})")
-            model.mmproj = None
-        return model
+        return flat[n - 1], flags
 
 # ---------------------------------------------------------------------------
 # llama-server discovery
@@ -200,7 +199,7 @@ _SERVER_SUBPATHS = [
 ]
 
 def _candidate_search_roots() -> List[Path]:
-    """Folders to look in for a llama.cpp / 1bllama.cpp checkout."""
+    """Folders to look in for a llama.cpp / 1b_llama.cpp checkout."""
     roots: List[Path] = []
     seen: set = set()
 
@@ -218,14 +217,14 @@ def _candidate_search_roots() -> List[Path]:
     if env_dir:
         add(env_dir)
         parent = Path(env_dir).expanduser()
-        add(parent.parent / "1bllama.cpp")
+        add(parent.parent / "1b_llama.cpp")
         add(parent.parent / "BitNet")
 
     bases = [Path(__file__).resolve().parent, Path.cwd()]
     common_subs = (
-        "llama.cpp", "1bllama.cpp", "BitNet",
-        "ai-local/llama.cpp", "ai-local/1bllama.cpp", "ai-local/BitNet",
-        "ai/llama.cpp", "ai/1bllama.cpp",
+        "llama.cpp", "1b_llama.cpp", "BitNet",
+        "ai-local/llama.cpp", "ai-local/1b_llama.cpp", "ai-local/BitNet",
+        "ai/llama.cpp", "ai/1b_llama.cpp",
         "ml/llama.cpp",
     )
     for base in bases:
@@ -251,7 +250,8 @@ def _resolve_server_binary(user_value: str) -> str:
 
         if inner is not None and fork_name:
             for root in _candidate_search_roots():
-                if root.name.lower() == fork_name:
+                # Prüfe ob der Ordnername mit dem fork_name beginnt (z.B. "1b_llama" matcht "1b_llama.cpp")
+                if root.name.lower().startswith(fork_name):
                     candidate = root / inner
                     if candidate.is_file():
                         return str(candidate)
@@ -348,7 +348,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--llama-cpp-dir",
         default=os.environ.get("LLAMA_CPP_DIR"),
         help="Path to your llama.cpp checkout (env LLAMA_CPP_DIR). "
-             "1bllama.cpp/BitNet are searched in the same parent folder. "
+             "1b_llama.cpp/BitNet are searched in the same parent folder. "
              "Useful when llama.cpp lives outside the standard search paths "
              "(e.g. C:\\LAB\\ai-local\\llama.cpp).",
     )
@@ -366,7 +366,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the launch confirmation prompt")
     p.add_argument("--novision", action="store_true",
-                   help="Disable vision (mmproj) even if available")
+                    help="Disable vision (mmproj) even if available")
+    p.add_argument("--nodraft", action="store_true",
+                    help="Disable speculative decoding/draft model")
+    p.add_argument("--nothinking", action="store_true",
+                    help="Disable thinking/reasoning output")
     p.add_argument(
         "--",
         dest="passthrough",
@@ -379,7 +383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     if args.llama_cpp_dir:
         # The existing _candidate_search_roots() already honors LLAMA_CPP_DIR
-        # and looks for sibling 1bllama.cpp / BitNet folders next to it.
+        # and looks for sibling 1b_llama.cpp / BitNet folders next to it.
         # Setting it here is process-local and does not affect the parent shell.
         os.environ["LLAMA_CPP_DIR"] = args.llama_cpp_dir
 
@@ -425,7 +429,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         flat = _print_menu(groups)
 
         try:
-            model = _pick_model(flat, args.model)
+            model, picked_flags = _pick_model(flat, args.model)
         except KeyboardInterrupt:
             print("\n[AutoTuner] Aborted by user.")
             return 0
@@ -433,6 +437,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         if model is None:
             print("[AutoTuner] No model selected — exiting.")
             return last_exit_code if first_iteration else 0
+
+        # Apply flags picked during model selection
+        for flag in picked_flags:
+            if flag == 'novision':
+                args.novision = True
+            elif flag == 'nodraft':
+                args.nodraft = True
+            elif flag == 'nothinking':
+                args.nothinking = True
 
         # Apply --novision flag if set
         if args.novision and model.mmproj is not None:
@@ -447,7 +460,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         #   e.g. "gemma-4-31B-it-Q3_K_S" -> base "gemma-4-31b-it"
         #        -> matches "gemma-4-31B-it-assistant-Q8_0"
         draft_model = None
-        if profile.draft_max > 0:
+        if profile.draft_max > 0 and not args.nodraft:
             import re as _re
             main_name_lower = model.name.lower()
 
@@ -491,12 +504,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if matching_type_drafts:
                         draft_model = min(matching_type_drafts, key=lambda x: x.size_gb)
                         print(f"[AutoTuner] Found draft model: {draft_model.name}")
+        if draft_model:
+            if not _confirm(f"Use draft model {draft_model.name}?", default_yes=True):
+                draft_model = None
+
         cfg = compute_config(model, system, profile, draft_model=draft_model, user_ctx=args.ctx)
         _print_config(model, profile, cfg, system)
 
         raw_server = profile.server_binary or args.server
         # --- FIX START: Profil-Binary bevorzugen ---
-        effective_server = profile.server_binary if (profile and profile.server_binary) else args.llama_server
+        effective_server = profile.server_binary if (profile and profile.server_binary) else args.server
         server = _resolve_server_binary(effective_server)
         # --- FIX END ---
         if server != raw_server:

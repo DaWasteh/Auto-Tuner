@@ -10,7 +10,7 @@ max_context: 262144
 recommended_kv_quant: q8_0
 
 # Zwingend erforderlich für MTP-Support (gemma4_mtp Architektur)
-server_binary: "ik_llama.cpp/build/bin/Release/llama-server.exe"
+server_binary: "ik_llama/llama-server"
 
 sampling:
   # Google's offizielle Empfehlung über alle Größen hinweg.

@@ -11,9 +11,6 @@ patterns:
 max_context: 131072
 recommended_kv_quant: q8_0
 
-# SenseNova hat eine ungewoehnliche, native multimodale Architektur.
-# Speculative Decoding (Draft-Modelle) wird nicht unterstuetzt.
-draft_max: 0
 
 sampling:
   # SenseNova hat keine offiziellen Sampling-Defaults für lokale Inferenz
