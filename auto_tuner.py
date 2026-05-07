@@ -25,7 +25,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from hardware import detect_system, format_system, SystemInfo
 from launcher import launch
@@ -282,7 +282,7 @@ def _candidate_search_roots() -> List[Path]:
     bases = [Path(__file__).resolve().parent, Path.cwd()]
     common_subs = (
         "llama.cpp", "1b_llama.cpp", "ik_llama.cpp", "BitNet",
-        "LAB/ai-local/llama.cpp", "LAB/ai-local/1b_llama.cpp", "LAB/ai-local/ik_llama.cpp",
+        "ai-local/llama.cpp", "ai-local/1b_llama.cpp", "ai-local/ik_llama.cpp",
     )
     for base in bases:
         chain = [base, *list(base.parents)[:5]]
@@ -319,12 +319,16 @@ def _resolve_server_binary(user_value: str) -> str:
                         _debug_print(f"Found candidate: {candidate}")
                         return str(candidate)
                     # Then try build subpaths inside the matched fork directory.
-                    binary_name = Path(inner).name  # e.g. "llama-server"
                     for sub in _SERVER_SUBPATHS:
                         candidate = root / sub
                         if candidate.is_file():
                             _debug_print(f"Found candidate in fork subpath: {candidate}")
                             return str(candidate)
+                        # Also check if inner exists within the subpath (e.g., build/bin/Release/llama-server)
+                        candidate_with_inner = (root / sub) / inner
+                        if candidate_with_inner.is_file():
+                            _debug_print(f"Found candidate in fork subpath with inner: {candidate_with_inner}")
+                            return str(candidate_with_inner)
 
         anchors: List[Path] = []
         seen: set = set()
