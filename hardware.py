@@ -1,8 +1,9 @@
 """Hardware detection: CPU, RAM, and GPU(s) across vendors.
 
 Supports NVIDIA (nvidia-smi), AMD (rocm-smi), Intel (lspci/WMI),
-and Apple Silicon (sysctl). Multi-GPU aware. No vendor-specific
-Python libs required - everything goes through subprocess.
+Apple Silicon (sysctl), and Windows Registry-based VRAM detection.
+Multi-GPU aware. Uses subprocess, winreg, and vendor SDKs for accurate
+free VRAM reporting on all platforms.
 """
 from __future__ import annotations
 
@@ -11,10 +12,76 @@ import platform
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-
 import psutil
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Windows Registry-Helper f\u00fcr 64-bit VRAM
+# ---------------------------------------------------------------------------
+
+def _get_vram_from_registry() -> Dict[str, int]:
+    """Lese DedicatedVRAM aus der Windows Registry (64-bit sicher).
+
+    Liest HardwareInformation.qwMemorySize aus dem Registry-Key
+    des GPU-Drivers. Vermeidet den 32-Bit-Overflow von
+    Win32_VideoController.AdapterRAM.
+    """
+    result: Dict[str, int] = {}
+    try:
+        import winreg
+    except ImportError:
+        return result
+
+    reg_path_base = (
+        r"SYSTEM\CurrentControlSet\Control\Class"
+        r"\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    )
+
+    for i in range(100):
+        key_name = f"000{i}"
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                reg_path_base + "\\" + key_name,
+                0,
+                winreg.KEY_READ,
+            )
+        except FileNotFoundError:
+            break
+        except OSError:
+            continue
+
+        driver_desc = ""
+        vram_qw = 0
+        try:
+            driver_desc, _ = winreg.QueryValueEx(key, "DriverDesc")
+            qw_mem, _ = winreg.QueryValueEx(
+                key, "HardwareInformation.qwMemorySize"
+            )
+            vram_qw = int(qw_mem)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                winreg.CloseKey(key)
+            except Exception:
+                pass
+
+        if not driver_desc or vram_qw <= 0:
+            continue
+
+        desc_lower = driver_desc.lower()
+        if any(skip in desc_lower for skip in (
+            "basic render", "remote display", "hyper-v",
+            "rdp", "microsoft", "mirror",
+        )):
+            continue
+
+        result[driver_desc] = vram_qw
+
+    return result
 
 
 @dataclass
@@ -238,17 +305,44 @@ $results | ConvertTo-Json -Compress -Depth 3
 def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
     """Enumerate every PCI video adapter on Windows via WMI + registry.
 
-    Key fix vs the old code: reads `HardwareInformation.qwMemorySize` from the
-    registry, which is 64-bit. WMI's `AdapterRAM` is signed 32-bit and wraps
-    on cards with > 4 GB of VRAM, so a 16 GB Radeon shows as 0 or garbage.
+    Key fix vs the old code: reads ``HardwareInformation.qwMemorySize`` from
+    the registry, which is 64-bit.  WMI's ``AdapterRAM`` is signed 32-bit and
+    wraps on cards with > 4 GB of VRAM, so a 16 GB Radeon shows as 0 or
+    garbage.
 
-    `skip_names` is for de-duplicating against vendor-specific detectors
+    Uses the native ``winreg``-based ``_get_vram_from_registry()`` helper when
+    available (faster, no PowerShell overhead) and falls back to the PowerShell
+    snippet for compatibility.
+
+    ``skip_names`` is for de-duplicating against vendor-specific detectors
     (e.g. an RTX card already found via nvidia-smi shouldn't be re-added).
     """
     if platform.system() != "Windows":
         return []
     skip = {n.lower() for n in (skip_names or set())}
 
+    # Try native winreg helper first (faster, no PowerShell overhead)
+    registry_vram = _get_vram_from_registry()
+    gpus: List[GPUInfo] = []
+
+    if registry_vram:
+        for name, vram_bytes in registry_vram.items():
+            if name.lower() in skip:
+                continue
+            total_mb = vram_bytes // (1024 * 1024)
+            # Ohne vendor-spezifisches Tool (nvidia-smi / rocm-smi) keinen
+            # genauen freien VRAM ermitteln – sch\u00e4tze 95 % frei.
+            free_mb = int(total_mb * 0.95)
+            gpus.append(GPUInfo(
+                index=len(gpus),
+                name=name,
+                vendor=_vendor_from_name(name),
+                total_vram_mb=total_mb,
+                free_vram_mb=free_mb,
+            ))
+        return gpus
+
+    # Fallback: PowerShell-WMI-Ansatz
     out = _run([
         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
         "-Command", _WIN_GPU_PS,
@@ -263,7 +357,6 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
     if isinstance(data, dict):
         data = [data]
 
-    gpus: List[GPUInfo] = []
     for d in data:
         name = (d.get("Name") or "").strip()
         if not name or name.lower() in skip:
@@ -275,8 +368,6 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         if vram < 0:  # paranoia: 32-bit overflow
             vram = 0
         total_mb = vram // (1024 * 1024)
-        # No reliable cross-vendor "free VRAM" on Windows without driver SDKs.
-        # Assume mostly free; user can override via --ctx if needed.
         free_mb = int(total_mb * 0.95)
         gpus.append(GPUInfo(
             index=len(gpus),

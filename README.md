@@ -10,15 +10,21 @@ the RAM/VRAM you actually have free — without manual edits.
   AutoTuner for llama.cpp  —  interactive launcher
 ────────────────────────────────────────────────────────────────
 
-========================================
-  DEBUGGING MODE SELECTION
-========================================
-  1. Debugging OFF
-  2. Debugging ON
-----------------------------------------
-Select mode [1/2] (default 1):
-[AutoTuner] Debugging mode disabled.
-========================================
+============================================================
+  DEBUG / VERBOSE MODE SELECTION
+============================================================
+  1. Debugging OFF (standard)
+  2. Debugging ON (alle Kategorien)
+------------------------------------------------------------
+  Kategorie-Debugging (einzelne Bereiche):
+  3. Hardware-Erkennung (GPU/RAM/CPU)
+  4. Model-Scanning & Profil-Matching
+  5. Server-Pfad-Suche (llama.cpp)
+  6. Konfigurations-Berechnung (KV-Cache, Kontext)
+------------------------------------------------------------
+Wahl [1-6] (default 1):
+[AutoTuner] Debugging deaktiviert.
+============================================================
 
 
 ========================================

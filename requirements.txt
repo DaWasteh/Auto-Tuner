@@ -1,6 +1,12 @@
-psutil>=5.9
+# Haupt-Abhängigkeiten
+psutil>=7.2.0
 PyYAML>=6.0
+pywin32>=311
+PyQt6>=6.11.0
 
-# dev / type-checking only
-types-psutil; extra == "dev"
-types-PyYAML; extra == "dev"
+# Type stubs / type-checking only
+types-psutil>=7.2.0
+types-PyYAML>=6.0
+types-pywin32>=311
+types-requests>=2.31.0
+PyQt6-stubs>=20250824

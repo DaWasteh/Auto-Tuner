@@ -38,11 +38,25 @@ from tuner import build_command, compute_config, TunedConfig
 
 _BAR = "─" * 64
 _DEBUG_MODE = False
+# Debug categories – expanded beyond just llama-cpp path searching
+_DEBUG_CATEGORIES: set[str] = set()
 
 def _debug_print(*args, **kwargs) -> None:
     """Print debug messages only if debugging mode is enabled."""
     if _DEBUG_MODE:
         print("[DEBUG]", *args, **kwargs)
+
+def enable_debug_category(category: str) -> None:
+    """Enable a specific debug category when global debug mode is off."""
+    _DEBUG_CATEGORIES.add(category)
+
+def debug_cat(category: str, *args, **kwargs) -> None:
+    """Print a debug message for a specific category.
+    
+    Prints if global debug mode is ON OR if this category is explicitly enabled.
+    """
+    if _DEBUG_MODE or category in _DEBUG_CATEGORIES:
+        print(f"[DEBUG:{category.upper()}]", *args, **kwargs)
 
 def _print_banner() -> None:
     print()
@@ -470,20 +484,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # --- Debugging Mode Selection ---
     global _DEBUG_MODE
-    print("\n" + "="*40)
-    print("  DEBUGGING MODE SELECTION")
-    print("="*40)
-    print("  1. Debugging OFF")
-    print("  2. Debugging ON")
-    print("-" * 40)
+    print("\n" + "="*60)
+    print("  DEBUG / VERBOSE MODE SELECTION")
+    print("="*60)
+    print("  1. Debugging OFF (standard)")
+    print("  2. Debugging ON (alle Kategorien)")
+    print("-" * 60)
+    print("  Kategorie-Debugging (einzelne Bereiche):")
+    print("  3. Hardware-Erkennung (GPU/RAM/CPU)")
+    print("  4. Model-Scanning & Profil-Matching")
+    print("  5. Server-Pfad-Suche (llama.cpp)")
+    print("  6. Konfigurations-Berechnung (KV-Cache, Kontext)")
+    print("-" * 60)
 
-    debug_choice = input("Select mode [1/2] (default 1): ").strip()
+    debug_choice = input("Wahl [1-6] (default 1): ").strip()
     if debug_choice == "2":
         _DEBUG_MODE = True
-        print("[AutoTuner] Debugging mode enabled.")
+        print("[AutoTuner] Globaler Debug-Modus aktiviert.")
+    elif debug_choice == "3":
+        enable_debug_category("hardware")
+        print("[AutoTuner] Kategorie-Debugging: Hardware-Erkennung")
+    elif debug_choice == "4":
+        enable_debug_category("scanner")
+        print("[AutoTuner] Kategorie-Debugging: Model-Scanning & Profile")
+    elif debug_choice == "5":
+        enable_debug_category("llama_cpp")
+        print("[AutoTuner] Kategorie-Debugging: Server-Pfad-Suche")
+    elif debug_choice == "6":
+        enable_debug_category("config")
+        print("[AutoTuner] Kategorie-Debugging: Konfigurations-Berechnung")
     else:
-        print("[AutoTuner] Debugging mode disabled.")
-    print("="*40 + "\n")
+        print("[AutoTuner] Debugging deaktiviert.")
+    print("="*60 + "\n")
 
     # --- Turbo-Quant Selection ---
     use_turbo = False
