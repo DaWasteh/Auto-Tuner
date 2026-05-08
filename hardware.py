@@ -79,6 +79,7 @@ def _get_vram_from_registry() -> Dict[str, int]:
         )):
             continue
 
+        # AMD RX 9000 Series (RDNA 5) und andere echte GPUs nicht filtern
         result[driver_desc] = vram_qw
 
     return result
@@ -90,6 +91,10 @@ def _get_gpu_vram_used_via_wmi() -> Dict[str, float]:
     Returns mapping of GPU name (lowercased) -> used VRAM in MB.
     Uses Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory
     which reports DedicatedUsage in bytes.
+
+    Die Verbindung zwischen LUID-Counter und GPU-Namen wird über das
+    VideoProcessor-Feld im Win32_VideoController hergestellt, welches die
+    DeviceId als Hex-Wert enthält (z.B. "AMD Radeon Graphics Processor (0x7550)").
 
     Returns empty dict if WMI is unavailable or GPU performance counters
     are not registered (common on AMD RX 9000 series under Windows).
@@ -104,16 +109,80 @@ def _get_gpu_vram_used_via_wmi() -> Dict[str, float]:
     try:
         pythoncom.CoInitialize()
         wmi = win32com.client.GetObject("winmgmts:\\\\root\\\\cimv2")
+
+        # Schritt 1: DeviceId (hex) -> GPU-Name Mapping über Win32_VideoController
+        # VideoProcessor enthält z.B. "AMD Radeon Graphics Processor (0x7550)"
+        devid_to_name: Dict[str, str] = {}
+        try:
+            for vc in wmi.ExecQuery("SELECT Name, VideoProcessor FROM Win32_VideoController"):
+                name = (vc.Name or "").strip()
+                processor = (vc.VideoProcessor or "").strip()
+                if not name or not processor:
+                    continue
+                # Filter out virtual/auxiliary adapters
+                lower = name.lower()
+                if any(skip in lower for skip in (
+                    "basic render", "remote display", "hyper-v",
+                    "rdp", "microsoft", "mirror",
+                )):
+                    continue
+                # Extrahiere DeviceId aus Klammern, z.B. "(0x7550)" -> "7550"
+                import re
+                m = re.search(r'\(0x([0-9a-fA-F]+)\)', processor)
+                if m:
+                    dev_id = m.group(1).lower()
+                    devid_to_name[dev_id] = name
+        except Exception:
+            pass
+
+        # Schritt 2: VRAM-Nutzung auslesen und mit GPU-Namen verknüpfen
         for obj in wmi.ExecQuery(
             "SELECT Name, DedicatedUsage "
             "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
         ):
-            name = str(obj.Name or "").split("_phys")[0].strip()
-            if not name:
+            counter_name = str(obj.Name or "").split("_phys")[0].strip()
+            if not counter_name:
                 continue
+
+            # LUID extrahieren (z.B. "luid_0x00000000_0x00015915" -> "00015915")
+            luid_parts = counter_name.split("_")
+            luid_dev = ""
+            for part in luid_parts:
+                if part.startswith("0x"):
+                    luid_dev = part[2:].lower()  # "0x" entfernen, lowercase
+                    break
+
             used_bytes = float(obj.DedicatedUsage or 0)
             used_mb = used_bytes / (1024 * 1024)
-            result[name.lower()] = used_mb
+
+            if not luid_dev:
+                continue
+
+            # Versuche, über DeviceId den GPU-Namen zu finden
+            gpu_name = None
+            
+            # Methode 1: Direkter Match (LUID == DeviceId)
+            if luid_dev in devid_to_name:
+                gpu_name = devid_to_name[luid_dev]
+            else:
+                # Methode 2: Vergleiche hex-Werte (LUID und DEV können unterschiedlich formatiert sein)
+                # z.B. LUID "15915" vs DeviceId "7550" – beide als int vergleichen
+                try:
+                    luid_int = int(luid_dev, 16)
+                    for known_dev_id, known_name in devid_to_name.items():
+                        dev_int = int(known_dev_id, 16)
+                        if luid_int == dev_int:
+                            gpu_name = known_name
+                            break
+                except ValueError:
+                    pass
+
+            if gpu_name:
+                result[gpu_name.lower()] = used_mb
+            else:
+                # Fallback: Verwende Counter-Name als Key (für Debugging)
+                result[counter_name.lower()] = used_mb
+
     except Exception:
         # WMI nicht verfügbar, RPC-Server fehlerhaft, oder keine GPU-Counter
         pass
@@ -173,6 +242,189 @@ def _get_gpu_vram_free_via_wmi() -> Dict[str, float]:
         except Exception:
             pass
 
+    return result
+
+
+def _get_gpu_vram_via_dxgi_powershell() -> Dict[str, float]:
+    """PowerShell-Fallback für VRAM-Usage-Erkennung (AMD RX 9000 Series).
+
+    Returns mapping of GPU name (lowercased) -> used_vram_mb.
+    
+    Bei AMD RX 9000 Series (RDNA 5) sind DedicatedVideoMemory und
+    AvailableVideoMemory in Win32_VideoController leer. Daher wird eine
+    kombinierte PowerShell-Abfrage verwendet die:
+    
+    1. Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory
+       für DedicatedUsage (VRAM-Nutzung) ausliest
+    2. Über Win32_VideoController.VideoProcessor die DeviceId mit dem
+       GPU-Namen verknüpft
+    3. Bei fehlendem LUID-Match: GPU mit der höchsten VRAM-Nutzung als
+       diskrete GPU verwendet (Fallback für AMD RX 9000)
+    
+    WICHTIG: Diese Funktion gibt NUR die genutzte VRAM-Menge zurück.
+    Total VRAM muss über _get_vram_from_registry() bezogen werden!
+    
+    Returns empty dict if PowerShell is unavailable or fails.
+    """
+    result: Dict[str, float] = {}
+    
+    # Registry-VRAM für DeviceId-Mapping holen
+    registry_vram = _get_vram_from_registry()
+    
+    ps_script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Schritt 1: GPU-Namen und DeviceId aus Win32_VideoController sammeln
+# VideoProcessor enthält z.B. "AMD Radeon Graphics Processor (0x7550)"
+$devidToName = @{}
+$controllers = Get-CimInstance Win32_VideoController |
+    Where-Object {
+        $_.PNPDeviceID -like 'PCI*' -and
+        $_.Name -notmatch 'Basic Render|Remote Display|Hyper-V|RDP|Mirror'
+    }
+foreach ($ctrl in $controllers) {
+    $name = $ctrl.Name.Trim()
+    $processor = $ctrl.VideoProcessor
+    if (-not $processor) { $processor = "" }
+    $processor = $processor.Trim()
+    if (-not $name -or -not $processor) { continue }
+    
+    # Extrahiere DeviceId aus Klammern, z.B. "(0x7550)" -> "7550"
+    if ($processor -match '\(0x([0-9a-fA-F]+)\)') {
+        $devId = $matches[1].ToLower()
+        $devidToName[$devId] = $name
+    }
+}
+
+# Schritt 2: GPU-Performance-Counter auslesen
+$counters = Get-CimInstance -Namespace root\cimv2 `
+    -Query "SELECT Name, DedicatedUsage FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
+
+# Schritt 3: Usage über LUID-to-DeviceId matching mit Fallback
+$results = @()
+foreach ($cnt in $counters) {
+    $counterName = ($cnt.Name -split '_phys')[0].Trim()
+    $luidParts = $counterName -split '_'
+    if ($luidParts.Count -lt 3) { continue }
+    
+    # LUID extrahieren – WICHTIG: den LETZTEN 0x-Teil nehmen!
+    # Format: luid_0xXXXXXXXX_0xYYYYYYYY -> wir brauchen 0xYYYYYYYY
+    $luidDev = ""
+    for ($i = $luidParts.Count - 1; $i -ge 0; $i--) {
+        $part = $luidParts[$i]
+        if ($part -match '^0x([0-9a-fA-F]+)$') {
+            $luidDev = $matches[1]
+            break
+        }
+    }
+    
+    if (-not $luidDev) { continue }
+    $luidDevLower = $luidDev.ToLower()
+    
+    # Versuche, GPU-Namen zu finden
+    $ctrlName = $null
+    
+    # Methode 1: Direkter Match mit DeviceId
+    if ($devidToName.ContainsKey($luidDevLower)) {
+        $ctrlName = $devidToName[$luidDevLower]
+    } else {
+        # Methode 2: Vergleiche hex-Werte (LUID und DEV können unterschiedlich sein)
+        try {
+            $luidInt = [Convert]::ToInt64($luidDev, 16)
+            foreach ($mapKey in $devidToName.Keys) {
+                $devInt = [Convert]::ToInt64($mapKey, 16)
+                if ($luidInt -eq $devInt) {
+                    $ctrlName = $devidToName[$mapKey]
+                    break
+                }
+            }
+        } catch {}
+    }
+    
+    # Fallback: Wenn kein LUID-Match, aber GPU mit hoher Usage vorhanden -> nimm sie
+    if (-not $ctrlName) {
+        $usageBytes = [int64]($cnt.DedicatedUsage -as [int64])
+        if ($usageBytes -lt 0) { $usageBytes = 0 }
+        $usedMB = $usageBytes / (1024 * 1024)
+        # Wenn Usage > 100 MB, handelt es sich wahrscheinlich um die diskrete GPU
+        if ($usedMB -gt 100) {
+            foreach ($name in $devidToName.Values) {
+                if ($name -like "*Radeon*" -or $name -like "*GeForce*" -or $name -like "*RTX*" -or $name -like "*GTX*") {
+                    $ctrlName = $name
+                    break
+                }
+            }
+            # Wenn keine diskrete GPU im Match, nimm die erste nicht-virtuelle GPU
+            if (-not $ctrlName -and $devidToName.Count -eq 1) {
+                $ctrlName = $devidToName.Values[0]
+            }
+        }
+    }
+    
+    if (-not $ctrlName) { continue }
+    
+    $usageBytes = [int64]($cnt.DedicatedUsage -as [int64])
+    if ($usageBytes -lt 0) { $usageBytes = 0 }
+    $usedMB = $usageBytes / (1024 * 1024)
+    
+    $results += [PSCustomObject]@{
+        Name     = $ctrlName
+        UsedMB   = [int64]$usedMB
+    }
+}
+
+if ($results) {
+    $results | ConvertTo-Json -Compress -Depth 3
+} else {
+    Write-Output "[]"
+}
+"""
+    
+    try:
+        out = _run([
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", ps_script,
+        ], timeout=15)
+        if not out:
+            return result
+        
+        data = json.loads(out)
+        if isinstance(data, dict):
+            data = [data]
+        
+        # Mapping: controller_name_lower -> used_mb
+        wmi_used_map: Dict[str, float] = {}
+        for d in data:
+            name = (d.get("Name") or "").strip()
+            if not name:
+                continue
+            lower = name.lower()
+            if any(skip in lower for skip in (
+                "basic render", "remote display", "hyper-v",
+                "rdp", "microsoft", "mirror",
+            )):
+                continue
+            try:
+                used_mb = float(d.get("UsedMB") or 0)
+                wmi_used_map[lower] = used_mb
+            except (TypeError, ValueError):
+                continue
+        
+        # Jetzt mit Registry-VRAM free_mb berechnen
+        for reg_name, vram_bytes in registry_vram.items():
+            reg_lower = reg_name.lower()
+            if any(skip in reg_lower for skip in (
+                "basic render", "remote display", "hyper-v",
+                "rdp", "microsoft", "mirror",
+            )):
+                continue
+            total_mb = vram_bytes / (1024 * 1024)
+            used_mb = wmi_used_map.get(reg_lower, 0)
+            if total_mb > 0:
+                result[reg_lower] = used_mb
+    except Exception:
+        pass
+    
     return result
 
 
@@ -361,44 +613,134 @@ def _vendor_from_name(name: str) -> str:
 # 64-bit registry value (HardwareInformation.qwMemorySize) so 16 GB+ cards
 # are reported correctly. Win32_VideoController.AdapterRAM is signed 32-bit
 # and overflows at 4 GB, so it's only used as a last-resort fallback.
+#
+# VRAM free detection: Uses DedicatedUsage from GPUAdapterMemory to calculate
+# free = total - used (more reliable than AvailableVideoMemory on AMD RX 9000).
+# Matching über VideoProcessor.DeviceId statt Win32_PnPEntity.
 _WIN_GPU_PS = r"""
 $ErrorActionPreference = 'SilentlyContinue'
+
+# Schritt 1: GPU-Namen aus Win32_VideoController sammeln
 $adapters = Get-CimInstance Win32_VideoController |
     Where-Object {
         $_.PNPDeviceID -like 'PCI*' -and
         $_.Name -notmatch 'Basic Render|Remote Display|Hyper-V|RDP|Mirror'
     }
+
+# Schritt 2: Registry VRAM holen (64-bit sicher)
 $regBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
 $regKeys = Get-ChildItem $regBase -ErrorAction SilentlyContinue
-$results = @()
+$regVram = @{}  # DriverDesc -> VRAM bytes
+foreach ($k in $regKeys) {
+    $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+    if ($null -ne $p -and $null -ne $p.DriverDesc -and $null -ne $p.'HardwareInformation.qwMemorySize') {
+        $regVram[$p.DriverDesc] = [int64]$p.'HardwareInformation.qwMemorySize'
+    }
+}
+
+# Schritt 3: DeviceId -> GPU-Namen Mapping über VideoProcessor erstellen
+# VideoProcessor enthält z.B. "AMD Radeon Graphics Processor (0x7550)"
+$devidToName = @{}
 foreach ($a in $adapters) {
-    # Total dedicated VRAM aus Registry (64-bit sicher)
-    $vram = [int64]0
-    foreach ($k in $regKeys) {
-        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-        if ($null -ne $p -and $p.DriverDesc -eq $a.Name) {
-            $qw = $p.'HardwareInformation.qwMemorySize'
-            if ($null -ne $qw) { $vram = [int64]$qw }
+    $processor = ($a.VideoProcessor or "").Trim()
+    if ($processor -match '\(0x([0-9a-fA-F]+)\)') {
+        $devId = $matches[1].ToLower()
+        $devidToName[$devId] = $a.Name.Trim()
+    }
+}
+
+# Schritt 4: DedicatedUsage aus GPUAdapterPerformanceCounters holen mit Fallback
+$counters = Get-CimInstance -Namespace root\cimv2 `
+    -Query "SELECT Name, DedicatedUsage FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
+
+$results = @()
+foreach ($cnt in $counters) {
+    $counterName = ($cnt.Name -split '_phys')[0].Trim()
+    $luidParts = $counterName -split '_'
+    if ($luidParts.Count -lt 3) { continue }
+    
+    # LUID extrahieren – WICHTIG: den LETZTEN 0x-Teil nehmen!
+    # Format: luid_0xXXXXXXXX_0xYYYYYYYY -> wir brauchen 0xYYYYYYYY
+    $luidDev = ""
+    for ($i = $luidParts.Count - 1; $i -ge 0; $i--) {
+        $part = $luidParts[$i]
+        if ($part -match '^0x([0-9a-fA-F]+)$') {
+            $luidDev = $matches[1]
             break
         }
     }
-    if ($vram -le 0 -and $a.AdapterRAM -gt 0) {
-        $vram = [int64]$a.AdapterRAM
+    
+    if (-not $luidDev) { continue }
+    $luidDevLower = $luidDev.ToLower()
+    
+    # Versuche, GPU-Namen über LUID/DeviceId zu finden
+    $ctrlName = $null
+    
+    # Methode 1: Direkter Match mit DeviceId
+    if ($devidToName.ContainsKey($luidDevLower)) {
+        $ctrlName = $devidToName[$luidDevLower]
+    } else {
+        # Methode 2: Vergleiche hex-Werte (LUID und DEV können unterschiedlich sein)
+        try {
+            $luidInt = [Convert]::ToInt64($luidDev, 16)
+            foreach ($mapKey in $devidToName.Keys) {
+                $devInt = [Convert]::ToInt64($mapKey, 16)
+                if ($luidInt -eq $devInt) {
+                    $ctrlName = $devidToName[$mapKey]
+                    break
+                }
+            }
+        } catch {}
     }
-    # Echten freien VRAM aus WMI lesen (AvailableVideoMemory in Bytes)
-    $freeBytes = [int64]($a.AvailableVideoMemory -as [int64])
-    if ($freeBytes -lt 0) { $freeBytes = 0 }
-    $freeMb = $freeBytes / (1024 * 1024)
-    # Free darf nicht Total übersteigen
-    if ($freeMb -gt ($vram / (1024 * 1024))) { $freeMb = $vram / (1024 * 1024) }
+    
+    # Fallback: Wenn kein LUID-Match, aber GPU mit hoher Usage vorhanden -> nimm sie
+    if (-not $ctrlName) {
+        $usageBytes = [int64]($cnt.DedicatedUsage -as [int64])
+        if ($usageBytes -lt 0) { $usageBytes = 0 }
+        $usedMB = $usageBytes / (1024 * 1024)
+        # Wenn Usage > 100 MB, handelt es sich wahrscheinlich um die diskrete GPU
+        if ($usedMB -gt 100) {
+            foreach ($name in $devidToName.Values) {
+                if ($name -like "*Radeon*" -or $name -like "*GeForce*" -or $name -like "*RTX*" -or $name -like "*GTX*") {
+                    $ctrlName = $name
+                    break
+                }
+            }
+            # Wenn keine diskrete GPU im Match, nimm die erste nicht-virtuelle GPU
+            if (-not $ctrlName -and $devidToName.Count -eq 1) {
+                $ctrlName = $devidToName.Values[0]
+            }
+        }
+    }
+    
+    if (-not $ctrlName) { continue }
+    
+    # Total VRAM aus Registry
+    $vram = [int64]0
+    if ($regVram.ContainsKey($ctrlName)) {
+        $vram = $regVram[$ctrlName]
+    }
+    
+    $usageBytes = [int64]($cnt.DedicatedUsage -as [int64])
+    if ($usageBytes -lt 0) { $usageBytes = 0 }
+    $totalMb = $vram / (1024 * 1024)
+    $usedMb = $usageBytes / (1024 * 1024)
+    $freeMb = [math]::Max(0, $totalMb - $usedMb)
+    
     $results += [PSCustomObject]@{
-        Name     = $a.Name
+        Name     = $ctrlName
         VRAM     = $vram
         FreeMB   = [int64]$freeMb
-        PNP      = $a.PNPDeviceID
+        UsedMB   = [int64]$usedMb
+        PNP      = ""
     }
 }
-$results | ConvertTo-Json -Compress -Depth 3
+
+if ($results) {
+    $results | ConvertTo-Json -Compress -Depth 3
+} else {
+    Write-Output "[]"
+}
 """
 
 
@@ -414,10 +756,12 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
     available (faster, no PowerShell overhead) and falls back to the PowerShell
     snippet for compatibility.
 
-    VRAM free detection priority:
-      1. DedicatedUsage (WMI GPUAdapterMemory) → total - used
-      2. AvailableVideoMemory (WMI VideoController) → direct free value
-      3. Both unavailable → free_mb = 0 (unknown)
+    VRAM free detection priority (updated for AMD RX 9000 / RDNA 5 compatibility):
+      1. DedicatedUsage (WMI GPUAdapterMemory) → free = total - used
+      2. DXGI/PowerShell (AMD RX 9000 Series fallback) → free = total - used
+      3. AvailableVideoMemory (WMI VideoController) → direct free value
+         (NOT used for AMD RX 9000 as it reports incorrectly ~4GB)
+      4. Both unavailable → free_mb = 0 (unknown)
 
     ``skip_names`` is for de-duplicating against vendor-specific detectors
     (e.g. an RTX card already found via nvidia-smi shouldn't be re-added).
@@ -428,7 +772,10 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
 
     # Echten belegten VRAM über WMI win32com auslesen (DedicatedUsage)
     vram_used_map: Dict[str, float] = _get_gpu_vram_used_via_wmi()
+    # DXGI/PowerShell-Fallback für AMD RX 9000 Series (return: used_mb)
+    dxgi_used_map: Dict[str, float] = _get_gpu_vram_via_dxgi_powershell()
     # Echten freien VRAM über WMI win32com auslesen (AvailableVideoMemory)
+    # Wird nur als letzte Option verwendet, da bei AMD RX 9000 ungenau
     vram_free_map: Dict[str, float] = _get_gpu_vram_free_via_wmi()
 
     # Try native winreg helper first (faster, no PowerShell overhead)
@@ -440,15 +787,20 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             if name.lower() in skip:
                 continue
             total_mb = vram_bytes // (1024 * 1024)
-            # VRAM-Berechnung mit Priorität:
-            # 1. DedicatedUsage → free = total - used
-            # 2. AvailableVideoMemory → direkte freie Menge
-            # 3. Beides nicht verfügbar → free_mb = 0 (unbekannt)
+            # VRAM-Berechnung mit Priorität (angepasst für AMD RX 9000):
+            # 1. DedicatedUsage (WMI GPUAdapterMemory) → free = total - used
+            # 2. DXGI/PowerShell-Fallback (AMD RX 9000 Series) → free = total - used
+            # 3. AvailableVideoMemory (WMI VideoController) → direkte freie Menge
+            # 4. Beides nicht verfügbar → free_mb = 0 (unbekannt)
             if name.lower() in vram_used_map:
                 used_mb = vram_used_map[name.lower()]
                 free_mb = max(0, total_mb - int(used_mb))
+            elif name.lower() in dxgi_used_map:
+                # DXGI/PowerShell-Fallback (AMD RX 9000 Series)
+                used_mb = dxgi_used_map[name.lower()]
+                free_mb = max(0, total_mb - int(used_mb))
             elif name.lower() in vram_free_map:
-                # AvailableVideoMemory direkt als freie Menge verwenden
+                # AvailableVideoMemory als letzte Option
                 free_mb = int(min(vram_free_map[name.lower()], total_mb))
             else:
                 free_mb = 0
@@ -487,22 +839,26 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         if vram < 0:  # paranoia: 32-bit overflow
             vram = 0
         total_mb = vram // (1024 * 1024)
+        
+        # Verwende FreeMB aus PowerShell (berechnet als total - used) direkt,
+        # da der PowerShell-Skript bereits DedicatedUsage korrekt verwendet
+        ps_free = d.get("FreeMB")
+        if ps_free is not None:
+            try:
+                free_mb = min(int(ps_free), total_mb)
+            except (TypeError, ValueError):
+                free_mb = 0
         # VRAM-Berechnung mit Priorität (wie oben)
-        if name.lower() in vram_used_map:
+        elif name.lower() in vram_used_map:
             used_mb = vram_used_map[name.lower()]
+            free_mb = max(0, total_mb - int(used_mb))
+        elif name.lower() in dxgi_used_map:
+            used_mb = dxgi_used_map[name.lower()]
             free_mb = max(0, total_mb - int(used_mb))
         elif name.lower() in vram_free_map:
             free_mb = int(min(vram_free_map[name.lower()], total_mb))
         else:
-            # PowerShell liefert bereits FreeMB — als letzten Fallback nutzen
-            ps_free = d.get("FreeMB")
-            if ps_free is not None:
-                try:
-                    free_mb = min(int(ps_free), total_mb)
-                except (TypeError, ValueError):
-                    free_mb = 0
-            else:
-                free_mb = 0
+            free_mb = 0
         gpus.append(GPUInfo(
             index=len(gpus),
             name=name,
