@@ -1,10 +1,10 @@
-# Haupt-Abhängigkeiten
+# Haupt-Abhängigkeiten (müssen immer installiert sein)
 psutil>=7.2.0
 PyYAML>=6.0
 pywin32>=311
 PyQt6>=6.11.0
 
-# Type stubs / type-checking only
+# Type stubs – immer installieren (vermeidet mypy import-untyped warnings)
 types-psutil>=7.2.0
 types-PyYAML>=6.0
 types-pywin32>=311

@@ -12,7 +12,6 @@ import json
 import platform
 import subprocess
 import sys
-import time
 import psutil
 
 from dataclasses import dataclass, field
@@ -456,10 +455,10 @@ def _create_live_monitor() -> Optional[type]:
     """
     try:
         from PyQt6.QtWidgets import (
-            QApplication, QMainWindow, QWidget, QVBoxLayout,
-            QHBoxLayout, QLabel, QProgressBar, QPushButton, QGroupBox,
+            QMainWindow, QWidget, QVBoxLayout,
+            QHBoxLayout, QLabel, QProgressBar, QGroupBox,
         )
-        from PyQt6.QtCore import QTimer, Qt
+        from PyQt6.QtCore import QTimer
         from PyQt6.QtGui import QFont
 
         class SystemMonitorWindow(QMainWindow):
@@ -506,7 +505,6 @@ def _create_live_monitor() -> Optional[type]:
 
                 # GPU Group
                 gpu_group = QGroupBox("GPU(s)")
-                gpu_layout = QVBoxLayout()
                 layout.addWidget(gpu_group)
                 self.gpu_layout_inner = QVBoxLayout(gpu_group)
                 gpu_group.setLayout(self.gpu_layout_inner)

@@ -84,6 +84,48 @@ def _get_vram_from_registry() -> Dict[str, int]:
     return result
 
 
+def _get_gpu_vram_used_via_wmi() -> Dict[str, float]:
+    """Echte VRAM-Nutzung (DedicatedUsage) über WMI win32com auslesen.
+
+    Returns mapping of GPU name (lowercased) -> used VRAM in MB.
+    Uses Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory
+    which reports DedicatedUsage in bytes.
+
+    Returns empty dict if WMI is unavailable or GPU performance counters
+    are not registered (common on AMD RX 9000 series under Windows).
+    """
+    result: Dict[str, float] = {}
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return result
+
+    try:
+        pythoncom.CoInitialize()
+        wmi = win32com.client.GetObject("winmgmts:\\\\root\\\\cimv2")
+        for obj in wmi.ExecQuery(
+            "SELECT Name, DedicatedUsage "
+            "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
+        ):
+            name = str(obj.Name or "").split("_phys")[0].strip()
+            if not name:
+                continue
+            used_bytes = float(obj.DedicatedUsage or 0)
+            used_mb = used_bytes / (1024 * 1024)
+            result[name.lower()] = used_mb
+    except Exception:
+        # WMI nicht verfügbar, RPC-Server fehlerhaft, oder keine GPU-Counter
+        pass
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    return result
+
+
 @dataclass
 class GPUInfo:
     index: int
@@ -280,6 +322,7 @@ $regBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc
 $regKeys = Get-ChildItem $regBase -ErrorAction SilentlyContinue
 $results = @()
 foreach ($a in $adapters) {
+    # Total dedicated VRAM aus Registry (64-bit sicher)
     $vram = [int64]0
     foreach ($k in $regKeys) {
         $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
@@ -292,10 +335,17 @@ foreach ($a in $adapters) {
     if ($vram -le 0 -and $a.AdapterRAM -gt 0) {
         $vram = [int64]$a.AdapterRAM
     }
+    # Echten freien VRAM aus WMI lesen (AvailableVideoMemory in Bytes)
+    $freeBytes = [int64]($a.AvailableVideoMemory -as [int64])
+    if ($freeBytes -lt 0) { $freeBytes = 0 }
+    $freeMb = $freeBytes / (1024 * 1024)
+    # Free darf nicht Total übersteigen
+    if ($freeMb -gt ($vram / (1024 * 1024))) { $freeMb = $vram / (1024 * 1024) }
     $results += [PSCustomObject]@{
-        Name = $a.Name
-        VRAM = $vram
-        PNP  = $a.PNPDeviceID
+        Name     = $a.Name
+        VRAM     = $vram
+        FreeMB   = [int64]$freeMb
+        PNP      = $a.PNPDeviceID
     }
 }
 $results | ConvertTo-Json -Compress -Depth 3
@@ -321,6 +371,9 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         return []
     skip = {n.lower() for n in (skip_names or set())}
 
+    # Echten belegten VRAM über WMI win32com auslesen (DedicatedUsage)
+    vram_used_map: Dict[str, float] = _get_gpu_vram_used_via_wmi()
+
     # Try native winreg helper first (faster, no PowerShell overhead)
     registry_vram = _get_vram_from_registry()
     gpus: List[GPUInfo] = []
@@ -330,9 +383,15 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             if name.lower() in skip:
                 continue
             total_mb = vram_bytes // (1024 * 1024)
-            # Ohne vendor-spezifisches Tool (nvidia-smi / rocm-smi) keinen
-            # genauen freien VRAM ermitteln – sch\u00e4tze 95 % frei.
-            free_mb = int(total_mb * 0.95)
+            # Echten belegten VRAM aus WMI verwenden, falls verfügbar.
+            # Wenn WMI keine Counter liefert (z.B. AMD RX 9000 Series),
+            # setze free_vram_mb auf 0 – das signalisiert "unbekannt" und
+            # verhindert eine irreführende Anzeige wie "15,9 GB frei".
+            if name.lower() in vram_used_map:
+                used_mb = vram_used_map[name.lower()]
+                free_mb = max(0, total_mb - int(used_mb))
+            else:
+                free_mb = 0
             gpus.append(GPUInfo(
                 index=len(gpus),
                 name=name,
@@ -368,7 +427,13 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         if vram < 0:  # paranoia: 32-bit overflow
             vram = 0
         total_mb = vram // (1024 * 1024)
-        free_mb = int(total_mb * 0.95)
+        # Echten belegten VRAM aus WMI verwenden, falls verfügbar.
+        # Wenn WMI keine Counter liefert, setze free_vram_mb auf 0.
+        if name.lower() in vram_used_map:
+            used_mb = vram_used_map[name.lower()]
+            free_mb = max(0, total_mb - int(used_mb))
+        else:
+            free_mb = 0
         gpus.append(GPUInfo(
             index=len(gpus),
             name=name,
