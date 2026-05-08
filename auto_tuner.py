@@ -465,6 +465,12 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--nothinking", action="store_true",
                     help="Disable thinking/reasoning output")
     p.add_argument(
+        "--force-mlock",
+        action="store_true",
+        help="Force --mlock / --no-mmap even for full-GPU-offload models "
+             "(prevents VRAM paging when enough free VRAM is available)",
+    )
+    p.add_argument(
         "--",
         dest="passthrough",
         nargs=argparse.REMAINDER,
@@ -663,7 +669,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not use_draft:
             effective_draft = None
 
-        cfg = compute_config(model, system, profile, draft_model=effective_draft, user_ctx=args.ctx)
+        cfg = compute_config(
+            model, system, profile,
+            draft_model=effective_draft,
+            user_ctx=args.ctx,
+            force_mlock=getattr(args, "force_mlock", False),
+        )
+        
+        # mlock/no_mmap Entscheidung immer anzeigen (wichtig für Troubleshooting)
+        print(f"\n  [mlock] decision: model={model.name}")
+        print(f"         full_offload={cfg.full_offload}  "
+              f"vram={cfg.estimated_model_vram_gb:.1f}GB  "
+              f"ram={cfg.estimated_model_ram_gb:.1f}GB")
+        print(f"         sys: total_vram={system.total_vram_gb:.1f}GB  "
+              f"free_vram={system.free_vram_gb:.1f}GB  "
+              f"total_ram={system.total_ram_gb:.1f}GB  "
+              f"free_ram={system.free_ram_gb:.1f}GB")
+        print(f"         force_mlock={getattr(args, 'force_mlock', False)}  "
+              f"-> mlock={cfg.mlock}  no_mmap={cfg.no_mmap}")
+        
         _print_config(model, profile, cfg, system)
 
         raw_server = profile.server_binary or args.server

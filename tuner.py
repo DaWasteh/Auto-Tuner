@@ -247,6 +247,7 @@ def compute_config(
     user_ctx: Optional[int] = None,
     ram_safety_gb: float = DEFAULT_RAM_SAFETY_GB,
     vram_safety_gb: float = DEFAULT_VRAM_SAFETY_GB,
+    force_mlock: bool = False,
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system."""
     has_gpu = bool(system.gpus) and system.total_vram_gb > 1
@@ -381,13 +382,36 @@ def compute_config(
         except Exception:
             is_admin = True
 
-    mlock = (
-        not full_off
-        and system.total_ram_gb > 32
-        and ram_resident_gb > 0
-        and ram_resident_gb < (system.free_ram_gb - 8)
-        and (not is_windows or is_admin) # <--- FIX: Nur mlock wenn Admin auf Windows
-    )
+    # Option A: VRAM-basierte Bedingung für full-off Modelle
+    # Wenn das Modell vollständig auf der GPU ist (full_off=True), kann mlock/no-mmap
+    # trotzdem sinnvoll sein, um VRAM-Paging zu verhindern.
+    vram_resident_gb = model_vram
+    has_enough_vram = system.total_vram_gb > 8
+    
+    if force_mlock:
+        # Option B: User-Override — aktiviert mlock/no-mmap wenn System-Ressourcen reichen
+        mlock = (
+            (has_enough_vram or vram_resident_gb > 0)
+            and (is_windows and is_admin or not is_windows)
+        )
+    else:
+        # Automatische Logik: zwei Fälle
+        if full_off:
+            # Full GPU offload: prüfe VRAM statt RAM
+            mlock = (
+                has_enough_vram
+                and vram_resident_gb > 0
+                and vram_resident_gb < (system.free_vram_gb - 2)
+                and (not is_windows or is_admin)
+            )
+        else:
+            # Partial/CPU offload: prüfe RAM
+            mlock = (
+                system.total_ram_gb > 32
+                and ram_resident_gb > 0
+                and ram_resident_gb < (system.free_ram_gb - 8)
+                and (not is_windows or is_admin)
+            )
     no_mmap = mlock
 
     # ---- (4d) Multi-GPU tensor split. Skipped for MoE.

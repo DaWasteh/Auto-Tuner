@@ -126,6 +126,56 @@ def _get_gpu_vram_used_via_wmi() -> Dict[str, float]:
     return result
 
 
+def _get_gpu_vram_free_via_wmi() -> Dict[str, float]:
+    """Echten freien VRAM (AvailableVideoMemory) über WMI auslesen.
+
+    Returns mapping of GPU name (lowercased) -> free VRAM in MB.
+    Uses Win32_VideoController.AvailableVideoMemory — this attribute reports
+    the amount of video memory available to applications, in bytes.
+
+    This is a fallback for GPUs where DedicatedUsage counters are not
+    registered (common on AMD RX 9000 series / RDNA 5 under Windows).
+    """
+    result: Dict[str, float] = {}
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return result
+
+    try:
+        pythoncom.CoInitialize()
+        wmi = win32com.client.GetObject("winmgmts:\\\\root\\\\cimv2")
+        for obj in wmi.ExecQuery(
+            "SELECT Name, AvailableVideoMemory "
+            "FROM Win32_VideoController"
+        ):
+            name = str(obj.Name or "").strip()
+            if not name:
+                continue
+            # Filter out virtual/auxiliary adapters
+            lower = name.lower()
+            if any(skip in lower for skip in (
+                "basic render", "remote display", "hyper-v",
+                "rdp", "microsoft", "mirror",
+            )):
+                continue
+            free_bytes = int(obj.AvailableVideoMemory or 0)
+            if free_bytes < 0:
+                free_bytes = 0
+            free_mb = free_bytes / (1024 * 1024)
+            result[name.lower()] = free_mb
+    except Exception:
+        pass
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    return result
+
+
 @dataclass
 class GPUInfo:
     index: int
@@ -364,6 +414,11 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
     available (faster, no PowerShell overhead) and falls back to the PowerShell
     snippet for compatibility.
 
+    VRAM free detection priority:
+      1. DedicatedUsage (WMI GPUAdapterMemory) → total - used
+      2. AvailableVideoMemory (WMI VideoController) → direct free value
+      3. Both unavailable → free_mb = 0 (unknown)
+
     ``skip_names`` is for de-duplicating against vendor-specific detectors
     (e.g. an RTX card already found via nvidia-smi shouldn't be re-added).
     """
@@ -373,6 +428,8 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
 
     # Echten belegten VRAM über WMI win32com auslesen (DedicatedUsage)
     vram_used_map: Dict[str, float] = _get_gpu_vram_used_via_wmi()
+    # Echten freien VRAM über WMI win32com auslesen (AvailableVideoMemory)
+    vram_free_map: Dict[str, float] = _get_gpu_vram_free_via_wmi()
 
     # Try native winreg helper first (faster, no PowerShell overhead)
     registry_vram = _get_vram_from_registry()
@@ -383,13 +440,16 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             if name.lower() in skip:
                 continue
             total_mb = vram_bytes // (1024 * 1024)
-            # Echten belegten VRAM aus WMI verwenden, falls verfügbar.
-            # Wenn WMI keine Counter liefert (z.B. AMD RX 9000 Series),
-            # setze free_vram_mb auf 0 – das signalisiert "unbekannt" und
-            # verhindert eine irreführende Anzeige wie "15,9 GB frei".
+            # VRAM-Berechnung mit Priorität:
+            # 1. DedicatedUsage → free = total - used
+            # 2. AvailableVideoMemory → direkte freie Menge
+            # 3. Beides nicht verfügbar → free_mb = 0 (unbekannt)
             if name.lower() in vram_used_map:
                 used_mb = vram_used_map[name.lower()]
                 free_mb = max(0, total_mb - int(used_mb))
+            elif name.lower() in vram_free_map:
+                # AvailableVideoMemory direkt als freie Menge verwenden
+                free_mb = int(min(vram_free_map[name.lower()], total_mb))
             else:
                 free_mb = 0
             gpus.append(GPUInfo(
@@ -427,13 +487,22 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         if vram < 0:  # paranoia: 32-bit overflow
             vram = 0
         total_mb = vram // (1024 * 1024)
-        # Echten belegten VRAM aus WMI verwenden, falls verfügbar.
-        # Wenn WMI keine Counter liefert, setze free_vram_mb auf 0.
+        # VRAM-Berechnung mit Priorität (wie oben)
         if name.lower() in vram_used_map:
             used_mb = vram_used_map[name.lower()]
             free_mb = max(0, total_mb - int(used_mb))
+        elif name.lower() in vram_free_map:
+            free_mb = int(min(vram_free_map[name.lower()], total_mb))
         else:
-            free_mb = 0
+            # PowerShell liefert bereits FreeMB — als letzten Fallback nutzen
+            ps_free = d.get("FreeMB")
+            if ps_free is not None:
+                try:
+                    free_mb = min(int(ps_free), total_mb)
+                except (TypeError, ValueError):
+                    free_mb = 0
+            else:
+                free_mb = 0
         gpus.append(GPUInfo(
             index=len(gpus),
             name=name,

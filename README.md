@@ -184,7 +184,46 @@ like Continue / Cline, **Open WebUI**, or any OpenAI-API client.
 | `--model SUBSTR` | Skip the menu, pick a model by name substring |
 | `--dry-run` | Print the command, don't start the server |
 | `--yes / -y` | Skip the launch confirmation prompt |
+| `--force-mlock` | Force `--mlock` / `--no-mmap` (prevents VRAM/RAM paging) |
 | `-- <args...>` | Anything after `--` is forwarded to `llama-server` |
+
+### Memory locking (`--mlock` / `--no-mmap`)
+
+The auto-tuner automatically decides whether to enable `--mlock` and `--no-mmap`
+based on available system resources. These flags pin model data in physical
+memory (RAM/VRAM) and prevent the OS from paging it to disk, which is critical
+for stable inference performance.
+
+**Automatic behavior:**
+
+| Scenario | Condition | Result |
+|---|---|---|
+| **Full GPU offload** | `total_vram > 8 GB` AND `free_vram > model_size + 2 GB` | `--mlock --no-mmap` enabled |
+| **Partial / CPU offload** | `total_ram > 32 GB` AND `free_ram > model_ram_on_cpu + 8 GB` | `--mlock --no-mmap` enabled |
+| **Insufficient memory** | Safety reserve not met | Disabled (fallback to default mmap) |
+
+**Force memory locking:**
+
+Use `--force-mlock` to override the automatic decision and always enable
+memory locking when the OS permits it:
+
+```bash
+python auto_tuner.py --force-mlock
+```
+
+This is useful when you know your system has enough memory but the tuner's
+conservative thresholds would otherwise skip it.
+
+**Debug output:**
+
+The tuner prints the mlock decision before every launch:
+
+```
+  [mlock] decision: model=Qwen3.6-35B-A3B-UD-Q6_K
+         full_offload=True  vram=18.5GB  ram=0.0GB
+         sys: total_vram=24.0GB  free_vram=5.2GB  total_ram=32.0GB  free_ram=12.1GB
+         force_mlock=False  -> mlock=True  no_mmap=True
+```
 
 ### Environment variables
 

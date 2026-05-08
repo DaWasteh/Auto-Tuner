@@ -13,7 +13,7 @@ git checkout prism
 cmake -B build -DGGML_VULKAN=ON -DCMAKE_ASM_COMPILER="cl.exe"
 cmake --build build --config Release -j 24
 
-´´´ MTP-Fork ´´´
+´´´ Ikawrakow MTP-Fork ´´´
 cd C:\LAB\ai-local
 git clone https://github.com/ikawrakow/ik_llama.cpp ik_llama.cpp
 cd ik_llama.cpp
@@ -28,5 +28,13 @@ cd C:\LAB\ai-local
 git clone https://github.com/TheTom/llama-cpp-turboquant tq_llama.cpp
 cd tq_llama.cpp
 git checkout thetom
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_ASM_COMPILER="cl.exe"
+cmake --build build --config Release -j 24
+
+´´´ Atomic MTP-Fork ´´´
+cd C:\LAB\ai-local
+git clone https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant atq_llama.cpp
+cd atq_llama.cpp
+git checkout Atomic
 cmake -B build -DGGML_VULKAN=ON -DCMAKE_ASM_COMPILER="cl.exe"
 cmake --build build --config Release -j 24
