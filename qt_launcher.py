@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 from hardware import detect_system, SystemInfo
 from scanner import scan_models, group_entries, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
-from tuner import build_command, compute_config, TunedConfig
+from tuner import build_command, compute_config
 from performance_target import (
     PERFORMANCE_TARGETS,
     list_target_names,
@@ -147,14 +147,10 @@ class _HwDetectWorker(QObject):
         self._timeout = timeout
 
     def run(self) -> None:
-        import time
         try:
-            start = time.monotonic()
             s = detect_system()
-            elapsed = time.monotonic() - start
             self.finished.emit(s, "")
         except Exception as exc:
-            elapsed = time.monotonic() - start
             self.finished.emit(None, str(exc))
 
 
@@ -1211,7 +1207,7 @@ class MainWindow(QMainWindow):
 
         pid = self._server.proc.pid if self._server.proc else "?"
         self._log(f"[AutoTuner] Server started — PID: {pid}")
-        self._log(f"[AutoTuner] Server output → separate terminal window")
+        self._log("[AutoTuner] Server output → separate terminal window")
         self._log(f"[AutoTuner] Web UI → http://{host}:{port}")
 
         self._btn_launch.setEnabled(False)
