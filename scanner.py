@@ -160,6 +160,189 @@ def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Hybrid Mamba+Transformer detection
+#
+# Pure Transformer models keep KV cache for every layer. Hybrid models
+# (Mamba/SSM blocks interleaved with Transformer blocks) only allocate
+# KV for the attention layers, which is typically 1/4 to 1/8 of all
+# blocks. Our params-based KV estimate dramatically overshoots on these
+# unless we know the real attention-layer count.
+
+# Architectures known to be hybrid (Mamba/SSM + Transformer).
+_HYBRID_ARCHS = frozenset({
+    "nemotron_h",
+    "nemotron-h",
+    "granitemoehybrid",
+    "granite-h",
+    "granite_h",
+    "jamba",
+    "bamba",
+    "falcon_h1",
+    "plamo2",       # Plamo-2 hybrid
+    "zamba2",       # Zamba2 hybrid
+    "rwkv6",        # RWKV — pure SSM, but treated similarly for KV
+    "rwkv7",
+})
+
+
+def metadata_is_hybrid_architecture(md: Dict[str, Any]) -> bool:
+    """Detect Mamba/SSM-Transformer hybrid models from GGUF metadata.
+
+    A model is "hybrid" when only a fraction of its layers carry KV
+    cache. We detect this two ways:
+      1. Architecture name matches a known hybrid (cheap, reliable).
+      2. Any ``<arch>.ssm.*`` keys exist in the metadata (catches new
+         hybrid architectures we don't have on the allow-list yet).
+    """
+    if not md:
+        return False
+    arch = str(md.get("general.architecture", "") or "").lower()
+    if arch in _HYBRID_ARCHS:
+        return True
+    # Generic SSM-state detection — any *.ssm.* key signals hybrid.
+    for k in md.keys():
+        if ".ssm." in k:
+            return True
+    return False
+
+
+def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
+    """Return the number of layers that actually carry KV cache.
+
+    For pure Transformer models this equals ``block_count``. For hybrid
+    Mamba/Transformer models we look for an explicit attention-layer
+    count first, then fall back to a conservative ratio of total blocks.
+
+    Returns 0 when the answer can't be determined (caller should treat
+    as "use total block count" — i.e. assume non-hybrid).
+    """
+    if not md:
+        return 0
+    arch = str(md.get("general.architecture", "") or "")
+    total = metadata_layer_count(md)
+    if total <= 0:
+        return 0
+
+    if not metadata_is_hybrid_architecture(md):
+        return total  # pure Transformer — every layer has KV
+
+    # Hybrid model — try explicit metadata keys.
+    explicit_keys = (
+        f"{arch}.attention.block_count",
+        f"{arch}.attention.layer_count",
+        f"{arch}.transformer.block_count",
+        f"{arch}.n_attention_layers",
+    )
+    for key in explicit_keys:
+        v = md.get(key)
+        if v is not None:
+            try:
+                n = int(v)
+                if 0 < n <= total:
+                    return n
+            except (TypeError, ValueError):
+                pass
+
+    # No explicit count — apply a per-architecture heuristic. These
+    # ratios come from each model's published architecture diagrams.
+    # When in doubt we err high (more attention layers ↔ larger KV
+    # estimate ↔ safer placement).
+    arch_l = arch.lower()
+    if "nemotron" in arch_l:
+        # Nemotron-H: roughly 1 attention block per 4 Mamba blocks.
+        ratio = 0.25
+    elif "jamba" in arch_l:
+        # Jamba: 1 attention per 7 Mamba (~14%).
+        ratio = 0.15
+    elif "granite" in arch_l and "hybrid" in arch_l:
+        # Granite-Hybrid: ~25% attention.
+        ratio = 0.25
+    elif "bamba" in arch_l:
+        ratio = 0.20
+    elif "rwkv" in arch_l:
+        # Pure SSM — no real KV cache. Use 1 to keep estimates small
+        # but non-zero so the rest of the code doesn't divide by zero.
+        return 1
+    else:
+        # Unknown hybrid — assume 25% attention layers (conservative).
+        ratio = 0.25
+
+    return max(1, int(total * ratio))
+
+
+# ---------------------------------------------------------------------------
+# Thinking / reasoning capability detection
+#
+# Detecting reasoning support purely by filename ("qwen3" → has thinking)
+# false-positives on non-thinking siblings like Qwen3-Coder, Qwen3-VL-
+# Captioner, or Qwen3-Embedding. The chat template is the authoritative
+# source: models built for thinking embed <think> tokens or
+# enable_thinking flags in their template.
+
+# Filename markers that exclude a model from thinking even if its base
+# family supports it (Qwen3-Coder is a Qwen3 model with no <think>).
+_NON_THINKING_NAME_HINTS = (
+    "coder",
+    "embedding",
+    "reranker",
+    "captioner",
+    "instruct-2507",   # Qwen3-2507-Instruct is the non-thinking branch
+    "non-thinking",
+)
+
+# Markers that indicate thinking support inside a chat template.
+_THINKING_TEMPLATE_MARKERS = (
+    "<think>",
+    "</think>",
+    "<|think|>",
+    "enable_thinking",
+    "reasoning_content",
+    "thinking_budget",
+    "preserve_thinking",
+)
+
+# Filename keywords used as a fallback when no chat template is present.
+_THINKING_NAME_HINTS = (
+    "gemma",
+    "deepseek-r",
+    "qwq",
+    "reasoning",
+    "thinking",
+)
+
+
+def metadata_supports_thinking(md: Dict[str, Any], filename: str = "") -> bool:
+    """Return True iff this model supports reasoning / thinking output.
+
+    Decision order:
+      1. Filename excludes thinking explicitly (e.g. "Qwen3-Coder") →
+         False, even if the chat template has <think>. The non-thinking
+         siblings sometimes inherit a generic template that mentions
+         thinking but they don't actually emit it.
+      2. Chat template contains a thinking marker → True.
+      3. No template available → fall back to filename keywords.
+      4. Otherwise → False.
+    """
+    name_l = (filename or "").lower()
+    if any(hint in name_l for hint in _NON_THINKING_NAME_HINTS):
+        return False
+
+    if md:
+        for key in ("tokenizer.chat_template",
+                    "tokenizer.chat_template.default"):
+            template = md.get(key)
+            if isinstance(template, str) and template:
+                if any(m in template for m in _THINKING_TEMPLATE_MARKERS):
+                    return True
+                # Template was present but had no thinking marker —
+                # this is informative enough to stop here.
+                return False
+
+    # No template at all — fall back to filename heuristic.
+    return any(hint in name_l for hint in _THINKING_NAME_HINTS)
+
+
+# ---------------------------------------------------------------------------
 # Model entries + scanner
 
 # Strip quant + extension when normalizing for mmproj pairing
@@ -211,6 +394,22 @@ class ModelEntry:
     def supports_rope_scale(self) -> bool:
         """Prüft ob das Modell RoPE-Scaling (YaRN) unterstützt."""
         return metadata_supports_rope_scale(self.metadata)
+
+    @property
+    def is_hybrid(self) -> bool:
+        """True for Mamba/Transformer hybrids (Nemotron-H, Jamba, …)."""
+        return metadata_is_hybrid_architecture(self.metadata)
+
+    @property
+    def n_attention_layers(self) -> int:
+        """Number of layers carrying KV cache. Equals ``n_layers`` for
+        pure Transformer; smaller for hybrids."""
+        return metadata_attention_layer_count(self.metadata)
+
+    @property
+    def supports_thinking(self) -> bool:
+        """True if the chat template signals thinking/reasoning support."""
+        return metadata_supports_thinking(self.metadata, self.name)
 
 
 def _strip_quant(filename: str) -> str:

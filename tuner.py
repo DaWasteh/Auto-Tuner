@@ -8,6 +8,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from hardware import SystemInfo
 from scanner import ModelEntry
 from settings_loader import ModelProfile
+from performance_target import (
+    PerformanceTarget,
+    PERFORMANCE_TARGETS,
+    resolve_performance_target,
+    DEFAULT_TARGET_NAME,
+)
 
 ctypes: Any = None
 try:
@@ -19,14 +25,18 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Tunables. Kept at module scope so tests / callers can override them.
- 
-DEFAULT_VRAM_SAFETY_GB = 0.3
-DEFAULT_RAM_SAFETY_GB = 1.5
-   
-# MoE-specific knobs. Adjusted for larger context support and more aggressive
-# GPU placement to match manual configuration behavior.
-MOE_VRAM_SAFETY_GB = 0.3
-MOE_PLACEMENT_CTX_TARGET = 131072
+#
+# These are now thin compat shims — the real values come from the active
+# PerformanceTarget. Keeping the module constants means external callers
+# (tests, scripts) that monkey-patched them in the past keep working, and
+# reading the constants still gives the "balanced" defaults.
+
+DEFAULT_VRAM_SAFETY_GB = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].dense_vram_safety_gb
+DEFAULT_RAM_SAFETY_GB = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].ram_safety_gb
+
+# MoE-specific knobs. Read from the "balanced" preset for back-compat.
+MOE_VRAM_SAFETY_GB = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].moe_vram_safety_gb
+MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].moe_placement_ctx_target
 MOE_KV_RESERVE_FRAC = 0.06
 
 
@@ -75,12 +85,18 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
     """Compute exact f16 K+V cache size per token (MB) from GGUF metadata.
 
     Formula:
-        bytes/token = n_layers * n_kv_heads * (key_length + value_length) * 2
+        bytes/token = n_attention_layers * n_kv_heads * (key_length + value_length) * 2
 
     The trailing 2 is K+V at FP16 (2 bytes each). With GQA, `n_kv_heads`
     is smaller than `n_heads`, which is why MoE models like
     Qwen3.6-35B-A3B have a small KV footprint despite a high total
     parameter count — they share KV across many query heads.
+
+    For *hybrid* Mamba/Transformer models (Nemotron-H, Jamba, …) only
+    a fraction of the layers actually carry KV cache. We multiply by
+    that fraction (via ``metadata_attention_layer_count``) instead of
+    the total block count, otherwise we'd over-reserve VRAM by 4–5×
+    on these architectures and pessimise placement.
 
     Returns 0.0 when metadata is incomplete; the caller should then fall
     back to the params-billion heuristic.
@@ -98,7 +114,14 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
         except (TypeError, ValueError):
             return 0
 
-    n_layers = _int("block_count")
+    # Use the attention-bearing layer count for hybrids; for pure
+    # Transformer this equals block_count and behaves as before.
+    from scanner import metadata_attention_layer_count
+    n_layers = metadata_attention_layer_count(md)
+    if n_layers <= 0:
+        # Fallback for older models / incomplete metadata: use total blocks.
+        n_layers = _int("block_count")
+
     n_heads = _int("attention.head_count")
     n_kv_heads = _int("attention.head_count_kv")
     embd = _int("embedding_length")
@@ -219,6 +242,10 @@ class TunedConfig:
     rope_scaling: bool = False
     rope_scale_factor: float = 1.0  # z.B. 4.0 für yarn mit 4x scaling
 
+    # Active performance target name ("safe" / "balanced" / "throughput").
+    # Set by compute_config so display code can show what was applied.
+    performance_target: str = DEFAULT_TARGET_NAME
+
     warning: Optional[str] = None
 
 
@@ -267,6 +294,8 @@ def _decide_moe_offload(
     target_ctx: int,
     base_kv_per_token_mb: float = 0.0,
     ram_safety_gb: float = DEFAULT_RAM_SAFETY_GB,
+    moe_vram_safety_gb: float = MOE_VRAM_SAFETY_GB,
+    moe_placement_ctx_target: int = MOE_PLACEMENT_CTX_TARGET,
 ) -> Tuple[int, Optional[int], float, float, bool]:
     """Decide how to split an MoE model between GPU and CPU.
 
@@ -278,11 +307,12 @@ def _decide_moe_offload(
       3. Pack as many expert layers as possible into the leftover VRAM;
          everything else goes to CPU via `--n-cpu-moe`.
 
-    A practical KV target of MOE_PLACEMENT_CTX_TARGET (~131k) is used
+    A practical KV target of ``moe_placement_ctx_target`` is used
     instead of the profile maximum, so we don't reserve VRAM for context
-    the user is unlikely to need on this run. The final ctx in
-    compute_config can still be larger if the actual remaining VRAM
-    permits.
+    the user is unlikely to need on this run. The actual ctx in
+    compute_config can still be larger if the remaining VRAM allows it.
+    The target is supplied by the active PerformanceTarget — "safe"
+    keeps the legacy 128k value, "throughput" shrinks it to 32k.
     """
     if base_kv_per_token_mb <= 0:
         base_kv_per_token_mb = kv_per_token_mb_f16(params_billion)
@@ -292,16 +322,16 @@ def _decide_moe_offload(
                               (model_size_gb - shared_overhead_gb) / n_layers)
 
     # ---- KV reservation in VRAM (q5_0 assumption) -----------------------
-    # Cap at MOE_PLACEMENT_CTX_TARGET so we don't pessimise layer placement
-    # for huge profile_max values (Qwen3.6 → 262k, but most users run 131k).
+    # Cap at moe_placement_ctx_target so we don't pessimise layer placement
+    # for huge profile_max values (Qwen3.6 → 262k, but most users run 32k).
     kv_reservation_ctx = max(2048, min(target_ctx,
-                                       MOE_PLACEMENT_CTX_TARGET))
+                                       moe_placement_ctx_target))
     kv_reserve_gb = (
         kv_reservation_ctx * base_kv_per_token_mb * kv_quant_factor("q5_0")
     ) / 1024.0
 
     # Layer placement uses VRAM left over AFTER KV + shared overhead.
-    usable_for_experts = (free_vram_gb - MOE_VRAM_SAFETY_GB
+    usable_for_experts = (free_vram_gb - moe_vram_safety_gb
                           - shared_overhead_gb - kv_reserve_gb)
 
     if usable_for_experts < 0:
@@ -371,9 +401,10 @@ def compute_config(
     profile: ModelProfile,
     draft_model: Optional[ModelEntry] = None,
     user_ctx: Optional[int] = None,
-    ram_safety_gb: float = DEFAULT_RAM_SAFETY_GB,
-    vram_safety_gb: float = DEFAULT_VRAM_SAFETY_GB,
+    ram_safety_gb: Optional[float] = None,
+    vram_safety_gb: Optional[float] = None,
     force_mlock: bool = False,
+    perf_target: Optional[PerformanceTarget] = None,
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system.
 
@@ -381,7 +412,31 @@ def compute_config(
       1. Vision model (mmproj) — always placed on GPU first
       2. Draft model (speculative decoding) — always placed on GPU first
       3. Main model (weights + KV cache)
+
+    The ``perf_target`` argument controls the safety/headroom regime
+    (see ``performance_target.py``). If ``None``, it is resolved from
+    ``profile.performance_target`` — falling back to "balanced" if the
+    profile doesn't specify one. Callers (CLI, GUI) typically resolve
+    the target themselves so a user override beats the YAML default.
+
+    Explicit ``ram_safety_gb`` / ``vram_safety_gb`` arguments still win
+    over the perf_target's values; pass ``None`` (the default) to use
+    whatever the resolved target prescribes.
     """
+    # ---- Resolve performance target. Caller-supplied wins; otherwise we
+    # fall back to whatever the profile recommends (or "balanced").
+    if perf_target is None:
+        perf_target = resolve_performance_target(
+            cli_choice=None,
+            profile_choice=getattr(profile, "performance_target", "") or None,
+        )
+
+    # ---- Apply the target's safety values where the caller didn't override.
+    if ram_safety_gb is None:
+        ram_safety_gb = perf_target.ram_safety_gb
+    if vram_safety_gb is None:
+        vram_safety_gb = perf_target.dense_vram_safety_gb
+
     has_gpu = bool(system.gpus) and system.total_vram_gb > 1
     free_vram = max(0.0, system.free_vram_gb)
     n_layers = model.n_layers
@@ -449,7 +504,42 @@ def compute_config(
             target_ctx=target_ctx_for_placement,
             base_kv_per_token_mb=base_kv_mb,
             ram_safety_gb=ram_safety_gb,
+            moe_vram_safety_gb=perf_target.moe_vram_safety_gb,
+            moe_placement_ctx_target=perf_target.moe_placement_ctx_target,
         )
+
+        # ---- Two-pass placement fallback ---------------------------------
+        # If the first pass dumped *every* expert layer to CPU but >4 GB
+        # of VRAM is still free, the KV reservation was clearly too
+        # pessimistic for this model. Retry once with the placement
+        # target halved (down to a 16k floor). This is a defensive net
+        # for hybrid architectures we don't recognise yet, or for
+        # quantisations where our heuristic mis-estimates KV footprint.
+        if (n_cpu_moe is not None
+                and n_layers > 0
+                and n_cpu_moe >= n_layers
+                and effective_free_vram > 4.0
+                and perf_target.moe_placement_ctx_target > 16384):
+            shrunk_target = max(
+                16384, perf_target.moe_placement_ctx_target // 2)
+            ngl_2, cpu_moe_2, vram_2, ram_2, full_2 = _decide_moe_offload(
+                model_size_gb=model.size_gb,
+                free_vram_gb=effective_free_vram,
+                free_ram_gb=system.free_ram_gb,
+                n_layers=n_layers,
+                expert_count=expert_count,
+                params_billion=params_b,
+                target_ctx=target_ctx_for_placement,
+                base_kv_per_token_mb=base_kv_mb,
+                ram_safety_gb=ram_safety_gb,
+                moe_vram_safety_gb=perf_target.moe_vram_safety_gb,
+                moe_placement_ctx_target=shrunk_target,
+            )
+            # Only adopt the second pass if it actually placed layers on GPU.
+            if cpu_moe_2 is not None and cpu_moe_2 < n_cpu_moe:
+                ngl, n_cpu_moe, model_vram, model_ram, full_off = (
+                    ngl_2, cpu_moe_2, vram_2, ram_2, full_2)
+
         if n_cpu_moe == 0:
             n_cpu_moe = None
     else:
@@ -462,7 +552,8 @@ def compute_config(
         )
 
     # ---- (2) Remaining KV budget — include vision/draft VRAM in total
-    effective_vram_safety = (MOE_VRAM_SAFETY_GB if n_cpu_moe is not None
+    effective_vram_safety = (perf_target.moe_vram_safety_gb
+                             if n_cpu_moe is not None
                              else vram_safety_gb)
     free_vram_after = max(0.0, free_vram - effective_vram_safety
                           - model_vram - vision_vram_gb - draft_vram_gb)
@@ -701,6 +792,7 @@ def compute_config(
         no_context_shift=no_context_shift,
         rope_scaling=rope_scaling_active,
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
+        performance_target=perf_target.name,
         warning=warning,
     )
 

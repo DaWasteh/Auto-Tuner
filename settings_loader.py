@@ -34,6 +34,12 @@ class ModelProfile:
     rope_scale_max_ctx: int = 0       # maximales Context mit RoPE-Scaling (0=auto 1M)
     rope_scale_factor: float = 4.0    # Standard Scaling-Faktor für Qwen3.5/3.6
 
+    # Performance target preset suggested by the profile author.
+    # Empty string = no profile-level recommendation, use the global
+    # default ("balanced"). Recognised values: "safe" / "balanced" /
+    # "throughput". Unknown values are ignored.
+    performance_target: str = ""
+
 
 def load_profiles(settings_dir: Path) -> List[ModelProfile]:
     """Load every *.yaml / *.yml file in settings_dir."""
@@ -66,6 +72,14 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         rope_scale_max_ctx = int(rope_scale_cfg.get("max_context", 0))
         rope_scale_factor = float(rope_scale_cfg.get("scale_factor", 4.0))
 
+        # Performance target preset (optional). Validate softly: any string
+        # other than the three known names is treated as "use global default".
+        perf_target_raw = str(data.get("performance_target", "") or "").lower().strip()
+        if perf_target_raw not in ("safe", "balanced", "throughput", ""):
+            print(f"[AutoTuner] {yml.name}: unknown performance_target "
+                  f"'{perf_target_raw}', ignoring (using global default).")
+            perf_target_raw = ""
+
         profiles.append(ModelProfile(
             display_name=str(data.get("display_name", yml.stem)),
             patterns=[str(p).lower() for p in (data.get("patterns") or [])],
@@ -82,6 +96,7 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
             rope_scale_enabled=rope_scale_enabled,
             rope_scale_max_ctx=rope_scale_max_ctx if rope_scale_max_ctx > 0 else 1048576,
             rope_scale_factor=rope_scale_factor,
+            performance_target=perf_target_raw,
         ))
     return profiles
 

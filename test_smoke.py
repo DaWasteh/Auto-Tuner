@@ -431,3 +431,296 @@ def test_ternary_bonsai_pattern_beats_regular_bonsai():
     assert p.source_file is not None, "matched profile must come from a YAML file"
     assert "ternary" in (p.display_name + " " + p.source_file).lower()
     assert p.server_binary, "Ternary profile must override the server"
+
+
+# ---------------------------------------------------------------------------
+# Performance targets
+
+def test_performance_target_registry_has_three_tiers():
+    """Sanity: the three documented tiers exist and are well-ordered."""
+    from performance_target import PERFORMANCE_TARGETS, list_target_names
+    names = list_target_names()
+    assert names == ["safe", "balanced", "throughput"]
+    safe = PERFORMANCE_TARGETS["safe"]
+    bal = PERFORMANCE_TARGETS["balanced"]
+    thr = PERFORMANCE_TARGETS["throughput"]
+    # KV reservation should shrink monotonically: safe ≥ balanced ≥ throughput
+    assert safe.moe_placement_ctx_target >= bal.moe_placement_ctx_target
+    assert bal.moe_placement_ctx_target >= thr.moe_placement_ctx_target
+    # Same for VRAM safety bands
+    assert safe.moe_vram_safety_gb >= bal.moe_vram_safety_gb
+    assert bal.moe_vram_safety_gb >= thr.moe_vram_safety_gb
+
+
+def test_resolve_performance_target_priority():
+    """CLI choice beats profile choice beats default."""
+    from performance_target import resolve_performance_target
+    # CLI wins
+    assert resolve_performance_target("safe", "throughput").name == "safe"
+    # Profile wins when CLI is empty
+    assert resolve_performance_target(None, "throughput").name == "throughput"
+    # Default kicks in when both empty
+    assert resolve_performance_target(None, None).name == "balanced"
+    # Unknown values are silently skipped
+    assert resolve_performance_target("typo", "alsotypo").name == "balanced"
+    # Mixed case + whitespace tolerated
+    assert resolve_performance_target("  Throughput ", None).name == "throughput"
+
+
+def test_yaml_performance_target_is_loaded():
+    """qwen3_5-3_6.yaml ships with performance_target: throughput."""
+    profiles = load_profiles(SETTINGS_DIR)
+    by_file = {p.source_file: p for p in profiles}
+    assert "qwen3_5-3_6.yaml" in by_file
+    assert by_file["qwen3_5-3_6.yaml"].performance_target == "throughput"
+
+
+def test_throughput_places_more_moe_layers_on_gpu_than_safe(tmp_path):
+    """The whole point of the perf_target switch: on a constrained MoE
+    setup, 'throughput' should reserve less KV and therefore put MORE
+    expert layers on the GPU than 'safe'.
+
+    We simulate Basti's actual situation: Qwen3.6-A3B (~28 GB Q6_K),
+    16 GB VRAM, 48 GB free RAM. Different ctx targets in the two tiers
+    must produce different cpu_moe counts.
+    """
+    from performance_target import PERFORMANCE_TARGETS
+    # Use a real MoE profile — Qwen3.6 ships expert_count via GGUF in the
+    # wild, but our fake_model has empty metadata. So we hand-craft a
+    # ModelEntry with metadata that tells the tuner "this is MoE".
+    from scanner import ModelEntry
+
+    p = tmp_path / "Qwen3.6-35B-A3B-UD-Q6_K.gguf"
+    _write_minimal_gguf(p)
+    model = ModelEntry(
+        path=p,
+        name="Qwen3.6-35B-A3B-UD-Q6_K",
+        group=".",
+        size_bytes=int(28.0 * 1024 ** 3),
+        metadata={
+            "general.architecture": "qwen3moe",
+            "qwen3moe.expert_count": 128,
+            "qwen3moe.block_count": 64,
+            "qwen3moe.context_length": 262144,
+        },
+    )
+
+    profiles = load_profiles(SETTINGS_DIR)
+    profile = match_profile(model.name, profiles)
+    sys_info = _fake_system(ram_total=64, ram_free=48,
+                            vram_total=16, vram_free=14)
+
+    cfg_safe = compute_config(model, sys_info, profile,
+                              perf_target=PERFORMANCE_TARGETS["safe"])
+    cfg_thr = compute_config(model, sys_info, profile,
+                             perf_target=PERFORMANCE_TARGETS["throughput"])
+
+    # Both should detect the MoE
+    assert cfg_safe.is_moe and cfg_thr.is_moe
+
+    # Throughput places fewer experts on CPU (= more on GPU). Allow equal
+    # for edge cases where the model fully fits or fully doesn't fit, but
+    # in this constrained scenario throughput must beat safe strictly.
+    safe_cpu = cfg_safe.n_cpu_moe or 0
+    thr_cpu = cfg_thr.n_cpu_moe or 0
+    assert thr_cpu < safe_cpu, (
+        f"throughput should keep more experts on GPU than safe; "
+        f"got safe={safe_cpu} CPU experts, throughput={thr_cpu}"
+    )
+
+    # And the metadata field round-trips into TunedConfig
+    assert cfg_safe.performance_target == "safe"
+    assert cfg_thr.performance_target == "throughput"
+
+
+def test_perf_target_default_balanced_when_profile_has_none(tmp_path):
+    """A profile without performance_target: falls back to balanced."""
+    profiles = load_profiles(SETTINGS_DIR)
+    # Pick a profile that we know has no perf_target set
+    p_default = next((pr for pr in profiles
+                      if pr.source_file == "_default.yaml"), None)
+    assert p_default is not None
+    assert p_default.performance_target == ""
+
+    model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
+    cfg = compute_config(model, _fake_system(), p_default)
+    assert cfg.performance_target == "balanced"
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Mamba/Transformer detection (Punkt 3)
+
+def test_hybrid_architecture_detection_by_name():
+    """Architecture name matches a known hybrid → True."""
+    from scanner import metadata_is_hybrid_architecture
+    assert metadata_is_hybrid_architecture(
+        {"general.architecture": "nemotron_h"}) is True
+    assert metadata_is_hybrid_architecture(
+        {"general.architecture": "jamba"}) is True
+    # Pure Transformer
+    assert metadata_is_hybrid_architecture(
+        {"general.architecture": "qwen3moe"}) is False
+    assert metadata_is_hybrid_architecture(
+        {"general.architecture": "llama"}) is False
+
+
+def test_hybrid_detection_via_ssm_keys():
+    """Generic SSM key catches new hybrid archs not on the allow-list."""
+    from scanner import metadata_is_hybrid_architecture
+    md = {
+        "general.architecture": "future_hybrid_arch",
+        "future_hybrid_arch.ssm.state_size": 16,
+    }
+    assert metadata_is_hybrid_architecture(md) is True
+
+
+def test_attention_layer_count_pure_transformer():
+    """For pure Transformer, attention count == block count."""
+    from scanner import metadata_attention_layer_count
+    md = {
+        "general.architecture": "qwen3moe",
+        "qwen3moe.block_count": 64,
+    }
+    assert metadata_attention_layer_count(md) == 64
+
+
+def test_attention_layer_count_hybrid_with_explicit_metadata():
+    """Hybrid with explicit attention count uses that, not the heuristic."""
+    from scanner import metadata_attention_layer_count
+    md = {
+        "general.architecture": "nemotron_h",
+        "nemotron_h.block_count": 50,
+        "nemotron_h.attention.block_count": 12,
+    }
+    assert metadata_attention_layer_count(md) == 12
+
+
+def test_attention_layer_count_hybrid_with_heuristic():
+    """Hybrid without explicit count falls back to per-arch ratio."""
+    from scanner import metadata_attention_layer_count
+    md = {
+        "general.architecture": "nemotron_h",
+        "nemotron_h.block_count": 50,
+    }
+    # Nemotron heuristic: ~25%
+    n = metadata_attention_layer_count(md)
+    assert 10 <= n <= 16, f"expected ~25% of 50, got {n}"
+
+
+def test_kv_per_token_estimate_smaller_for_hybrid(tmp_path):
+    """A hybrid model should produce a smaller per-token KV estimate
+    than the same-shaped pure Transformer would."""
+    from tuner import kv_per_token_mb_from_metadata
+
+    common = {
+        "attention.head_count": 32,
+        "attention.head_count_kv": 8,
+        "embedding_length": 4096,
+        "block_count": 50,
+    }
+    pure = {"general.architecture": "llama",
+            **{f"llama.{k}": v for k, v in common.items()}}
+    hybrid = {"general.architecture": "nemotron_h",
+              **{f"nemotron_h.{k}": v for k, v in common.items()}}
+
+    pure_kv = kv_per_token_mb_from_metadata(pure)
+    hybrid_kv = kv_per_token_mb_from_metadata(hybrid)
+    assert pure_kv > 0 and hybrid_kv > 0
+    # Hybrid should be roughly 25% of pure (Nemotron heuristic).
+    ratio = hybrid_kv / pure_kv
+    assert 0.15 <= ratio <= 0.35, (
+        f"expected hybrid KV ≈ 25% of pure, got {ratio:.2%}"
+    )
+
+
+def test_two_pass_placement_recovers_when_first_pass_dumps_to_cpu(tmp_path):
+    """Defensive net: if pass 1 forces all experts to CPU but VRAM is
+    free, pass 2 with a halved target_ctx must recover at least one
+    layer onto the GPU."""
+    from performance_target import PERFORMANCE_TARGETS
+    from scanner import ModelEntry
+
+    # Construct a tight scenario: 28 GB MoE on 14 GB VRAM, but we lie
+    # about KV-per-token by NOT supplying metadata, so the params-based
+    # heuristic kicks in (which over-estimates for MoE) and pass 1 dumps
+    # everything to CPU. The Two-Pass should retry and pull at least
+    # one layer back onto the GPU once the target_ctx is halved.
+    p = tmp_path / "FakeMoE-35B-A3B.gguf"
+    _write_minimal_gguf(p)
+    model = ModelEntry(
+        path=p, name="FakeMoE-35B-A3B", group=".",
+        size_bytes=int(28.0 * 1024 ** 3),
+        metadata={
+            "general.architecture": "qwen3moe",
+            "qwen3moe.expert_count": 128,
+            "qwen3moe.block_count": 64,
+            "qwen3moe.context_length": 262144,
+            # Deliberately no attention.* keys → forces params heuristic.
+        },
+    )
+    profiles = load_profiles(SETTINGS_DIR)
+    profile = match_profile(model.name, profiles)
+    sys_info = _fake_system(ram_total=64, ram_free=48,
+                            vram_total=16, vram_free=14)
+
+    cfg_safe = compute_config(model, sys_info, profile,
+                              perf_target=PERFORMANCE_TARGETS["safe"])
+    # Even safe (128k target) should not dump all 64 layers to CPU when
+    # the two-pass kicks in.
+    assert (cfg_safe.n_cpu_moe or 0) < 64, (
+        f"two-pass should have rescued at least one layer; "
+        f"got n_cpu_moe={cfg_safe.n_cpu_moe}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reasoning / thinking detection (Punkt 2)
+
+def test_thinking_detection_qwen3_coder_is_false():
+    """Qwen3-Coder must NOT be flagged as a thinking model just because
+    its filename contains 'qwen3' — that's the bug we're fixing."""
+    from scanner import metadata_supports_thinking
+    # No metadata at all — pure filename heuristic.
+    assert metadata_supports_thinking({}, "Qwen3-Coder-30B-A3B-Q6_K") is False
+
+
+def test_thinking_detection_uses_chat_template():
+    """When the chat template contains thinking markers, return True."""
+    from scanner import metadata_supports_thinking
+    md_with_think = {
+        "tokenizer.chat_template": "{% if enable_thinking %}<think>\n{% endif %}"
+    }
+    assert metadata_supports_thinking(md_with_think, "SomeModel") is True
+
+
+def test_thinking_detection_template_without_marker_is_false():
+    """A model that ships a chat template without <think> markers is not
+    a thinking model — even if its name contains 'qwen3'."""
+    from scanner import metadata_supports_thinking
+    md_no_think = {
+        "tokenizer.chat_template": "<|im_start|>user\n{{ messages }}<|im_end|>"
+    }
+    # Filename hint says "qwen3" → would have been True under old heuristic.
+    assert metadata_supports_thinking(md_no_think, "Qwen3.6-35B-Q6") is False
+
+
+def test_thinking_detection_falls_back_to_filename_when_no_template():
+    """No metadata at all → use filename keywords."""
+    from scanner import metadata_supports_thinking
+    assert metadata_supports_thinking({}, "Gemma-3-27B-it") is True
+    assert metadata_supports_thinking({}, "DeepSeek-R1-Distill-Llama-70B") is True
+    assert metadata_supports_thinking({}, "QwQ-32B-Preview") is True
+    # Pure non-thinking
+    assert metadata_supports_thinking({}, "Mistral-7B-Instruct") is False
+
+
+def test_thinking_detection_excludes_qwen3_2507_instruct():
+    """Qwen3-2507-Instruct is the explicitly non-thinking branch — even
+    if it inherits a generic template that mentions <think>, the filename
+    exclusion must win."""
+    from scanner import metadata_supports_thinking
+    md_with_think = {
+        "tokenizer.chat_template": "<think>{{ content }}</think>"
+    }
+    assert metadata_supports_thinking(
+        md_with_think, "Qwen3-7B-Instruct-2507-Q6_K") is False

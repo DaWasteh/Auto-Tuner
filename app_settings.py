@@ -105,6 +105,27 @@ def set_fork_path(path: Path) -> None:
     _update("fork_path", str(path.resolve()))
 
 
+def get_performance_target() -> Optional[str]:
+    """Return the persisted GUI performance-target choice, or None.
+
+    Empty string and unknown values are treated as None so the GUI
+    falls back to whatever the active profile (or global default)
+    recommends.
+    """
+    val = load_settings().get("performance_target")
+    if not val:
+        return None
+    val = str(val).lower().strip()
+    return val if val in ("safe", "balanced", "throughput") else None
+
+
+def set_performance_target(name: str) -> None:
+    """Persist the GUI performance-target choice. Empty string clears it."""
+    name = (name or "").lower().strip()
+    if name in ("safe", "balanced", "throughput", ""):
+        _update("performance_target", name)
+
+
 def settings_file_location() -> Path:
     """Where settings are (or would be) written. For diagnostic logging."""
     return _settings_file()

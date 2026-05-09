@@ -5,6 +5,12 @@ Interactive launcher for `llama-server` that **detects your hardware**,
 KV-cache quantization, GPU offload, threading, and batch size to fit in
 the RAM/VRAM you actually have free — without manual edits.
 
+# GUI-Design
+```
+![v0.7_GUI](image.png)
+```
+
+# Terminal-Design
 ```
 ────────────────────────────────────────────────────────────────
   AutoTuner for llama.cpp  —  interactive launcher
@@ -53,9 +59,6 @@ Available models:
   [Alibaba/Qwen3.6]
     7.  👁 Qwen3.6-27B-UD-Q3_K_XL                                   13.5 GB  (256k native)
     8.  👁 Qwen3.6-35B-A3B-UD-IQ3_S                                 12.7 GB  (256k native)
-
-  [Frankenmerger]
-    9.    Archon-14B.Q6_K                                          11.3 GB  (40k native)
   ...
 
   [Google]
@@ -69,7 +72,7 @@ Available models:
     22.    granite-4.1-3b-UD-Q8_K_XL                                 4.0 GB  (128k native)
   ...
 
-  [Mistral AI/Mistral-Medium]
+  [Mistral AI]
     36.  👁 Mistral-Medium-3.5-128B-UD-IQ3_XXS                       45.9 GB  (256k native)
 
   [NVIDIA]
@@ -82,7 +85,7 @@ Available models:
 Select a model [1-40, q to quit]: 15
 [AutoTuner] Found draft model: gemma-4-26B-A4B-it-assistant-Q8_0
 Vision aktivieren? (mmproj-gemma-4-26B-A4B-it-BF16.gguf) [Y/n] y
-Draft-Modell aktivieren? (gemma-4-26B-A4B-it-assistant-Q8_0) [Y/n] y
+Draft-Modell aktivieren? (gemma-4-26B-A4B-it-assistant-Q8_0) [Y/n] n
 Thinking/Reasoning aktivieren? (<|think|> / <|reserved_special_token>) [Y/n] y
 ────────────────────────────────────────────────────────────────
 Model:    gemma-4-26B-A4B-it-UD-IQ4_XS
@@ -103,7 +106,7 @@ Vision:   mmproj-gemma-4-26B-A4B-it-BF16.gguf
     model on CPU  ~   0.0 GB    (free RAM:    18.1 GB)
     KV cache      ~  17.4 GB
 ────────────────────────────────────────────────────────────────
-[AutoTuner] Found server binary: C:\LAB\ai-local\ik_llama.cpp\build\bin\Release\llama-server.exe
+[AutoTuner] Found server binary: C:\LAB\ai-local\llama.cpp\build\bin\Release\llama-server.exe
 Launch llama-server now? [Y/n]
 ```
 
@@ -185,7 +188,35 @@ like Continue / Cline, **Open WebUI**, or any OpenAI-API client.
 | `--dry-run` | Print the command, don't start the server |
 | `--yes / -y` | Skip the launch confirmation prompt |
 | `--force-mlock` | Force `--mlock` / `--no-mmap` (prevents VRAM/RAM paging) |
+| `--performance-target {safe,balanced,throughput}` | VRAM utilisation preset (see below) |
 | `-- <args...>` | Anything after `--` is forwarded to `llama-server` |
+
+### Performance targets (`--performance-target`)
+
+A single switch that controls how aggressively the AutoTuner reserves
+VRAM. It changes both the safety bands and the KV-cache budget that
+gets reserved up front during MoE layer placement, so picking the right
+tier can move several expert layers between GPU and CPU.
+
+| Tier | KV reservation | VRAM safety | When to use |
+|---|---|---|---|
+| `safe` | 128 k tokens | 0.30 GB | Long-context sessions (>64 k), maximum stability |
+| `balanced` *(default)* | 64 k tokens | 0.25 GB | General use — moderate optimisation that helps everyone |
+| `throughput` | 32 k tokens | 0.15 GB | Short-context inference (chat, reasoning ≤32 k); pushes more expert layers onto the GPU for higher tokens/s |
+
+**Resolution priority** (highest wins): explicit CLI flag → GUI dropdown
+→ `performance_target:` in the model's YAML profile → `balanced` default.
+Unknown values are silently ignored, so a typo in a YAML never breaks
+anything.
+
+A profile can declare its preferred tier in YAML:
+
+```yaml
+# settings/qwen3_5-3_6.yaml
+performance_target: throughput   # MoE — wants every spare GB on the GPU
+```
+
+The user choice (CLI / GUI) always wins over the profile recommendation.
 
 ### Memory locking (`--mlock` / `--no-mmap`)
 

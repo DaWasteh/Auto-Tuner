@@ -34,6 +34,11 @@ from launcher import launch
 from scanner import scan_models, group_entries, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import build_command, compute_config, TunedConfig
+from performance_target import (
+    resolve_performance_target,
+    list_target_names,
+    describe_targets,
+)
 
 # ---------------------------------------------------------------------------
 # Pretty-printing helpers
@@ -115,6 +120,7 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
     else:
         placement = "CPU only"
     print(f"  Placement       : {placement}")
+    print(f"  Perf target     : {cfg.performance_target}")
     print(f"  Context         : {cfg.ctx:,} tokens")
     print(f"  KV cache quant  : K={cfg.cache_k}  V={cfg.cache_v}")
     print(f"  Threads         : {cfg.threads} (batch: {cfg.batch_threads})")
@@ -192,12 +198,10 @@ def _ask_interactive_features(
             effective_draft = None
 
     # ── Thinking / Reasoning ────────────────────────────────────────
+    # Read the chat template from GGUF metadata (the authoritative source);
+    # fall back to filename heuristics only when no template is available.
     use_thinking = False
-    has_thinking_arch = (
-        "gemma" in model.name.lower()
-        or "deepseek" in model.name.lower()
-        or "think" in model.name.lower()
-    )
+    has_thinking_arch = model.supports_thinking
     if has_thinking_arch:
         use_thinking = _confirm(
             "Thinking/Reasoning aktivieren? (<|think|> / <|reserved_special_token>)",
@@ -648,6 +652,14 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
              "(prevents VRAM paging when enough free VRAM is available)",
     )
     p.add_argument(
+        "--performance-target",
+        choices=list_target_names(),
+        default=None,
+        metavar="{safe,balanced,throughput}",
+        help="VRAM utilisation preset. Overrides any 'performance_target:' "
+             "in the YAML profile. Tiers:\n" + describe_targets(),
+    )
+    p.add_argument(
         "--gui",
         action="store_true",
         help="Open the Qt log-viewer window after the server starts "
@@ -868,11 +880,18 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             effective_draft = None
 
         # ── Config computation ───────────────────────────────────────────
+        # Resolve performance target: CLI > YAML profile > "balanced".
+        perf_target = resolve_performance_target(
+            cli_choice=getattr(args, "performance_target", None),
+            profile_choice=getattr(profile, "performance_target", "") or None,
+        )
+
         cfg = compute_config(
             model, system, profile,
             draft_model=effective_draft,
             user_ctx=args.ctx,
             force_mlock=getattr(args, "force_mlock", False),
+            perf_target=perf_target,
         )
 
         print(f"\n  [mlock] decision: model={model.name}")

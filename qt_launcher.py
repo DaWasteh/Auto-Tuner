@@ -32,6 +32,12 @@ from hardware import detect_system, SystemInfo
 from scanner import scan_models, group_entries, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import build_command, compute_config, TunedConfig
+from performance_target import (
+    PERFORMANCE_TARGETS,
+    list_target_names,
+    resolve_performance_target,
+    DEFAULT_TARGET_NAME,
+)
 import app_settings
 
 
@@ -291,6 +297,28 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._btn_fork_folder)
 
         tb.addSeparator()
+        tb.addWidget(QLabel(" Performance:"))
+        self._perf_combo = QComboBox()
+        self._perf_combo.setMinimumWidth(120)
+        # Build tooltip from registry so a future 4th tier auto-appears.
+        tip_lines = ["VRAM utilisation preset:"]
+        for tname in list_target_names():
+            t = PERFORMANCE_TARGETS[tname]
+            tip_lines.append(f"  • {tname}: {t.description}")
+        self._perf_combo.setToolTip("\n".join(tip_lines))
+        for tname in list_target_names():
+            self._perf_combo.addItem(tname)
+        # Restore persisted choice (may be None → default).
+        persisted_perf = app_settings.get_performance_target()
+        initial_perf = persisted_perf or DEFAULT_TARGET_NAME
+        idx = self._perf_combo.findText(initial_perf)
+        if idx < 0:
+            idx = self._perf_combo.findText(DEFAULT_TARGET_NAME)
+        self._perf_combo.setCurrentIndex(max(0, idx))
+        self._perf_combo.currentIndexChanged.connect(self._on_perf_changed)
+        tb.addWidget(self._perf_combo)
+
+        tb.addSeparator()
         tb.addWidget(QLabel(" Font:"))
         for delta, label in ((-1, "A−"), (+1, "A+")):
             b = QPushButton(label)
@@ -510,9 +538,42 @@ class MainWindow(QMainWindow):
         self._fork_combo.blockSignals(True)
         self._fork_combo.clear()
 
-        if manual_path and not env_contains_forks:
-            # Einzelner manueller Pfad — zeige "custom"
-            self._fork_combo.addItem("📁 custom", userData=manual_path)
+        # If the persisted manual path matches one of the auto-discovered
+        # forks, show it under its real name instead of as "📁 custom".
+        # Avoids the cosmetic regression where every restart looked like
+        # the path had been forgotten when it was actually loaded fine.
+        matched_idx = -1
+        if manual_path and self._forks and not env_contains_forks:
+            for i, (_, p) in enumerate(self._forks):
+                try:
+                    if p.resolve() == manual_path:
+                        matched_idx = i
+                        break
+                except OSError:
+                    continue
+
+        if matched_idx >= 0 and manual_path is not None:
+            # Persisted path IS one of the discovered forks — restore by name.
+            # The explicit `manual_path is not None` check is redundant at
+            # runtime (matched_idx >= 0 implies it was matched against a
+            # non-None path) but makes the implication legible to mypy /
+            # Pylance, which can't infer it from the loop above.
+            for name, path in self._forks:
+                self._fork_combo.addItem(name, userData=path)
+            self._fork_combo.setCurrentIndex(matched_idx)
+            self._fork_path = self._forks[matched_idx][1]
+            self._fork_path_lbl.setText(manual_path.name)
+            src_label = ("persisted settings" if manual_source == "settings"
+                         else "LLAMA_CPP_DIR")
+            self._log(f"[Fork] Restored from {src_label}: "
+                      f"{self._forks[matched_idx][0]}  →  {manual_path}")
+            self._apply_fork(matched_idx)
+        elif manual_path and not env_contains_forks:
+            # Truly custom path outside the auto-discover scope. Label it
+            # by directory name rather than the literal word "custom" so
+            # the user can recognise their selection at a glance.
+            label = f"📁 {manual_path.name}"
+            self._fork_combo.addItem(label, userData=manual_path)
             self._fork_path = manual_path
             self._fork_combo.setCurrentIndex(0)
             self._fork_path_lbl.setText(manual_path.name)
@@ -575,6 +636,39 @@ class MainWindow(QMainWindow):
         if path is not None:
             os.environ["LLAMA_CPP_DIR"] = str(path)
             self._log(f"[Fork] → {path.name}")
+
+    # ------------------------------------------------------------------
+    # Performance target selection
+    # ------------------------------------------------------------------
+    def _on_perf_changed(self, index: int) -> None:
+        """User picked a new performance target — persist + refresh view."""
+        name = self._perf_combo.itemText(index).strip()
+        try:
+            app_settings.set_performance_target(name)
+        except Exception as exc:
+            self._log(f"[Warning] Could not save performance target: {exc}")
+        self._log(f"[Perf] → {name}")
+        # If a model is already selected, recompute the displayed config
+        # so the user sees the effect immediately.
+        entry = getattr(self, "_current_entry", None)
+        if entry is not None and self._system is not None:
+            try:
+                self._show_config(entry)
+            except Exception as exc:
+                self._log(f"[Warning] Config refresh failed: {exc}")
+
+    def _resolve_perf_target_for_profile(self, profile: ModelProfile):
+        """Combine GUI choice with profile-level recommendation.
+
+        GUI choice always wins; profile.performance_target is only used
+        if the user hasn't picked anything (which currently never happens
+        because the combo is initialised to "balanced", but stay robust).
+        """
+        gui_choice = self._perf_combo.currentText().strip() if hasattr(self, "_perf_combo") else None
+        return resolve_performance_target(
+            cli_choice=gui_choice,
+            profile_choice=getattr(profile, "performance_target", "") or None,
+        )
 
     def _hw_detect_done(
         self, s: Optional[SystemInfo], err: str = ""
@@ -655,8 +749,10 @@ class MainWindow(QMainWindow):
             os.environ["LLAMA_CPP_DIR"] = str(path)
             self._fork_path_lbl.setText(path.name + " (📁)")
         else:
-            # Einzelner Fork — zeige "custom"
-            self._fork_combo.addItem("📁 custom", userData=path)
+            # Single fork — label by directory name, not the literal "custom".
+            # Keeps the combo readable when the user reopens the app and
+            # also when they switch back from a multi-fork container.
+            self._fork_combo.addItem(f"📁 {path.name}", userData=path)
             self._fork_combo.setCurrentIndex(0)
             self._fork_path_lbl.setText(path.name)
             os.environ["LLAMA_CPP_DIR"] = str(path)
@@ -823,8 +919,12 @@ class MainWindow(QMainWindow):
         )
         self._chk_draft.blockSignals(False)
 
-        thinking_kws = ("gemma", "deepseek", "think", "qwq", "qwen3", "reasoning")
-        has_thinking = any(kw in entry.name.lower() for kw in thinking_kws)
+        # Reasoning/thinking detection — read the chat template from GGUF
+        # metadata, fall back to a conservative filename heuristic when the
+        # template is missing. This fixes the Qwen3-Coder false-positive:
+        # the old heuristic matched any "qwen3" filename, but Qwen3-Coder
+        # has no <think> tokens and llama-server logs "reasoning 0".
+        has_thinking = entry.supports_thinking
         self._chk_thinking.blockSignals(True)
         self._chk_thinking.setEnabled(has_thinking)
         self._chk_thinking.setChecked(has_thinking)
@@ -899,6 +999,7 @@ class MainWindow(QMainWindow):
             model=entry_for_cfg, system=self._system, profile=profile,
             draft_model=self._current_draft if use_draft else None,
             user_ctx=None, force_mlock=False,
+            perf_target=self._resolve_perf_target_for_profile(profile),
         )
 
         W = 64
@@ -932,6 +1033,7 @@ class MainWindow(QMainWindow):
 
         lines += [
             f"Placement       : {placement}",
+            f"Perf target     : {cfg.performance_target}",
             f"Context         : {cfg.ctx:,} tokens",
             f"KV cache quant  : K={cfg.cache_k}  V={cfg.cache_v}",
             f"Threads         : {cfg.threads}  (batch: {cfg.batch_threads})",
@@ -1075,6 +1177,7 @@ class MainWindow(QMainWindow):
             model=entry, system=self._system, profile=profile,
             draft_model=self._current_draft if use_draft else None,
             user_ctx=None, force_mlock=False,
+            perf_target=self._resolve_perf_target_for_profile(profile),
         )
 
         host = self._host_edit.text().strip() or "127.0.0.1"
