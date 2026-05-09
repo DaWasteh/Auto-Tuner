@@ -1,12 +1,11 @@
-# Haupt-Abhängigkeiten (müssen immer installiert sein)
+# Haupt-Abhängigkeiten
 psutil>=7.2.0
 PyYAML>=6.0
-pywin32>=311
+pywin32>=311; sys_platform == "win32"
 PyQt6>=6.11.0
 
-# Type stubs – immer installieren (vermeidet mypy import-untyped warnings)
+# Type stubs
 types-psutil>=7.2.0
 types-PyYAML>=6.0
-types-pywin32>=311
-types-requests>=2.31.0
+types-pywin32>=311; sys_platform == "win32"
 PyQt6-stubs>=20250824
