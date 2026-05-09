@@ -11,7 +11,6 @@ recommended_kv_quant: q8_0
 # Bonsai 8B (1-bit) braucht den PrismML-Fork mit 1-bit Kerneln.
 # Q1_0 Support ist in Upstream llama.cpp gemerged (ab ca. 2026), aber
 # weitere Backends (optimierte x86 CPU, AMD) sind noch im Fork.
-server_binary: "1b_llama/llama-server"
 
 sampling:
   # PrismML's eigenes README-Beispiel zeigt:

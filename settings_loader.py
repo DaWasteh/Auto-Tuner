@@ -29,6 +29,10 @@ class ModelProfile:
     server_binary: Optional[str] = None
     draft_max: int = 16
     draft_p_min: float = 0.0
+    # RoPE-Scaling (YaRN): aktiviert wenn ctx > native_ctx und genügend Speicher
+    rope_scale_enabled: bool = False  # YAML-Konfiguration: rope_scale: true
+    rope_scale_max_ctx: int = 0       # maximales Context mit RoPE-Scaling (0=auto 1M)
+    rope_scale_factor: float = 4.0    # Standard Scaling-Faktor für Qwen3.5/3.6
 
 
 def load_profiles(settings_dir: Path) -> List[ModelProfile]:
@@ -54,6 +58,14 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         if not isinstance(extra, list):
             extra = []
 
+        # RoPE-Scaling Konfiguration (optional)
+        rope_scale_cfg = data.get("rope_scale") or {}
+        if not isinstance(rope_scale_cfg, dict):
+            rope_scale_cfg = {}
+        rope_scale_enabled = bool(rope_scale_cfg.get("enabled", False))
+        rope_scale_max_ctx = int(rope_scale_cfg.get("max_context", 0))
+        rope_scale_factor = float(rope_scale_cfg.get("scale_factor", 4.0))
+
         profiles.append(ModelProfile(
             display_name=str(data.get("display_name", yml.stem)),
             patterns=[str(p).lower() for p in (data.get("patterns") or [])],
@@ -67,6 +79,9 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                            if data.get("server_binary") else None),
             draft_max=int(data.get("draft_max", 16)),
             draft_p_min=float(data.get("draft_p_min", 0.0)),
+            rope_scale_enabled=rope_scale_enabled,
+            rope_scale_max_ctx=rope_scale_max_ctx if rope_scale_max_ctx > 0 else 1048576,
+            rope_scale_factor=rope_scale_factor,
         ))
     return profiles
 

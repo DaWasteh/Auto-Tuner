@@ -9,6 +9,15 @@ patterns:
 max_context: 262144
 recommended_kv_quant: q8_0
 
+# RoPE-Scaling (YaRN): Optional aktivierbar wenn genügend Speicher frei ist
+# und der berechnete Context das native Limit überschreitet.
+rope_scale:
+  enabled: false        # Standard aus — User kann in GUI aktivieren
+  max_context: 524288   # 0.5M tokens mit YaRN möglich
+  scale_factor: 4.0     # yarn scaling factor (4x für Gemma-4-E2B/E4B, 2x für 26B-A4B/31B)
+
+
+
 # Zwingend erforderlich für MTP-Support (gemma4_mtp Architektur)
 server_binary: "ik_llama/llama-server"
 

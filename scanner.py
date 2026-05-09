@@ -136,6 +136,29 @@ def metadata_native_context(md: Dict[str, Any]) -> int:
     return 0
 
 
+# Architektur-Namen die RoPE-Scaling (YaRN) unterstützen bis zu 1M tokens
+_ROPE_SCALE_SUPPORTED_ARCHS = frozenset({
+    "qwen2",   # Qwen2/Qwen2.5/Qwen3/Qwen3.5/Qwen3.6 Familie
+})
+
+
+def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
+    """Prüft ob das Modell RoPE-Scaling (YaRN) unterstützt.
+    
+    Returns True wenn die Architektur RoPE-Scaling bis zu 1M tokens unterstützt.
+    """
+    if not md:
+        return False
+    arch = md.get("general.architecture")
+    if not arch:
+        return False
+    # Prüfe ob die Architektur in der Support-Liste ist
+    for supported in _ROPE_SCALE_SUPPORTED_ARCHS:
+        if arch.startswith(supported):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Model entries + scanner
 
@@ -183,6 +206,11 @@ class ModelEntry:
     @property
     def architecture(self) -> str:
         return str(self.metadata.get("general.architecture", "") or "")
+
+    @property
+    def supports_rope_scale(self) -> bool:
+        """Prüft ob das Modell RoPE-Scaling (YaRN) unterstützt."""
+        return metadata_supports_rope_scale(self.metadata)
 
 
 def _strip_quant(filename: str) -> str:

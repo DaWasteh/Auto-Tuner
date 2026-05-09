@@ -8,6 +8,14 @@ patterns:
 max_context: 131072
 recommended_kv_quant: q8_0
 
+# RoPE-Scaling (YaRN): Optional aktivierbar wenn genügend Speicher frei ist
+# und der berechnete Context das native Limit überschreitet.
+rope_scale:
+  enabled: false       # Standard aus — User kann in GUI aktivieren
+  max_context: 1048576  # 1M tokens mit YaRN möglich
+  scale_factor: 4.0     # yarn scaling factor (4x für Qwen3.5/3.6)
+
+
 sampling:
   temperature: 0.7
   top_k: 40

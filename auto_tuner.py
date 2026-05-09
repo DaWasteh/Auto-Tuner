@@ -12,6 +12,7 @@ Usage:
   python auto_tuner.py
   python auto_tuner.py --models-path D:/models --port 1234
   python auto_tuner.py --model Devstral --dry-run
+  python auto_tuner.py --gui          # Qt log-viewer alongside the server
 
 Environment variables:
   AUTOTUNER_MODELS    default models path
@@ -22,10 +23,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from hardware import detect_system, format_system, SystemInfo
 from launcher import launch
@@ -38,25 +40,22 @@ from tuner import build_command, compute_config, TunedConfig
 
 _BAR = "─" * 64
 _DEBUG_MODE = False
-# Debug categories – expanded beyond just llama-cpp path searching
 _DEBUG_CATEGORIES: set[str] = set()
 
+
 def _debug_print(*args, **kwargs) -> None:
-    """Print debug messages only if debugging mode is enabled."""
     if _DEBUG_MODE:
         print("[DEBUG]", *args, **kwargs)
 
+
 def enable_debug_category(category: str) -> None:
-    """Enable a specific debug category when global debug mode is off."""
     _DEBUG_CATEGORIES.add(category)
 
+
 def debug_cat(category: str, *args, **kwargs) -> None:
-    """Print a debug message for a specific category.
-    
-    Prints if global debug mode is ON OR if this category is explicitly enabled.
-    """
     if _DEBUG_MODE or category in _DEBUG_CATEGORIES:
         print(f"[DEBUG:{category.upper()}]", *args, **kwargs)
+
 
 def _print_banner() -> None:
     print()
@@ -64,11 +63,14 @@ def _print_banner() -> None:
     print("  AutoTuner for llama.cpp  —  interactive launcher")
     print(_BAR)
 
+
 def _print_system(info: SystemInfo) -> None:
     print(format_system(info))
 
+
 def _vision_marker(entry: ModelEntry) -> str:
     return " 👁" if entry.has_vision else "  "
+
 
 def _print_menu(groups: dict) -> List[ModelEntry]:
     """Print grouped model menu and return a flat list in display order."""
@@ -93,6 +95,7 @@ def _print_menu(groups: dict) -> List[ModelEntry]:
     print()
     return flat
 
+
 def _print_config(model: ModelEntry, profile: ModelProfile,
                   cfg: TunedConfig, system: SystemInfo) -> None:
     print(_BAR)
@@ -108,7 +111,7 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
     if cfg.full_offload:
         placement = f"GPU full offload (ngl=all of {model.n_layers or '?'})"
     elif cfg.ngl > 0:
-        placement = (f"hybrid: {cfg.ngl} layers on GPU, rest on CPU")
+        placement = f"hybrid: {cfg.ngl} layers on GPU, rest on CPU"
     else:
         placement = "CPU only"
     print(f"  Placement       : {placement}")
@@ -118,9 +121,13 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
     print(f"  Batch / ubatch  : {cfg.batch} / {cfg.ubatch}")
     print(f"  Flash attention : {'on' if cfg.flash_attn else 'off'}")
     if cfg.mlock:
-        print("  mlock           : on (model pinned in RAM)")
+        print("  mlock           : on (model pinned in RAM/VRAM)")
+    if cfg.no_mmap:
+        print("  no-mmap         : on (prevent swapping)")
     if cfg.numa:
         print(f"  NUMA            : {cfg.numa}")
+    if cfg.no_context_shift:
+        print("  no-context-shift: on (better performance for large context)")
     if cfg.tensor_split:
         print(f"  Tensor split    : {cfg.tensor_split}")
     if cfg.main_gpu is not None:
@@ -132,13 +139,12 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
           f"min_p={s.get('min_p')} rep={s.get('repeat_penalty')}")
 
     print()
-    print("  Memory estimate:")
-    print(f"    model on GPU  ~ {cfg.estimated_model_vram_gb:5.1f} GB"
-          f"    (free VRAM:  {system.free_vram_gb:5.1f} GB)")
-    print(f"    model on CPU  ~ {cfg.estimated_model_ram_gb:5.1f} GB"
-          f"    (free RAM:   {system.free_ram_gb:5.1f} GB)")
-    print(f"    KV cache      ~ {cfg.estimated_kv_gb:5.1f} GB")
+    print("  Memory estimate (with current options):")
+    print(f"    Model GPU : ~ {cfg.estimated_model_vram_gb:5.1f} GB   (free VRAM: {system.free_vram_gb:5.1f} GB)")
+    print(f"    Model CPU : ~ {cfg.estimated_model_ram_gb:5.1f} GB   (free RAM:  {system.free_ram_gb:5.1f} GB)")
+    print(f"    KV cache  : ~ {cfg.estimated_kv_gb:5.1f} GB")
     print(_BAR)
+
 
 # ---------------------------------------------------------------------------
 # Selection
@@ -162,9 +168,7 @@ def _ask_interactive_features(
     """Interaktive Fragen-Kette nach Modellauswahl.
 
     Returns:
-        (use_vision, use_draft, use_thinking, effective_draft) –
-        use_vision/use_draft/use_thinking sind True wenn aktiviert,
-        effective_draft ist das zu verwendende Draft-Modell (oder None)
+        (use_vision, use_draft, use_thinking, effective_draft)
     """
     # ── Vision ───────────────────────────────────────────────────────
     use_vision = False
@@ -203,14 +207,16 @@ def _ask_interactive_features(
     return use_vision, use_draft, use_thinking, effective_draft
 
 
-def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> tuple[Optional[ModelEntry], List[str]]:
+def _pick_model(
+    flat: List[ModelEntry], cli_query: Optional[str]
+) -> tuple[Optional[ModelEntry], List[str]]:
     if cli_query:
         parts = cli_query.split()
         query_parts = []
         flags = []
         for p in parts:
-            if p.startswith('--') or p.lower() in ('novision', 'nodraft', 'nothinking'):
-                flags.append(p.lower().lstrip('-'))
+            if p.startswith("--") or p.lower() in ("novision", "nodraft", "nothinking"):
+                flags.append(p.lower().lstrip("-"))
             else:
                 query_parts.append(p)
 
@@ -224,7 +230,6 @@ def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> tuple[Optio
             for e in matches:
                 print(f"    - {e.name}")
             return None, []
-
         return matches[0], flags
 
     while True:
@@ -239,12 +244,12 @@ def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> tuple[Optio
         model_idx_str = None
         flags = []
         for p in parts:
-            if p.startswith('--') or p.lower() in ('novision', 'nodraft', 'nothinking'):
-                flags.append(p.lower().lstrip('-'))
+            if p.startswith("--") or p.lower() in ("novision", "nodraft", "nothinking"):
+                flags.append(p.lower().lstrip("-"))
             elif model_idx_str is None and p.isdigit():
                 model_idx_str = p
             else:
-                flags.append(p.lower().lstrip('-'))
+                flags.append(p.lower().lstrip("-"))
 
         if model_idx_str is None:
             print("  please enter a number (optionally followed by flags like '--novision').")
@@ -254,6 +259,7 @@ def _pick_model(flat: List[ModelEntry], cli_query: Optional[str]) -> tuple[Optio
             print(f"  number must be between 1 and {len(flat)}.")
             continue
         return flat[n - 1], flags
+
 
 # ---------------------------------------------------------------------------
 # llama-server discovery
@@ -267,6 +273,7 @@ _SERVER_SUBPATHS = [
     "llama-server.exe",
     "llama-server",
 ]
+
 
 def _candidate_search_roots() -> List[Path]:
     """Folders to look in for a llama.cpp / 1b_llama.cpp checkout."""
@@ -289,14 +296,21 @@ def _candidate_search_roots() -> List[Path]:
     if env_dir:
         add(env_dir)
         parent = Path(env_dir).expanduser()
-        add(parent.parent / "1b_llama.cpp")
-        add(parent.parent / "ik_llama.cpp")
+        # Also add siblings: other forks next to the selected one
+        try:
+            for sibling in parent.parent.iterdir():
+                if sibling.is_dir() and re.search(r"llama", sibling.name, re.IGNORECASE):
+                    add(sibling)
+        except (OSError, PermissionError):
+            pass
         add(parent.parent / "BitNet")
 
     bases = [Path(__file__).resolve().parent, Path.cwd()]
     common_subs = (
-        "llama.cpp", "1b_llama.cpp", "ik_llama.cpp", "BitNet",
-        "ai-local/llama.cpp", "ai-local/1b_llama.cpp", "ai-local/ik_llama.cpp",
+        "llama.cpp", "1b_llama.cpp", "ik_llama.cpp", "tq_llama.cpp",
+        "atq_llama.cpp", "BitNet",
+        "ai-local/llama.cpp", "ai-local/1b_llama.cpp",
+        "ai-local/ik_llama.cpp", "ai-local/tq_llama.cpp",
     )
     for base in bases:
         chain = [base, *list(base.parents)[:5]]
@@ -305,14 +319,17 @@ def _candidate_search_roots() -> List[Path]:
                 add(p / sub)
     return roots
 
+
 def _resolve_server_binary(user_value: str) -> str:
     """Turn a user-provided server name/path into something runnable."""
     p = Path(user_value).expanduser()
     if p.is_absolute() and p.is_file():
         return str(p)
 
-    has_sep = (os.sep in user_value
-               or (os.altsep is not None and os.altsep in user_value))
+    has_sep = (
+        os.sep in user_value
+        or (os.altsep is not None and os.altsep in user_value)
+    )
 
     if has_sep and not p.is_absolute():
         parts = list(p.parts)
@@ -321,53 +338,47 @@ def _resolve_server_binary(user_value: str) -> str:
 
         if inner is not None and fork_name:
             for root in _candidate_search_roots():
-                # Match fork name against directory name, ignoring .cpp suffix.
-                # e.g. "ik_llama" matches "ik_llama.cpp", "1b_llama" matches "1b_llama.cpp"
                 root_base = root.name.lower()
                 if root_base.endswith(".cpp"):
                     root_base = root_base[:-4]
                 if root_base.startswith(fork_name) or fork_name.startswith(root_base):
-                    # First try the direct path (e.g. fork/llama-server)
                     candidate = root / inner
                     if candidate.is_file():
                         _debug_print(f"Found candidate: {candidate}")
                         return str(candidate)
-                    # Then try build subpaths inside the matched fork directory.
                     for sub in _SERVER_SUBPATHS:
                         candidate = root / sub
                         if candidate.is_file():
                             _debug_print(f"Found candidate in fork subpath: {candidate}")
                             return str(candidate)
-                        # Also check if inner exists within the subpath (e.g., build/bin/Release/llama-server)
                         candidate_with_inner = (root / sub) / inner
                         if candidate_with_inner.is_file():
                             _debug_print(f"Found candidate in fork subpath with inner: {candidate_with_inner}")
                             return str(candidate_with_inner)
 
-        anchors: List[Path] = []
-        seen: set = set()
+    anchors: List[Path] = []
+    seen: set = set()
 
-        def add_anchor(a: Path):
-            try:
-                ra = a.resolve()
-                _debug_print(f"Adding anchor: {ra}")
-            except (OSError, RuntimeError):
-                return
-            if ra in seen:
-                return
-            seen.add(ra)
-            anchors.append(ra)
+    def add_anchor(a: Path):
+        try:
+            ra = a.resolve()
+        except (OSError, RuntimeError):
+            return
+        if ra in seen:
+            return
+        seen.add(ra)
+        anchors.append(ra)
 
-        for base in (Path(__file__).resolve().parent, Path.cwd()):
-            chain = [base, *list(base.parents)[:5]]
-            for a in chain:
-                add_anchor(a)
+    for base in (Path(__file__).resolve().parent, Path.cwd()):
+        chain = [base, *list(base.parents)[:5]]
+        for a in chain:
+            add_anchor(a)
 
-        for a in anchors:
-            candidate = a / p
-            if candidate.is_file():
-                _debug_print(f"Found candidate in anchors: {candidate}")
-                return str(candidate)
+    for a in anchors:
+        candidate = a / p
+        if candidate.is_file():
+            _debug_print(f"Found candidate in anchors: {candidate}")
+            return str(candidate)
 
     if not has_sep:
         which = shutil.which(user_value)
@@ -398,10 +409,173 @@ def _resolve_server_binary(user_value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# llama.cpp fork discovery
+
+def _discover_llama_forks() -> List[Tuple[str, Path]]:
+    """Scan the filesystem for llama.cpp fork directories.
+
+    A fork directory is any dir whose name matches ``*llama.cpp`` and that
+    contains at least one runnable llama-server binary inside.
+
+    When LLAMA_CPP_DIR points to a parent folder (e.g. C:\\LAB\\ai-local),
+    this function recursively walks that tree to find all subdirectories
+    matching ``*llama.cpp*`` — supporting nested structures like
+    ``C:\\LAB\\ai-local\\1b_llama.cpp\\build\\…``.
+
+    Returns a list of ``(display_name, resolved_path)`` tuples sorted so that
+    the bare ``llama.cpp`` comes first, then alphabetical.
+    """
+    seen: set = set()
+    forks: List[Tuple[str, Path]] = []
+
+    # Collect candidate parent directories to scan
+    parents: List[Path] = []
+
+    env_dir = os.environ.get("LLAMA_CPP_DIR")
+    if env_dir:
+        try:
+            p = Path(env_dir).expanduser().resolve()
+            if p.exists():
+                # If the env dir itself matches, add it too
+                if re.search(r"llama\.cpp", p.name, re.IGNORECASE):
+                    parents.append(p)
+                # Always scan the env dir as a root — forks may be direct
+                # children or nested deeper.
+                parents.append(p)
+                # Also scan parent in case env points to e.g. C:\LAB
+                parents.append(p.parent)
+        except (OSError, RuntimeError):
+            pass
+
+    for base in (Path(__file__).resolve().parent, Path.cwd()):
+        for ancestor in [base, *list(base.parents)[:6]]:
+            parents.append(ancestor)
+
+    # Deduplicate while preserving order
+    deduped: List[Path] = []
+    for p in parents:
+        try:
+            rp = p.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if rp not in seen:
+            seen.add(rp)
+            deduped.append(rp)
+    parents = deduped
+
+    for parent in parents:
+        if not parent.exists():
+            continue
+        try:
+            children = list(parent.iterdir())
+        except (OSError, PermissionError):
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            name = child.name
+            # Match: "llama.cpp", "*_llama.cpp", "*llama.cpp*"
+            if not re.search(r"llama\.cpp", name, re.IGNORECASE):
+                continue
+            try:
+                rp = child.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if rp in seen:
+                continue
+            # Must actually contain a runnable binary — otherwise it's a
+            # stale checkout or a source-only clone without a build.
+            has_binary = any((rp / sub).is_file() for sub in _SERVER_SUBPATHS)
+            if not has_binary:
+                continue
+            seen.add(rp)
+            forks.append((name, rp))
+
+    # Sort: bare "llama.cpp" first (case-insensitive), then other *llama.cpp* forks alphabetically
+    def _fork_sort_key(item: Tuple[str, Path]) -> tuple:
+        name = item[0]
+        name_lower = name.lower()
+        is_bare = name_lower == "llama.cpp"
+        # Strip common prefixes like "1b_", "atq_" etc for better sorting
+        stripped = re.sub(r"^[\w-]+(?=_llama\.cpp)", "", name_lower)
+        return (not is_bare, stripped)
+    
+    forks.sort(key=_fork_sort_key)
+    return forks
+
+
+def _pick_fork(
+    forks: List[Tuple[str, Path]],
+) -> Optional[Path]:
+    """Show the fork menu and return the chosen fork directory.
+
+    Returns ``None`` only when no forks were discovered at all.
+    Handles ``EOFError`` gracefully (non-TTY / CI context) by defaulting to
+    the first (standard) fork.
+    """
+    if not forks:
+        return None
+
+    if len(forks) == 1:
+        print(f"[AutoTuner] Found one llama.cpp fork: {forks[0][0]}")
+        return forks[0][1]
+
+    print("\n" + "═" * 64)
+    print("  LLAMA.CPP FORK SELECTION")
+    print("═" * 64)
+    print("  Found the following llama.cpp forks:\n")
+    for i, (name, path) in enumerate(forks, 1):
+        print(f"  {i}. {name:<30} {path}")
+    print()
+    print("  Enter a number to select, or press Enter for the default.")
+    print("═" * 64)
+
+    try:
+        raw = input(f"Select fork [1-{len(forks)}] (default 1): ").strip()
+    except EOFError:
+        raw = ""
+
+    if not raw:
+        selected = forks[0]
+        print(f"[AutoTuner] Using fork: {selected[0]}")
+        return selected[1]
+
+    if raw.isdigit():
+        n = int(raw)
+        if 1 <= n <= len(forks):
+            selected = forks[n - 1]
+            print(f"[AutoTuner] Using fork: {selected[0]}")
+            return selected[1]
+
+    print(f"[AutoTuner] Invalid choice '{raw}' — using default: {forks[0][0]}")
+    return forks[0][1]
+
+
+def _required_fork_name(profile: ModelProfile) -> Optional[str]:
+    """Extract the required fork directory name from ``profile.server_binary``.
+
+    Examples:
+      ``"1b_llama/llama-server"``  → ``"1b_llama.cpp"``
+      ``"ik_llama.cpp/llama-server"`` → ``"ik_llama.cpp"``
+      ``None`` → ``None``
+    """
+    if not profile.server_binary:
+        return None
+    parts = Path(profile.server_binary).parts
+    if not parts:
+        return None
+    first = parts[0]
+    # Normalize: add .cpp suffix when missing
+    if re.search(r"llama", first, re.IGNORECASE) and not first.endswith(".cpp"):
+        return first + ".cpp"
+    return first
+
+
+# ---------------------------------------------------------------------------
 # Client settings hint
 
 def _print_client_settings(host: str, port: int, ctx: int,
-                           model: ModelEntry) -> None:
+                            model: ModelEntry) -> None:
     """Print a copy-pasteable block for OpenAI-API clients."""
     base_url = f"http://{host}:{port}/v1"
     print()
@@ -413,6 +587,10 @@ def _print_client_settings(host: str, port: int, ctx: int,
     print(f"    Model name        : {model.name}")
     print(f"    Context window    : {ctx:,} tokens   ← set this in your client")
     print(_BAR)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -441,11 +619,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--llama-cpp-dir",
         default=os.environ.get("LLAMA_CPP_DIR"),
         help="Path to your llama.cpp checkout (env LLAMA_CPP_DIR). "
-             "1b_llama.cpp/BitNet are searched in the same parent folder. "
+             "All forks in the same parent folder are discovered automatically. "
              "Useful when llama.cpp lives outside the standard search paths "
              "(e.g. C:\\LAB\\ai-local\\llama.cpp).",
     )
-
     p.add_argument("--host", default="127.0.0.1",
                    help="Server bind host (default: 127.0.0.1)")
     p.add_argument("--port", type=int, default=1234,
@@ -459,16 +636,22 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the launch confirmation prompt")
     p.add_argument("--novision", action="store_true",
-                    help="Disable vision (mmproj) even if available")
+                   help="Disable vision (mmproj) even if available")
     p.add_argument("--nodraft", action="store_true",
-                    help="Disable speculative decoding/draft model")
+                   help="Disable speculative decoding/draft model")
     p.add_argument("--nothinking", action="store_true",
-                    help="Disable thinking/reasoning output")
+                   help="Disable thinking/reasoning output")
     p.add_argument(
         "--force-mlock",
         action="store_true",
         help="Force --mlock / --no-mmap even for full-GPU-offload models "
              "(prevents VRAM paging when enough free VRAM is available)",
+    )
+    p.add_argument(
+        "--gui",
+        action="store_true",
+        help="Open the Qt log-viewer window after the server starts "
+             "(requires PyQt6; server stdout/stderr stream into the window).",
     )
     p.add_argument(
         "--",
@@ -478,21 +661,22 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     )
     return p.parse_args(argv)
 
-def main(argv: Optional[List[str]] = None) -> int:
+
+# ---------------------------------------------------------------------------
+# main
+
+def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but intentional)
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     if args.llama_cpp_dir:
-        # The existing _candidate_search_roots() already honors LLAMA_CPP_DIR
-        # and looks for sibling 1b_llama.cpp / BitNet folders next to it.
-        # Setting it here is process-local and does not affect the parent shell.
         os.environ["LLAMA_CPP_DIR"] = args.llama_cpp_dir
 
     _print_banner()
 
-    # --- Debugging Mode Selection ---
+    # ── Debug / verbose mode selection ─────────────────────────────────────
     global _DEBUG_MODE
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("  DEBUG / VERBOSE MODE SELECTION")
-    print("="*60)
+    print("=" * 60)
     print("  1. Debugging OFF (standard)")
     print("  2. Debugging ON (alle Kategorien)")
     print("-" * 60)
@@ -503,7 +687,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("  6. Konfigurations-Berechnung (KV-Cache, Kontext)")
     print("-" * 60)
 
-    debug_choice = input("Wahl [1-6] (default 1): ").strip()
+    try:
+        debug_choice = input("Wahl [1-6] (default 1): ").strip()
+    except EOFError:
+        debug_choice = ""
+
     if debug_choice == "2":
         _DEBUG_MODE = True
         print("[AutoTuner] Globaler Debug-Modus aktiviert.")
@@ -521,25 +709,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[AutoTuner] Kategorie-Debugging: Konfigurations-Berechnung")
     else:
         print("[AutoTuner] Debugging deaktiviert.")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
-    # --- Turbo-Quant Selection ---
-    use_turbo = False
-    print("\n" + "="*40)
-    print("  QUANTIZATION MODE SELECTION")
-    print("="*40)
-    print("  1. Standard-Quant (llama.cpp)")
-    print("  2. Turbo-Quant (tq_llama.cpp)")
-    print("-" * 40)
-    
-    choice = input("Select mode [1/2] (default 1): ").strip()
-    if choice == "2":
-        use_turbo = True
-        print("[AutoTuner] Turbo-Quant mode selected.")
-    else:
-        print("[AutoTuner] Standard-Quant mode selected.")
-    print("="*40 + "\n")
+    # ── llama.cpp fork discovery ────────────────────────────────────────────
+    # Only show the fork menu when --server was NOT specified explicitly by the
+    # user (i.e. it is still the default "llama-server" or from LLAMA_SERVER).
+    # An explicit --server path overrides everything.
+    user_specified_server = (
+        "--server" in (argv or sys.argv[1:])
+        or "LLAMA_SERVER" in os.environ
+    )
 
+    discovered_forks: List[Tuple[str, Path]] = []
+    selected_fork_path: Optional[Path] = None
+
+    if not user_specified_server:
+        discovered_forks = _discover_llama_forks()
+        selected_fork_path = _pick_fork(discovered_forks)
+        if selected_fork_path is not None:
+            # Point LLAMA_CPP_DIR at the chosen fork so that
+            # _candidate_search_roots() finds binaries there (and siblings).
+            os.environ["LLAMA_CPP_DIR"] = str(selected_fork_path)
+            print(f"[AutoTuner] LLAMA_CPP_DIR → {selected_fork_path}\n")
+        else:
+            print("[AutoTuner] No llama.cpp forks found on disk — "
+                  "set LLAMA_CPP_DIR or pass --server.\n")
+
+    # ── System detection ────────────────────────────────────────────────────
     system = detect_system()
     _print_system(system)
 
@@ -556,26 +752,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     profiles = load_profiles(Path(args.settings_path))
-    print(f"[AutoTuner] Loaded {len(profiles)} profile(s) from "
-          f"{args.settings_path}")
+    print(f"[AutoTuner] Loaded {len(profiles)} profile(s) from {args.settings_path}")
 
-    # Main loop: pick model → launch → on stop, ask whether to pick another.
-    # This avoids the cmd.exe "Batchvorgang abbrechen?" prompt the user gets
-    # when the script exits after Ctrl+C inside a .bat wrapper, and lets
-    # them switch models without restarting the whole tool.
+    # ── Main loop ───────────────────────────────────────────────────────────
     first_iteration = True
     last_exit_code = 0
 
     while True:
-        # On every iteration after the first, re-detect the system so the
-        # auto-tuner sees the RAM/VRAM that was just freed by the previous
-        # llama-server, and clear any one-shot CLI selectors.
         if not first_iteration:
             print()
             system = detect_system()
             _print_system(system)
-            args.model = None  # force the menu to show again
-            args.ctx = None    # don't keep an override meant for the prev model
+            args.model = None
+            args.ctx = None
 
         groups = group_entries(entries)
         flat = _print_menu(groups)
@@ -590,61 +779,78 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("[AutoTuner] No model selected — exiting.")
             return last_exit_code if first_iteration else 0
 
-        # Apply flags picked during model selection
         for flag in picked_flags:
-            if flag == 'novision':
+            if flag == "novision":
                 args.novision = True
-            elif flag == 'nodraft':
+            elif flag == "nodraft":
                 args.nodraft = True
-            elif flag == 'nothinking':
+            elif flag == "nothinking":
                 args.nothinking = True
 
-        # Apply --novision flag if set
         if args.novision and model.mmproj is not None:
-            print(f"[AutoTuner] Vision disabled per --novision (ignoring {model.mmproj.name})")
+            print(f"[AutoTuner] Vision disabled per --novision "
+                  f"(ignoring {model.mmproj.name})")
             model.mmproj = None
 
         profile = match_profile(model.name, profiles)
-        
-        # Handle Turbo-Quant binary override
-        if use_turbo:
-            # We force the server binary to be the one from tq_llama.cpp
-            # The user provided path: C:\LAB\ai-local\tq_llama.cpp
-            # Assuming it's a directory containing the binary, or the binary itself.
-            # Usually, these are directories with a 'llama-server' inside.
-            # If it's the binary itself, we use it directly.
-            tq_path = Path(r"C:\LAB\ai-local\tq_llama.cpp")
-            if tq_path.is_dir():
-                # Try to find llama-server inside
-                potential_binary = tq_path / "llama-server.exe"
-                if potential_binary.exists():
-                    server = str(potential_binary)
-                else:
-                    # Fallback to what we found or just use the path if it's a binary
-                    server = str(tq_path)
-            else:
-                server = str(tq_path)
 
-        # Try to find a draft model for this family if available.
-        # Strategy: strip the quant suffix from the main model name, then look
-        # for an assistant model that shares the same base prefix.
-        #   e.g. "gemma-4-31B-it-Q3_K_S" -> base "gemma-4-31b-it"
-        #        -> matches "gemma-4-31B-it-assistant-Q8_0"
+        # ── Fork / model mismatch check ─────────────────────────────────
+        # Some models require a specific fork (e.g. bonsai → 1b_llama.cpp).
+        # Warn the user if their selected fork differs and offer to switch.
+        # This check is skipped when the user passed --server explicitly.
+        if not user_specified_server and selected_fork_path is not None:
+            required_fork = _required_fork_name(profile)
+            if required_fork:
+                selected_name = selected_fork_path.name.lower()
+                req_lower = required_fork.lower()
+                if selected_name != req_lower:
+                    print(f"\n[AutoTuner] ⚠  Profile '{profile.display_name}' "
+                          f"requires: {required_fork}")
+                    print(f"             You selected:  {selected_fork_path.name}")
+                    # Look for the required fork among already-discovered forks
+                    matching = [
+                        (n, p) for n, p in discovered_forks
+                        if n.lower() == req_lower
+                    ]
+                    if matching:
+                        switch = _confirm(
+                            f"Switch to {required_fork} for this model?",
+                            default_yes=True,
+                        )
+                        if switch:
+                            selected_fork_path = matching[0][1]
+                            os.environ["LLAMA_CPP_DIR"] = str(selected_fork_path)
+                            print(f"[AutoTuner] Switched to: {selected_fork_path.name}")
+                        else:
+                            print(f"[AutoTuner] Keeping {selected_fork_path.name} "
+                                  "— the model may not load correctly.")
+                    else:
+                        print(f"[AutoTuner] ⚠  {required_fork} not found on this system.")
+                        print("             Continuing with current fork "
+                              "— the model may not load correctly.")
+
+        # ── Draft model detection ────────────────────────────────────────
         draft_model = None
         if profile.draft_max > 0 and not args.nodraft:
             import re as _re
             main_name_lower = model.name.lower()
 
-            # Strip quant suffix (Q3_K_S, Q8_0, BF16, F16, IQ2_XXS, etc.)
+            # Step 1: strip quant suffix  (Q4_K_XL, IQ3_XXS, BF16, …)
+            # Also handles trailing bpw tags like "IQ4_XS-4.04bpw"
             base_name = _re.sub(
-                r"[-_]?(?:q\d+(?:_+[a-z]+)+|iq\d+_+[a-z]+|tf\d+|bf16|f16|f32)$",
-                "", main_name_lower
+                r"[-_]?(?:iq\d+(?:_+[a-z\d]+)*(?:[-_]\d+[\.\d]*bpw)?|"
+                r"q\d+(?:_+[a-z\d]+)*|tf\d+|bf16|f16|f32)$",
+                "", main_name_lower,
             ).strip("-_")
 
-            # STRICT matching: assistant must share the EXACT same architectural
-            # variant (e.g., 26b-a4b only matches 26b-a4b, NOT e2b or 31b).
-            # The assistant name must start with exactly the same base prefix
-            # as the main model (after quant stripping), not just any common word.
+            # Step 2: strip distributor/packing tags that precede the quant
+            # (UD = Unsloth Default, IQ-prefix packs, etc.)
+            base_name = _re.sub(
+                r"[-_](?:ud|unsloth)$", "", base_name, flags=_re.IGNORECASE
+            ).strip("-_")
+
+            # STRICT matching: assistant model must start with exactly the
+            # same architectural base prefix as the main model.
             exact_drafts = [
                 e for e in entries
                 if "assistant" in e.name.lower()
@@ -654,29 +860,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 draft_model = min(exact_drafts, key=lambda x: x.size_gb)
                 print(f"[AutoTuner] Found draft model: {draft_model.name}")
 
-            # NO fallback to arbitrary assistant models — speculative decoding
-            # requires architecturally compatible draft models. Using an
-            # incompatible draft (e.g., E2B for 26B-A4B) causes crashes.
-        # Interaktive Fragen-Kette: Vision → Draft → Thinking
-        (
-            use_vision,
-            use_draft,
-            use_thinking,
-            effective_draft,
-        ) = _ask_interactive_features(model, draft_model, args.settings_path)
-
-        # Wenn User "No" bei Draft drückt, setze draft_model auf None
+        # ── Interactive feature chain ────────────────────────────────────
+        (use_vision, use_draft, use_thinking, effective_draft) = (
+            _ask_interactive_features(model, draft_model, args.settings_path)
+        )
         if not use_draft:
             effective_draft = None
 
+        # ── Config computation ───────────────────────────────────────────
         cfg = compute_config(
             model, system, profile,
             draft_model=effective_draft,
             user_ctx=args.ctx,
             force_mlock=getattr(args, "force_mlock", False),
         )
-        
-        # mlock/no_mmap Entscheidung immer anzeigen (wichtig für Troubleshooting)
+
         print(f"\n  [mlock] decision: model={model.name}")
         print(f"         full_offload={cfg.full_offload}  "
               f"vram={cfg.estimated_model_vram_gb:.1f}GB  "
@@ -687,78 +885,60 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"free_ram={system.free_ram_gb:.1f}GB")
         print(f"         force_mlock={getattr(args, 'force_mlock', False)}  "
               f"-> mlock={cfg.mlock}  no_mmap={cfg.no_mmap}")
-        
+
         _print_config(model, profile, cfg, system)
 
-        raw_server = profile.server_binary or args.server
-        
-        # ── Spezialisierte Binary-Logik ────────────────────────────────
-        # PrismML (bonsai-ternary) → 1b_llama.cpp
-        # Gemma 4 mit Draft → ik_llama.cpp
-        # Gemma 4 ohne Draft → Standard llama.cpp
-        # Sonstige → Profil-Binary oder Standard
-        
+        # ── Binary resolution ────────────────────────────────────────────
         def resolve_specialized_binary(
             profile: ModelProfile,
             use_draft_flag: bool,
             model_name: str,
         ) -> str:
-            """Wähle die passende llama-server Binary basierend auf YAML-Setting + Features.
+            """Choose the llama-server binary for this model.
 
-            Priorität:
-            1. Spezialfall: Gemma 4 (MTP-Support)
-            2. server_binary aus settings/*.yaml (wenn vorhanden)
-            3. Fallback: Standard llama-server
+            Priority:
+              1. Gemma 4 WITH draft  → ik_llama.cpp (MTP support required)
+              2. server_binary from YAML profile
+              3. Fallback: whatever the user selected / args.server
             """
-            # 1. Spezialfall: Gemma 4 (MTP-Support)
+            # Gemma 4 needs ik_llama.cpp only when speculative decoding is active
             if "gemma-4" in model_name.lower() or "gemma4" in model_name.lower():
                 if use_draft_flag:
-                    # Mit Draft → Entweder aus YAML oder ik_llama.cpp
-                    return profile.server_binary if profile.server_binary else "ik_llama.cpp/llama-server"
-                else:
-                    # Ohne Draft → Immer Standard llama.cpp
-                    return "llama.cpp/llama-server"
+                    return (profile.server_binary
+                            if profile.server_binary
+                            else "ik_llama.cpp/llama-server")
+                # Without draft, use whichever fork the user selected
 
-            # 2. ZUERST: server_binary aus YAML verwenden (wenn vorhanden)
+            # Explicit server_binary in YAML always wins
             if profile.server_binary:
                 return profile.server_binary
 
-            # 3. Fallback: Standard
+            # Default: let _resolve_server_binary find it in LLAMA_CPP_DIR
             return args.server
-        
-        if use_turbo:
-            # Override server for Turbo-Quant
-            tq_path = Path(r"C:\LAB\ai-local\tq_llama.cpp")
-            if tq_path.is_dir():
-                potential_binary = tq_path / "llama-server.exe"
-                if potential_binary.exists():
-                    server = str(potential_binary)
-                else:
-                    server = str(tq_path)
-            else:
-                server = str(tq_path)
-            print(f"[AutoTuner] Using Turbo-Quant binary: {server}")
-        else:
-            effective_server = resolve_specialized_binary(profile, use_draft, model.name)
-            server = _resolve_server_binary(effective_server)
-            if server != raw_server:
-                print(f"[AutoTuner] Found server binary: {server}")
-            elif not Path(server).is_file() and not shutil.which(server):
-                print(f"[AutoTuner] Warning: server binary '{server}' not found.")
-                print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
-                print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
 
+        raw_server = profile.server_binary or args.server
+        effective_server = resolve_specialized_binary(profile, use_draft, model.name)
+        server = _resolve_server_binary(effective_server)
+
+        if server != raw_server:
+            print(f"[AutoTuner] Found server binary: {server}")
+        elif not Path(server).is_file() and not shutil.which(server):
+            print(f"[AutoTuner] Warning: server binary '{server}' not found.")
+            print("  Pass --server /path/to/llama-server, set LLAMA_SERVER, or")
+            print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
+
+        # ── Build command ────────────────────────────────────────────────
         extra = args.passthrough or []
         cmd = build_command(
             model=model,
             config=cfg,
             profile=profile,
-            draft_model=effective_draft,  # ← FIX: effective_draft statt draft_model
+            draft_model=effective_draft,
             server_binary=server,
             host=args.host,
             port=args.port,
             extra_args=extra,
-            use_thinking=use_thinking,  # ← Thinking-Flag übergeben
+            use_thinking=use_thinking,
         )
 
         if args.dry_run:
@@ -782,21 +962,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         _print_client_settings(args.host, args.port, cfg.ctx, model)
         print(f"\n[AutoTuner] Web UI will be available at "
               f"http://{args.host}:{args.port}\n")
-        
-        # If Turbo-Quant is selected, we need to ensure the command uses the correct binary.
-        # However, the 'launch' function in launcher.py handles the execution.
-        # We must ensure 'cmd' contains the correct binary if use_turbo is True.
-        # Since build_command already returns the command list, we check if it's correct.
-        
-        # Note: The user wants to use tq_llama.cpp.
-        # If use_turbo is true, we should ensure the binary in 'cmd' is the one from C:\LAB\ai-local\tq_llama.cpp
-        # This is handled by the fact that build_command uses 'server_binary'.
-        # We will pass the correct binary to build_command if use_turbo is selected.
-        
-        last_exit_code = launch(cmd)
 
-        # Server has stopped (Ctrl+C, crash, or normal exit). Offer to pick
-        # another model instead of falling through and exiting.
+        # ── Launch (terminal or GUI) ─────────────────────────────────────
+        if args.gui:
+            # Lazy import: only when --gui is actually used.
+            # This keeps the CI smoke-import clean even without PyQt6.
+            try:
+                from PyQt6.QtWidgets import QApplication
+                from qt_log_viewer import LogViewerWindow
+                from server_process import ServerProcess
+            except ImportError as exc:
+                print(f"[AutoTuner] --gui requires PyQt6 and qt_log_viewer.py: {exc}")
+                print("[AutoTuner] Falling back to terminal mode.")
+                last_exit_code = launch(cmd)
+            else:
+                srv = ServerProcess(cmd)
+                srv.start()
+                app = QApplication(sys.argv)
+                window = LogViewerWindow(srv)
+                window.show()
+                sys.exit(app.exec())
+        else:
+            last_exit_code = launch(cmd)
+
         print()
         try:
             keep_going = _confirm("Server stopped. Pick another model?",
@@ -810,6 +998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         first_iteration = False
+
 
 if __name__ == "__main__":
     sys.exit(main())

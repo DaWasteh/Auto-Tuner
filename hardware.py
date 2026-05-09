@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import psutil
+import os
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -435,6 +436,7 @@ class GPUInfo:
     vendor: str  # "nvidia" | "amd" | "intel" | "apple" | "unknown"
     total_vram_mb: int
     free_vram_mb: int
+    gpu_util_percent: float = 0.0  # GPU-Auslastung in %
 
     @property
     def total_vram_gb(self) -> float:
@@ -482,14 +484,25 @@ class SystemInfo:
 # Helpers
 
 def _run(cmd: List[str], timeout: float = 5) -> Optional[str]:
-    """Run a command and return stdout, or None on any failure."""
+    """Run a command and return stdout, or None on any failure.
+
+    On Windows, CREATE_NO_WINDOW suppresses the brief console-window flash
+    that would otherwise appear for every powershell / wmic call.
+    """
     try:
+        kwargs: dict = {}
+        if os.name == "nt":
+            # Prevent subprocess from creating a visible console window.
+            # Without this flag, every powershell call briefly flashes a
+            # black terminal on screen.
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
             errors="ignore",
+            **kwargs,
         )
         if result.returncode == 0:
             return result.stdout
@@ -506,7 +519,7 @@ def _detect_nvidia() -> List[GPUInfo]:
         return []
     out = _run([
         "nvidia-smi",
-        "--query-gpu=index,name,memory.total,memory.free",
+        "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
         "--format=csv,noheader,nounits",
     ])
     if not out:
@@ -514,7 +527,11 @@ def _detect_nvidia() -> List[GPUInfo]:
     gpus: List[GPUInfo] = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 4:
+        if len(parts) >= 5:
+            try:
+                gpu_util = float(parts[4].replace("%", "").strip())
+            except (ValueError, IndexError):
+                gpu_util = 0.0
             try:
                 gpus.append(GPUInfo(
                     index=int(parts[0]),
@@ -522,10 +539,38 @@ def _detect_nvidia() -> List[GPUInfo]:
                     vendor="nvidia",
                     total_vram_mb=int(parts[2]),
                     free_vram_mb=int(parts[3]),
+                    gpu_util_percent=gpu_util,
                 ))
             except ValueError:
                 continue
     return gpus
+
+
+def _get_nvidia_gpu_utilization() -> Dict[str, float]:
+    """Ermittle GPU-Auslastung über nvidia-smi.
+    
+    Returns mapping of GPU name (lowercased) -> utilization %.
+    """
+    result: Dict[str, float] = {}
+    if not shutil.which("nvidia-smi"):
+        return result
+    out = _run([
+        "nvidia-smi",
+        "--query-gpu=index,name,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ])
+    if not out:
+        return result
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            try:
+                gpu_name = parts[1]
+                gpu_util = float(parts[2].replace("%", "").strip())
+                result[gpu_name.lower()] = gpu_util
+            except (ValueError, IndexError):
+                continue
+    return result
 
 
 def _detect_amd_rocm() -> List[GPUInfo]:
@@ -546,6 +591,7 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                 idx = int(m.group(1))
                 total_b = 0
                 used_b = 0
+                gpu_pct = 0.0
                 name = (info.get("Card Series")
                         or info.get("Card model")
                         or info.get("Card SKU")
@@ -561,6 +607,13 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                             used_b = int(str(v).strip().split()[0])
                         except (ValueError, IndexError):
                             pass
+                    # GPU-Utilization aus verschiedenen möglichen Feldnamen
+                    elif "GPU Item" in k or "System Total" in k or "GPU utilization" in k.lower():
+                        try:
+                            val_str = str(v).strip().replace("%", "")
+                            gpu_pct = float(val_str)
+                        except (ValueError, IndexError):
+                            pass
                 total_mb = total_b // (1024 * 1024)
                 used_mb = used_b // (1024 * 1024)
                 gpus.append(GPUInfo(
@@ -569,6 +622,7 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                     vendor="amd",
                     total_vram_mb=total_mb,
                     free_vram_mb=max(0, total_mb - used_mb),
+                    gpu_util_percent=gpu_pct,
                 ))
             if gpus:
                 return gpus
@@ -592,6 +646,7 @@ def _detect_amd_rocm() -> List[GPUInfo]:
             vendor="amd",
             total_vram_mb=info.get("total", 0) // (1024 * 1024),
             free_vram_mb=info.get("total", 0) // (1024 * 1024),
+            gpu_util_percent=0.0,
         )
         for i, info in by_idx.items()
     ]
@@ -777,6 +832,9 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
     # Echten freien VRAM über WMI win32com auslesen (AvailableVideoMemory)
     # Wird nur als letzte Option verwendet, da bei AMD RX 9000 ungenau
     vram_free_map: Dict[str, float] = _get_gpu_vram_free_via_wmi()
+    # GPU-Auslastung (nur NVIDIA über nvidia-smi, schnell)
+    # WMI-basierte Utilization-Erkennung kann langsam sein und wird übersprungen
+    gpu_util_map: Dict[str, float] = _get_nvidia_gpu_utilization()
 
     # Try native winreg helper first (faster, no PowerShell overhead)
     registry_vram = _get_vram_from_registry()
@@ -804,12 +862,15 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
                 free_mb = int(min(vram_free_map[name.lower()], total_mb))
             else:
                 free_mb = 0
+            # GPU-Auslastung holen
+            gpu_util = gpu_util_map.get(name.lower(), 0.0)
             gpus.append(GPUInfo(
                 index=len(gpus),
                 name=name,
                 vendor=_vendor_from_name(name),
                 total_vram_mb=total_mb,
                 free_vram_mb=free_mb,
+                gpu_util_percent=gpu_util,
             ))
         return gpus
 
@@ -865,6 +926,7 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             vendor=_vendor_from_name(name),
             total_vram_mb=total_mb,
             free_vram_mb=free_mb,
+            gpu_util_percent=0.0,
         ))
     return gpus
 
@@ -898,6 +960,7 @@ def _detect_linux_other_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             vendor=_vendor_from_name(f"{vendor_str} {name}"),
             total_vram_mb=0,
             free_vram_mb=0,
+            gpu_util_percent=0.0,
         ))
     return gpus
 
@@ -922,29 +985,42 @@ def _detect_apple() -> List[GPUInfo]:
         vendor="apple",
         total_vram_mb=mem_mb,
         free_vram_mb=mem_mb,
+        gpu_util_percent=0.0,
     )]
 
 
 def _detect_cpu_name() -> str:
-    if platform.system() == "Linux":
-        try:
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if line.startswith("model name"):
-                        return line.split(":", 1)[1].strip()
-        except OSError:
-            pass
-    elif platform.system() == "Darwin":
-        out = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
-        if out:
-            return out.strip()
-    elif platform.system() == "Windows":
-        out = _run([
-            "powershell", "-NoProfile", "-Command",
-            "(Get-CimInstance Win32_Processor).Name",
-        ])
-        if out:
-            return out.strip()
+    """Detect CPU name — best-effort, never raises."""
+    try:
+        if platform.system() == "Linux":
+            try:
+                with open("/proc/cpuinfo") as f:
+                    for line in f:
+                        if line.startswith("model name"):
+                            return line.split(":", 1)[1].strip()
+            except OSError:
+                pass
+        elif platform.system() == "Darwin":
+            out = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
+            if out:
+                return out.strip()
+        elif platform.system() == "Windows":
+            # Fallback: zuerst environment variable prüfen (schnell, kein subprocess)
+            env_cpu = os.environ.get("AUTOTUNER_CPU_NAME", "")
+            if env_cpu:
+                return env_cpu
+            # PowerShell-Command mit Timeout-Schutz
+            try:
+                out = _run([
+                    "powershell", "-NoProfile", "-Command",
+                    "(Get-CimInstance Win32_Processor).Name",
+                ], timeout=5)
+                if out:
+                    return out.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
     return platform.processor() or "Unknown CPU"
 
 
@@ -995,20 +1071,34 @@ def _filter_inference_gpus(
 
 
 def detect_system() -> SystemInfo:
-    """Detect everything in one call. Best-effort; never raises."""
-    vm = psutil.virtual_memory()
+    """Detect everything in one call. Best-effort; never raises.
 
+    Every sub-detection step is wrapped in try/except so that a failure
+    in one component (e.g. nvidia-smi timeout) does not break the entire
+    detection pipeline.
+    """
+    try:
+        vm = psutil.virtual_memory()
+    except Exception:
+        vm = None  # will be handled below
+
+    # --- GPU detection (each vendor independently protected) ---
     raw: List[GPUInfo] = []
-    raw.extend(_detect_nvidia())
-    raw.extend(_detect_amd_rocm())
-    raw.extend(_detect_apple())
+    for detector in (_detect_nvidia, _detect_amd_rocm, _detect_apple):
+        try:
+            raw.extend(detector())
+        except Exception:
+            pass
 
     # OS-specific catch-all detectors fill in whatever the vendor-specific
     # ones missed (Windows: AMD without ROCm, Intel Arc; Linux: Intel iGPUs).
     found_names = {g.name.lower() for g in raw}
-    raw.extend(_detect_windows_gpus(skip_names=found_names))
-    found_names = {g.name.lower() for g in raw}
-    raw.extend(_detect_linux_other_gpus(skip_names=found_names))
+    for detector in (_detect_windows_gpus, _detect_linux_other_gpus):
+        try:
+            raw.extend(detector(skip_names=found_names))
+            found_names = {g.name.lower() for g in raw}
+        except Exception:
+            pass
 
     # Re-index in detection order for stable display
     for i, g in enumerate(raw):
@@ -1016,13 +1106,38 @@ def detect_system() -> SystemInfo:
 
     used, ignored = _filter_inference_gpus(raw)
 
+    # --- CPU / RAM fallbacks ---
+    os_name = f"{platform.system()} {platform.release()}"
+
+    try:
+        cpu_name = _detect_cpu_name()
+    except Exception:
+        cpu_name = "Unknown CPU"
+
+    try:
+        cpu_cores_physical = psutil.cpu_count(logical=False) or 1
+    except Exception:
+        cpu_cores_physical = 1
+
+    try:
+        cpu_cores_logical = psutil.cpu_count(logical=True) or 1
+    except Exception:
+        cpu_cores_logical = 1
+
+    if vm is not None:
+        total_ram_gb = vm.total / (1024 ** 3)
+        free_ram_gb = vm.available / (1024 ** 3)
+    else:
+        total_ram_gb = 0.0
+        free_ram_gb = 0.0
+
     return SystemInfo(
-        os_name=f"{platform.system()} {platform.release()}",
-        cpu_name=_detect_cpu_name(),
-        cpu_cores_physical=psutil.cpu_count(logical=False) or 1,
-        cpu_cores_logical=psutil.cpu_count(logical=True) or 1,
-        total_ram_gb=vm.total / (1024 ** 3),
-        free_ram_gb=vm.available / (1024 ** 3),
+        os_name=os_name,
+        cpu_name=cpu_name,
+        cpu_cores_physical=cpu_cores_physical,
+        cpu_cores_logical=cpu_cores_logical,
+        total_ram_gb=total_ram_gb,
+        free_ram_gb=free_ram_gb,
         gpus=used,
         ignored_gpus=ignored,
     )
