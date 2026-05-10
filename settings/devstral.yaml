@@ -1,4 +1,4 @@
-display_name: "Devstral (Mistral, code) [legacy]"
+display_name: "Devstral (Mistral, code)"
 patterns:
   - devstral
 
@@ -6,19 +6,22 @@ max_context: 262144
 recommended_kv_quant: q8_0
 
 # Sampling-Profile pro Modus.
-# Devstral ist primär ein Code-Modell - selbst der "Chat"-Modus bleibt
-# also relativ deterministisch.
+# Devstral ist ein Coding-spezialisiertes Modell, daher ist "coding"
+# der Fokus. Das chat-Profil ist hier explizit "Devstral als Conversational
+# Coding-Assistant" — etwas mehr Spielraum als der harte Completion-Modus.
 sampling:
   chat:
-    # Etwas wärmer als Coding für Erklärungen, Diskussion über Code,
-    # Architektur-Brainstorming etc. - aber immer noch konservativ.
+    # Etwas weniger deterministisch für Erklärungen, Diskussion über
+    # Code, Refactoring-Vorschläge — aber immer noch konservativ
+    # weil Devstral primär codet.
     temperature: 0.4
     top_k: 40
     top_p: 0.9
     min_p: 0.05
     repeat_penalty: 1.05
   coding:
-    # Sehr niedrig für deterministische Code-Completion (Cline, Aider, VS Code).
+    # Niedrig für deterministische Code-Completion. Original-Wert
+    # aus dem alten Flat-Profil.
     temperature: 0.15
     top_k: 40
     top_p: 0.9
@@ -27,8 +30,5 @@ sampling:
 
 notes: >
   Optimiert für Code-Completion (Cline, Aider, VS Code).
-  HINWEIS: Mistral Medium 3.5 (29.04.2026) ersetzt offiziell Devstral 2 -
-  Mistral selbst schreibt: "Mistral Medium 3.5 supersedes all our previous
-  coding models, namely Devstral, across all benchmarks". Die Vibe CLI
-  nutzt jetzt ebenfalls Medium 3.5 statt Devstral. Devstral bleibt für
-  Edge-/Low-VRAM-Setups relevant, ist aber kein aktives Update-Ziel mehr.
+  Coding-Profil (temp=0.15) für deterministische Completion;
+  Chat-Profil (temp=0.4) für Code-Erklärungen und Diskussion.

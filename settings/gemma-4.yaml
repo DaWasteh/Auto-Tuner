@@ -3,7 +3,6 @@ patterns:
   - gemma-4
   - gemma4
 
-# Vier Größen (April 2026): E2B, E4B, 26B-A4B (MoE), 31B (Dense).
 # E2B/E4B unterstützen 131072 (128k); 26B-A4B und 31B bis 262144 (256k).
 # Wird automatisch via GGUF-Metadata (native_context) je nach Modell
 # heruntergeregelt - daher hier den größten Wert eintragen.
@@ -15,13 +14,21 @@ recommended_kv_quant: q8_0
 rope_scale:
   enabled: false        # Standard aus — User kann in GUI aktivieren
   max_context: 524288   # 0.5M tokens mit YaRN möglich
-  scale_factor: 4.0     # 4x für E2B/E4B (128k→512k), 2x für 26B-A4B/31B (256k→512k)
+  scale_factor: 4.0     # yarn scaling factor (4x für Gemma-4-E2B/E4B, 2x für 26B-A4B/31B)
 
-
-# Zwingend erforderlich für MTP-Support (gemma4_mtp Architektur).
-# Google hat MTP-Drafter für ALLE vier Größen released (E2B, E4B,
-# 26B-A4B, 31B) - bis zu 3x End-to-End-Speedup über Speculative Decoding.
+# Zwingend erforderlich für MTP-Support (gemma4_mtp Architektur)
 server_binary: "ik_llama/llama-server"
+
+# Performance-Target-Empfehlung des Profils.
+# Gemma-4-26B-A4B ist ein MoE-Modell (4B aktiv von 26B total), das auf
+# 16-GB-GPUs nicht voll in VRAM passt. Gleiche Logik wie bei Qwen3.6-A3B:
+# "throughput" reserviert nur 32k KV-Budget statt 64k, sodass mehr
+# VRAM für Expert-Layer übrig bleibt. Wer regelmäßig >32k Kontext
+# braucht, in der GUI auf "balanced" oder "safe" wechseln — die
+# GUI-Wahl gewinnt immer gegen diese Empfehlung.
+# Für die Dense-Varianten (E2B/E4B/31B) ist das Target relativ
+# folgenlos, weil sie eh komplett in VRAM passen.
+performance_target: throughput
 
 # Sampling-Profile pro Modus.
 sampling:
@@ -33,12 +40,10 @@ sampling:
     min_p: 0.0
     repeat_penalty: 1.0   # Gemma reagiert schlecht auf >1.0
   coding:
-    # Konservativeres Coding-Default. Community-Tests zeigen, dass Gemma 4
-    # auch mit höheren Temperaturen für Coding gut funktioniert (manche
-    # berichten temp=1.5 als optimal für Coding-Tasks!) - aber als
-    # konservativer Default ist 0.7 sicherer und immer noch im offiziellen
-    # Empfehlungs-Korridor.
-    temperature: 0.7
+    # Community-Tests zeigen, dass Gemma 4 für Coding mit höherer
+    # Temperatur besser performt — gegen den Standard-Reflex
+    # "deterministisch = 0.2" hier explizit höher.
+    temperature: 1.5
     top_k: 64
     top_p: 0.95
     min_p: 0.0
@@ -52,15 +57,10 @@ draft_max: 3
 draft_p_min: 0.0
 
 notes: >
-  Gemma 4 (Release 02.04.2026, Apache 2.0) - vier Größen unter
-  einer Architektur:
-    E2B / E4B   - mobile/edge, 128k Kontext, multimodal Text+Bild+Audio
-    26B-A4B     - MoE mit 3.8B aktiven Parametern, 256k, Text+Bild
-    31B Dense   - Workstation-Modell, 256k, Text+Bild
-  Gemma reagiert empfindlich auf repeat_penalty > 1.0 (NICHT erhöhen).
-  Neu in Gemma 4: native System-Prompt-Role, konfigurierbare Thinking-
-  Modi, und MTP-Drafter für alle vier Größen (~3x Speedup via Speculative
-  Decoding). Thinking-Modus aktivierbar durch <|think|> am Anfang des
-  System-Prompts.
-  Tipp: Manche Community-Tests zeigen, dass Gemma 4 für Coding sogar mit
-  temp=1.5 besser performt - bei Bedarf mit `-- --temp 1.5` überschreiben.
+  Gemma ist empfindlich gegenüber repeat_penalty > 1.0.
+  E2B/E4B = multimodal (Text+Bild+Audio), 26B-A4B + 31B = Text+Bild.
+  Thinking-Modus aktivierbar durch <|think|> am Anfang des System-Prompts.
+  Coding-Profil nutzt temp=1.5 (vs. 1.0 chat) entsprechend Community-Tests
+  die zeigen, dass Gemma 4 für Coding mit höherer Temperatur kreativere
+  und korrektere Lösungen liefert — bei Bedarf mit `-- --temp 1.0`
+  überschreiben falls die höhere Temperatur in deinem Workflow stört.

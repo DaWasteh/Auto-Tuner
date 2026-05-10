@@ -59,9 +59,9 @@ def kv_per_token_mb_f16(params_billion: float) -> float:
     """Approximate KV-cache memory per token at f16 quant, in MB.
 
     Fallback heuristic when GGUF metadata is unavailable. NOTE: this is
-    calibrated for *dense* models. For MoE models (e.g. Qwen3.6-35B-A3B,
-    where only ~3B params are active per token), this heuristic
-    overestimates KV by roughly an order of magnitude — prefer
+    calibrated for *dense* models. For MoE models (e.g. Qwen3.6-35B-A3B
+    and Gemma-4-26B-A4B where only ~3B and ~4B params are active per token),
+    this heuristic overestimates KV by roughly an order of magnitude — prefer
     `kv_per_token_mb_from_metadata()` whenever metadata is present.
     """
     if params_billion <= 0:
@@ -89,7 +89,7 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
 
     The trailing 2 is K+V at FP16 (2 bytes each). With GQA, `n_kv_heads`
     is smaller than `n_heads`, which is why MoE models like
-    Qwen3.6-35B-A3B have a small KV footprint despite a high total
+    Qwen3.6-35B-A3B and Gemma-4-26B-A4B have a small KV footprint despite a high total
     parameter count — they share KV across many query heads.
 
     For *hybrid* Mamba/Transformer models (Nemotron-H, Jamba, …) only
@@ -182,25 +182,73 @@ def kv_quant_factor(quant: str) -> float:
 # ---------------------------------------------------------------------------
 # MoE detection
 
+# Common alternate metadata keys some quantizers emit instead of the
+# canonical "<arch>.expert_count". Order matters: more specific first.
+_MOE_ALT_KEY_SUFFIXES = (
+    ".expert_count",        # canonical (qwen3moe.expert_count, etc.)
+    ".num_local_experts",   # HF-style fallback
+    ".num_experts",         # plain
+    ".moe.expert_count",    # some hybrid/MTP forks
+)
+
+# Filename-level MoE marker: the "A{N}B" suffix that vendors use to
+# advertise the active-parameter count of an MoE model
+# (e.g. Qwen3.5-30B-A3B, Gemma-4-26B-A4B, Qwen3.5-122B-A10B). This is
+# a *fallback only* — when GGUF metadata declares no expert count but
+# the filename clearly says "active 3B of 30B total", we trust the
+# filename and route the model through the MoE placement path.
+_MOE_FILENAME_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(\d+(?:\.\d+)?)B"          # total params, e.g. "30B"
+    r"[-_.]?A(\d+(?:\.\d+)?)B"   # active params, e.g. "A3B"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
 def _moe_expert_count(model: ModelEntry) -> int:
-    """Return expert_count from GGUF metadata, or 0 if dense / unknown."""
+    """Return expert_count from GGUF metadata, or 0 if dense / unknown.
+
+    Detection order:
+      1. ``<arch>.expert_count`` — canonical GGUF key.
+      2. Any ``*.expert_count`` key in metadata (older quantizers).
+      3. Common alternate suffixes (``num_local_experts`` etc.) — some
+         MTP and hybrid forks emit these instead of the canonical name.
+      4. Filename heuristic: ``{Total}B-A{Active}B`` pattern returns 1
+         (sentinel "MoE confirmed by filename, exact count unknown" —
+         enough to enter the MoE placement branch). This catches GGUFs
+         where the metadata writer dropped the expert count entirely.
+    """
     md = model.metadata
-    if not md:
-        return 0
-    arch = md.get("general.architecture")
-    if arch:
-        key = f"{arch}.expert_count"
-        if key in md:
-            try:
-                return int(md[key])
-            except (TypeError, ValueError):
-                pass
-    for k, v in md.items():
-        if k.endswith(".expert_count"):
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                continue
+    if md:
+        arch = md.get("general.architecture")
+        # Step 1+3: try every alt suffix on the model's own architecture.
+        if arch:
+            for suffix in _MOE_ALT_KEY_SUFFIXES:
+                key = f"{arch}{suffix}"
+                if key in md:
+                    try:
+                        n = int(md[key])
+                        if n > 0:
+                            return n
+                    except (TypeError, ValueError):
+                        pass
+        # Step 2+3: scan all keys for any of the alt suffixes.
+        for k, v in md.items():
+            if any(k.endswith(s) for s in _MOE_ALT_KEY_SUFFIXES):
+                try:
+                    n = int(v)
+                    if n > 0:
+                        return n
+                except (TypeError, ValueError):
+                    continue
+
+    # Step 4: filename fallback. Returns 1 (sentinel) — caller treats
+    # any value > 1 as "definitely MoE". We bump the sentinel to 2 so
+    # `is_moe = expert_count > 1` triggers correctly without lying about
+    # the real count, which we don't know.
+    if _MOE_FILENAME_RE.search(model.name):
+        return 2
     return 0
 
 
@@ -754,7 +802,32 @@ def compute_config(
         numa = "distribute"
 
     # ---- (4f) Sampling
-    sd = (profile.sampling or {}).get(mode, {})  # mode ∈ {"chat", "coding"}
+    # Two YAML schema variants are supported:
+    #   New (chat/coding split):   sampling: { chat: {...}, coding: {...} }
+    #   Old (flat / shared):       sampling: { temperature: ..., top_k: ... }
+    #
+    # The flat form is detected by the ABSENCE of both "chat" and
+    # "coding" sub-dicts — in that case we use the flat dict for every
+    # mode. New-format profiles that define only one of the two modes
+    # still fall back to the flat dict for the missing mode, so a
+    # half-migrated file behaves predictably.
+    raw_sampling = profile.sampling or {}
+    has_chat_block = isinstance(raw_sampling.get("chat"), dict)
+    has_coding_block = isinstance(raw_sampling.get("coding"), dict)
+    has_split = has_chat_block or has_coding_block
+    if has_split:
+        sd = raw_sampling.get(mode)
+        if not isinstance(sd, dict):
+            # Mode not defined in this profile — fall back to the other
+            # mode if present, then to any flat top-level keys.
+            other = "coding" if mode == "chat" else "chat"
+            sd = raw_sampling.get(other) if isinstance(
+                raw_sampling.get(other), dict) else {}
+    else:
+        # Old flat format: every mode shares the same sampling block.
+        sd = {k: v for k, v in raw_sampling.items()
+              if not isinstance(v, dict)}
+
     sampling = {
         "temperature": float(sd.get("temperature", 0.7)),
         "top_k": int(sd.get("top_k", 40)),
@@ -797,6 +870,28 @@ def compute_config(
         warning=warning,
    )
 
+def _has_integrated_mtp(model: ModelEntry) -> bool:
+    """Detect models that ship an integrated MTP drafter inside the GGUF.
+
+    Integrated-MTP variants (e.g. ``Qwen3.6-27B-MTP-UD-Q3_K_XL.gguf``)
+    bundle the speculative-decoding drafter as extra tensors in the main
+    file — no sibling ``-Assistant`` GGUF, no ``-md`` flag, just
+    ``--spec-type mtp`` and ``--spec-draft-n-max N`` against the main
+    binary on a fork that supports it.
+
+    Detection is filename-only on purpose: the metadata key naming
+    differs between forks (mtp_llama.cpp uses ``<arch>.mtp.*``,
+    ik_llama.cpp uses different keys) and the filename marker is
+    universal across distributors. False positives here are cheap —
+    the worst case is the server starts without speculative decoding
+    when a misnamed file slipped through.
+    """
+    name = model.name.lower()
+    # Match "MTP" as a token surrounded by separators or at boundaries —
+    # avoids matching arbitrary substrings inside other words.
+    return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", name))
+
+
 def build_command(
     model: ModelEntry,
     config: TunedConfig,
@@ -807,7 +902,21 @@ def build_command(
     port: int = 1234,
     extra_args: Optional[List[str]] = None,
     use_thinking: bool = False,
+    enable_speculative: bool = True,
 ) -> List[str]:
+    """Build the llama-server command line for ``model`` and ``config``.
+
+    Speculative decoding paths
+    --------------------------
+    * ``draft_model`` is set → sibling-drafter path. Adds ``-md`` plus
+      ``--spec-type mtp`` and ``--draft-max``.
+    * ``draft_model`` is None and the main filename contains ``MTP`` →
+      integrated-drafter path. Adds ``--spec-type mtp`` and
+      ``--spec-draft-n-max`` only (the drafter rides inside the GGUF).
+    * ``enable_speculative=False`` overrides both paths and emits no
+      speculative flags at all — for the case where the user explicitly
+      unchecked Draft on an MTP-named model.
+    """
     cmd: List[str] = [
         server_binary,
         "-m", str(model.path),
@@ -823,18 +932,27 @@ def build_command(
         "--port", str(port),
     ]
 
-    # Add draft model if provided (MTP speculative decoding)
-    # NOTE: -md MUST come BEFORE --spec-type because llama-server parses
-    # arguments left-to-right. If --spec-type is seen before -md, the server
-    # thinks no draft model was given and aborts with:
-    #   "unknown speculative decoding type without draft model"
-    if draft_model is not None:
-        draft_val = getattr(profile, 'draft_max', 0) or 3
+    # Speculative decoding — three states:
+    #   - sibling drafter passed in        → Path A (-md + --draft-max)
+    #   - integrated MTP filename          → Path B (--spec-draft-n-max)
+    #   - enable_speculative=False         → emit nothing, even if the
+    #                                        filename suggests MTP
+    draft_val = getattr(profile, 'draft_max', 0) or 3
+    draft_p_min = getattr(profile, 'draft_p_min', 0.0) or 0.0
+    if enable_speculative and draft_model is not None:
+        # Path A — sibling drafter file.
+        # NOTE: -md MUST come BEFORE --spec-type because llama-server
+        # parses arguments left-to-right; otherwise the server aborts
+        # with "unknown speculative decoding type without draft model".
         cmd += ["-md", str(draft_model.path)]
-        cmd += ["--spec-type", "mtp"]  # Erforderlich für ik_llama.cpp
+        cmd += ["--spec-type", "mtp"]
         cmd += ["-ngld", "99"]
-        cmd += ["--draft-max", str(draft_val)] # Dieser Fork nutzt oft wieder --draft-max
-        cmd += ["--draft-p-min", str(getattr(profile, 'draft_p_min', 0.0) or 0.0)]
+        cmd += ["--draft-max", str(draft_val)]
+        cmd += ["--draft-p-min", str(draft_p_min)]
+    elif enable_speculative and _has_integrated_mtp(model):
+        # Path B — integrated MTP drafter inside the main GGUF.
+        cmd += ["--spec-type", "mtp"]
+        cmd += ["--spec-draft-n-max", str(draft_val)]
 
     if config.flash_attn:
         cmd += ["-fa", "on"]
@@ -846,76 +964,13 @@ def build_command(
         cmd.append("--no-mmap")
     if config.no_context_shift:
         cmd.append("--no-context-shift")
-    
+
     # RoPE-Scaling (YaRN) optional aktivieren für erweiterte Context-Längen
     # Bei Qwen3.5/3.6 möglich: native 262144 → bis 1048576 mit yarn scaling
     if config.rope_scaling and config.rope_scale_factor > 1.0:
         cmd += ["--rope-scaling", "yarn"]
         cmd += ["--rope-scale", str(int(config.rope_scale_factor))]
-    
-    if config.n_cpu_moe is not None and config.n_cpu_moe > 0:
-        cmd += ["--n-cpu-moe", str(config.n_cpu_moe)]
-    if config.tensor_split:
-        cmd += ["--tensor-split", config.tensor_split]
-    if config.main_gpu is not None:
-        cmd += ["--main-gpu", str(config.main_gpu)]
 
-    s = config.sampling
-    cmd += [
-        "--temp", str(s["temperature"]),
-        "--top-k", str(s["top_k"]),
-        "--top-p", str(s["top_p"]),
-        "--min-p", str(s["min_p"]),
-        "--repeat-penalty", str(s["repeat_penalty"]),
-    ]
-    pp = s.get("presence_penalty", 0.0)
-    if pp:
-        cmd += ["--presence-penalty", str(pp)]
-
-    if model.mmproj is not None:
-        cmd += ["--mmproj", str(model.mmproj)]
-
-    # Thinking/Reasoning-Modus (Gemma 4, DeepSeek, etc.)
-    # Thinking wird über Prompt-Tags gesteuert (<|think|>), nicht über CLI-Argumente.
-    # use_thinking ist ein internes Flag - extra_args werden immer angehängt:
-
-    if profile.extra_args:
-        cmd.extend(profile.extra_args)
-    if extra_args:
-        cmd.extend(extra_args)
-
-    return cmd
-
-    # Add draft model if provided (MTP speculative decoding)
-    # NOTE: -md MUST come BEFORE --spec-type because llama-server parses
-    # arguments left-to-right. If --spec-type is seen before -md, the server
-    # thinks no draft model was given and aborts with:
-    #   "unknown speculative decoding type without draft model"
-    if draft_model is not None:
-        draft_val = getattr(profile, 'draft_max', 0) or 3
-        cmd += ["-md", str(draft_model.path)]
-        cmd += ["--spec-type", "mtp"]  # Erforderlich für ik_llama.cpp
-        cmd += ["-ngld", "99"]
-        cmd += ["--draft-max", str(draft_val)] # Dieser Fork nutzt oft wieder --draft-max
-        cmd += ["--draft-p-min", str(getattr(profile, 'draft_p_min', 0.0) or 0.0)]
-
-    if config.flash_attn:
-        cmd += ["-fa", "on"]
-    if config.numa:
-        cmd += ["--numa", config.numa]
-    if config.mlock:
-        cmd.append("--mlock")
-    if config.no_mmap:
-        cmd.append("--no-mmap")
-    if config.no_context_shift:
-        cmd.append("--no-context-shift")
-    
-    # RoPE-Scaling (YaRN) optional aktivieren für erweiterte Context-Längen
-    # Bei Qwen3.5/3.6 möglich: native 262144 → bis 1048576 mit yarn scaling
-    if config.rope_scaling and config.rope_scale_factor > 1.0:
-        cmd += ["--rope-scaling", "yarn"]
-        cmd += ["--rope-scale", str(int(config.rope_scale_factor))]
-    
     if config.n_cpu_moe is not None and config.n_cpu_moe > 0:
         cmd += ["--n-cpu-moe", str(config.n_cpu_moe)]
     if config.tensor_split:

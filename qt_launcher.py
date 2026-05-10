@@ -369,6 +369,26 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._perf_combo)
 
         tb.addSeparator()
+        tb.addWidget(QLabel(" Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.setMinimumWidth(90)
+        self._mode_combo.setToolTip(
+            "Sampling profile:\n"
+            "  • chat   — conversational defaults (higher temperature,\n"
+            "             lower repetition control)\n"
+            "  • coding — deterministic defaults from each model's\n"
+            "             official coding/agentic-bench setup\n"
+            "Profiles without a coding block fall back to chat values."
+        )
+        for m in ("chat", "coding"):
+            self._mode_combo.addItem(m)
+        persisted_mode = app_settings.get_mode() or "chat"
+        idx = self._mode_combo.findText(persisted_mode)
+        self._mode_combo.setCurrentIndex(max(0, idx))
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        tb.addWidget(self._mode_combo)
+
+        tb.addSeparator()
         tb.addWidget(QLabel(" Font:"))
         for delta, label in ((-1, "A−"), (+1, "A+")):
             b = QPushButton(label)
@@ -426,6 +446,18 @@ class MainWindow(QMainWindow):
         self._chk_vision   = QCheckBox("Vision (mmproj)")
         self._chk_draft    = QCheckBox("Draft model (speculative decoding)")
         self._chk_thinking = QCheckBox("Thinking / Reasoning")
+
+        self._chk_vision.setToolTip(
+            "Load the multimodal projector (mmproj) so the model can\n"
+            "process images. Mutually exclusive with Draft — both want\n"
+            "VRAM, and integrated-MTP models don't combine with vision."
+        )
+        self._chk_draft.setToolTip(
+            "Enable speculative decoding using a smaller drafter model.\n"
+            "Either a paired -Assistant.gguf sibling, or — when the main\n"
+            "filename contains 'MTP' — the integrated drafter inside\n"
+            "the same GGUF. Mutually exclusive with Vision."
+        )
 
         for chk in (self._chk_vision, self._chk_draft, self._chk_thinking):
             chk.setEnabled(False)
@@ -787,6 +819,33 @@ class MainWindow(QMainWindow):
             profile_choice=getattr(profile, "performance_target", "") or None,
         )
 
+    def _current_mode(self) -> str:
+        """Return the active sampling mode ("chat" / "coding")."""
+        if not hasattr(self, "_mode_combo"):
+            return "chat"
+        m = self._mode_combo.currentText().strip().lower()
+        return m if m in ("chat", "coding") else "chat"
+
+    def _on_mode_changed(self, index: int) -> None:
+        """User flipped chat ↔ coding — persist + refresh preview only.
+
+        The mode change only affects sampling values (temperature/top-k);
+        VRAM placement and feature checkboxes stay untouched.
+        """
+        name = self._mode_combo.itemText(index).strip()
+        try:
+            app_settings.set_mode(name)
+        except Exception as exc:
+            self._log(f"[Warning] Could not save mode: {exc}")
+        self._log(f"[Mode] → {name}")
+        entry = getattr(self, "_current_entry", None)
+        if entry is not None and self._system is not None:
+            try:
+                profile = match_profile(entry.name, self._profiles)
+                self._update_config_text(entry, profile)
+            except Exception as exc:
+                self._log(f"[Warning] Config refresh failed: {exc}")
+
     def _hw_detect_done(
         self, s: Optional[SystemInfo], err: str = ""
     ) -> None:
@@ -1059,16 +1118,29 @@ class MainWindow(QMainWindow):
         self._chk_vision.blockSignals(False)
 
         # ── Draft ───────────────────────────────────────────────────
+        # Two ways to have a "draft" capability:
+        #   1. A paired sibling -Assistant.gguf (entry.draft is set)
+        #   2. The main GGUF carries an integrated MTP drafter inside —
+        #      filenames like "Qwen3.6-27B-MTP-UD-Q3_K_XL.gguf". In that
+        #      case there is no separate draft model to display, but the
+        #      checkbox still gates the --spec-type / --spec-draft-n-max
+        #      flags in the launch command (handled in tuner.build_command).
         draft = self._current_draft
-        has_draft = draft is not None
+        from tuner import _has_integrated_mtp  # local import: tuner needed
+        integrated_mtp = _has_integrated_mtp(entry)
+        has_draft = (draft is not None) or integrated_mtp
         draft_state = ov["draft"] if "draft" in ov else has_draft
         self._chk_draft.blockSignals(True)
         self._chk_draft.setEnabled(has_draft)
         self._chk_draft.setChecked(has_draft and draft_state)
-        self._chk_draft.setText(
-            f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
-            if draft is not None else "Draft (no assistant model found)"
-        )
+        if draft is not None:
+            self._chk_draft.setText(
+                f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
+            )
+        elif integrated_mtp:
+            self._chk_draft.setText("Draft   (integrated MTP — drafter inside GGUF)")
+        else:
+            self._chk_draft.setText("Draft (no assistant model found)")
         self._chk_draft.blockSignals(False)
 
         # ── Thinking / Reasoning ────────────────────────────────────
@@ -1083,6 +1155,57 @@ class MainWindow(QMainWindow):
         self._chk_thinking.setEnabled(has_thinking)
         self._chk_thinking.setChecked(has_thinking and thinking_state)
         self._chk_thinking.blockSignals(False)
+
+        # ── Vision / Draft mutual exclusion ────────────────────────
+        # Vision (mmproj) and speculative drafting both want VRAM, and
+        # the few models that legitimately ship both (rare) work better
+        # one-at-a-time on a 16 GB card. Enforce the constraint here
+        # so the UI matches what the launcher will actually do.
+        self._enforce_vision_draft_exclusion()
+
+    def _enforce_vision_draft_exclusion(self) -> None:
+        """Ensure Vision and Draft can't both be checked simultaneously.
+
+        Rules:
+          * Whichever is currently checked stays enabled; the other gets
+            disabled (greyed out).
+          * If neither is checked, both stay enabled (model permitting).
+          * Capability-disabled checkboxes (no mmproj / no draft sibling)
+            stay disabled regardless — capability beats UI policy.
+        """
+        has_vision_cap = self._chk_vision.isEnabled() or self._chk_vision.isChecked()
+        has_draft_cap  = self._chk_draft.isEnabled()  or self._chk_draft.isChecked()
+
+        # Re-derive the "is this even possible for this model" flag from
+        # the current model entry, so we don't accidentally enable a
+        # checkbox the model itself doesn't support.
+        entry = self._current_entry
+        model_has_vision = entry is not None and entry.mmproj is not None
+        model_has_draft  = self._current_draft is not None
+
+        v_checked = self._chk_vision.isChecked()
+        d_checked = self._chk_draft.isChecked()
+
+        # Block signals while we re-enable, so we don't trip the toggle slots.
+        self._chk_vision.blockSignals(True)
+        self._chk_draft.blockSignals(True)
+        try:
+            if v_checked and not d_checked:
+                self._chk_vision.setEnabled(model_has_vision)
+                self._chk_draft.setEnabled(False)
+            elif d_checked and not v_checked:
+                self._chk_vision.setEnabled(False)
+                self._chk_draft.setEnabled(model_has_draft)
+            else:
+                # Neither checked — both enabled if the model supports them.
+                self._chk_vision.setEnabled(model_has_vision)
+                self._chk_draft.setEnabled(model_has_draft)
+        finally:
+            self._chk_vision.blockSignals(False)
+            self._chk_draft.blockSignals(False)
+        # Touch the unused capability flags to keep linters quiet —
+        # they're meaningful in the docstring even if not in the body.
+        _ = (has_vision_cap, has_draft_cap)
 
     def _auto_select_fork(self, profile: ModelProfile) -> None:
         """Auto-select fork from combo based on profile requirement.
@@ -1159,10 +1282,24 @@ class MainWindow(QMainWindow):
 
     def _on_vision_toggled(self, checked: bool) -> None:
         self._record_override("vision", checked)
+        # Vision freshly enabled → uncheck draft (keeps state consistent).
+        if checked and self._chk_draft.isChecked():
+            self._chk_draft.blockSignals(True)
+            self._chk_draft.setChecked(False)
+            self._chk_draft.blockSignals(False)
+            self._record_override("draft", False)
+        self._enforce_vision_draft_exclusion()
         self._refresh_config_preview()
 
     def _on_draft_toggled(self, checked: bool) -> None:
         self._record_override("draft", checked)
+        # Draft freshly enabled → uncheck vision.
+        if checked and self._chk_vision.isChecked():
+            self._chk_vision.blockSignals(True)
+            self._chk_vision.setChecked(False)
+            self._chk_vision.blockSignals(False)
+            self._record_override("vision", False)
+        self._enforce_vision_draft_exclusion()
         self._refresh_config_preview()
 
     def _on_thinking_toggled(self, checked: bool) -> None:
@@ -1190,6 +1327,7 @@ class MainWindow(QMainWindow):
             draft_model=self._current_draft if use_draft else None,
             user_ctx=None, force_mlock=False,
             perf_target=self._resolve_perf_target_for_profile(profile),
+            mode=self._current_mode(),
         )
 
         W = 64
@@ -1224,6 +1362,7 @@ class MainWindow(QMainWindow):
         lines += [
             f"Placement       : {placement}",
             f"Perf target     : {cfg.performance_target}",
+            f"Mode            : {self._current_mode()}",
             f"Context         : {cfg.ctx:,} tokens",
             f"KV cache quant  : K={cfg.cache_k}  V={cfg.cache_v}",
             f"Threads         : {cfg.threads}  (batch: {cfg.batch_threads})",
@@ -1373,6 +1512,7 @@ class MainWindow(QMainWindow):
             draft_model=self._current_draft if use_draft else None,
             user_ctx=None, force_mlock=False,
             perf_target=self._resolve_perf_target_for_profile(profile),
+            mode=self._current_mode(),
         )
 
         host = self._host_edit.text().strip() or "127.0.0.1"
@@ -1389,11 +1529,13 @@ class MainWindow(QMainWindow):
             draft_model=self._current_draft if use_draft else None,
             server_binary=server_binary, host=host, port=port,
             extra_args=["-a", alias], use_thinking=use_thinking,
+            enable_speculative=use_draft,
         )
 
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
-        self._log(f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking}")
+        self._log(f"Options : vision={use_vision} draft={use_draft} "
+                  f"thinking={use_thinking} mode={self._current_mode()}")
 
         self._server = _TerminalProcess(cmd)
         try:

@@ -14,17 +14,18 @@ sampling:
   chat:
     # Offizielle DeepSeek-Empfehlung für lokales Deployment (V3.2 HF Card):
     # "We recommend setting the sampling parameters to temperature = 1.0,
-    # top_p = 0.95." Die offizielle DeepSeek-App selbst nutzt für R1
-    # intern temp=0.6 - 1.0 ist die obere Schranke der Empfehlung.
+    # top_p = 0.95." Niedrigere temp (~0.6) funktioniert auch, kann aber
+    # Reasoning-Qualität reduzieren.
     temperature: 1.0
     top_k: 50
     top_p: 0.95
     min_p: 0.05
     repeat_penalty: 1.0
   coding:
-    # DeepSeek-R1 Bench-Setup laut HF-Card: temp=0.6, top_p=0.95.
-    # Dieser Wert wird auch in der offiziellen App (chat.deepseek.com)
-    # verwendet. Für deterministische Coding-Tasks ist das die Referenz.
+    # DeepSeek-R1 / V3.2 für Coding profitieren von niedrigerer
+    # Temperatur — die Reasoning-Kette darf "kreativ" sein, der
+    # finale Code soll deterministisch werden. 0.6 ist der von
+    # DeepSeek im Coder-Setup verwendete Wert.
     temperature: 0.6
     top_k: 50
     top_p: 0.95
@@ -39,9 +40,7 @@ extra_args:
 notes: >
   DeepSeek-V3.2 (671B MoE / 37B aktiv) mit DSA für effiziente long-context
   attention, oder R1 (Reasoning). Die R1- und V3.2-Modelle nutzen
-  <think>-Tags für Chain-of-Thought.
-  Chat-Profil = offizielle V3.2 Empfehlung (temp=1.0). Coding-Profil
-  = offizielles R1 Bench-Setup (temp=0.6) und gleichzeitig der Wert
-  den die DeepSeek-App selbst nutzt.
-  ACHTUNG: Speciale-Variante (V3.2-Speciale) unterstützt KEIN Tool-Calling
-  - sie ist explizit nur für deep-reasoning-Tasks ausgelegt.
+  <think>-Tags für Chain-of-Thought. Coding-Profil mit temp=0.6 (vs. 1.0
+  chat) für deterministischeren finalen Code; Reasoning-Kette bleibt
+  "kreativ". ACHTUNG: Speciale-Variante (V3.2-Speciale) unterstützt
+  KEIN Tool-Calling.

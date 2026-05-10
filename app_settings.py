@@ -232,6 +232,38 @@ def set_performance_target(name: str) -> None:
         _update("performance_target", name)
 
 
+# ---------------------------------------------------------------------------
+# Sampling mode (chat / coding)
+#
+# Each YAML profile (new format) carries two sampling sub-blocks:
+#   sampling:
+#     chat:   { temperature: 1.0, top_k: 64, ... }
+#     coding: { temperature: 1.5, top_k: 64, ... }
+#
+# The active mode is a global GUI choice (not per-model) — most users
+# stay in one mode for hours, switch to coding when they pair-program,
+# switch back. Per-model overrides would only add UI clutter without
+# matching the actual workflow.
+
+_VALID_MODES = ("chat", "coding")
+
+
+def get_mode() -> Optional[str]:
+    """Return the persisted sampling mode ("chat" / "coding"), or None."""
+    val = load_settings().get("mode")
+    if not val:
+        return None
+    val = str(val).lower().strip()
+    return val if val in _VALID_MODES else None
+
+
+def set_mode(name: str) -> None:
+    """Persist the GUI sampling-mode choice. Empty string clears it."""
+    name = (name or "").lower().strip()
+    if name in _VALID_MODES + ("",):
+        _update("mode", name)
+
+
 def settings_file_location() -> Path:
     """Where settings are (or would be) written. For diagnostic logging."""
     return _settings_file()

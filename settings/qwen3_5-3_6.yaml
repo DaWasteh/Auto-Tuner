@@ -48,6 +48,7 @@ sampling:
     # Default daher konservativ auf 0.0. Wer reine Chat-Konversation ohne
     # Tools fährt und Wiederholungen sieht, kann beim Start überschreiben:
     #   -- --presence-penalty 1.5
+    -jinja: true  # <think>-Blöcke sauber ins reasoning_content-Feld packen (statt inline im content)
     presence_penalty: 0.0
   coding:
     # Aus dem offiziellen QwenClawBench-Setup (HF-Card Qwen3.6-35B-A3B):
@@ -59,6 +60,14 @@ sampling:
     min_p: 0.0
     repeat_penalty: 1.0
     presence_penalty: 0.0
+
+# MTP (Multi-Token Prediction) draft model configuration
+# Qwen3.6-...-MTP uses integrated assistant models for speculative decoding via MTP.
+# draft_max = number of MTP tokens to predict per step (default: 3)
+# draft_p_min = minimum probability threshold for accepting draft tokens
+draft_max: 3
+draft_p_min: 0.0
+
 
 notes: >
   Qwen3.5 (Feb 2026) und Qwen3.6 (April 2026) sind Thinking-by-default
