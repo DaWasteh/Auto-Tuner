@@ -12,12 +12,16 @@
     },
     "gemma-4-26B-A4B-it-UD-Q8_K_XL": {
       "vision": true,
-      "draft": true
+      "draft": false
     },
     "Qwen3.6-27B-UD-Q3_K_XL": {
       "vision": true
     },
     "Mistral-Medium-3.5-128B-UD-IQ3_XXS": {
+      "vision": true
+    },
+    "gemma-4-E4B-it-UD-Q8_K_XL": {
+      "draft": true,
       "vision": true
     }
   }

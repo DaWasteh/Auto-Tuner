@@ -65,3 +65,4 @@ BitNet/
 .env
 .env.local
 *.local
+autotuner_settings.json

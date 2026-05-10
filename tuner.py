@@ -405,6 +405,7 @@ def compute_config(
     vram_safety_gb: Optional[float] = None,
     force_mlock: bool = False,
     perf_target: Optional[PerformanceTarget] = None,
+    mode: str = "chat",
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system.
 
@@ -794,8 +795,7 @@ def compute_config(
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
         performance_target=perf_target.name,
         warning=warning,
-    )
-
+   )
 
 def build_command(
     model: ModelEntry,
@@ -822,6 +822,69 @@ def build_command(
         "--host", host,
         "--port", str(port),
     ]
+
+    # Add draft model if provided (MTP speculative decoding)
+    # NOTE: -md MUST come BEFORE --spec-type because llama-server parses
+    # arguments left-to-right. If --spec-type is seen before -md, the server
+    # thinks no draft model was given and aborts with:
+    #   "unknown speculative decoding type without draft model"
+    if draft_model is not None:
+        draft_val = getattr(profile, 'draft_max', 0) or 3
+        cmd += ["-md", str(draft_model.path)]
+        cmd += ["--spec-type", "mtp"]  # Erforderlich für ik_llama.cpp
+        cmd += ["-ngld", "99"]
+        cmd += ["--draft-max", str(draft_val)] # Dieser Fork nutzt oft wieder --draft-max
+        cmd += ["--draft-p-min", str(getattr(profile, 'draft_p_min', 0.0) or 0.0)]
+
+    if config.flash_attn:
+        cmd += ["-fa", "on"]
+    if config.numa:
+        cmd += ["--numa", config.numa]
+    if config.mlock:
+        cmd.append("--mlock")
+    if config.no_mmap:
+        cmd.append("--no-mmap")
+    if config.no_context_shift:
+        cmd.append("--no-context-shift")
+    
+    # RoPE-Scaling (YaRN) optional aktivieren für erweiterte Context-Längen
+    # Bei Qwen3.5/3.6 möglich: native 262144 → bis 1048576 mit yarn scaling
+    if config.rope_scaling and config.rope_scale_factor > 1.0:
+        cmd += ["--rope-scaling", "yarn"]
+        cmd += ["--rope-scale", str(int(config.rope_scale_factor))]
+    
+    if config.n_cpu_moe is not None and config.n_cpu_moe > 0:
+        cmd += ["--n-cpu-moe", str(config.n_cpu_moe)]
+    if config.tensor_split:
+        cmd += ["--tensor-split", config.tensor_split]
+    if config.main_gpu is not None:
+        cmd += ["--main-gpu", str(config.main_gpu)]
+
+    s = config.sampling
+    cmd += [
+        "--temp", str(s["temperature"]),
+        "--top-k", str(s["top_k"]),
+        "--top-p", str(s["top_p"]),
+        "--min-p", str(s["min_p"]),
+        "--repeat-penalty", str(s["repeat_penalty"]),
+    ]
+    pp = s.get("presence_penalty", 0.0)
+    if pp:
+        cmd += ["--presence-penalty", str(pp)]
+
+    if model.mmproj is not None:
+        cmd += ["--mmproj", str(model.mmproj)]
+
+    # Thinking/Reasoning-Modus (Gemma 4, DeepSeek, etc.)
+    # Thinking wird über Prompt-Tags gesteuert (<|think|>), nicht über CLI-Argumente.
+    # use_thinking ist ein internes Flag - extra_args werden immer angehängt:
+
+    if profile.extra_args:
+        cmd.extend(profile.extra_args)
+    if extra_args:
+        cmd.extend(extra_args)
+
+    return cmd
 
     # Add draft model if provided (MTP speculative decoding)
     # NOTE: -md MUST come BEFORE --spec-type because llama-server parses

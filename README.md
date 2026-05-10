@@ -7,7 +7,7 @@ the RAM/VRAM you actually have free — without manual edits.
 
 # GUI-Design
 
-![v0.7_GUI](image.png)
+![v0.8_GUI](image.png)
 
 # Terminal-Design
 ```
