@@ -148,7 +148,6 @@ Launch llama-server now? [Y/n]
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
   the next launch re-expands the same set of builds in the dropdown.
   No more re-navigating one folder up after every restart.
-- **diag_kv.py and diag_kv_v2.py** — for debugging problems with auto-detect model-architecture, etc.
 
   
 ### Vision control
