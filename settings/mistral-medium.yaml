@@ -2,34 +2,52 @@ display_name: "Mistral Medium 3.x"
 patterns:
   - mistral-medium
 
-# Mistral Medium 3.5 (April 2026): dense 128B, 256k Kontext.
-# Vorgänger Medium 3.1 hatte ebenfalls 256k - 131072 war zu niedrig.
+# Mistral Medium 3.5 (Release 29.04.2026): dense 128B, 256k Kontext.
+# Vorgänger Medium 3.1 hatte ebenfalls 256k.
 max_context: 262144
 recommended_kv_quant: q8_0
 
+# Sampling-Profile pro Modus.
 sampling:
-  # Mistral's offizielle Empfehlung:
-  #   reasoning_effort="high"  -> temp=0.7
-  #   reasoning_effort="none"  -> temp=0.0 bis 0.7 (task-abhängig)
-  # 0.7 ist der saubere Default für beide Modi. Für reines Coding ohne
-  # Reasoning kann man via CLI auf 0.2 runter:  -- --temp 0.2
-  temperature: 0.7
-  top_k: 40
-  top_p: 0.95
-  min_p: 0.0
-  # WICHTIG: Mistral sagt "Keep repetition and presence penalties disabled
-  # or at 1.0 unless you see looping" - Penalty 1.05 wie vorher kann die
-  # Output-Qualität reduzieren.
-  repeat_penalty: 1.0
+  chat:
+    # Mistral's offizielle Empfehlung:
+    #   reasoning_effort="high"  -> temp=0.7
+    #   reasoning_effort="none"  -> temp=0.0 bis 0.7 (task-abhängig)
+    # 0.7 ist der saubere Default für beide Modi im Chat-Kontext.
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    # WICHTIG: Mistral sagt "Keep repetition and presence penalties disabled
+    # or at 1.0 unless you see looping" - höhere Penalty kann die
+    # Output-Qualität reduzieren.
+    repeat_penalty: 1.0
+  coding:
+    # Für reines Coding ohne Reasoning empfiehlt Mistral selbst
+    # temp=0.0 bis 0.7. 0.2 ist der Sweet-Spot für agentisches
+    # Code-Editing (Vibe CLI nutzt ähnliche Werte).
+    temperature: 0.2
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
 
 notes: >
-  Mistral Medium 3.5 (128B Dense, multimodal Text+Bild) ist Mistrals
-  erstes vereintes Modell - ersetzt Medium 3.1, Magistral und Devstral 2
-  in einem. Hybrid-Reasoning mit per-Request konfigurierbarem
-  reasoning_effort (none/high). Modified MIT License.
+  Mistral Medium 3.5 (128B Dense, multimodal Text+Bild, 29.04.2026) ist
+  Mistrals erstes vereintes Modell - ersetzt Medium 3.1, Magistral UND
+  Devstral 2 in einem (Mistral selbst: "supersedes all our previous
+  coding models, namely Devstral, across all benchmarks"). Hybrid-Reasoning
+  mit per-Request konfigurierbarem reasoning_effort (none/high). Modified
+  MIT License. Vibe CLI (Mistral's Coding-Agent) läuft jetzt auf
+  Medium 3.5 statt Devstral 2.
   Lokal: ~64 GB RAM für UD-Q4_K_XL via llama.cpp.
+  Chat-Profil = Mistral's Default (temp 0.7, funktioniert für beide
+  Reasoning-Modi). Coding-Profil = deterministischer (temp 0.2) für
+  agentische Code-Tasks.
   Reasoning-Modus aktivieren via:
     -- --chat-template-kwargs '{"reasoning_effort":"high"}'
   WICHTIG: Verwende GGUFs vom 1. Mai 2026 oder neuer - frühere Versionen
   hatten einen YaRN-Bug (mscale_all_dim) der long-context-Performance
-  ruinierte. Bei Unsloth heißt der gefixte Build z.B. UD-Q4_K_XL.
+  ruinierte (Mistral hat selbst bestätigt, dass die ursprüngliche
+  Transformers-Config einen Long-Context-Performance-Bug hatte). Bei
+  Unsloth heißt der gefixte Build z.B. UD-Q4_K_XL.

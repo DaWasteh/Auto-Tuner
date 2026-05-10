@@ -10,12 +10,31 @@ patterns:
 max_context: 16384
 recommended_kv_quant: q8_0
 
+# Sampling-Profile pro Modus.
 sampling:
-  temperature: 0.85  # Höher für mehr Kreativität
-  top_k: 50
-  top_p: 0.95
-  min_p: 0.03
-  repeat_penalty: 1.1
+  chat:
+    # Frankenmerges sind primär Roleplay/Creative-Writing-Modelle.
+    # Höhere Temperature für mehr Kreativität.
+    temperature: 0.85
+    top_k: 50
+    top_p: 0.95
+    min_p: 0.03
+    repeat_penalty: 1.1
+  coding:
+    # Diese Merges sind nicht für Code optimiert - aber für den Fall,
+    # dass jemand sie trotzdem für Code nutzen will, ein deutlich
+    # konservativeres Profil. Höher als 0.15 (typisch für Coder) weil
+    # Merges bei sehr niedriger Temp oft kohärenz-verlieren.
+    temperature: 0.4
+    top_k: 50
+    top_p: 0.9
+    min_p: 0.03
+    repeat_penalty: 1.1
 
 notes: >
-  Merges haben oft inkonsistente Context-Limits.
+  Merges haben oft inkonsistente Context-Limits und Sampling-Sweet-Spots.
+  Chat-Profil ist für Roleplay/Creative-Writing optimiert (höhere Temp,
+  stärkere Repeat-Penalty gegen Loops in langen RP-Sessions).
+  Coding-Profil ist defensiv - diese Modelle sind nicht primär für Code
+  trainiert; falls Code-Performance schlecht ist, lieber ein dediziertes
+  Coder-Profil verwenden.

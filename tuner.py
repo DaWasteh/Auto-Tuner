@@ -753,7 +753,7 @@ def compute_config(
         numa = "distribute"
 
     # ---- (4f) Sampling
-    sd = profile.sampling or {}
+    sd = (profile.sampling or {}).get(mode, {})  # mode ∈ {"chat", "coding"}
     sampling = {
         "temperature": float(sd.get("temperature", 0.7)),
         "top_k": int(sd.get("top_k", 40)),

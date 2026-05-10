@@ -1,0 +1,57 @@
+display_name: "GLM-4.7 / GLM-4.7-Flash (Z.ai)"
+patterns:
+  - glm-4.7
+  - glm4.7
+
+# GLM-4.7 (358B MoE / 32B aktiv): 200k Input + 128k Output.
+# GLM-4.7-Flash (30B MoE / ~3.6B aktiv): bis 200k mit MLA.
+# Native context wird via GGUF-Metadata automatisch je Variante gecappt.
+max_context: 202752
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+sampling:
+  chat:
+    # Z.ai offizielle Empfehlung (HF-Card GLM-4.6 / Migration-Doc GLM-5.1):
+    # "For general evaluations, we recommend using a sampling temperature
+    # of 1.0." top_p default 0.95, "not recommended to adjust both
+    # simultaneously".
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    # Unsloth empfiehlt min_p 0.01 statt dem llama.cpp Standard 0.05
+    min_p: 0.01
+    # Sehr wichtig: GLM-Modelle mögen keine Repeat Penalty (1.0 = aus)
+    repeat_penalty: 1.0
+  coding:
+    # Z.ai's HF-Card schreibt für Code-Tasks (LCB) explizit eine niedrigere
+    # Temperatur. Die LM-Studio-Preset für GLM-4.7-Flash nutzt sogar
+    # temp=0.2. 0.6 ist ein sinnvoller Mittelweg, der Reasoning-Qualität
+    # erhält aber deterministischer ist als Chat.
+    temperature: 0.6
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.01
+    repeat_penalty: 1.0
+
+extra_args:
+  # Ohne --jinja funktioniert das Chat-Template bei GLM-4.7 oft nicht
+  # korrekt (Preserved Thinking / Interleaved Thinking schmieren ab).
+  # WARNUNG: Bei manchen GGUF-Builds führt --jinja in Kombination mit
+  # --chat-template glm4 zu Looping/Gibberish. Falls das Modell loopt,
+  # diesen Eintrag entfernen und das im Modell eingebettete Default-
+  # Template verwenden.
+  - --jinja
+
+notes: >
+  Flagship 358B MoE Coding-Modell oder 30B-Flash-Variante. Drei-stufige
+  Thinking-Architektur (Interleaved/Preserved/Turn-level Thinking).
+  Sehr stark in SWE-Bench (~73.8% beim Full-Modell, 59.2% beim Flash)
+  und Tool-Use.
+  Chat-Profil = Z.ai's offizielle "general evaluation"-Empfehlung
+  (temp 1.0). Coding-Profil ist deterministischer (0.6) für stabile
+  Tool-Calls und reproduzierbare Code-Outputs.
+  Hinweis: Inzwischen gibt es auch GLM-5.1 (Z.ai's neuestes Coding-Modell,
+  256k Kontext) - dafür braucht es perspektivisch ein eigenes Profil.
+  Tipp: Für Coding `thinking=enabled` setzen — interne Reasoning-Traces
+  verbessern Code-Qualität spürbar.

@@ -11,18 +11,32 @@ recommended_kv_quant: q8_0
 # RoPE-Scaling (YaRN): Optional aktivierbar wenn genügend Speicher frei ist
 # und der berechnete Context das native Limit überschreitet.
 rope_scale:
-  enabled: false       # Standard aus — User kann in GUI aktivieren
+  enabled: false        # Standard aus — User kann in GUI aktivieren
   max_context: 1048576  # 1M tokens mit YaRN möglich
-  scale_factor: 4.0     # yarn scaling factor (4x für Qwen3.5/3.6)
+  scale_factor: 4.0     # YaRN scaling factor (4x)
 
-
+# Sampling-Profile pro Modus.
 sampling:
-  temperature: 0.7
-  top_k: 40
-  top_p: 0.9
-  min_p: 0.05
-  repeat_penalty: 1.05
+  chat:
+    # Allround-Defaults für Qwen 2.5 / 3 Standard-Instruct.
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.05
+  coding:
+    # Qwen2.5-Coder / Qwen3-Coder werden offiziell mit deutlich
+    # niedrigerer Temperature betrieben. Alibaba's eigene Beispiele
+    # nennen 0.1 - 0.2 für deterministische Code-Completion.
+    temperature: 0.15
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.05
 
 notes: >
-  Hervorragendes Allround-Modell. Die Coder-Varianten können auch 
-  mit niedrigerer Temperature (0.1 - 0.2) betrieben werden.
+  Hervorragendes Allround-Modell. Chat-Profil ist der allgemeine Default;
+  Coding-Profil greift Alibabas eigene Empfehlung für die Coder-Varianten
+  auf (temp 0.1-0.2). Pattern matched auch qwen3-coder.
+  Hinweis: Für Qwen 3.5 / 3.6 (256k native, andere Sampling-Defaults)
+  separates Profil qwen3_5-3_6.yaml verwenden.

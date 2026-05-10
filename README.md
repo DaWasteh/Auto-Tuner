@@ -9,7 +9,6 @@ the RAM/VRAM you actually have free — without manual edits.
 
 ![v0.7_GUI](image.png)
 
-
 # Terminal-Design
 ```
 ────────────────────────────────────────────────────────────────
@@ -54,36 +53,36 @@ GPU1: [amd] AMD Radeon RX 9070 XT (15.9 GB total, 15.1 GB free)
 
 Available models:
 ────────────────────────────────────────────────────────────────
+  Symbols: 👁 vision · ⚡ draft · 🧠 thinking · 🛠 tool-use
   ...
 
   [Alibaba/Qwen3.6]
-    7.  👁 Qwen3.6-27B-UD-Q3_K_XL                                   13.5 GB  (256k native)
-    8.  👁 Qwen3.6-35B-A3B-UD-IQ3_S                                 12.7 GB  (256k native)
+    7.  👁 🧠 🛠   Qwen3.6-27B-UD-Q3_K_XL                              13.5 GB  (256k native)
+    8.  👁 🧠 🛠   Qwen3.6-35B-A3B-UD-IQ3_S                            12.7 GB  (256k native)
   ...
 
   [Google]
   ...
-    16.  👁 gemma-4-E2B-it-assistant-Q8_0                             0.1 GB  (128k native)
-    17.  👁 gemma-4-E2B-it-BF16                                       8.7 GB  (128k native)
+    16.  👁 ⚡ 🧠   gemma-4-26B-A4B-it-UD-IQ4_XS                        14.0 GB  (128k native)
+    17.  👁         gemma-4-E2B-it-BF16                                 8.7 GB  (128k native)
   ...
 
   [IBM]
-    21.    granite-4.1-30b-IQ4_XS                                   14.4 GB  (128k native)
-    22.    granite-4.1-3b-UD-Q8_K_XL                                 4.0 GB  (128k native)
+    21.   🛠         granite-4.1-30b-IQ4_XS                             14.4 GB  (128k native)
+    22.   🛠         granite-4.1-3b-UD-Q8_K_XL                           4.0 GB  (128k native)
   ...
 
   [Mistral AI]
-    36.  👁 Mistral-Medium-3.5-128B-UD-IQ3_XXS                       45.9 GB  (256k native)
+    36.  👁 🛠       Mistral-Medium-3.5-128B-UD-IQ3_XXS                 45.9 GB  (256k native)
 
   [NVIDIA]
-    37.  👁 NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ4_XS  18.2 GB  (1024k native)
+    37.  👁 🧠 🛠   NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-…    18.2 GB  (1024k native)
 
   [PrismML]
-    38.    Bonsai-8B                                                 1.1 GB  (64k native)
+    38.              Bonsai-8B                                           1.1 GB  (64k native)
   ...
 
-Select a model [1-40, q to quit]: 15
-[AutoTuner] Found draft model: gemma-4-26B-A4B-it-assistant-Q8_0
+Select a model [1-40, q to quit]: 16
 Vision aktivieren? (mmproj-gemma-4-26B-A4B-it-BF16.gguf) [Y/n] y
 Draft-Modell aktivieren? (gemma-4-26B-A4B-it-assistant-Q8_0) [Y/n] n
 Thinking/Reasoning aktivieren? (<|think|> / <|reserved_special_token>) [Y/n] y
@@ -123,11 +122,32 @@ Launch llama-server now? [Y/n]
 - **Per-family YAML profiles** in `settings/` — override sampling,
   max context, chat template, and llama-server flags per model family.
   Easy for contributors to extend without touching Python.
-- **mmproj auto-pairing** — if your model has a sibling
-  `mmproj-*.gguf`, vision is enabled automatically (longest-prefix
-  match picks the most specific one).
+- **Companion-file auto-pairing** — sibling files don't pollute the
+  model menu, they're attached to their main model:
+    - `mmproj-*.gguf` → vision (longest-prefix wins)
+    - `*-assistant-*.gguf` / `*-draft-*.gguf` → speculative decoding
+      (smallest matching sibling wins)
+- **Capability badges in the model list** — symbols make it obvious
+  what each model can do at a glance:
+    - 👁 vision (mmproj projector paired)
+    - ⚡ draft  (assistant sibling for speculative decoding)
+    - 🧠 thinking (chat template emits `<think>` / `reasoning_content`)
+    - 🛠 tool-use (chat template advertises `tool_calls` / `function_call`)
+
+  Detection reads the GGUF chat template directly — no name-based
+  guessing — so `Qwen3-Coder` (no thinking) and `Qwen3-Embedding`
+  (neither thinking nor tools) are correctly excluded.
 - **Reads GGUF metadata** — pulls `n_layers` and `context_length`
   straight from the file so partial GPU offload (`-ngl`) is exact.
+- **Sticky GUI choices** — the Qt launcher remembers per-model
+  vision/draft/thinking toggles in `autotuner_settings.json`. Switch
+  to another model and back, restart the app, change the performance
+  target — your manual choices stay put. They only revert when you
+  click them again.
+- **Fork-folder memory** — if you point the GUI at a parent folder
+  that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
+  the next launch re-expands the same set of builds in the dropdown.
+  No more re-navigating one folder up after every restart.
   
 ### Vision control
 
@@ -173,6 +193,27 @@ http://127.0.0.1:1234
 
 Works with the built-in **llama.cpp Web UI**, **VS Code** extensions
 like Continue / Cline, **Open WebUI**, or any OpenAI-API client.
+
+### Qt GUI
+
+```bash
+python qt_launcher.py
+```
+
+Same engine as the terminal launcher, plus a few quality-of-life bits
+that only make sense with persistent state:
+
+- **Sticky per-model options.** Toggle vision / draft / thinking once;
+  the choice survives switching to another model and back, swapping
+  performance targets, and restarting the app. Stored in
+  `autotuner_settings.json` under `model_overrides`.
+- **Fork picker remembers the parent folder.** Hit *📂 Fork* and
+  pick a directory that holds multiple `*_llama.cpp` builds — every
+  build appears in the dropdown next time too, not just the last one
+  you used. The active build within that container is also restored.
+- **Live config preview.** The right pane recomputes
+  context / KV / placement whenever you tick a checkbox or change the
+  performance target — no need to launch first.
 
 ### Useful flags
 
@@ -359,12 +400,14 @@ matches. See `settings/_default.yaml`.
 
 ```
 auto_tuner/
-├── auto_tuner.py        # main entry: menu + glue
+├── auto_tuner.py        # main entry: terminal menu + glue
+├── qt_launcher.py       # Qt GUI (model picker + sticky options + fork picker)
 ├── hardware.py          # CPU + multi-vendor GPU detection
-├── scanner.py           # GGUF scanner + mmproj pairing + metadata reader
+├── scanner.py           # GGUF scanner: mmproj/draft pairing, capability detection
 ├── settings_loader.py   # YAML profile loader and matcher
 ├── tuner.py             # config calculation + llama-server command builder
 ├── launcher.py          # subprocess + Ctrl+C handling (Windows + Unix)
+├── app_settings.py      # persistent GUI prefs (autotuner_settings.json)
 ...
 ├── settings/
 │   ├── _default.yaml
@@ -378,7 +421,7 @@ auto_tuner/
 
 ## Building llama.cpp and forks
 
-# Recommended build settings for this system:
+Recommended build settings for this system:
  - Ninja generator
  - native CPU optimizations
  - static build

@@ -10,13 +10,23 @@ recommended_kv_quant: q8_0
 # Ternary-Gewichte hardware-freundlich in 2 bits.
 server_binary: "1b_llama/llama-server"
 
+# Sampling-Profile pro Modus.
+# Gleiche Empfehlung wie Bonsai 8B (PrismML README-Beispiel).
 sampling:
-  # Gleiche Empfehlung wie Bonsai 8B.
-  temperature: 0.5
-  top_k: 20
-  top_p: 0.85
-  min_p: 0.05
-  repeat_penalty: 1.05
+  chat:
+    temperature: 0.5
+    top_k: 20
+    top_p: 0.85
+    min_p: 0.05
+    repeat_penalty: 1.05
+  coding:
+    # Wie bei 1-bit Bonsai: nur leicht abgesenkt, weil aggressive Quants
+    # bei niedriger Temperatur zu Loops tendieren.
+    temperature: 0.3
+    top_k: 20
+    top_p: 0.85
+    min_p: 0.05
+    repeat_penalty: 1.05
 
 notes: >
   Ternary-Bonsai (8B/4B/1.7B) - Gewichte in {-1, 0, +1} (1.58 bits/weight).

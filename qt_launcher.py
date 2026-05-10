@@ -75,11 +75,6 @@ def _default_models_path() -> Path:
     return script_dir / "models"
 
 
-def _persisted_fork_path() -> Optional[Path]:
-    """Persisted fork-folder choice, if still valid on disk."""
-    return app_settings.get_fork_path()
-
-
 # ---------------------------------------------------------------------------
 # Terminal process — spawns llama-server in its own visible terminal window
 
@@ -175,22 +170,56 @@ class _ScanWorker(QObject):
 # ---------------------------------------------------------------------------
 # Draft-model detection helper (mirrors auto_tuner.py logic)
 
+# ---------------------------------------------------------------------------
+# Draft-model lookup
+#
+# scanner.py already pairs each main model with its assistant/draft
+# sibling (when present) and stores the path in `entry.draft`. We just
+# wrap that path in a ModelEntry so the rest of the launcher (which
+# expects a ModelEntry with `.path` and `.size_gb`) keeps working.
+
 def _find_draft_model(
     entry: ModelEntry, all_entries: List[ModelEntry]
 ) -> Optional[ModelEntry]:
-    name = entry.name.lower()
-    base = re.sub(
-        r"[-_]?(?:iq\d+(?:_+[a-z\d]+)*(?:[-_]\d+[\.\d]*bpw)?|"
-        r"q\d+(?:_+[a-z\d]+)*|tf\d+|bf16|f16|f32)$",
-        "", name,
-    ).strip("-_")
-    base = re.sub(r"[-_](?:ud|unsloth)$", "", base, flags=re.IGNORECASE).strip("-_")
-    candidates = [
-        e for e in all_entries
-        if "assistant" in e.name.lower()
-        and e.name.lower().startswith(base + "-")
-    ]
-    return min(candidates, key=lambda x: x.size_gb) if candidates else None
+    """Return a synthetic ModelEntry for `entry`'s paired draft, or None."""
+    if entry.draft is None:
+        return None
+    p = entry.draft
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    return ModelEntry(
+        path=p,
+        name=p.stem,
+        group=entry.group,   # same parent folder
+        size_bytes=size,
+        mmproj=None,
+        draft=None,
+        metadata={},
+    )
+
+
+# Capability markers shown next to the model name in the list. Keep
+# Terminal and GUI in sync — both pull from this single source.
+#
+#   👁  vision     (mmproj projector found)
+#   ⚡  draft      (assistant/draft sibling found → speculative decoding)
+#   🧠  thinking   (chat template emits <think> / reasoning_content)
+#   🛠  tool-use   (chat template advertises tool_calls / function_call)
+
+def _capability_markers(entry: ModelEntry) -> str:
+    """Return a small symbol string summarising what this model supports."""
+    syms: List[str] = []
+    if entry.has_vision:
+        syms.append("👁")
+    if entry.has_draft:
+        syms.append("⚡")
+    if entry.supports_thinking:
+        syms.append("🧠")
+    if entry.supports_tool_use:
+        syms.append("🛠")
+    return " ".join(syms)
 
 
 def _clean_model_name(name: str) -> str:
@@ -208,6 +237,13 @@ def _clean_model_name(name: str) -> str:
 # Main window
 
 class MainWindow(QMainWindow):
+    # Signal carrying SystemInfo updates from the background sysinfo thread.
+    # Qt widgets are NOT thread-safe — touching a QLabel from a daemon
+    # thread produced sporadic random crashes ("GUI just closed itself").
+    # Background work emits this signal; the slot runs on the GUI thread.
+    _sysinfo_ready = pyqtSignal(object)   # SystemInfo
+    _bg_log       = pyqtSignal(str)       # log message from background thread
+
     def __init__(self, models_path: Path, settings_path: Path) -> None:
         super().__init__()
         self.setWindowTitle("AutoTuner Qt Launcher")
@@ -227,8 +263,21 @@ class MainWindow(QMainWindow):
         self._current_entry: Optional[ModelEntry] = None
         self._current_draft: Optional[ModelEntry] = None
 
+        # Per-model override cache for the vision/draft/thinking checkboxes.
+        # Populated when the user toggles a checkbox, so switching to a
+        # different model and back preserves the manual choice for the
+        # rest of the session. Persisted to JSON on every change so the
+        # choice also survives an app restart.
+        # Shape:  { "<model_name>": {"vision": bool, "draft": bool, "thinking": bool} }
+        self._option_overrides: dict = {}
+
         # Track whether the user has manually overridden the fork selection
         self._fork_manual_override = False
+
+        # Remember the *container* the user pointed at via "📂 Fork" so
+        # restarts still show every sibling build. This stays distinct
+        # from the currently active fork in `self._fork_path`.
+        self._fork_container: Optional[Path] = None
 
         self._scan_thread: Optional[QThread]     = None
         self._scan_worker: Optional[_ScanWorker] = None
@@ -236,6 +285,11 @@ class MainWindow(QMainWindow):
         self._font_size    = 10
 
         self._build_ui()
+        # Wire background → GUI signals BEFORE the first scan kicks off,
+        # so a fast hardware probe can't fire its result into a slot
+        # that hasn't been connected yet (one of the crash patterns).
+        self._sysinfo_ready.connect(self._update_sysinfo_labels)
+        self._bg_log.connect(self._log)
         QTimer.singleShot(0, self._startup_load)
 
         # Server crash-detection (lightweight poll — no stdout read)
@@ -377,10 +431,12 @@ class MainWindow(QMainWindow):
             chk.setEnabled(False)
             ol.addWidget(chk)
 
-        # Checkbox toggles → refresh context / memory estimates
-        self._chk_vision.toggled.connect(self._on_option_toggled)
-        self._chk_draft.toggled.connect(self._on_option_toggled)
-        self._chk_thinking.toggled.connect(self._on_option_toggled)
+        # Checkbox toggles → persist the override AND refresh the
+        # context / memory estimates. Three dedicated slots so each
+        # one knows which option it represents.
+        self._chk_vision.toggled.connect(self._on_vision_toggled)
+        self._chk_draft.toggled.connect(self._on_draft_toggled)
+        self._chk_thinking.toggled.connect(self._on_thinking_toggled)
 
         opts.setMaximumHeight(110)
 
@@ -474,6 +530,40 @@ class MainWindow(QMainWindow):
             w.setFont(f)
 
     # ------------------------------------------------------------------
+    # Fork-container helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _expand_fork_container(path: Path) -> List[Tuple[str, Path]]:
+        """List all llama.cpp build directories inside `path`.
+
+        Returns a list of (display_name, fork_path) pairs for every
+        immediate child whose name contains "llama.cpp" and which has
+        a built llama-server binary. Empty list when `path` is not a
+        container (e.g. it IS a single build folder).
+        """
+        result: List[Tuple[str, Path]] = []
+        try:
+            for child in sorted(path.iterdir(), key=lambda c: c.name.lower()):
+                if not child.is_dir():
+                    continue
+                if not re.search(r"llama\.cpp", child.name, re.IGNORECASE):
+                    continue
+                has_binary = any(
+                    (child / sub).is_file()
+                    for sub in (
+                        "build/bin/Release/llama-server.exe",
+                        "build/bin/Debug/llama-server.exe",
+                        "build/bin/llama-server.exe",
+                        "build/bin/llama-server",
+                    )
+                )
+                if has_binary:
+                    result.append((child.name, child))
+        except (OSError, PermissionError):
+            pass
+        return result
+
+    # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
     def _startup_load(self) -> None:
@@ -495,41 +585,50 @@ class MainWindow(QMainWindow):
             self._log(f"[Warning] Fork discovery failed: {exc}")
             self._forks = []
 
-        # Resolve manual fork path: persisted choice > LLAMA_CPP_DIR env var.
-        # Persisted setting overrides env so that the user's last manual
-        # selection in the GUI survives reboots.
+        # ── Resolve persisted fork state ────────────────────────────
+        # The container path (the parent folder the user picked via
+        # "📂 Fork") is the authoritative restore target — it lets us
+        # show ALL sibling builds again. The active fork path is just
+        # the last selection within that container, used to restore
+        # the combo's current index.
+        persisted_container = app_settings.get_fork_container_path()
+        persisted_active    = app_settings.get_fork_path()
+        env_fork            = os.environ.get("LLAMA_CPP_DIR", "")
+
+        # If no container was ever explicitly stored but a manual fork
+        # path is, peek at its parent: if that parent itself contains
+        # multiple llama.cpp builds, treat it as a container — this
+        # migrates older settings files where only `fork_path` existed.
+        if persisted_container is None and persisted_active is not None:
+            cand_parent = persisted_active.parent
+            if cand_parent and cand_parent.is_dir():
+                if self._expand_fork_container(cand_parent):
+                    persisted_container = cand_parent
+                    self._log(
+                        f"[Fork] Migrating: treating {cand_parent} "
+                        "as fork container (siblings found)."
+                    )
+
         manual_path: Optional[Path] = None
-        manual_source = ""  # "settings" | "env" | ""
-        env_fork = os.environ.get("LLAMA_CPP_DIR", "")
-        persisted = _persisted_fork_path()
-        if persisted is not None and persisted.is_dir():
-            manual_path = persisted.resolve()
+        manual_source = ""    # "container" | "settings" | "env" | ""
+        if persisted_container is not None:
+            manual_path = persisted_container.resolve()
+            manual_source = "container"
+            self._log(f"[Fork] Loaded persisted container: {manual_path}")
+        elif persisted_active is not None and persisted_active.is_dir():
+            manual_path = persisted_active.resolve()
             manual_source = "settings"
             self._log(f"[Fork] Loaded persisted path: {manual_path}")
         elif env_fork and Path(env_fork).is_dir():
             manual_path = Path(env_fork).resolve()
             manual_source = "env"
 
-        # Prüfe ob der manuelle Pfad ein Container mit mehreren Forks ist
-        # (z.B. C:\LAB\ai-local mit Unterverzeichnissen wie 1b_llama.cpp, atq_llama.cpp, ...)
-        env_contains_forks = False
-        if manual_path:
-            try:
-                for child in manual_path.iterdir():
-                    if child.is_dir() and re.search(r"llama\.cpp", child.name, re.IGNORECASE):
-                        # Prüfe ob dieser Fork ein lauffähiges Binary hat
-                        has_binary = any(
-                            (child / sub).is_file()
-                            for sub in ["build/bin/Release/llama-server.exe",
-                                        "build/bin/Debug/llama-server.exe",
-                                        "build/bin/llama-server.exe",
-                                        "build/bin/llama-server"]
-                        )
-                        if has_binary:
-                            env_contains_forks = True
-                            break
-            except (OSError, PermissionError):
-                pass
+        # Detect whether `manual_path` itself is a container with several
+        # llama.cpp builds inside (e.g. C:\LAB\ai-local).
+        container_children: List[Tuple[str, Path]] = []
+        if manual_path is not None:
+            container_children = self._expand_fork_container(manual_path)
+        env_contains_forks = bool(container_children)
 
         self._fork_combo.blockSignals(True)
         self._fork_combo.clear()
@@ -550,10 +649,6 @@ class MainWindow(QMainWindow):
 
         if matched_idx >= 0 and manual_path is not None:
             # Persisted path IS one of the discovered forks — restore by name.
-            # The explicit `manual_path is not None` check is redundant at
-            # runtime (matched_idx >= 0 implies it was matched against a
-            # non-None path) but makes the implication legible to mypy /
-            # Pylance, which can't infer it from the loop above.
             for name, path in self._forks:
                 self._fork_combo.addItem(name, userData=path)
             self._fork_combo.setCurrentIndex(matched_idx)
@@ -564,10 +659,36 @@ class MainWindow(QMainWindow):
             self._log(f"[Fork] Restored from {src_label}: "
                       f"{self._forks[matched_idx][0]}  →  {manual_path}")
             self._apply_fork(matched_idx)
-        elif manual_path and not env_contains_forks:
-            # Truly custom path outside the auto-discover scope. Label it
-            # by directory name rather than the literal word "custom" so
-            # the user can recognise their selection at a glance.
+        elif env_contains_forks and manual_path is not None:
+            # Container with multiple llama.cpp builds — this is the
+            # "remember the parent folder" case. Show every sibling.
+            self._fork_container = manual_path
+            self._log(f"[Fork] Container '{manual_path.name}' "
+                      f"contains {len(container_children)} fork(s):")
+            for name, fork_path in container_children:
+                self._log(f"  - {name} → {fork_path}")
+                self._fork_combo.addItem(name, userData=fork_path)
+            os.environ["LLAMA_CPP_DIR"] = str(manual_path)
+            self._fork_path_lbl.setText(manual_path.name + " (📁)")
+            # Restore previously active selection inside the container,
+            # if persisted_active points at one of these children.
+            initial_idx = 0
+            if persisted_active is not None:
+                try:
+                    pa = persisted_active.resolve()
+                    for i, (_n, p) in enumerate(container_children):
+                        if p.resolve() == pa:
+                            initial_idx = i
+                            break
+                except OSError:
+                    pass
+            self._fork_combo.setCurrentIndex(initial_idx)
+            self._fork_path = container_children[initial_idx][1]
+            self._apply_fork(initial_idx)
+        elif manual_path:
+            # Truly custom path outside the auto-discover scope and not
+            # a container — single-build manual fork. Label it by its
+            # directory name so the user can recognise their selection.
             label = f"📁 {manual_path.name}"
             self._fork_combo.addItem(label, userData=manual_path)
             self._fork_path = manual_path
@@ -577,26 +698,17 @@ class MainWindow(QMainWindow):
                          else "LLAMA_CPP_DIR")
             self._log(f"[Fork] Using manual path from {src_label}: {manual_path}")
         elif self._forks:
-            # Automatisch entdeckte Forks anzeigen
+            # No manual choice — auto-discovered forks.
             for name, path in self._forks:
                 self._fork_combo.addItem(name, userData=path)
             self._fork_combo.setCurrentIndex(0)
-            if manual_path and env_contains_forks:
-                self._fork_path = manual_path
-                self._log(f"[Fork] Container '{manual_path.name}' enthält mehrere Forks:")
-                for name, path in self._forks:
-                    self._log(f"  - {name} → {path}")
-            else:
-                self._fork_path = self._forks[0][1] if self._forks else None
-                self._log(f"Found {len(self._forks)} fork(s). Using: {self._forks[0][0]}")
+            self._fork_path = self._forks[0][1] if self._forks else None
+            self._log(f"Found {len(self._forks)} fork(s). Using: {self._forks[0][0]}")
             self._apply_fork(0)
         else:
             self._fork_combo.addItem("not found", userData=None)
             self._fork_path = None
-            if manual_path and env_contains_forks:
-                self._log(f"[Warning] LLAMA_CPP_DIR='{env_fork}' exists but no forks with llama-server binary found.")
-            else:
-                self._log("[Warning] No llama.cpp forks found. Set LLAMA_CPP_DIR.")
+            self._log("[Warning] No llama.cpp forks found. Set LLAMA_CPP_DIR.")
         self._fork_combo.blockSignals(False)
 
         # Hardware detection (spawns PowerShell on Windows) → background thread
@@ -619,7 +731,9 @@ class MainWindow(QMainWindow):
     def _on_fork_changed(self, index: int) -> None:
         self._fork_manual_override = True
         self._apply_fork(index)
-        # Persist the user's combo-box selection too.
+        # Persist the active build choice without touching the
+        # container — switching combos within a container should NOT
+        # collapse the container to a single fork.
         path: Optional[Path] = self._fork_combo.itemData(index)
         if path is not None:
             try:
@@ -637,19 +751,26 @@ class MainWindow(QMainWindow):
     # Performance target selection
     # ------------------------------------------------------------------
     def _on_perf_changed(self, index: int) -> None:
-        """User picked a new performance target — persist + refresh view."""
+        """User picked a new performance target — persist + refresh view.
+
+        Only the *config text* is recomputed; the vision/draft/thinking
+        checkboxes must NOT be touched here. Performance target affects
+        VRAM placement and KV-cache decisions, never feature selection.
+        """
         name = self._perf_combo.itemText(index).strip()
         try:
             app_settings.set_performance_target(name)
         except Exception as exc:
             self._log(f"[Warning] Could not save performance target: {exc}")
         self._log(f"[Perf] → {name}")
-        # If a model is already selected, recompute the displayed config
-        # so the user sees the effect immediately.
+        # Recompute the displayed config in-place, leaving every
+        # checkbox alone — `_update_config_text` reads the current
+        # checkbox state and reflects it back into the preview.
         entry = getattr(self, "_current_entry", None)
         if entry is not None and self._system is not None:
             try:
-                self._show_config(entry)
+                profile = match_profile(entry.name, self._profiles)
+                self._update_config_text(entry, profile)
             except Exception as exc:
                 self._log(f"[Warning] Config refresh failed: {exc}")
 
@@ -701,66 +822,64 @@ class MainWindow(QMainWindow):
     def _set_manual_fork_path(self, path: Path) -> None:
         r"""Manuellen Fork-Pfad setzen und UI aktualisieren.
 
-        Wenn der Pfad mehrere Forks enthält (z.B. C:\LAB\ai-local),
-        werden alle Forks im Menü angezeigt statt nur "custom".
+        If `path` is a *container* — i.e. its immediate children include
+        multiple llama.cpp builds — every sibling is shown in the combo
+        and the container itself is persisted via
+        ``fork_container_path``. Restarts then re-expand the same set
+        of builds instead of dropping the user back to a single child.
         """
         if not path.is_dir():
             QMessageBox.warning(self, "Ungültiger Ordner",
                               f"Der Ordner existiert nicht:\n{path}")
             return
-        
+
         path = path.resolve()
-        
-        # Prüfe ob dieser Ordner mehrere Forks enthält
-        child_forks = []
-        try:
-            for child in path.iterdir():
-                if child.is_dir() and re.search(r"llama\.cpp", child.name, re.IGNORECASE):
-                    has_binary = any(
-                        (child / sub).is_file()
-                        for sub in ["build/bin/Release/llama-server.exe",
-                                    "build/bin/Debug/llama-server.exe",
-                                    "build/bin/llama-server.exe",
-                                    "build/bin/llama-server"]
-                    )
-                    if has_binary:
-                        child_forks.append((child.name, child))
-        except (OSError, PermissionError):
-            pass
-        
+        child_forks = self._expand_fork_container(path)
+
         self._fork_path = path
         self._log(f"[Fork] Pfad: {path}")
-        
+
         self._fork_combo.blockSignals(True)
         self._fork_combo.clear()
-        
+
         if child_forks:
-            # Mehrere Forks im Ordner — alle anzeigen
+            # Container with multiple builds — persist as container so
+            # the next restart still shows every sibling.
+            self._fork_container = path
             self._log(f"[Fork] '{path.name}' enthält {len(child_forks)} Fork(s):")
             for name, fork_path in child_forks:
                 self._log(f"  - {name} → {fork_path}")
                 self._fork_combo.addItem(name, userData=fork_path)
             self._fork_combo.setCurrentIndex(0)
-            # LLAMA_CPP_DIR auf den Container setzen
             os.environ["LLAMA_CPP_DIR"] = str(path)
             self._fork_path_lbl.setText(path.name + " (📁)")
+            try:
+                app_settings.set_fork_container_path(path)
+                # Active selection within the container — the first build.
+                app_settings.set_fork_path(child_forks[0][1])
+                self._log(f"[Fork] Saved container: {path}")
+            except Exception as exc:
+                self._log(f"[Warning] Could not save fork container: {exc}")
         else:
-            # Single fork — label by directory name, not the literal "custom".
-            # Keeps the combo readable when the user reopens the app and
-            # also when they switch back from a multi-fork container.
+            # Single build — clear any previous container so we don't keep
+            # advertising one that no longer holds multiple forks.
+            self._fork_container = None
+            try:
+                app_settings.clear_fork_container_path()
+            except Exception as exc:
+                self._log(f"[Warning] Could not clear fork container: {exc}")
             self._fork_combo.addItem(f"📁 {path.name}", userData=path)
             self._fork_combo.setCurrentIndex(0)
             self._fork_path_lbl.setText(path.name)
             os.environ["LLAMA_CPP_DIR"] = str(path)
-        
+            try:
+                app_settings.set_fork_path(path)
+                self._log(f"[Fork] Saved as default: {path}")
+            except Exception as exc:
+                self._log(f"[Warning] Could not save fork path: {exc}")
+
         self._fork_combo.blockSignals(False)
         self._apply_fork(0)
-        # Persist this manual choice so the next launch picks it up.
-        try:
-            app_settings.set_fork_path(path)
-            self._log(f"[Fork] Saved as default: {path}")
-        except Exception as exc:
-            self._log(f"[Warning] Could not save fork path: {exc}")
 
     # ------------------------------------------------------------------
     # Background model scan
@@ -826,11 +945,30 @@ class MainWindow(QMainWindow):
         groups = group_entries(entries)
         for group_name in sorted(groups.keys()):
             for entry in sorted(groups[group_name], key=lambda e: e.name.lower()):
-                vision = " 👁" if entry.has_vision else ""
-                item = QListWidgetItem(
-                    f"{entry.name}{vision}  ({entry.size_gb:.1f} GB)"
-                )
+                marks = _capability_markers(entry)
+                # Right-align the size so capabilities stay readable when
+                # filenames vary in length.
+                tail = f"  ({entry.size_gb:.1f} GB)"
+                if marks:
+                    item = QListWidgetItem(f"{entry.name}  {marks}{tail}")
+                else:
+                    item = QListWidgetItem(f"{entry.name}{tail}")
                 item.setData(Qt.ItemDataRole.UserRole, entry)
+                # Tooltip lists what each symbol means and which assets
+                # are paired. Use explicit `is not None` checks instead of
+                # the convenience `has_*` properties so Pylance/Mypy can
+                # narrow Optional[Path] → Path on the next line.
+                lines = [entry.name, ""]
+                if entry.mmproj is not None:
+                    lines.append(f"👁  Vision      {entry.mmproj.name}")
+                if entry.draft is not None:
+                    lines.append(f"⚡  Draft       {entry.draft.name}")
+                if entry.supports_thinking:
+                    lines.append("🧠  Thinking    chat template emits <think>")
+                if entry.supports_tool_use:
+                    lines.append("🛠  Tool use    chat template supports tool_calls")
+                if len(lines) > 2:
+                    item.setToolTip("\n".join(lines))
                 self._model_list.addItem(item)
 
     def _apply_filter(self, text: str) -> None:
@@ -891,39 +1029,59 @@ class MainWindow(QMainWindow):
         self._update_config_text(entry, profile)
 
     def _update_checkboxes(self, entry: ModelEntry) -> None:
-        """Set checkbox enabled/checked states (blockSignals prevents loop)."""
+        """Set checkbox enabled/checked states.
+
+        Defaults reflect the model's capabilities (vision when an mmproj
+        was paired, draft when an assistant sibling was found, thinking
+        when the chat template advertises it). Once the user has
+        manually toggled any of them for this model, that override wins
+        — both within the session (in-memory cache) and across restarts
+        (persisted to autotuner_settings.json).
+        """
+        # Pull persisted overrides first so a fresh app launch already
+        # honours last session's choices. The in-memory cache wins if
+        # both exist, since the user may have toggled mid-session.
+        persisted = app_settings.get_model_overrides(entry.name)
+        cached    = self._option_overrides.get(entry.name, {})
+        ov = {**persisted, **cached}
+
+        # ── Vision ──────────────────────────────────────────────────
         mmproj = entry.mmproj
         has_vision = mmproj is not None
-        for sig in (True, False):
-            self._chk_vision.blockSignals(sig)
+        vision_state = ov["vision"] if "vision" in ov else has_vision
         self._chk_vision.blockSignals(True)
         self._chk_vision.setEnabled(has_vision)
-        self._chk_vision.setChecked(has_vision)
+        self._chk_vision.setChecked(has_vision and vision_state)
         self._chk_vision.setText(
-            f"Vision  ({mmproj.name})" if mmproj is not None else "Vision (no mmproj found)"
+            f"Vision  ({mmproj.name})" if mmproj is not None
+            else "Vision (no mmproj found)"
         )
         self._chk_vision.blockSignals(False)
 
+        # ── Draft ───────────────────────────────────────────────────
         draft = self._current_draft
         has_draft = draft is not None
+        draft_state = ov["draft"] if "draft" in ov else has_draft
         self._chk_draft.blockSignals(True)
         self._chk_draft.setEnabled(has_draft)
-        self._chk_draft.setChecked(has_draft)
+        self._chk_draft.setChecked(has_draft and draft_state)
         self._chk_draft.setText(
             f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
             if draft is not None else "Draft (no assistant model found)"
         )
         self._chk_draft.blockSignals(False)
 
-        # Reasoning/thinking detection — read the chat template from GGUF
-        # metadata, fall back to a conservative filename heuristic when the
-        # template is missing. This fixes the Qwen3-Coder false-positive:
-        # the old heuristic matched any "qwen3" filename, but Qwen3-Coder
-        # has no <think> tokens and llama-server logs "reasoning 0".
+        # ── Thinking / Reasoning ────────────────────────────────────
+        # Read the chat template from GGUF metadata (the authoritative source);
+        # fall back to a conservative filename heuristic when the template is
+        # missing. This fixes the Qwen3-Coder false-positive: the old heuristic
+        # matched any "qwen3" filename, but Qwen3-Coder has no <think> tokens
+        # and llama-server logs "reasoning 0".
         has_thinking = entry.supports_thinking
+        thinking_state = ov["thinking"] if "thinking" in ov else has_thinking
         self._chk_thinking.blockSignals(True)
         self._chk_thinking.setEnabled(has_thinking)
-        self._chk_thinking.setChecked(has_thinking)
+        self._chk_thinking.setChecked(has_thinking and thinking_state)
         self._chk_thinking.blockSignals(False)
 
     def _auto_select_fork(self, profile: ModelProfile) -> None:
@@ -975,7 +1133,43 @@ class MainWindow(QMainWindow):
             # No specific fork required — keep current selection, don't reset
             pass
 
-    def _on_option_toggled(self) -> None:
+    # ------------------------------------------------------------------
+    # Per-option toggle slots
+    #
+    # Each slot:
+    #   1. records the override against the currently-selected model
+    #      (in-memory + persisted JSON), so the choice survives both
+    #      a model switch and an app restart, and
+    #   2. recomputes the config preview to reflect the new option set.
+    #
+    # The override is keyed by `entry.name` (GGUF filename stem). We
+    # only persist when there's actually a current model — slot calls
+    # during programmatic checkbox setup are guarded by blockSignals.
+    # ------------------------------------------------------------------
+    def _record_override(self, key: str, checked: bool) -> None:
+        entry = self._current_entry
+        if entry is None:
+            return
+        cur = self._option_overrides.setdefault(entry.name, {})
+        cur[key] = bool(checked)
+        try:
+            app_settings.set_model_override(entry.name, key, bool(checked))
+        except Exception as exc:
+            self._log(f"[Warning] Could not save {key} override: {exc}")
+
+    def _on_vision_toggled(self, checked: bool) -> None:
+        self._record_override("vision", checked)
+        self._refresh_config_preview()
+
+    def _on_draft_toggled(self, checked: bool) -> None:
+        self._record_override("draft", checked)
+        self._refresh_config_preview()
+
+    def _on_thinking_toggled(self, checked: bool) -> None:
+        self._record_override("thinking", checked)
+        self._refresh_config_preview()
+
+    def _refresh_config_preview(self) -> None:
         """Checkbox changed → recompute context/memory with new options."""
         if self._current_entry is not None and self._system is not None:
             profile = match_profile(self._current_entry.name, self._profiles)
@@ -1065,18 +1259,23 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._sysinfo_bg, daemon=True).start()
 
     def _sysinfo_bg(self) -> None:
-        """Background thread for hardware detection (runs every 6 seconds)."""
+        """Background thread for hardware detection (runs every 6 seconds).
+
+        IMPORTANT: never touches Qt widgets directly. The original code
+        called `self._update_sysinfo_labels(s)` and `self._log(...)`
+        from this thread, which crashed the app sporadically (Qt is
+        thread-affine — widgets must only be touched from the GUI
+        thread). We now emit signals; their slots run on the GUI thread.
+        """
         import time
         try:
             start = time.monotonic()
             s = detect_system()
             elapsed = time.monotonic() - start
-            # Qt widgets are thread-safe for updates from any thread in PyQt6
-            # (they auto-marshal to the GUI thread internally)
-            self._update_sysinfo_labels(s)
-            self._log(f"[SysInfo] Refreshed ({elapsed:.1f}s)")
+            self._sysinfo_ready.emit(s)
+            self._bg_log.emit(f"[SysInfo] Refreshed ({elapsed:.1f}s)")
         except Exception as exc:
-            self._log(f"[Warning] Sysinfo detection failed: {exc}")
+            self._bg_log.emit(f"[Warning] Sysinfo detection failed: {exc}")
         finally:
             self._sysinfo_busy = False
 

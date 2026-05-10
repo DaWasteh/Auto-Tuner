@@ -9,16 +9,27 @@ patterns:
 max_context: 131072
 recommended_kv_quant: q8_0
 
+# Sampling-Profile pro Modus.
 sampling:
-  # Offizielle DeepSeek-Empfehlung für lokales Deployment (V3.2 HF Card):
-  # "We recommend setting the sampling parameters to temperature = 1.0,
-  # top_p = 0.95." Niedrigere temp (~0.6) funktioniert auch, kann aber
-  # Reasoning-Qualität reduzieren.
-  temperature: 1.0
-  top_k: 50
-  top_p: 0.95
-  min_p: 0.05
-  repeat_penalty: 1.0
+  chat:
+    # Offizielle DeepSeek-Empfehlung für lokales Deployment (V3.2 HF Card):
+    # "We recommend setting the sampling parameters to temperature = 1.0,
+    # top_p = 0.95." Die offizielle DeepSeek-App selbst nutzt für R1
+    # intern temp=0.6 - 1.0 ist die obere Schranke der Empfehlung.
+    temperature: 1.0
+    top_k: 50
+    top_p: 0.95
+    min_p: 0.05
+    repeat_penalty: 1.0
+  coding:
+    # DeepSeek-R1 Bench-Setup laut HF-Card: temp=0.6, top_p=0.95.
+    # Dieser Wert wird auch in der offiziellen App (chat.deepseek.com)
+    # verwendet. Für deterministische Coding-Tasks ist das die Referenz.
+    temperature: 0.6
+    top_k: 50
+    top_p: 0.95
+    min_p: 0.05
+    repeat_penalty: 1.0
 
 extra_args:
   # Ohne --jinja landen die <think>-Blöcke der R1-Modelle im content-Feld
@@ -29,4 +40,8 @@ notes: >
   DeepSeek-V3.2 (671B MoE / 37B aktiv) mit DSA für effiziente long-context
   attention, oder R1 (Reasoning). Die R1- und V3.2-Modelle nutzen
   <think>-Tags für Chain-of-Thought.
-  ACHTUNG: Speciale-Variante (V3.2-Speciale) unterstützt KEIN Tool-Calling.
+  Chat-Profil = offizielle V3.2 Empfehlung (temp=1.0). Coding-Profil
+  = offizielles R1 Bench-Setup (temp=0.6) und gleichzeitig der Wert
+  den die DeepSeek-App selbst nutzt.
+  ACHTUNG: Speciale-Variante (V3.2-Speciale) unterstützt KEIN Tool-Calling
+  - sie ist explizit nur für deep-reasoning-Tasks ausgelegt.

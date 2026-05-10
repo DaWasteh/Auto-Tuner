@@ -6,13 +6,31 @@ patterns:
 max_context: 131072
 recommended_kv_quant: q8_0
 
+# Sampling-Profile pro Modus.
 sampling:
-  temperature: 0.0
-  top_k: 0
-  top_p: 1.0
-  min_p: 0.0
-  repeat_penalty: 1.0
+  chat:
+    # Phi-Modelle laufen Greedy am stabilsten, aber für freien Chat
+    # ist etwas Variation OK. Immer noch konservativ - Phi neigt bei
+    # zu hoher Temperatur zu Halluzinationen wegen seiner kleinen
+    # Parameterzahl.
+    temperature: 0.5
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.0
+  coding:
+    # Microsoft's offizielle Empfehlung: Greedy für logische Aufgaben.
+    # Phi ist auf strukturiertes Reasoning trainiert und braucht keine
+    # Sampling-Variation für Code.
+    temperature: 0.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
 
 notes: >
-  Kleines, aber extrem mächtiges Modell. Läuft am stabilsten mit 
-  Greedy-Decoding (Temp 0) für logische Aufgaben.
+  Kleines, aber extrem mächtiges Modell. Läuft am stabilsten mit
+  Greedy-Decoding (Temp 0) für logische Aufgaben - das ist deshalb der
+  Coding-Default. Chat-Modus erlaubt etwas Variation (temp 0.5), bleibt
+  aber deutlich konservativer als bei größeren Modellen, weil Phi bei
+  hoher Temperatur schneller halluziniert als 30B+ Modelle.

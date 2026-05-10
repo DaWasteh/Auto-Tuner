@@ -1,0 +1,35 @@
+display_name: "Command R / R+ (Cohere)"
+patterns:
+  - command-r
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+# Command R/R+ sind primär RAG- und Tool-Calling-spezialisiert.
+# Beide Modi bleiben relativ deterministisch, weil das Modell aus
+# Quellen zitieren soll - "kreative" Halluzinationen sind hier
+# ein Antifeature.
+sampling:
+  chat:
+    temperature: 0.3
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.0
+  coding:
+    # Command R/R+ ist kein dedizierter Code-Modell, aber für strukturierte
+    # Tool-Calls und JSON-Outputs profitiert man hier von noch niedrigerer
+    # Temperatur. Cohere selbst nennt 0.0-0.3 als sinnvolle Range.
+    temperature: 0.1
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.0
+
+notes: >
+  Spezialisiert auf RAG und Tool-Calling. Niedrige Temperature schon im
+  Chat-Modus, weil Command R/R+ aus Quellen zitieren soll - "Chat" ist
+  hier eher dokument-gestützte Konversation, nicht freies Schreiben.
+  Coding-Profil ist quasi greedy (0.1) für deterministische Tool-Calls
+  und strukturierte Ausgaben.

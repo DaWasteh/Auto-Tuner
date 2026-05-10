@@ -1,20 +1,22 @@
-display_name: "Qwen3 (Alibaba)"
+display_name: "Qwen3.5 / Qwen3.6 (Alibaba)"
 patterns:
   - qwen3.5
   - qwen3.6
 
-# Qwen3.5/3.6 nativ 262144 (256k), erweiterbar via YaRN bis 1M.
-# Original Qwen3 hat nur 32k - wird automatisch via GGUF-Metadata
-# (native_context) heruntergeregelt, daher hier den größten Wert.
+# Qwen3.5 (Feb 2026): 0.8B/2B/4B/9B/27B/35B-A3B/122B-A10B/397B-A17B.
+# Qwen3.6 (April 2026): erste Open-Weights 27B + 35B-A3B.
+# Native 262144 (256k), erweiterbar via YaRN bis ~1.01M Tokens.
+# HF-Card Qwen3.6: "Context Length: 262,144 natively and extensible up
+# to 1,010,000 tokens" - daher hier den größten nativen Wert.
 max_context: 262144
 recommended_kv_quant: q8_0
 
 # RoPE-Scaling (YaRN): Optional aktivierbar wenn genügend Speicher frei ist
 # und der berechnete Context das native Limit überschreitet.
 rope_scale:
-  enabled: false       # Standard aus — User kann in GUI aktivieren
-  max_context: 1048576  # 1M tokens mit YaRN möglich
-  scale_factor: 4.0     # yarn scaling factor (4x für Qwen3.5/3.6)
+  enabled: false        # Standard aus — User kann in GUI aktivieren
+  max_context: 1010000  # ~1M tokens mit YaRN möglich (offiziell 1,010,000)
+  scale_factor: 4.0     # YaRN scaling factor (4x für Qwen3.5/3.6)
 
 # Performance-Target-Empfehlung des Profils.
 # Qwen3.6-A3B ist ein MoE-Modell, das auf 16-GB-GPUs nicht voll in VRAM
@@ -26,35 +28,51 @@ rope_scale:
 # die GUI-Wahl gewinnt immer gegen diese Empfehlung.
 performance_target: throughput
 
+# Sampling-Profile pro Modus.
 sampling:
-  # Qwen3.5/3.6 Default ist Thinking-Modus, daher die "Thinking general"-
-  # Werte aus den offiziellen Modell-Cards. Bei Coding-Tasks kann
-  # temperature=0.6 mit presence_penalty=0.0 sinnvoller sein.
-  temperature: 1.0
-  top_k: 20
-  top_p: 0.95
-  min_p: 0.0
-  repeat_penalty: 1.0     # Qwen empfiehlt explizit 1.0
-  # Qwen empfiehlt presence_penalty: 1.5 *für Chat*. Beim Tool-Calling und
-  # strukturierter Ausgabe ist das eine bekannte Loop-Quelle: das Modell
-  # muss in jedem Tool-Call exakt dieselben Tokens emittieren (gleiche
-  # JSON-Keys, gleiche Tool-Namen), und ein presence_penalty von 1.5
-  # bestraft genau diese Wiederholungen → kaputtes JSON → Client meldet
-  # Fehler → Modell "kreativiert" → Schleife.
-  # Default daher konservativ auf 0.0. Wer reine Chat-Konversation ohne
-  # Tools fährt und Wiederholungen sieht, kann beim Start überschreiben:
-  #   -- --presence-penalty 1.5
-  presence_penalty: 0.0
+  chat:
+    # Qwen3.5/3.6 Default ist Thinking-Modus. Werte sind die offiziellen
+    # "Thinking general"-Settings aus den HF-Modell-Cards
+    # (Bench-Setup für SWE-Bench: temp=1.0, top_p=0.95, top_k=20).
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0     # Qwen empfiehlt explizit 1.0
+    # Qwen empfiehlt presence_penalty: 1.5 *für Chat*. Beim Tool-Calling und
+    # strukturierter Ausgabe ist das eine bekannte Loop-Quelle: das Modell
+    # muss in jedem Tool-Call exakt dieselben Tokens emittieren (gleiche
+    # JSON-Keys, gleiche Tool-Namen), und ein presence_penalty von 1.5
+    # bestraft genau diese Wiederholungen → kaputtes JSON → Client meldet
+    # Fehler → Modell "kreativiert" → Schleife.
+    # Default daher konservativ auf 0.0. Wer reine Chat-Konversation ohne
+    # Tools fährt und Wiederholungen sieht, kann beim Start überschreiben:
+    #   -- --presence-penalty 1.5
+    presence_penalty: 0.0
+  coding:
+    # Aus dem offiziellen QwenClawBench-Setup (HF-Card Qwen3.6-35B-A3B):
+    # "QwenClawBench: temp=0.6, 256K ctx" - das ist der von Alibaba selbst
+    # für agentische Coding-Tasks verwendete Wert.
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
 
 notes: >
-  Qwen3.5/3.6 sind Thinking-by-default Vision-Language-Modelle mit 256k
-  Kontext (erweiterbar bis 1M via YaRN). Original Qwen3 hat nur 32k -
-  wird automatisch über GGUF-native_context begrenzt.
+  Qwen3.5 (Feb 2026) und Qwen3.6 (April 2026) sind Thinking-by-default
+  Multimodal-Modelle mit 256k nativem Kontext (erweiterbar bis 1.01M via
+  YaRN). Original Qwen3 hat nur 32k - wird automatisch über
+  GGUF-native_context begrenzt.
+  Chat-Profil entspricht dem offiziellen Thinking-Setup; Coding-Profil
+  spiegelt das offizielle QwenClawBench-Setting (temp=0.6) wider.
   presence_penalty steht hier auf 0.0 statt der offiziellen Qwen-Empfehlung
   von 1.5, weil 1.5 reproduzierbar Tool-Calling-Schleifen erzeugt
   (strukturierte Ausgabe braucht repeated tokens, die ein hohes
   presence_penalty bestraft). Für reinen Chat ohne Tools: `-- --presence-penalty 1.5`.
-  Für reine Coding-Tasks: `-- --temp 0.6` zusätzlich.
+  Qwen3.6 Neu: `preserve_thinking` API-Flag hält Thinking-Content über
+  Multi-Turn-Konversationen hinweg → bessere agentische Konsistenz.
   Tipp: `--jinja` als Extra-Arg beim Start aktiviert die saubere
   Trennung von <think>-Blöcken ins reasoning_content-API-Feld
   (statt sie inline im content zu lassen):

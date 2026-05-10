@@ -73,8 +73,21 @@ def _print_system(info: SystemInfo) -> None:
     print(format_system(info))
 
 
-def _vision_marker(entry: ModelEntry) -> str:
-    return " 👁" if entry.has_vision else "  "
+def _capability_markers(entry: ModelEntry) -> str:
+    """Compact capability symbols mirroring the Qt GUI:
+    👁 vision · ⚡ draft · 🧠 thinking · 🛠 tool-use.
+    Returned with leading space so the menu still aligns when empty.
+    """
+    syms = []
+    if entry.has_vision:
+        syms.append("👁")
+    if entry.has_draft:
+        syms.append("⚡")
+    if entry.supports_thinking:
+        syms.append("🧠")
+    if entry.supports_tool_use:
+        syms.append("🛠")
+    return ("  " + " ".join(syms)) if syms else "    "
 
 
 def _print_menu(groups: dict) -> List[ModelEntry]:
@@ -82,6 +95,7 @@ def _print_menu(groups: dict) -> List[ModelEntry]:
     flat: List[ModelEntry] = []
     print("\nAvailable models:")
     print(_BAR)
+    print("  Symbols: 👁 vision · ⚡ draft · 🧠 thinking · 🛠 tool-use")
     idx = 1
     for group_name in sorted(groups.keys()):
         entries = sorted(groups[group_name], key=lambda e: e.name.lower())
@@ -93,7 +107,7 @@ def _print_menu(groups: dict) -> List[ModelEntry]:
             ctx = ""
             if e.native_context:
                 ctx = f"  ({e.native_context // 1024}k native)"
-            print(f"    {idx:>2}. {_vision_marker(e)} {e.name:<55} "
+            print(f"    {idx:>2}.{_capability_markers(e)} {e.name:<55} "
                   f"{size}{ctx}")
             flat.append(e)
             idx += 1
@@ -842,35 +856,25 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                               "— the model may not load correctly.")
 
         # ── Draft model detection ────────────────────────────────────────
+        # scanner.py already paired each main model with its assistant /
+        # draft sibling (when present). We just wrap that path in a
+        # ModelEntry — `compute_config` only needs `.path` and `.size_gb`.
         draft_model = None
-        if profile.draft_max > 0 and not args.nodraft:
-            import re as _re
-            main_name_lower = model.name.lower()
-
-            # Step 1: strip quant suffix  (Q4_K_XL, IQ3_XXS, BF16, …)
-            # Also handles trailing bpw tags like "IQ4_XS-4.04bpw"
-            base_name = _re.sub(
-                r"[-_]?(?:iq\d+(?:_+[a-z\d]+)*(?:[-_]\d+[\.\d]*bpw)?|"
-                r"q\d+(?:_+[a-z\d]+)*|tf\d+|bf16|f16|f32)$",
-                "", main_name_lower,
-            ).strip("-_")
-
-            # Step 2: strip distributor/packing tags that precede the quant
-            # (UD = Unsloth Default, IQ-prefix packs, etc.)
-            base_name = _re.sub(
-                r"[-_](?:ud|unsloth)$", "", base_name, flags=_re.IGNORECASE
-            ).strip("-_")
-
-            # STRICT matching: assistant model must start with exactly the
-            # same architectural base prefix as the main model.
-            exact_drafts = [
-                e for e in entries
-                if "assistant" in e.name.lower()
-                and e.name.lower().replace(".gguf", "").startswith(base_name + "-")
-            ]
-            if exact_drafts:
-                draft_model = min(exact_drafts, key=lambda x: x.size_gb)
+        if profile.draft_max > 0 and not args.nodraft and model.draft is not None:
+            try:
+                draft_size = model.draft.stat().st_size
+                draft_model = ModelEntry(
+                    path=model.draft,
+                    name=model.draft.stem,
+                    group=model.group,
+                    size_bytes=draft_size,
+                    mmproj=None,
+                    draft=None,
+                    metadata={},
+                )
                 print(f"[AutoTuner] Found draft model: {draft_model.name}")
+            except OSError as exc:
+                print(f"[AutoTuner] Draft sibling unreadable ({exc}); skipping.")
 
         # ── Interactive feature chain ────────────────────────────────────
         (use_vision, use_draft, use_thinking, effective_draft) = (

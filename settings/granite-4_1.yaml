@@ -1,0 +1,44 @@
+display_name: "Granite 4.1 (IBM)"
+patterns:
+  - granite-4.1
+  - granite4.1
+  - granite-4-1
+
+# 8B/30B unterstützen 524288 (512k); 3B nur 131072 (128k).
+# Wird automatisch via GGUF-Metadata (native_context) je nach Modell
+# heruntergeregelt - daher hier den größten Wert eintragen.
+max_context: 524288
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+sampling:
+  chat:
+    # Für freien Chat etwas Variation - aber Granite ist primär ein
+    # Instruction-Follower, daher temp 0.7 ist obere Schranke.
+    # IBM empfiehlt für Tool-Calling und Instruction-Following ohnehin
+    # Greedy (siehe coding-Profil).
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.0   # Granite mag keine Penalty
+  coding:
+    # IBM/Unsloth empfehlen Greedy-Decoding für Tool-Calling und
+    # deterministische Instruction-Following-Antworten. Das ist der
+    # native Modus, in dem Granite trainiert wurde.
+    temperature: 0.0
+    top_k: 0       # 0 = deaktiviert
+    top_p: 1.0     # 1.0 = deaktiviert
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+notes: >
+  Dichte Decoder-only Transformer (3B/8B/30B Dense), KEIN Reasoning-Modell.
+  Stark in Tool-Calling, Instruction-Following, RAG und Coding - das 8B
+  matcht/schlägt das alte 32B-MoE Granite 4.0-H-Small. 3B unterstützt 128k
+  Kontext, 8B und 30B bis zu 512k. Apache 2.0 Lizenz.
+  Chat-Profil hat etwas Variation für freien Dialog. Coding-Profil ist
+  Greedy (temp 0.0) - das ist Granite's nativer und von IBM empfohlener
+  Modus für Tool-Calling und Code.
+  ACHTUNG: NICHT mit CUDA 13.2 verwenden - produziert Gibberish-Output.
+  NVIDIA arbeitet am Fix; bis dahin CUDA 12.9 oder 13.0 nutzen.

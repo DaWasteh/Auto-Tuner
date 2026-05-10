@@ -12,14 +12,25 @@ recommended_kv_quant: q8_0
 # Q1_0 Support ist in Upstream llama.cpp gemerged (ab ca. 2026), aber
 # weitere Backends (optimierte x86 CPU, AMD) sind noch im Fork.
 
+# Sampling-Profile pro Modus.
+# PrismML's eigenes README-Beispiel zeigt:
+# llama-cli -m Bonsai-8B-Q1_0.gguf --temp 0.5 --top-p 0.85 --top-k 20
 sampling:
-  # PrismML's eigenes README-Beispiel zeigt:
-  # llama-cli -m Bonsai-8B-Q1_0.gguf --temp 0.5 --top-p 0.85 --top-k 20
-  temperature: 0.5
-  top_k: 20
-  top_p: 0.85
-  min_p: 0.05
-  repeat_penalty: 1.05
+  chat:
+    temperature: 0.5
+    top_k: 20
+    top_p: 0.85
+    min_p: 0.05
+    repeat_penalty: 1.05
+  coding:
+    # Bonsai ist kein Coder-Modell, deshalb für Code nur leicht
+    # deterministischer als Chat - bei zu niedriger Temp kollabiert
+    # das Modell oft in Wiederholungen (typisch für aggressive Quants).
+    temperature: 0.3
+    top_k: 20
+    top_p: 0.85
+    min_p: 0.05
+    repeat_penalty: 1.05
 
 notes: >
   PrismML Bonsai 8B - das erste kommerziell tragfähige 1-bit LLM (Q1_0 GGUF,
@@ -28,3 +39,5 @@ notes: >
   Braucht den PrismML-Fork von llama.cpp (1b_llama.cpp), nicht Mainline.
   Q1_0 Quant ist in Upstream gemerged für CPU/Metal/CUDA/Vulkan, aber für
   AMD ROCm + optimierte x86 Pfade braucht man noch den Fork.
+  Coding-Profil ist nur leicht abgesenkt (0.3) statt aggressiv 0.15 -
+  bei extrem niedrigen Temperaturen tendieren 1-bit Quants zu Loops.

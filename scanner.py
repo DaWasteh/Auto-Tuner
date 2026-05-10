@@ -343,6 +343,81 @@ def metadata_supports_thinking(md: Dict[str, Any], filename: str = "") -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Tool-use / function-calling capability detection
+#
+# Modern instruct/chat models advertise tool-calling support inside their
+# chat template — older models (Llama-2 base, original Mistral, Phi-2,
+# many GGUFs from 2023) genuinely cannot do tool calls and llama-server
+# will refuse `--jinja` workflows that need them. Detection mirrors the
+# thinking-detection: scan the chat template for known markers, with a
+# small filename allow-list as a fallback.
+
+# Markers that indicate tool/function-calling support in a chat template.
+_TOOLUSE_TEMPLATE_MARKERS = (
+    "<tool_call>",
+    "</tool_call>",
+    "<|tool_call_begin|>",     # DeepSeek
+    "<|tool_calls_begin|>",    # DeepSeek-V3
+    "<|tool|>",
+    "<|tool_results|>",
+    "tool_calls",              # OpenAI-style; common in modern templates
+    "function_call",
+    "<|im_start|>tool",        # Hermes / Qwen tool role
+    "[TOOL_CALLS]",            # Mistral
+    "[AVAILABLE_TOOLS]",       # Mistral
+    "{{ tools }}",             # Jinja variable — only present when supported
+    "{%- if tools",
+    "{% if tools",
+    "if tools is defined",
+)
+
+# Filenames that strongly imply tool-use even without a template
+# (rare; mostly for older quants stripped of their chat template).
+_TOOLUSE_NAME_HINTS = (
+    "hermes",
+    "functionary",
+    "tool",
+)
+
+# Architectures known to NOT support tool calls regardless of template
+# heuristics (embedding-only, captioner-only, base completion models).
+_NON_TOOLUSE_NAME_HINTS = (
+    "embedding",
+    "reranker",
+    "captioner",
+    "base",                    # raw-base completion models
+)
+
+
+def metadata_supports_tool_use(md: Dict[str, Any], filename: str = "") -> bool:
+    """Return True iff this model can invoke tools / call functions.
+
+    Decision order mirrors :func:`metadata_supports_thinking`:
+      1. Filename excludes tool-use explicitly → False.
+      2. Chat template contains a tool-call marker → True.
+      3. Template was present but had no marker → False (informative).
+      4. No template available → fall back to filename hints.
+      5. Otherwise → False.
+    """
+    name_l = (filename or "").lower()
+    if any(hint in name_l for hint in _NON_TOOLUSE_NAME_HINTS):
+        return False
+
+    if md:
+        for key in ("tokenizer.chat_template",
+                    "tokenizer.chat_template.default"):
+            template = md.get(key)
+            if isinstance(template, str) and template:
+                if any(m in template for m in _TOOLUSE_TEMPLATE_MARKERS):
+                    return True
+                # Template present but no tool marker — authoritative no.
+                return False
+
+    # No template — fall back to filename heuristic.
+    return any(hint in name_l for hint in _TOOLUSE_NAME_HINTS)
+
+
+# ---------------------------------------------------------------------------
 # Model entries + scanner
 
 # Strip quant + extension when normalizing for mmproj pairing
@@ -368,6 +443,7 @@ class ModelEntry:
     group: str         # parent folder relative to scan root (e.g. "Alibaba/Qwen3.6")
     size_bytes: int
     mmproj: Optional[Path] = None
+    draft:  Optional[Path] = None     # paired assistant/draft model (if any)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -377,6 +453,11 @@ class ModelEntry:
     @property
     def has_vision(self) -> bool:
         return self.mmproj is not None
+
+    @property
+    def has_draft(self) -> bool:
+        """True iff a paired assistant/draft model was found in the same folder."""
+        return self.draft is not None
 
     @property
     def n_layers(self) -> int:
@@ -410,6 +491,11 @@ class ModelEntry:
     def supports_thinking(self) -> bool:
         """True if the chat template signals thinking/reasoning support."""
         return metadata_supports_thinking(self.metadata, self.name)
+
+    @property
+    def supports_tool_use(self) -> bool:
+        """True if the chat template signals tool-call / function support."""
+        return metadata_supports_tool_use(self.metadata, self.name)
 
 
 def _strip_quant(filename: str) -> str:
@@ -453,22 +539,105 @@ def _find_mmproj(model: Path, candidates: List[Path]) -> Optional[Path]:
     return best
 
 
+# ---------------------------------------------------------------------------
+# Draft / assistant pairing
+#
+# Speculative decoding (and llama.cpp's `--model-draft` flag) needs a
+# small "assistant" sibling that shares the main model's tokenizer.
+# Distributors like Unsloth, Bartowski, and ggml-org publish these as
+# files named e.g. "Qwen3.6-32B-Assistant-Q4_K_M.gguf" alongside the
+# main "Qwen3.6-32B-Q4_K_M.gguf". They aren't useful on their own —
+# loading just the draft yields gibberish — so the GUI/Terminal must
+# never offer them as standalone choices, mirroring the mmproj rule.
+
+# Filename markers that identify a draft/assistant model.
+_DRAFT_FILENAME_TOKENS = ("assistant", "draft")
+
+
+def _is_draft_filename(name: str) -> bool:
+    """Cheap pre-filter: does this filename look like a draft/assistant file?"""
+    n = name.lower()
+    # Match token surrounded by separators OR at the end of stem
+    # (e.g. "qwen3.5-30b-a3b-assistant-q4_k_m.gguf" is a draft;
+    #  "rooks_assistant_v2.gguf" — a fictional case — would also match,
+    #  which is acceptable, false-positives just cost a draft pairing).
+    for tok in _DRAFT_FILENAME_TOKENS:
+        if re.search(rf"[-_.]{tok}[-_.]", n) or n.startswith(tok + "-") \
+                or n.startswith(tok + "_"):
+            return True
+    return False
+
+
+def _strip_draft_token(stem: str) -> str:
+    """Remove ``-assistant-…`` / ``_draft_…`` segments from a filename stem
+    so the remaining base can be matched against the main model's stem.
+    """
+    s = stem.lower()
+    for tok in _DRAFT_FILENAME_TOKENS:
+        # remove ``-assistant`` segment (and any quant tail attached to it)
+        s = re.sub(rf"[-_.]{tok}(?=[-_.]|$)", "", s)
+    return s.strip("-_.")
+
+
+def _find_draft(model: Path, candidates: List[Path]) -> Optional[Path]:
+    """Pick the smallest draft whose base prefix matches the main model.
+
+    Same directory only — drafts only count if they sit beside the main
+    model. Among multiple matches, pick the smallest on disk (drafts are
+    speculative; smaller is faster to evaluate).
+    """
+    main_norm = _normalize_model(model.name)
+    best: Optional[Path] = None
+    best_size = -1
+    for c in candidates:
+        if c.parent != model.parent:
+            continue
+        # Normalize the draft: strip its quant tail AND the assistant/draft token,
+        # then check whether the result is a prefix of the main model's base.
+        c_base = _strip_quant(c.name).lower()
+        c_norm = _strip_draft_token(c_base.removesuffix(".gguf"))
+        if not c_norm:
+            continue
+        if not main_norm.startswith(c_norm + "-") and main_norm != c_norm:
+            continue
+        try:
+            sz = c.stat().st_size
+        except OSError:
+            continue
+        if best is None or sz < best_size:
+            best = c
+            best_size = sz
+    return best
+
+
 def scan_models(
     root: Path,
     read_metadata: bool = True,
 ) -> List[ModelEntry]:
-    """Walk `root` recursively and return all loadable GGUF models,
-    each paired with its mmproj if one is present in the same folder."""
+    """Walk `root` recursively and return all loadable GGUF models.
+
+    Two kinds of files get filtered out of the main list and attached
+    to their "big-brother" model instead:
+      * mmproj projectors (vision encoders) → :attr:`ModelEntry.mmproj`
+      * assistant / draft models             → :attr:`ModelEntry.draft`
+
+    Both kinds are useless on their own — loading a bare mmproj file
+    fails outright, and a draft model alone produces garbage — so the
+    UI should never present them as choosable models.
+    """
     if not root.exists() or not root.is_dir():
         return []
 
     all_gguf = list(root.rglob("*.gguf"))
     mmprojs: List[Path] = []
-    models: List[Path] = []
+    drafts:  List[Path] = []
+    models:  List[Path] = []
     for f in all_gguf:
         nm = f.name.lower()
         if nm.startswith("mmproj-") or nm.startswith("mmproj_"):
             mmprojs.append(f)
+        elif _is_draft_filename(f.name):
+            drafts.append(f)
         else:
             models.append(f)
 
@@ -491,6 +660,7 @@ def scan_models(
             group=group,
             size_bytes=size,
             mmproj=_find_mmproj(m, mmprojs),
+            draft=_find_draft(m, drafts),
             metadata=md,
         ))
     return entries
