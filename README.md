@@ -6,9 +6,9 @@ KV-cache quantization, GPU offload, threading, and batch size to fit in
 the RAM/VRAM you actually have free — without manual edits.
 
 # GUI-Design
-```
+
 ![v0.7_GUI](image.png)
-```
+
 
 # Terminal-Design
 ```
@@ -379,11 +379,11 @@ auto_tuner/
 ## Building llama.cpp and forks
 
 # Recommended build settings for this system:
-# - Ninja generator
-# - native CPU optimizations
-# - static build
-# - Release mode
-# - 20 parallel build jobs
+ - Ninja generator
+ - native CPU optimizations
+ - static build
+ - Release mode
+ - 20 parallel build jobs
 
 ```
 ## Building llama.cpp and forks - Example
