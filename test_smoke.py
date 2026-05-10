@@ -63,7 +63,7 @@ def test_all_profiles_load():
     ("Qwen3.6-35B-A3B-UD-IQ3_S",              "Qwen3.5 / Qwen3.6 (Alibaba)"),
     ("Gemma-4-26B-A4B-IQ3_M",                 "Gemma 4 (Google)"),
     ("gemma-4-E2B-it-BF16",                   "Gemma 4 (Google)"),
-    ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code) [legacy]"),
+    ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
     ("Ministral-3-14B-Reasoning-2512-Q6_K",   "Ministral 3 (Mistral, reasoning)"),
     ("Mistral-Medium-3.5-128B-UD-IQ3_XXS",    "Mistral Medium 3.x"),
     ("Bonsai-8B",                             "Bonsai 8B (PrismML, 1-bit)"),
