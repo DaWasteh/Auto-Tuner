@@ -81,25 +81,117 @@ def kv_per_token_mb_f16(params_billion: float) -> float:
     return 1.40
 
 
+def _kv_per_token_for_interleaved_attention(
+    md: Dict[str, Any], arch: str, n_kv_heads_per_layer: List[Any],
+) -> float:
+    """KV per-token (MB) for models with per-layer KV-head arrays.
+
+    The Gemma-4 family (26B-A4B, 31B, and likely future siblings)
+    stores ``<arch>.attention.head_count_kv`` as a **per-layer array**
+    rather than a single scalar, because each layer alternates between
+    full attention and sliding-window attention (SWA) with different
+    head/dim configurations. Example from gemma-4-26B-A4B:
+
+        head_count_kv          = [8,8,8,8,8,2, 8,8,8,8,8,2, …]   # 30 layers
+        sliding_window_pattern = [T,T,T,T,T,F, T,T,T,T,T,F, …]   # 30 layers
+        sliding_window         = 1024
+
+    The pattern array tells us which layers do SWA (True) and which
+    do full attention (False). SWA layers cap their KV at
+    ``sliding_window`` tokens — they contribute a **constant** overhead
+    that does NOT scale with ctx. Full-attention layers (the False
+    entries) scale linearly with ctx.
+
+    For the AutoTuner's "per-token KV size" estimate at large ctx, we
+    return only the asymptotic part: the sum over full-attention
+    layers. At typical ctx >> sliding_window (e.g. 32k >> 1024) the
+    constant SWA overhead is well under 100 MB and can be ignored.
+
+    Fallback: if ``sliding_window_pattern`` is missing or shorter than
+    the head array, sum every entry (treat all as full-attention).
+    That overshoots, but on the safe side — better the AutoTuner
+    reserves too much KV than too little.
+    """
+    def _int_md(key: str) -> int:
+        v = md.get(f"{arch}.{key}", 0)
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    sliding_pattern = md.get(f"{arch}.attention.sliding_window_pattern")
+    kl = _int_md("attention.key_length")
+    vl = _int_md("attention.value_length")
+    n_heads = _int_md("attention.head_count")
+    embd = _int_md("embedding_length")
+
+    # Fall back to embd/n_heads if explicit head dims absent.
+    if kl <= 0 or vl <= 0:
+        if n_heads > 0 and embd > 0:
+            head_size = max(1, embd // n_heads)
+            if kl <= 0:
+                kl = head_size
+            if vl <= 0:
+                vl = head_size
+        else:
+            return 0.0
+
+    full_kv = 0
+    if isinstance(sliding_pattern, list) and sliding_pattern:
+        # Sum KV-heads only for full-attention layers (pattern entry False).
+        for i, h in enumerate(n_kv_heads_per_layer):
+            if i >= len(sliding_pattern):
+                break
+            # Pattern entry True = SWA → skip (constant overhead).
+            if not bool(sliding_pattern[i]):
+                try:
+                    full_kv += int(h)
+                except (TypeError, ValueError):
+                    continue
+    else:
+        # No pattern info — treat every layer as full attention.
+        for h in n_kv_heads_per_layer:
+            try:
+                full_kv += int(h)
+            except (TypeError, ValueError):
+                continue
+
+    if full_kv <= 0:
+        return 0.0
+
+    bytes_per_token = full_kv * (kl + vl) * 2
+    return bytes_per_token / (1024.0 * 1024.0)
+
+
 def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
     """Compute exact f16 K+V cache size per token (MB) from GGUF metadata.
 
-    Formula:
+    Standard transformer formula:
         bytes/token = n_attention_layers * n_kv_heads * (key_length + value_length) * 2
 
-    The trailing 2 is K+V at FP16 (2 bytes each). With GQA, `n_kv_heads`
-    is smaller than `n_heads`, which is why MoE models like
-    Qwen3.6-35B-A3B and Gemma-4-26B-A4B have a small KV footprint despite a high total
-    parameter count — they share KV across many query heads.
+    Three special cases are handled before the formula:
 
-    For *hybrid* Mamba/Transformer models (Nemotron-H, Jamba, …) only
-    a fraction of the layers actually carry KV cache. We multiply by
-    that fraction (via ``metadata_attention_layer_count``) instead of
-    the total block count, otherwise we'd over-reserve VRAM by 4–5×
-    on these architectures and pessimise placement.
+    1. **Interleaved-attention models** (Gemma-4 family) — when
+       ``head_count_kv`` is stored as a *per-layer array* instead of a
+       scalar, we route to :func:`_kv_per_token_for_interleaved_attention`
+       which uses the sliding-window pattern to count only the
+       full-attention layers (those that actually scale with ctx).
 
-    Returns 0.0 when metadata is incomplete; the caller should then fall
-    back to the params-billion heuristic.
+    2. **Hybrid Mamba/Transformer models** (Nemotron-H, Jamba, …) —
+       only a fraction of layers carry KV cache. We multiply by that
+       fraction via :func:`metadata_attention_layer_count`. Otherwise
+       we'd over-reserve VRAM by 4–5× on these architectures.
+
+    3. **GQA** — when ``head_count_kv`` is present and a positive scalar,
+       it's already smaller than ``head_count`` and the formula uses
+       it directly. When the value is missing (``head_count_kv = 0``)
+       we fall back to ``head_count``, which over-estimates KV for
+       any modern GQA model. Such over-estimates are visible in the
+       config preview; if you see them, the GGUF likely stored the
+       value under a non-canonical key or as an array (case 1).
+
+    Returns 0.0 when metadata is incomplete; the caller should then
+    fall back to the params-billion heuristic.
     """
     if not md:
         return 0.0
@@ -107,6 +199,12 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
     if not arch:
         return 0.0
 
+    # ── Case 1: interleaved attention with per-layer KV-head array ─────
+    n_kv_raw = md.get(f"{arch}.attention.head_count_kv")
+    if isinstance(n_kv_raw, list) and n_kv_raw:
+        return _kv_per_token_for_interleaved_attention(md, arch, n_kv_raw)
+
+    # ── Standard scalar path (existing behaviour) ─────────────────────
     def _int(key: str) -> int:
         v = md.get(f"{arch}.{key}", 0)
         try:
