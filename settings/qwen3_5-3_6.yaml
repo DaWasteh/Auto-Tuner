@@ -48,7 +48,6 @@ sampling:
     # Default daher konservativ auf 0.0. Wer reine Chat-Konversation ohne
     # Tools fährt und Wiederholungen sieht, kann beim Start überschreiben:
     #   -- --presence-penalty 1.5
-    -jinja: true  # <think>-Blöcke sauber ins reasoning_content-Feld packen (statt inline im content)
     presence_penalty: 0.0
   coding:
     # Aus dem offiziellen QwenClawBench-Setup (HF-Card Qwen3.6-35B-A3B):

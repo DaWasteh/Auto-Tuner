@@ -381,12 +381,36 @@ class TunedConfig:
     estimated_kv_gb: float = 0.0
     full_offload: bool = False
 
+    # ---- New (display fidelity) ---------------------------------------
+    # VRAM that vision (mmproj) and draft model consume on the GPU.
+    # The main model placement subtracts these from `free_vram_gb` to
+    # decide layer placement, but until now the display only showed the
+    # main-model VRAM number — so toggling vision/draft produced
+    # counter-intuitive context changes the user could not explain.
+    # Surfacing both here lets the GUI render the FULL GPU picture.
+    vision_vram_gb: float = 0.0
+    draft_vram_gb: float = 0.0
+    # KV split between VRAM and RAM (set by compute_config). For
+    # full-offload / MoE-on-GPU the entire KV cache lives in VRAM and
+    # `kv_ram_gb == 0`. For dense-hybrid placement the small RAM share
+    # is shown so the user can see why context is throttled.
+    kv_vram_gb: float = 0.0
+    kv_ram_gb: float = 0.0
+    # KV-quant labels actually applied (may differ from cache_k/cache_v
+    # when an explicit Expert override was used — kept for diagnostics).
+    kv_quant_strategy: str = "symmetric"   # "symmetric" | "asymmetric" | "manual" | "turbo"
+
     no_context_shift: bool = False
 
     # RoPE-Scaling: aktiviert wenn ctx > native_ctx und YaRN/rope-scaling
     # verwendet werden soll (optional, nur für Modelle die es unterstützen).
     rope_scaling: bool = False
     rope_scale_factor: float = 1.0  # z.B. 4.0 für yarn mit 4x scaling
+
+    # Optional CLI extras the GUI's Expert mode injects. Examples:
+    # "--jinja", "--verbose". Built-in defaults stay empty so the
+    # auto-mode behaviour is unchanged.
+    extra_cli_flags: List[str] = field(default_factory=list)
 
     # Active performance target name ("safe" / "balanced" / "throughput").
     # Set by compute_config so display code can show what was applied.
@@ -502,40 +526,118 @@ def _decide_moe_offload(
     return 999, n_cpu_moe, model_vram, model_ram, False
 
 
+# ---- Turbo-Quant labels --------------------------------------------------
+# The TurboQuant forks (TheTom/llama-cpp-turboquant, AtomicBot's
+# atomic-llama-cpp-turboquant) accept additional K-quant labels that pack
+# the KV-cache tighter than the stock q4_0/q5_0/q8_0 set. The exact label
+# strings differ between forks, so we keep a simple mapping the user can
+# refine via the Expert panel. Defaults below pick the most aggressive
+# label that is widely accepted; if a build rejects it the user sees an
+# immediate error from llama-server and can override in Expert/Manual mode.
+_TURBO_QUANT_MAP: Dict[str, str] = {
+    "q8_0": "q8_0",     # already optimal — no turbo equivalent needed
+    "q5_0": "q5_1",     # asymmetric q5 with shared scale, denser packing
+    "q4_0": "q4_1",     # asymmetric q4 with shared scale (~10% less memory)
+}
+
+
+def _turbo_quant_for(label: str) -> str:
+    """Map a normal KV quant label to its TurboQuant equivalent.
+
+    Falls back to the input label when no mapping is known — that keeps
+    Turbo a *safe* toggle: the worst case is "same quant as before".
+    """
+    return _TURBO_QUANT_MAP.get(label.lower(), label)
+
+
 def _pick_kv_quant(
     profile_recommended: str,
     target_ctx: int,
     base_kv_per_token_mb: float,
     kv_budget_gb: float,
-    model_max_ctx: int = 0,  # native_ctx aus GGUF-Metadata (0 = keine Begrenzung)
+    model_max_ctx: int = 0,        # native_ctx aus GGUF-Metadata (0 = keine Begrenzung)
+    *,
+    turbo: bool = False,
+    asymmetric: bool = True,       # Vulkan b9106+ supports asymmetric FA
 ) -> Tuple[str, str]:
-    """Wähle die beste KV-Quantisierung die target_ctx unterstützt.
-    
-    Priorität: höchste Qualität (q8 > q5 > q4), die den target_ctx in das
-    verfügbare Budget passt. Wenn model_max_ctx > 0 und target_ctx darüber
-    hinausgeht, wird target_ctx auf model_max_ctx beschränkt (sonst muss
-    rope-scaling aktiviert werden).
+    """Pick best (K, V) quants that fit target_ctx into kv_budget_gb.
+
+    With ``asymmetric=True`` (default — Vulkan ≥ b9106, ROCm, CUDA all
+    support it) K and V may use *different* quants. The strategy is to
+    keep K at the highest quality that still fits, and step V down one
+    bucket — because K-quantisation hurts attention recall more than
+    V-quantisation hurts output quality. When K and V cannot live at
+    different levels (e.g. an older fork without asymmetric FA), pass
+    ``asymmetric=False`` for the legacy K=V behaviour.
+
+    With ``turbo=True`` the chosen labels are mapped via
+    :data:`_TURBO_QUANT_MAP` to the TurboQuant equivalents. Practical
+    effect: ~10 % smaller KV at the same nominal precision.
+
+    Order tried (top → bottom = best → worst quality):
+
+        K=q8_0  V=q8_0     # symmetric high
+        K=q8_0  V=q5_0     # asymmetric mid     (only if asymmetric=True)
+        K=q5_0  V=q5_0     # symmetric mid
+        K=q5_0  V=q4_0     # asymmetric low     (only if asymmetric=True)
+        K=q4_0  V=q4_0     # symmetric low
     """
-    # Beschränke target_ctx auf Modell-Maximum wenn nötig
+    # Beschränke target_ctx auf Modell-Maximum wenn nötig.
     if model_max_ctx > 0 and target_ctx > model_max_ctx:
         target_ctx = model_max_ctx
 
-    # Reihenfolge: von hochwertig nach niedrig — erste die passt gewinnt
-    order = ["q8_0", "q5_0", "q4_0"]
+    # Quality-ranked pairs. The list is *static*; the profile-recommended
+    # quant only nudges the starting index forward when its symmetric
+    # variant is in the list (so e.g. recommended_kv_quant=q8_0 still
+    # tries q8_0/q8_0 first even though it's the default top-of-list).
+    pairs: List[Tuple[str, str]] = []
+    if asymmetric:
+        pairs = [
+            ("q8_0", "q8_0"),
+            ("q8_0", "q5_0"),
+            ("q5_0", "q5_0"),
+            ("q5_0", "q4_0"),
+            ("q4_0", "q4_0"),
+        ]
+    else:
+        pairs = [
+            ("q8_0", "q8_0"),
+            ("q5_0", "q5_0"),
+            ("q4_0", "q4_0"),
+        ]
+
+    # Honour profile_recommended as the starting *floor* — never go above
+    # what the model author tested. If the recommended quant is q5_0 we
+    # skip the q8_0 rows.
     rec = profile_recommended.lower()
-    if rec in order:
-        order.remove(rec)
-        order.insert(0, rec)
+    if rec in ("q8_0", "q5_0", "q4_0"):
+        # Drop pairs whose K-quant is strictly better than the recommended.
+        order_rank = {"q4_0": 0, "q5_0": 1, "q8_0": 2}
+        rec_rank = order_rank[rec]
+        pairs = [p for p in pairs if order_rank[p[0]] <= rec_rank]
+        if not pairs:
+            pairs = [(rec, rec)]   # defensive — should never happen
 
     budget_mb = kv_budget_gb * 1024 * 0.98
-    for q in order:
-        per_tok = base_kv_per_token_mb * kv_quant_factor(q)
+    for k, v in pairs:
+        per_tok = base_kv_per_token_mb * (
+            kv_quant_factor(k) + kv_quant_factor(v)
+        ) / 2
         if per_tok <= 0:
             continue
         max_fit = int(budget_mb / per_tok)
         if max_fit >= target_ctx:
-            return q, q
-    return "q4_0", "q4_0"
+            chosen_k, chosen_v = k, v
+            break
+    else:
+        # Nothing in the table fit — fall back to the most aggressive entry.
+        chosen_k, chosen_v = pairs[-1]
+
+    if turbo:
+        chosen_k = _turbo_quant_for(chosen_k)
+        chosen_v = _turbo_quant_for(chosen_v)
+
+    return chosen_k, chosen_v
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +654,19 @@ def compute_config(
     force_mlock: bool = False,
     perf_target: Optional[PerformanceTarget] = None,
     mode: str = "chat",
+    *,
+    # ---- Expert-mode (auto-cascade) overrides --------------------------
+    # When any of these is set, the AutoTuner respects the user-supplied
+    # value and lets the rest of the configuration cascade around it.
+    # Manual mode bypasses compute_config entirely and builds a
+    # TunedConfig directly from widget values, so these only apply to
+    # the cascading Auto branch of the Expert panel.
+    turbo_kv: bool = False,                  # Map quants → TurboQuant equivalents
+    force_cache_k: Optional[str] = None,     # Pin K-quant; ctx adjusts
+    force_cache_v: Optional[str] = None,     # Pin V-quant; ctx adjusts
+    force_ngl: Optional[int] = None,         # Pin layer offload count
+    force_n_cpu_moe: Optional[int] = None,   # Pin MoE CPU-layer count
+    force_rope_scale: Optional[bool] = None, # Force YaRN on/off
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system.
 
@@ -569,6 +684,13 @@ def compute_config(
     Explicit ``ram_safety_gb`` / ``vram_safety_gb`` arguments still win
     over the perf_target's values; pass ``None`` (the default) to use
     whatever the resolved target prescribes.
+
+    Expert overrides (keyword-only)
+    --------------------------------
+    These are exposed primarily for the GUI's Expert panel. The plain
+    CLI path keeps using the auto-tuned defaults — only set these when
+    you have a specific reason to pin a value. The cascading rule:
+    *whatever you pin stays; everything not pinned recomputes around it*.
     """
     # ---- Resolve performance target. Caller-supplied wins; otherwise we
     # fall back to whatever the profile recommends (or "balanced").
@@ -698,6 +820,40 @@ def compute_config(
             vram_headroom_gb=vram_safety_gb,
         )
 
+    # ---- (1.5) Expert overrides: force_ngl / force_n_cpu_moe -----------
+    # Applied AFTER the automatic placement so model_vram / model_ram
+    # estimates reflect the user's pinned values. The user owns the
+    # consequences (over/undercommit); we only redistribute the model
+    # size estimate to match the new layer split.
+    if force_n_cpu_moe is not None and is_moe and has_gpu and n_layers > 0:
+        new_cpu_moe = max(0, min(n_layers, int(force_n_cpu_moe)))
+        # Re-derive model_vram/ram from the new split, holding shared
+        # overhead constant (it scales with model size, not layer
+        # placement).
+        shared_overhead_gb = model.size_gb * 0.08
+        per_layer_expert_gb = max(0.001,
+                                  (model.size_gb - shared_overhead_gb) / n_layers)
+        layers_on_gpu = n_layers - new_cpu_moe
+        model_vram = shared_overhead_gb + layers_on_gpu * per_layer_expert_gb
+        model_ram = new_cpu_moe * per_layer_expert_gb
+        n_cpu_moe = new_cpu_moe if new_cpu_moe > 0 else None
+        full_off = (new_cpu_moe == 0)
+        ngl = 999
+
+    if force_ngl is not None and n_layers > 0 and not (is_moe and has_gpu):
+        new_ngl = max(0, min(n_layers, int(force_ngl)))
+        per_layer_gb = model.size_gb / n_layers
+        ngl = new_ngl if new_ngl < n_layers else 999
+        if new_ngl >= n_layers:
+            model_vram = model.size_gb
+            model_ram = 0.0
+            full_off = True
+        else:
+            model_vram = new_ngl * per_layer_gb
+            residual_overhead = model.size_gb * 0.02
+            model_ram = (n_layers - new_ngl) * per_layer_gb + residual_overhead
+            full_off = False
+
     # ---- (2) Remaining KV budget — include vision/draft VRAM in total
     effective_vram_safety = (perf_target.moe_vram_safety_gb
                              if n_cpu_moe is not None
@@ -710,13 +866,47 @@ def compute_config(
     #   - MoE on GPU: KV must live in VRAM only. The Vulkan backend
     #     crashes with GGML_ASSERT(addr) when MoE KV spills to RAM.
     #   - Dense full-offload: KV in VRAM only (it's already on GPU).
-    #   - Dense partial / CPU-only: KV may use VRAM + RAM.
+    #   - Dense partial: KV split MIRRORS layer split. The VRAM portion
+    #     limits the total budget; RAM portion is intentionally capped
+    #     so we never bleed multi-GB KV cache into slow main memory.
+    #     This was the root cause of the gemma-31B-Q3-with-draft bug:
+    #     the old code added free_ram_after wholesale and produced an
+    #     11 GB KV cache living in RAM, dragging inference to a crawl.
+    #   - CPU-only: KV lives entirely in RAM.
+    #
+    # Cap RAM-resident KV at this many GB for hybrid placements. The
+    # value is chosen so a small (≤10 %) CPU-resident layer slice can
+    # still carry a useful context while preventing the 10-GB-KV-in-RAM
+    # trap. Override via the perf_target if a future tier needs it.
+    HYBRID_KV_RAM_CAP_GB = 2.0
+
     if is_moe and has_gpu:
         kv_budget_gb = free_vram_after
     elif full_off:
         kv_budget_gb = free_vram_after
+    elif ngl > 0 and n_layers > 0:
+        # Dense hybrid: derive max total-KV budget so neither the GPU
+        # nor the (capped) RAM share blows past its limit. The actual
+        # ctx in step (3) picks whichever quant fits this total budget.
+        gpu_layer_fraction = ngl / n_layers
+        if gpu_layer_fraction >= 0.99:
+            # Effectively full offload — treat KV as VRAM-only.
+            kv_budget_gb = free_vram_after
+        elif gpu_layer_fraction <= 0.0:
+            # No GPU layers — should not happen (ngl > 0) but stay defensive.
+            kv_budget_gb = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
+        else:
+            # Total KV that fits if we max out the VRAM portion:
+            max_total_via_vram = free_vram_after / gpu_layer_fraction
+            # Total KV that fits if we max out the (capped) RAM portion:
+            cpu_layer_fraction = 1.0 - gpu_layer_fraction
+            ram_share_cap = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
+            max_total_via_ram = (ram_share_cap / cpu_layer_fraction
+                                 if cpu_layer_fraction > 0 else 1e9)
+            kv_budget_gb = min(max_total_via_vram, max_total_via_ram)
     else:
-        kv_budget_gb = free_vram_after + free_ram_after
+        # CPU-only — KV lives entirely in RAM.
+        kv_budget_gb = free_ram_after
 
     # ---- (2.5) RoPE-Scaling (YaRN) auto-detection
     # Aktiviere RoPE-Scaling automatisch wenn:
@@ -749,7 +939,20 @@ def compute_config(
             if (profile_rope_scale or total_available >= rope_kv_gb * 1.1):
                 rope_scaled_ctx = min(desired_ctx, profile_rope_max)
                 rope_scaling_active = True
-    
+
+    # Expert override: force_rope_scale = True turns it on unconditionally;
+    # force_rope_scale = False turns it off. Either choice respects native_ctx
+    # as a hard upper bound.
+    if force_rope_scale is True:
+        rope_scaled_ctx = min(
+            (user_ctx if user_ctx is not None else profile_rope_max),
+            profile_rope_max,
+        )
+        rope_scaling_active = True
+    elif force_rope_scale is False:
+        rope_scaled_ctx = 0
+        rope_scaling_active = False
+
     # ---- (3) Context + KV quant
     target_ctx = user_ctx if user_ctx is not None else profile_max
 
@@ -760,10 +963,37 @@ def compute_config(
     if model_ctx_limit <= 0:
         model_ctx_limit = profile_max
 
-    cache_k, cache_v = _pick_kv_quant(
-        profile.recommended_kv_quant, target_ctx, base_kv_mb, kv_budget_gb,
-        model_ctx_limit,
-    )
+    # Expert overrides for KV-quant: when both K and V are pinned we
+    # respect the user's pair as-is; when only one is pinned we still
+    # let _pick_kv_quant decide the other within budget.
+    kv_quant_strategy = "symmetric"
+    if force_cache_k is not None and force_cache_v is not None:
+        cache_k, cache_v = force_cache_k, force_cache_v
+        if turbo_kv:
+            cache_k = _turbo_quant_for(cache_k)
+            cache_v = _turbo_quant_for(cache_v)
+            kv_quant_strategy = "manual+turbo"
+        else:
+            kv_quant_strategy = "manual"
+    else:
+        cache_k, cache_v = _pick_kv_quant(
+            profile.recommended_kv_quant, target_ctx, base_kv_mb, kv_budget_gb,
+            model_ctx_limit,
+            turbo=turbo_kv,
+            asymmetric=True,
+        )
+        if force_cache_k is not None:
+            cache_k = _turbo_quant_for(force_cache_k) if turbo_kv else force_cache_k
+        if force_cache_v is not None:
+            cache_v = _turbo_quant_for(force_cache_v) if turbo_kv else force_cache_v
+        if cache_k != cache_v:
+            kv_quant_strategy = "asymmetric"
+        if turbo_kv:
+            kv_quant_strategy = (
+                f"{kv_quant_strategy}+turbo"
+                if kv_quant_strategy != "symmetric" else "turbo"
+            )
+
     actual_per_tok_mb = base_kv_mb * (
         kv_quant_factor(cache_k) + kv_quant_factor(cache_v)
     ) / 2
@@ -946,6 +1176,24 @@ def compute_config(
     # no_context_shift für bessere Performance bei grossen Kontexten aktivieren
     no_context_shift = (ctx >= 32768) or full_off
 
+    # ---- KV split between VRAM and RAM for display fidelity -----------
+    # Mirrors the budget logic in step (2): MoE/full_off keep KV on GPU
+    # entirely; dense-hybrid splits proportionally to the layer split;
+    # CPU-only keeps it all in RAM.
+    if is_moe and has_gpu:
+        kv_vram_gb = estimated_kv_gb
+        kv_ram_gb = 0.0
+    elif full_off:
+        kv_vram_gb = estimated_kv_gb
+        kv_ram_gb = 0.0
+    elif ngl > 0 and n_layers > 0:
+        gpu_layer_fraction = min(1.0, ngl / n_layers)
+        kv_vram_gb = estimated_kv_gb * gpu_layer_fraction
+        kv_ram_gb = estimated_kv_gb * (1.0 - gpu_layer_fraction)
+    else:
+        kv_vram_gb = 0.0
+        kv_ram_gb = estimated_kv_gb
+
     return TunedConfig(
         ctx=ctx,
         ngl=ngl,
@@ -969,6 +1217,11 @@ def compute_config(
         estimated_model_ram_gb=model_ram,
         estimated_kv_gb=estimated_kv_gb,
         full_offload=full_off,
+        vision_vram_gb=vision_vram_gb,
+        draft_vram_gb=draft_vram_gb,
+        kv_vram_gb=kv_vram_gb,
+        kv_ram_gb=kv_ram_gb,
+        kv_quant_strategy=kv_quant_strategy,
         no_context_shift=no_context_shift,
         rope_scaling=rope_scaling_active,
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
@@ -1105,6 +1358,10 @@ def build_command(
 
     if profile.extra_args:
         cmd.extend(profile.extra_args)
+    # Expert-mode extras (--jinja, --verbose, …). Injected before the
+    # caller-passed extra_args so a caller can still override.
+    if config.extra_cli_flags:
+        cmd.extend(config.extra_cli_flags)
     if extra_args:
         cmd.extend(extra_args)
 

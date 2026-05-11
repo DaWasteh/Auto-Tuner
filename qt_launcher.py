@@ -22,16 +22,17 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QSplitter, QStatusBar,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+    QScrollArea, QSpinBox, QSplitter, QStackedWidget, QStatusBar,
     QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
 from hardware import detect_system, SystemInfo
 from scanner import scan_models, group_entries, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
-from tuner import build_command, compute_config
+from tuner import build_command, compute_config, TunedConfig
 from performance_target import (
     PERFORMANCE_TARGETS,
     list_target_names,
@@ -234,6 +235,531 @@ def _clean_model_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Expert panel — editable settings overlay
+# ---------------------------------------------------------------------------
+
+class ExpertPanel(QWidget):
+    """Editable replacement for the read-only config preview.
+
+    Lives inside a ``QStackedWidget`` paired with the preview, so toggling
+    Expert mode just switches the visible page — the surrounding layout
+    (Launch options below, log panel underneath) does not move.
+
+    Two sub-modes:
+
+    * **Auto** — every widget edit recomputes the rest via ``compute_config``
+      with the matching ``force_*`` parameter. The view re-populates from
+      the new config so cascade effects are visible immediately. The
+      Expert override values are kept in ``self._user_pins`` and reapplied
+      on every recompute (so pinning ctx=32k then changing K-quant keeps
+      ctx pinned).
+    * **Manual** — edits go straight into the local widget state and are
+      assembled into a ``TunedConfig`` at launch time. No cascade, no
+      recompute. The user owns the consequences.
+
+    A signal is emitted when the user wants to leave Expert mode entirely
+    (the parent swaps the stacked widget back to the preview page).
+    """
+
+    # Emitted with the current configuration after any cascading recompute,
+    # so the parent window can refresh its memory-estimate footer.
+    configChanged = pyqtSignal(object)   # TunedConfig
+    # Emitted with the new mode name when the user toggles Auto/Manual.
+    modeChanged = pyqtSignal(str)        # "auto" | "manual"
+    # Emitted when the user clicks the close (×) button.
+    closeRequested = pyqtSignal()
+
+    _KV_QUANT_OPTIONS = ["q4_0", "q5_0", "q8_0", "f16"]
+    _NUMA_OPTIONS = ["off", "distribute", "isolate", "numactl"]
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+
+        # Recompute callback: parent sets this so we can call
+        # compute_config with the current model/system/profile in Auto
+        # mode. Signature: (force_overrides: dict) -> Optional[TunedConfig]
+        self._recompute_cb = None
+
+        # Persistent overrides the user has pinned in Auto mode. Keys
+        # are compute_config kwarg names ("force_cache_k", "user_ctx",
+        # …). A None entry means "release this pin" — equivalent to
+        # popping the key, but kept distinct so we can show in the
+        # log what the user explicitly released.
+        self._user_pins: dict = {}
+
+        # Cached last config we displayed — needed by Manual mode to
+        # build the final TunedConfig at launch time.
+        self._last_cfg: Optional[TunedConfig] = None
+
+        # Hardware snapshot used to clamp ctx slider etc. Set by parent
+        # on every mode switch.
+        self._system: Optional[SystemInfo] = None
+        self._native_ctx: int = 0      # native_context from GGUF (0 = unknown)
+        self._profile_max: int = 8192  # YAML max_context
+
+        # Guard flag — when True we are programmatically setting widget
+        # values inside `_populate_from_cfg`, so the valueChanged signals
+        # must NOT trigger a recompute (which would either be a no-op
+        # echo or an infinite loop).
+        self._populating = False
+
+        # ── Mode toggle row + close button ─────────────────────────────
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 4)
+        mode_row.setSpacing(6)
+
+        self._btn_auto = QPushButton("⚙ Auto")
+        self._btn_auto.setCheckable(True)
+        self._btn_auto.setChecked(True)
+        self._btn_auto.setToolTip(
+            "Auto-cascade: edit any setting and the others re-fit around it."
+        )
+        self._btn_auto.clicked.connect(lambda: self._set_mode("auto"))
+        mode_row.addWidget(self._btn_auto)
+
+        self._btn_manual = QPushButton("✎ Manual")
+        self._btn_manual.setCheckable(True)
+        self._btn_manual.setToolTip(
+            "Full manual: settings stay exactly as you set them. No cascade."
+        )
+        self._btn_manual.clicked.connect(lambda: self._set_mode("manual"))
+        mode_row.addWidget(self._btn_manual)
+
+        mode_row.addStretch(1)
+
+        self._btn_close = QPushButton("✕")
+        self._btn_close.setFixedWidth(28)
+        self._btn_close.setToolTip("Close Expert panel — return to read-only preview.")
+        self._btn_close.clicked.connect(self.closeRequested.emit)
+        mode_row.addWidget(self._btn_close)
+
+        # ── Editable widgets (created once, populated per model) ───────
+        self._widgets_created = False
+        self._build_widgets()
+
+        # ── Layout ─────────────────────────────────────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(2)
+        outer.addLayout(mode_row)
+
+        # The scroll area keeps the panel usable when the user shrinks
+        # the window or picks a tiny font.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self._inner)
+        outer.addWidget(scroll, 1)
+
+        self._mode = "auto"
+
+    # ------------------------------------------------------------------
+    # Widget construction
+    # ------------------------------------------------------------------
+    def _build_widgets(self) -> None:
+        """Create the grid of editable widgets (once, reused per model)."""
+        self._inner = QWidget()
+        grid = QGridLayout(self._inner)
+        grid.setContentsMargins(4, 0, 4, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(3)
+
+        row = 0
+
+        def _add(label: str, widget: QWidget, tip: str = "") -> None:
+            nonlocal row
+            l = QLabel(label)
+            l.setStyleSheet("color:#bbb;")
+            grid.addWidget(l, row, 0)
+            grid.addWidget(widget, row, 1)
+            if tip:
+                widget.setToolTip(tip)
+                l.setToolTip(tip)
+            row += 1
+
+        def _section(title: str) -> None:
+            nonlocal row
+            l = QLabel(f"── {title} ──")
+            l.setStyleSheet("color:#8be;padding-top:4px;")
+            grid.addWidget(l, row, 0, 1, 2)
+            row += 1
+
+        # Context length
+        _section("Context & KV cache")
+        self._sp_ctx = QSpinBox()
+        self._sp_ctx.setRange(1024, 4_194_304)
+        self._sp_ctx.setSingleStep(1024)
+        self._sp_ctx.setGroupSeparatorShown(True)
+        self._sp_ctx.valueChanged.connect(lambda _: self._on_edit("user_ctx"))
+        _add("Context tokens", self._sp_ctx,
+             "Maximum context length. Auto mode: changing this re-picks "
+             "KV quants and placement to fit.")
+
+        self._cb_cache_k = QComboBox()
+        self._cb_cache_k.addItems(self._KV_QUANT_OPTIONS)
+        self._cb_cache_k.currentTextChanged.connect(lambda _: self._on_edit("force_cache_k"))
+        _add("K-quant", self._cb_cache_k,
+             "K-cache quantisation. Higher = better attention recall.")
+
+        self._cb_cache_v = QComboBox()
+        self._cb_cache_v.addItems(self._KV_QUANT_OPTIONS)
+        self._cb_cache_v.currentTextChanged.connect(lambda _: self._on_edit("force_cache_v"))
+        _add("V-quant", self._cb_cache_v,
+             "V-cache quantisation. May be lower than K-quant (asymmetric FA).")
+
+        # Layer placement
+        _section("Layer placement")
+        self._sp_ngl = QSpinBox()
+        self._sp_ngl.setRange(0, 999)
+        self._sp_ngl.valueChanged.connect(lambda _: self._on_edit("force_ngl"))
+        _add("GPU layers (ngl)", self._sp_ngl,
+             "Dense models: how many layers go on GPU. 999 = all. "
+             "Ignored for MoE — use n_cpu_moe.")
+
+        self._sp_ncpumoe = QSpinBox()
+        self._sp_ncpumoe.setRange(0, 999)
+        self._sp_ncpumoe.valueChanged.connect(lambda _: self._on_edit("force_n_cpu_moe"))
+        _add("n_cpu_moe", self._sp_ncpumoe,
+             "MoE only: how many expert layers run on CPU.")
+
+        # Threads & batching
+        _section("Threads & batching")
+        self._sp_threads = QSpinBox()
+        self._sp_threads.setRange(1, 256)
+        _add("threads", self._sp_threads, "-t  (compute threads)")
+
+        self._sp_batch_threads = QSpinBox()
+        self._sp_batch_threads.setRange(1, 256)
+        _add("batch threads", self._sp_batch_threads, "-tb (batch threads)")
+
+        self._sp_batch = QSpinBox()
+        self._sp_batch.setRange(1, 16384)
+        self._sp_batch.setSingleStep(64)
+        _add("batch", self._sp_batch, "-b  (logical batch size)")
+
+        self._sp_ubatch = QSpinBox()
+        self._sp_ubatch.setRange(1, 16384)
+        self._sp_ubatch.setSingleStep(64)
+        _add("ubatch", self._sp_ubatch, "-ub (physical batch size)")
+
+        # Flags
+        _section("Flags")
+        self._chk_fa = QCheckBox("flash attention (-fa)")
+        _add("", self._chk_fa, "Flash Attention — required for KV-quantisation.")
+
+        self._chk_mlock = QCheckBox("--mlock")
+        _add("", self._chk_mlock,
+             "Lock model in memory. Windows: needs SeLockMemoryPrivilege.")
+
+        self._chk_no_mmap = QCheckBox("--no-mmap")
+        _add("", self._chk_no_mmap, "Load model fully into memory at startup.")
+
+        self._chk_jinja = QCheckBox("--jinja")
+        _add("", self._chk_jinja,
+             "Use the embedded chat template (separates <think> tags into reasoning_content).")
+
+        self._chk_verbose = QCheckBox("--verbose")
+        _add("", self._chk_verbose, "Verbose llama-server logging.")
+
+        self._cb_numa = QComboBox()
+        self._cb_numa.addItems(self._NUMA_OPTIONS)
+        _add("NUMA", self._cb_numa, "--numa policy (off = no flag).")
+
+        self._chk_rope = QCheckBox("RoPE scaling (YaRN)")
+        self._chk_rope.toggled.connect(lambda _: self._on_edit("force_rope_scale"))
+        _add("", self._chk_rope,
+             "Force YaRN context extension on/off (overrides profile default).")
+
+        self._sp_rope_factor = QDoubleSpinBox()
+        self._sp_rope_factor.setRange(1.0, 32.0)
+        self._sp_rope_factor.setSingleStep(0.5)
+        self._sp_rope_factor.setDecimals(1)
+        _add("RoPE factor", self._sp_rope_factor, "YaRN scale factor (1.0 = native).")
+
+        # Sampling
+        _section("Sampling")
+        self._sp_temp = QDoubleSpinBox()
+        self._sp_temp.setRange(0.0, 5.0); self._sp_temp.setSingleStep(0.05); self._sp_temp.setDecimals(2)
+        _add("temperature", self._sp_temp, "--temp")
+
+        self._sp_top_k = QSpinBox()
+        self._sp_top_k.setRange(0, 1000)
+        _add("top_k", self._sp_top_k, "--top-k  (0 = disabled)")
+
+        self._sp_top_p = QDoubleSpinBox()
+        self._sp_top_p.setRange(0.0, 1.0); self._sp_top_p.setSingleStep(0.01); self._sp_top_p.setDecimals(3)
+        _add("top_p", self._sp_top_p, "--top-p")
+
+        self._sp_min_p = QDoubleSpinBox()
+        self._sp_min_p.setRange(0.0, 1.0); self._sp_min_p.setSingleStep(0.01); self._sp_min_p.setDecimals(3)
+        _add("min_p", self._sp_min_p, "--min-p")
+
+        self._sp_rep = QDoubleSpinBox()
+        self._sp_rep.setRange(0.5, 2.5); self._sp_rep.setSingleStep(0.01); self._sp_rep.setDecimals(3)
+        _add("repeat_penalty", self._sp_rep, "--repeat-penalty")
+
+        self._sp_presence = QDoubleSpinBox()
+        self._sp_presence.setRange(-2.0, 2.0); self._sp_presence.setSingleStep(0.1); self._sp_presence.setDecimals(2)
+        _add("presence_penalty", self._sp_presence, "--presence-penalty")
+
+        # Extra free-form CLI flags
+        _section("Extra CLI flags")
+        self._le_extra = QLineEdit()
+        self._le_extra.setPlaceholderText("e.g.  --chat-template-kwargs '{\"reasoning_effort\":\"high\"}'")
+        _add("extras", self._le_extra,
+             "Appended verbatim to the llama-server command line.")
+
+        grid.setRowStretch(row, 1)
+        self._widgets_created = True
+
+    # ------------------------------------------------------------------
+    # Mode toggling
+    # ------------------------------------------------------------------
+    def _set_mode(self, mode: str) -> None:
+        if mode not in ("auto", "manual"):
+            return
+        self._mode = mode
+        self._btn_auto.setChecked(mode == "auto")
+        self._btn_manual.setChecked(mode == "manual")
+        # Switching from Manual → Auto drops any stale pins so the
+        # cascade starts from the current model's auto-defaults.
+        if mode == "auto":
+            self._user_pins.clear()
+            self._recompute(force_overrides={})
+        self.modeChanged.emit(mode)
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    # ------------------------------------------------------------------
+    # Public API — called by the parent window
+    # ------------------------------------------------------------------
+    def configure_for_model(
+        self,
+        cfg: TunedConfig,
+        system: SystemInfo,
+        native_ctx: int,
+        profile_max: int,
+        recompute_cb,
+    ) -> None:
+        """Bind the panel to a specific model selection.
+
+        ``recompute_cb`` takes a dict of ``force_*`` kwargs and returns a
+        fresh ``TunedConfig`` (or None on failure). Called from Auto
+        mode whenever the user edits a cascading widget.
+        """
+        self._system = system
+        self._native_ctx = native_ctx
+        self._profile_max = profile_max
+        self._recompute_cb = recompute_cb
+        # New model → drop pins, repaint from the fresh cfg.
+        self._user_pins.clear()
+        self._populate_from_cfg(cfg)
+
+    def current_config(self) -> Optional[TunedConfig]:
+        """Return the configuration to launch with.
+
+        Auto mode: the last cascaded config.
+        Manual mode: assembled from the live widget values.
+        """
+        if self._mode == "auto":
+            return self._last_cfg
+        return self._build_manual_config()
+
+    # ------------------------------------------------------------------
+    # Widget ↔ cfg bridging
+    # ------------------------------------------------------------------
+    def _populate_from_cfg(self, cfg: TunedConfig) -> None:
+        """Mirror cfg values into widgets without firing recompute."""
+        self._last_cfg = cfg
+        self._populating = True
+        try:
+            # Context
+            ctx_max = max(self._profile_max, self._native_ctx, cfg.ctx, 8192)
+            self._sp_ctx.setMaximum(ctx_max)
+            self._sp_ctx.setValue(cfg.ctx)
+
+            # KV quants
+            self._set_combo(self._cb_cache_k, cfg.cache_k)
+            self._set_combo(self._cb_cache_v, cfg.cache_v)
+
+            # Layer placement
+            self._sp_ngl.setValue(min(999, cfg.ngl))
+            self._sp_ncpumoe.setValue(cfg.n_cpu_moe or 0)
+
+            # Threads & batching
+            self._sp_threads.setValue(cfg.threads)
+            self._sp_batch_threads.setValue(cfg.batch_threads)
+            self._sp_batch.setValue(cfg.batch)
+            self._sp_ubatch.setValue(cfg.ubatch)
+
+            # Flags
+            self._chk_fa.setChecked(cfg.flash_attn)
+            self._chk_mlock.setChecked(cfg.mlock)
+            self._chk_no_mmap.setChecked(cfg.no_mmap)
+            self._chk_jinja.setChecked("--jinja" in (cfg.extra_cli_flags or []))
+            self._chk_verbose.setChecked("--verbose" in (cfg.extra_cli_flags or []))
+            self._set_combo(self._cb_numa, cfg.numa or "off")
+
+            self._chk_rope.setChecked(cfg.rope_scaling)
+            self._sp_rope_factor.setValue(
+                float(cfg.rope_scale_factor) if cfg.rope_scale_factor > 0 else 1.0
+            )
+
+            # Sampling
+            s = cfg.sampling or {}
+            self._sp_temp.setValue(float(s.get("temperature", 0.7)))
+            self._sp_top_k.setValue(int(s.get("top_k", 40)))
+            self._sp_top_p.setValue(float(s.get("top_p", 0.9)))
+            self._sp_min_p.setValue(float(s.get("min_p", 0.05)))
+            self._sp_rep.setValue(float(s.get("repeat_penalty", 1.05)))
+            self._sp_presence.setValue(float(s.get("presence_penalty", 0.0)))
+
+            # Extra CLI: filter out the flags we already model as checkboxes
+            modeled = {"--jinja", "--verbose"}
+            free_flags = [
+                f for f in (cfg.extra_cli_flags or []) if f not in modeled
+            ]
+            self._le_extra.setText(" ".join(free_flags))
+        finally:
+            self._populating = False
+
+    @staticmethod
+    def _set_combo(combo: QComboBox, value: str) -> None:
+        """Select ``value`` in ``combo``; insert it if missing (Turbo quants)."""
+        idx = combo.findText(value)
+        if idx < 0:
+            combo.addItem(value)
+            idx = combo.findText(value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------------
+    # Auto-cascade
+    # ------------------------------------------------------------------
+    def _on_edit(self, kind: str) -> None:
+        """A cascading widget was edited.
+
+        Only acts in Auto mode and only when we are not in the middle
+        of programmatically populating widgets.
+        """
+        if self._populating or self._mode != "auto":
+            return
+        # Update the pin set for this widget kind.
+        if kind == "user_ctx":
+            self._user_pins["user_ctx"] = self._sp_ctx.value()
+        elif kind == "force_cache_k":
+            self._user_pins["force_cache_k"] = self._cb_cache_k.currentText()
+        elif kind == "force_cache_v":
+            self._user_pins["force_cache_v"] = self._cb_cache_v.currentText()
+        elif kind == "force_ngl":
+            self._user_pins["force_ngl"] = self._sp_ngl.value()
+        elif kind == "force_n_cpu_moe":
+            v = self._sp_ncpumoe.value()
+            self._user_pins["force_n_cpu_moe"] = v if v > 0 else None
+        elif kind == "force_rope_scale":
+            self._user_pins["force_rope_scale"] = self._chk_rope.isChecked()
+
+        self._recompute(force_overrides=dict(self._user_pins))
+
+    def _recompute(self, force_overrides: dict) -> None:
+        """Ask the parent to rebuild the config with these overrides."""
+        if self._recompute_cb is None:
+            return
+        cfg = self._recompute_cb(force_overrides)
+        if cfg is None:
+            return
+        # Apply the live (non-cascading) widget values on top of the
+        # cascaded result so the user's batch/thread/flag/sampling edits
+        # survive the rebuild.
+        cfg = self._apply_noncascading(cfg)
+        self._populate_from_cfg(cfg)
+        self.configChanged.emit(cfg)
+
+    def _apply_noncascading(self, cfg: TunedConfig) -> TunedConfig:
+        """Overlay the widget values that do not feed back into compute_config."""
+        try:
+            cfg.threads = self._sp_threads.value() or cfg.threads
+            cfg.batch_threads = self._sp_batch_threads.value() or cfg.batch_threads
+            cfg.batch = self._sp_batch.value() or cfg.batch
+            cfg.ubatch = self._sp_ubatch.value() or cfg.ubatch
+            cfg.flash_attn = self._chk_fa.isChecked()
+            cfg.mlock = self._chk_mlock.isChecked()
+            cfg.no_mmap = self._chk_no_mmap.isChecked()
+            numa_choice = self._cb_numa.currentText()
+            cfg.numa = None if numa_choice == "off" else numa_choice
+            # Sampling
+            cfg.sampling = {
+                "temperature": float(self._sp_temp.value()),
+                "top_k": int(self._sp_top_k.value()),
+                "top_p": float(self._sp_top_p.value()),
+                "min_p": float(self._sp_min_p.value()),
+                "repeat_penalty": float(self._sp_rep.value()),
+                "presence_penalty": float(self._sp_presence.value()),
+            }
+            # Free-form extras + the two modelled flags
+            extras: List[str] = []
+            if self._chk_jinja.isChecked():
+                extras.append("--jinja")
+            if self._chk_verbose.isChecked():
+                extras.append("--verbose")
+            free = self._le_extra.text().strip()
+            if free:
+                extras.extend(free.split())
+            cfg.extra_cli_flags = extras
+        except Exception:
+            pass
+        return cfg
+
+    def _build_manual_config(self) -> Optional[TunedConfig]:
+        """Construct a TunedConfig from widget values without compute_config."""
+        base = self._last_cfg
+        if base is None:
+            return None
+        # Clone the auto-cfg then overwrite every field with the live widget value.
+        # Using copy() keeps the unmodelled fields (tensor_split, main_gpu, etc.)
+        import copy as _copy
+        cfg = _copy.copy(base)
+        cfg.ctx = self._sp_ctx.value()
+        cfg.cache_k = self._cb_cache_k.currentText()
+        cfg.cache_v = self._cb_cache_v.currentText()
+        cfg.ngl = self._sp_ngl.value()
+        n_cpu = self._sp_ncpumoe.value()
+        cfg.n_cpu_moe = n_cpu if n_cpu > 0 else None
+        cfg.threads = self._sp_threads.value()
+        cfg.batch_threads = self._sp_batch_threads.value()
+        cfg.batch = self._sp_batch.value()
+        cfg.ubatch = self._sp_ubatch.value()
+        cfg.flash_attn = self._chk_fa.isChecked()
+        cfg.mlock = self._chk_mlock.isChecked()
+        cfg.no_mmap = self._chk_no_mmap.isChecked()
+        numa_choice = self._cb_numa.currentText()
+        cfg.numa = None if numa_choice == "off" else numa_choice
+        cfg.rope_scaling = self._chk_rope.isChecked()
+        cfg.rope_scale_factor = float(self._sp_rope_factor.value())
+        cfg.sampling = {
+            "temperature": float(self._sp_temp.value()),
+            "top_k": int(self._sp_top_k.value()),
+            "top_p": float(self._sp_top_p.value()),
+            "min_p": float(self._sp_min_p.value()),
+            "repeat_penalty": float(self._sp_rep.value()),
+            "presence_penalty": float(self._sp_presence.value()),
+        }
+        extras: List[str] = []
+        if self._chk_jinja.isChecked():
+            extras.append("--jinja")
+        if self._chk_verbose.isChecked():
+            extras.append("--verbose")
+        free = self._le_extra.text().strip()
+        if free:
+            extras.extend(free.split())
+        cfg.extra_cli_flags = extras
+        cfg.kv_quant_strategy = "manual"
+        return cfg
+
+
+# ---------------------------------------------------------------------------
 # Main window
 
 class MainWindow(QMainWindow):
@@ -369,26 +895,6 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._perf_combo)
 
         tb.addSeparator()
-        tb.addWidget(QLabel(" Mode:"))
-        self._mode_combo = QComboBox()
-        self._mode_combo.setMinimumWidth(90)
-        self._mode_combo.setToolTip(
-            "Sampling profile:\n"
-            "  • chat   — conversational defaults (higher temperature,\n"
-            "             lower repetition control)\n"
-            "  • coding — deterministic defaults from each model's\n"
-            "             official coding/agentic-bench setup\n"
-            "Profiles without a coding block fall back to chat values."
-        )
-        for m in ("chat", "coding"):
-            self._mode_combo.addItem(m)
-        persisted_mode = app_settings.get_mode() or "chat"
-        idx = self._mode_combo.findText(persisted_mode)
-        self._mode_combo.setCurrentIndex(max(0, idx))
-        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        tb.addWidget(self._mode_combo)
-
-        tb.addSeparator()
         tb.addWidget(QLabel(" Font:"))
         for delta, label in ((-1, "A−"), (+1, "A+")):
             b = QPushButton(label)
@@ -432,11 +938,42 @@ class MainWindow(QMainWindow):
         ll.addWidget(fr)
         ll.addWidget(self._model_list)
 
-        # ── Config preview ─────────────────────────────────────────────
+        # ── Config preview / Expert panel (stacked) ────────────────────
         self._config_preview = QTextEdit()
         self._config_preview.setReadOnly(True)
         self._config_preview.setPlaceholderText("Select a model to see its config…")
         self._apply_mono_font(self._config_preview)
+
+        # The Expert panel lives in the same area as the read-only
+        # preview; switching is a single setCurrentIndex() call so the
+        # surrounding layout stays put (no relayout / no flicker).
+        self._expert_panel = ExpertPanel()
+        self._expert_panel.configChanged.connect(self._on_expert_cfg_changed)
+        self._expert_panel.modeChanged.connect(self._on_expert_mode_changed)
+        self._expert_panel.closeRequested.connect(self._exit_expert_mode)
+
+        self._config_stack = QStackedWidget()
+        self._config_stack.addWidget(self._config_preview)   # index 0 — preview
+        self._config_stack.addWidget(self._expert_panel)     # index 1 — expert
+        self._config_stack.setCurrentIndex(0)
+
+        # ── Expert button row (sits between preview and Launch options) ─
+        # In normal mode this row shows a single "🔧 Expert" button.
+        # When Expert mode is active the button is replaced by an
+        # [Auto] [Manual] pair (the Expert panel itself owns those
+        # toggle buttons — see ExpertPanel — but we still mirror the
+        # state here in the bottom row for parallel access).
+        self._btn_expert = QPushButton("🔧 Expert settings")
+        self._btn_expert.setToolTip(
+            "Open the Expert panel to override AutoTuner decisions."
+        )
+        self._btn_expert.clicked.connect(self._enter_expert_mode)
+        self._btn_expert_row = QWidget()
+        bex = QHBoxLayout(self._btn_expert_row)
+        bex.setContentsMargins(0, 0, 0, 0)
+        bex.addStretch(1)
+        bex.addWidget(self._btn_expert)
+        bex.addStretch(1)
 
         # ── Launch options (checkboxes) ────────────────────────────────
         opts = QGroupBox("Launch options")
@@ -445,21 +982,15 @@ class MainWindow(QMainWindow):
 
         self._chk_vision   = QCheckBox("Vision (mmproj)")
         self._chk_draft    = QCheckBox("Draft model (speculative decoding)")
+        # NEW: Turbo KV-quant toggle. Sits between Draft and Thinking,
+        # as requested. When on, the AutoTuner maps the chosen KV
+        # quants to their TurboQuant equivalents (denser packing on
+        # the TheTom/AtomicBot forks; harmless no-op on stock builds
+        # because the mapping is identity for unknown labels).
+        self._chk_turbo_kv = QCheckBox("Turbo KV-quant (TurboQuant forks)")
         self._chk_thinking = QCheckBox("Thinking / Reasoning")
 
-        self._chk_vision.setToolTip(
-            "Load the multimodal projector (mmproj) so the model can\n"
-            "process images. Mutually exclusive with Draft — both want\n"
-            "VRAM, and integrated-MTP models don't combine with vision."
-        )
-        self._chk_draft.setToolTip(
-            "Enable speculative decoding using a smaller drafter model.\n"
-            "Either a paired -Assistant.gguf sibling, or — when the main\n"
-            "filename contains 'MTP' — the integrated drafter inside\n"
-            "the same GGUF. Mutually exclusive with Vision."
-        )
-
-        for chk in (self._chk_vision, self._chk_draft, self._chk_thinking):
+        for chk in (self._chk_vision, self._chk_draft, self._chk_turbo_kv, self._chk_thinking):
             chk.setEnabled(False)
             ol.addWidget(chk)
 
@@ -468,15 +999,17 @@ class MainWindow(QMainWindow):
         # one knows which option it represents.
         self._chk_vision.toggled.connect(self._on_vision_toggled)
         self._chk_draft.toggled.connect(self._on_draft_toggled)
+        self._chk_turbo_kv.toggled.connect(self._on_turbo_toggled)
         self._chk_thinking.toggled.connect(self._on_thinking_toggled)
 
-        opts.setMaximumHeight(110)
+        opts.setMaximumHeight(140)
 
         right = QWidget()
         rl2 = QVBoxLayout(right)
         rl2.setContentsMargins(0, 0, 0, 0)
         rl2.setSpacing(4)
-        rl2.addWidget(self._config_preview, 1)
+        rl2.addWidget(self._config_stack, 1)
+        rl2.addWidget(self._btn_expert_row)
         rl2.addWidget(opts)
 
         # ── Top HSplitter ──────────────────────────────────────────────
@@ -819,33 +1352,6 @@ class MainWindow(QMainWindow):
             profile_choice=getattr(profile, "performance_target", "") or None,
         )
 
-    def _current_mode(self) -> str:
-        """Return the active sampling mode ("chat" / "coding")."""
-        if not hasattr(self, "_mode_combo"):
-            return "chat"
-        m = self._mode_combo.currentText().strip().lower()
-        return m if m in ("chat", "coding") else "chat"
-
-    def _on_mode_changed(self, index: int) -> None:
-        """User flipped chat ↔ coding — persist + refresh preview only.
-
-        The mode change only affects sampling values (temperature/top-k);
-        VRAM placement and feature checkboxes stay untouched.
-        """
-        name = self._mode_combo.itemText(index).strip()
-        try:
-            app_settings.set_mode(name)
-        except Exception as exc:
-            self._log(f"[Warning] Could not save mode: {exc}")
-        self._log(f"[Mode] → {name}")
-        entry = getattr(self, "_current_entry", None)
-        if entry is not None and self._system is not None:
-            try:
-                profile = match_profile(entry.name, self._profiles)
-                self._update_config_text(entry, profile)
-            except Exception as exc:
-                self._log(f"[Warning] Config refresh failed: {exc}")
-
     def _hw_detect_done(
         self, s: Optional[SystemInfo], err: str = ""
     ) -> None:
@@ -1080,6 +1586,12 @@ class MainWindow(QMainWindow):
                 "Die Konfiguration wird automatisch aktualisiert."
             )
             return
+        # Switching models drops the Expert state — the panel's pins were
+        # for the *previous* model. Keep the user in the read-only preview
+        # so they see the fresh AutoTuner output before re-entering Expert.
+        if self._config_stack.currentIndex() == 1:
+            self._config_stack.setCurrentIndex(0)
+            self._btn_expert_row.setVisible(True)
         self._current_entry = entry
         self._current_draft = _find_draft_model(entry, self._all_entries)
         self._update_checkboxes(entry)
@@ -1118,29 +1630,16 @@ class MainWindow(QMainWindow):
         self._chk_vision.blockSignals(False)
 
         # ── Draft ───────────────────────────────────────────────────
-        # Two ways to have a "draft" capability:
-        #   1. A paired sibling -Assistant.gguf (entry.draft is set)
-        #   2. The main GGUF carries an integrated MTP drafter inside —
-        #      filenames like "Qwen3.6-27B-MTP-UD-Q3_K_XL.gguf". In that
-        #      case there is no separate draft model to display, but the
-        #      checkbox still gates the --spec-type / --spec-draft-n-max
-        #      flags in the launch command (handled in tuner.build_command).
         draft = self._current_draft
-        from tuner import _has_integrated_mtp  # local import: tuner needed
-        integrated_mtp = _has_integrated_mtp(entry)
-        has_draft = (draft is not None) or integrated_mtp
+        has_draft = draft is not None
         draft_state = ov["draft"] if "draft" in ov else has_draft
         self._chk_draft.blockSignals(True)
         self._chk_draft.setEnabled(has_draft)
         self._chk_draft.setChecked(has_draft and draft_state)
-        if draft is not None:
-            self._chk_draft.setText(
-                f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
-            )
-        elif integrated_mtp:
-            self._chk_draft.setText("Draft   (integrated MTP — drafter inside GGUF)")
-        else:
-            self._chk_draft.setText("Draft (no assistant model found)")
+        self._chk_draft.setText(
+            f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
+            if draft is not None else "Draft (no assistant model found)"
+        )
         self._chk_draft.blockSignals(False)
 
         # ── Thinking / Reasoning ────────────────────────────────────
@@ -1156,56 +1655,16 @@ class MainWindow(QMainWindow):
         self._chk_thinking.setChecked(has_thinking and thinking_state)
         self._chk_thinking.blockSignals(False)
 
-        # ── Vision / Draft mutual exclusion ────────────────────────
-        # Vision (mmproj) and speculative drafting both want VRAM, and
-        # the few models that legitimately ship both (rare) work better
-        # one-at-a-time on a 16 GB card. Enforce the constraint here
-        # so the UI matches what the launcher will actually do.
-        self._enforce_vision_draft_exclusion()
-
-    def _enforce_vision_draft_exclusion(self) -> None:
-        """Ensure Vision and Draft can't both be checked simultaneously.
-
-        Rules:
-          * Whichever is currently checked stays enabled; the other gets
-            disabled (greyed out).
-          * If neither is checked, both stay enabled (model permitting).
-          * Capability-disabled checkboxes (no mmproj / no draft sibling)
-            stay disabled regardless — capability beats UI policy.
-        """
-        has_vision_cap = self._chk_vision.isEnabled() or self._chk_vision.isChecked()
-        has_draft_cap  = self._chk_draft.isEnabled()  or self._chk_draft.isChecked()
-
-        # Re-derive the "is this even possible for this model" flag from
-        # the current model entry, so we don't accidentally enable a
-        # checkbox the model itself doesn't support.
-        entry = self._current_entry
-        model_has_vision = entry is not None and entry.mmproj is not None
-        model_has_draft  = self._current_draft is not None
-
-        v_checked = self._chk_vision.isChecked()
-        d_checked = self._chk_draft.isChecked()
-
-        # Block signals while we re-enable, so we don't trip the toggle slots.
-        self._chk_vision.blockSignals(True)
-        self._chk_draft.blockSignals(True)
-        try:
-            if v_checked and not d_checked:
-                self._chk_vision.setEnabled(model_has_vision)
-                self._chk_draft.setEnabled(False)
-            elif d_checked and not v_checked:
-                self._chk_vision.setEnabled(False)
-                self._chk_draft.setEnabled(model_has_draft)
-            else:
-                # Neither checked — both enabled if the model supports them.
-                self._chk_vision.setEnabled(model_has_vision)
-                self._chk_draft.setEnabled(model_has_draft)
-        finally:
-            self._chk_vision.blockSignals(False)
-            self._chk_draft.blockSignals(False)
-        # Touch the unused capability flags to keep linters quiet —
-        # they're meaningful in the docstring even if not in the body.
-        _ = (has_vision_cap, has_draft_cap)
+        # ── Turbo KV-quant ──────────────────────────────────────────
+        # Always enabled — the AutoTuner cannot detect whether the
+        # active fork is a TurboQuant build (binary inspection would
+        # be expensive and unreliable). On stock builds the toggle is
+        # a harmless no-op because _turbo_quant_for() returns the
+        # input label when no mapping exists. State is NOT persisted
+        # per-model (it's a fork-level capability flag).
+        self._chk_turbo_kv.setEnabled(True)
+        # Don't touch the checked state on model switch — Turbo is a
+        # session-global preference.
 
     def _auto_select_fork(self, profile: ModelProfile) -> None:
         """Auto-select fork from combo based on profile requirement.
@@ -1282,25 +1741,24 @@ class MainWindow(QMainWindow):
 
     def _on_vision_toggled(self, checked: bool) -> None:
         self._record_override("vision", checked)
-        # Vision freshly enabled → uncheck draft (keeps state consistent).
-        if checked and self._chk_draft.isChecked():
-            self._chk_draft.blockSignals(True)
-            self._chk_draft.setChecked(False)
-            self._chk_draft.blockSignals(False)
-            self._record_override("draft", False)
-        self._enforce_vision_draft_exclusion()
         self._refresh_config_preview()
 
     def _on_draft_toggled(self, checked: bool) -> None:
         self._record_override("draft", checked)
-        # Draft freshly enabled → uncheck vision.
-        if checked and self._chk_vision.isChecked():
-            self._chk_vision.blockSignals(True)
-            self._chk_vision.setChecked(False)
-            self._chk_vision.blockSignals(False)
-            self._record_override("vision", False)
-        self._enforce_vision_draft_exclusion()
         self._refresh_config_preview()
+
+    def _on_turbo_toggled(self, checked: bool) -> None:
+        """Turbo KV-quant toggle. Not persisted per-model: it's a
+        fork-level capability flag rather than a model preference, so
+        flipping it just rebuilds the preview / current Expert config.
+        """
+        self._refresh_config_preview()
+        if self._config_stack.currentIndex() == 1:
+            # Already in Expert mode → re-cascade through the panel so
+            # the K/V quant widgets update to show the turbo-mapped labels.
+            self._expert_panel._recompute(
+                force_overrides=dict(self._expert_panel._user_pins)
+            )
 
     def _on_thinking_toggled(self, checked: bool) -> None:
         self._record_override("thinking", checked)
@@ -1312,23 +1770,76 @@ class MainWindow(QMainWindow):
             profile = match_profile(self._current_entry.name, self._profiles)
             self._update_config_text(self._current_entry, profile)
 
-    def _update_config_text(self, entry: ModelEntry, profile: ModelProfile) -> None:
-        """Recompute config using current checkbox states, refresh preview."""
-        assert self._system is not None
+    def _build_auto_config(
+        self,
+        entry: ModelEntry,
+        profile: ModelProfile,
+        force_overrides: Optional[dict] = None,
+    ) -> Optional[TunedConfig]:
+        """Helper: rebuild a TunedConfig for the given model with the
+        current checkbox states. Returns None when system info is missing.
+
+        Centralised so both the preview path and the Expert panel's
+        recompute callback share the same code path (and therefore the
+        same handling of vision / draft / turbo_kv).
+        """
+        if self._system is None:
+            return None
+
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
         use_draft  = self._chk_draft.isChecked()  and self._chk_draft.isEnabled()
+        turbo_kv   = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
 
         entry_for_cfg = copy.copy(entry)
         if not use_vision:
             entry_for_cfg.mmproj = None
 
-        cfg = compute_config(
-            model=entry_for_cfg, system=self._system, profile=profile,
-            draft_model=self._current_draft if use_draft else None,
-            user_ctx=None, force_mlock=False,
-            perf_target=self._resolve_perf_target_for_profile(profile),
-            mode=self._current_mode(),
-        )
+        # Build the kwargs dict carefully — only forward keys whose
+        # values the caller actually pinned. Sending None for an unset
+        # force_* parameter is fine (compute_config handles it), but
+        # being explicit makes the call site easier to read in logs.
+        kwargs = dict(force_overrides or {})
+
+        try:
+            return compute_config(
+                model=entry_for_cfg, system=self._system, profile=profile,
+                draft_model=self._current_draft if use_draft else None,
+                force_mlock=False,
+                perf_target=self._resolve_perf_target_for_profile(profile),
+                turbo_kv=turbo_kv,
+                **kwargs,
+            )
+        except Exception as exc:
+            self._log(f"[Warning] compute_config failed: {exc}")
+            return None
+
+    def _update_config_text(self, entry: ModelEntry, profile: ModelProfile) -> None:
+        """Recompute config using current checkbox states, refresh preview."""
+        assert self._system is not None
+        cfg = self._build_auto_config(entry, profile)
+        if cfg is None:
+            return
+        self._render_cfg_to_preview(entry, profile, cfg)
+        # When Expert mode is open, push the rebuilt cfg through the
+        # panel too so vision/draft/turbo toggles cascade visibly.
+        if self._config_stack.currentIndex() == 1:
+            self._expert_panel.configure_for_model(
+                cfg=cfg,
+                system=self._system,
+                native_ctx=entry.native_context,
+                profile_max=profile.max_context,
+                recompute_cb=lambda overrides:
+                    self._build_auto_config(entry, profile, overrides),
+            )
+
+    def _render_cfg_to_preview(
+        self, entry: ModelEntry, profile: ModelProfile, cfg: TunedConfig,
+    ) -> None:
+        """Format ``cfg`` into the read-only preview QTextEdit."""
+        assert self._system is not None
+        use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
+        use_draft  = self._chk_draft.isChecked()  and self._chk_draft.isEnabled()
+        turbo_kv   = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
 
         W = 64
         bar = "─" * W
@@ -1354,40 +1865,146 @@ class MainWindow(QMainWindow):
 
         if cfg.full_offload:
             placement = f"GPU full offload  ({entry.n_layers or '?'} layers)"
+        elif cfg.is_moe and cfg.n_cpu_moe:
+            placement = (f"MoE hybrid — {cfg.n_cpu_moe} CPU expert layer(s) "
+                         f"of {entry.n_layers or '?'} total")
         elif cfg.ngl > 0:
-            placement = f"Hybrid — {cfg.ngl} layers GPU + CPU"
+            placement = f"Hybrid — {cfg.ngl}/{entry.n_layers or '?'} layers GPU + CPU"
         else:
             placement = "CPU only"
+
+        # KV-quant line annotated with the strategy (symmetric /
+        # asymmetric / turbo / manual) so the user sees at a glance
+        # what the AutoTuner actually applied.
+        kv_line = f"KV cache quant  : K={cfg.cache_k}  V={cfg.cache_v}"
+        if cfg.kv_quant_strategy and cfg.kv_quant_strategy != "symmetric":
+            kv_line += f"  [{cfg.kv_quant_strategy}]"
+        elif turbo_kv:
+            kv_line += "  [turbo]"
 
         lines += [
             f"Placement       : {placement}",
             f"Perf target     : {cfg.performance_target}",
-            f"Mode            : {self._current_mode()}",
             f"Context         : {cfg.ctx:,} tokens",
-            f"KV cache quant  : K={cfg.cache_k}  V={cfg.cache_v}",
+            kv_line,
             f"Threads         : {cfg.threads}  (batch: {cfg.batch_threads})",
             f"Batch / ubatch  : {cfg.batch} / {cfg.ubatch}",
             f"Flash attention : {'on' if cfg.flash_attn else 'off'}",
         ]
         if cfg.mlock:
             lines.append("mlock           : on")
+        if cfg.rope_scaling:
+            lines.append(
+                f"RoPE scaling    : on (factor {cfg.rope_scale_factor:.1f}×)"
+            )
         s = cfg.sampling
         lines.append(
             f"Sampling        : temp={s.get('temperature')}  "
             f"top_k={s.get('top_k')}  top_p={s.get('top_p')}  "
             f"min_p={s.get('min_p')}  rep={s.get('repeat_penalty')}"
         )
-        lines += [
-            bar,
-            "Memory estimate (with current options):",
+
+        # ── Memory estimate (with vision / draft / KV breakdown) ────
+        # The old version only printed `Model GPU` for the main weights,
+        # which made vision/draft toggles look counter-intuitive (the
+        # main number went down while total GPU usage went up). We now
+        # show every component plus a `Total GPU` row so the user sees
+        # exactly what fits where.
+        total_gpu = (cfg.estimated_model_vram_gb + cfg.vision_vram_gb
+                     + cfg.draft_vram_gb + cfg.kv_vram_gb)
+        total_cpu = cfg.estimated_model_ram_gb + cfg.kv_ram_gb
+        lines += [bar, "Memory estimate (with current options):"]
+        lines.append(
             f"  Model GPU : ~{cfg.estimated_model_vram_gb:5.1f} GB"
-            f"   (free VRAM: {self._system.free_vram_gb:.1f} GB)",
+            f"   (free VRAM: {self._system.free_vram_gb:.1f} GB)"
+        )
+        if cfg.vision_vram_gb > 0.05:
+            lines.append(f"  Vision GPU: ~{cfg.vision_vram_gb:5.1f} GB")
+        if cfg.draft_vram_gb > 0.05:
+            lines.append(f"  Draft GPU : ~{cfg.draft_vram_gb:5.1f} GB")
+        # KV split: show both parts when hybrid; otherwise the single number.
+        if cfg.kv_ram_gb > 0.05:
+            lines.append(
+                f"  KV cache  : ~{cfg.estimated_kv_gb:5.1f} GB"
+                f"   (VRAM {cfg.kv_vram_gb:.1f} + RAM {cfg.kv_ram_gb:.1f})"
+            )
+        else:
+            lines.append(f"  KV cache  : ~{cfg.estimated_kv_gb:5.1f} GB")
+        lines.append(
+            f"  Total GPU : ~{total_gpu:5.1f} GB"
+            f"   of {self._system.free_vram_gb:.1f} GB free"
+        )
+        lines.append(
             f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB"
-            f"   (free RAM:  {self._system.free_ram_gb:.1f} GB)",
-            f"  KV cache  : ~{cfg.estimated_kv_gb:5.1f} GB",
-            bar,
-        ]
+            f"   (free RAM:  {self._system.free_ram_gb:.1f} GB)"
+        )
+        if total_cpu > cfg.estimated_model_ram_gb + 0.05:
+            lines.append(f"  Total CPU : ~{total_cpu:5.1f} GB")
+        if cfg.warning:
+            lines.append(f"  ⚠ {cfg.warning}")
+        lines.append(bar)
+
         self._config_preview.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Expert mode entry / exit
+    # ------------------------------------------------------------------
+    def _enter_expert_mode(self) -> None:
+        """Swap the read-only preview for the editable Expert panel."""
+        if self._current_entry is None or self._system is None:
+            QMessageBox.information(
+                self, "No model selected",
+                "Select a model first — the Expert panel needs a current "
+                "configuration to start from."
+            )
+            return
+        profile = match_profile(self._current_entry.name, self._profiles)
+        cfg = self._build_auto_config(self._current_entry, profile)
+        if cfg is None:
+            return
+        entry = self._current_entry
+        self._expert_panel.configure_for_model(
+            cfg=cfg,
+            system=self._system,
+            native_ctx=entry.native_context,
+            profile_max=profile.max_context,
+            recompute_cb=lambda overrides:
+                self._build_auto_config(entry, profile, overrides),
+        )
+        self._config_stack.setCurrentIndex(1)
+        # Hide the Expert button (it's now "covered" by the panel — the
+        # Auto/Manual toggles inside the panel take its place at the
+        # top of the same area).
+        self._btn_expert_row.setVisible(False)
+        self._log("[Expert] Entered Expert mode (Auto).")
+
+    def _exit_expert_mode(self) -> None:
+        """Return to the read-only preview view."""
+        self._config_stack.setCurrentIndex(0)
+        self._btn_expert_row.setVisible(True)
+        # Re-render the preview from the panel's current cfg so the
+        # user's last Expert tweaks remain visible until they pick a
+        # different model.
+        cfg = self._expert_panel.current_config()
+        if cfg is not None and self._current_entry is not None:
+            profile = match_profile(self._current_entry.name, self._profiles)
+            self._render_cfg_to_preview(self._current_entry, profile, cfg)
+        self._log("[Expert] Returned to preview.")
+
+    def _on_expert_cfg_changed(self, cfg: TunedConfig) -> None:
+        """Slot: Expert panel finished a cascade. Mirror to preview footer.
+
+        We do NOT swap the stacked widget back here — the user is still
+        editing. We just refresh the on-disk preview text so the next
+        time they exit, it reflects their state.
+        """
+        if self._current_entry is not None:
+            profile = match_profile(self._current_entry.name, self._profiles)
+            self._render_cfg_to_preview(self._current_entry, profile, cfg)
+
+    def _on_expert_mode_changed(self, mode: str) -> None:
+        self._log(f"[Expert] Mode → {mode}.")
+
     # ------------------------------------------------------------------
     # System info — non-blocking (daemon thread → signal/slot)
     # ------------------------------------------------------------------
@@ -1500,6 +2117,7 @@ class MainWindow(QMainWindow):
         use_vision   = self._chk_vision.isChecked()   and self._chk_vision.isEnabled()
         use_draft    = self._chk_draft.isChecked()    and self._chk_draft.isEnabled()
         use_thinking = self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
+        turbo_kv     = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
 
         # Build a copy of entry so we can control mmproj inclusion
         entry = copy.copy(self._current_entry)
@@ -1507,13 +2125,25 @@ class MainWindow(QMainWindow):
             entry.mmproj = None
 
         profile = match_profile(entry.name, self._profiles)
-        cfg = compute_config(
-            model=entry, system=self._system, profile=profile,
-            draft_model=self._current_draft if use_draft else None,
-            user_ctx=None, force_mlock=False,
-            perf_target=self._resolve_perf_target_for_profile(profile),
-            mode=self._current_mode(),
-        )
+
+        # When Expert mode is open we use the panel's current config
+        # (Manual mode = literal widget values; Auto mode = the last
+        # cascaded result the user can see in the panel). Otherwise we
+        # rebuild via compute_config from scratch.
+        expert_open = (self._config_stack.currentIndex() == 1)
+        cfg: Optional[TunedConfig] = None
+        if expert_open:
+            cfg = self._expert_panel.current_config()
+            if cfg is None:
+                self._log("[Warning] Expert panel had no config; falling back to auto.")
+        if cfg is None:
+            cfg = compute_config(
+                model=entry, system=self._system, profile=profile,
+                draft_model=self._current_draft if use_draft else None,
+                user_ctx=None, force_mlock=False,
+                perf_target=self._resolve_perf_target_for_profile(profile),
+                turbo_kv=turbo_kv,
+            )
 
         host = self._host_edit.text().strip() or "127.0.0.1"
         try:
@@ -1529,13 +2159,11 @@ class MainWindow(QMainWindow):
             draft_model=self._current_draft if use_draft else None,
             server_binary=server_binary, host=host, port=port,
             extra_args=["-a", alias], use_thinking=use_thinking,
-            enable_speculative=use_draft,
         )
 
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
-        self._log(f"Options : vision={use_vision} draft={use_draft} "
-                  f"thinking={use_thinking} mode={self._current_mode()}")
+        self._log(f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking}")
 
         self._server = _TerminalProcess(cmd)
         try:
