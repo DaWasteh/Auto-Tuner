@@ -913,14 +913,22 @@ def compute_config(
     has_chat_block = isinstance(raw_sampling.get("chat"), dict)
     has_coding_block = isinstance(raw_sampling.get("coding"), dict)
     has_split = has_chat_block or has_coding_block
+
+    # Resolve to a concrete dict that the rest of the function can
+    # call .get() on. Done in two passes (mode → fallback) so the
+    # type checker can narrow sd to `dict` after the assignment.
+    sd: Dict[str, Any] = {}
     if has_split:
-        sd = raw_sampling.get(mode)
-        if not isinstance(sd, dict):
+        mode_block = raw_sampling.get(mode)
+        if isinstance(mode_block, dict):
+            sd = mode_block
+        else:
             # Mode not defined in this profile — fall back to the other
-            # mode if present, then to any flat top-level keys.
+            # mode if present.
             other = "coding" if mode == "chat" else "chat"
-            sd = raw_sampling.get(other) if isinstance(
-                raw_sampling.get(other), dict) else {}
+            other_block = raw_sampling.get(other)
+            if isinstance(other_block, dict):
+                sd = other_block
     else:
         # Old flat format: every mode shares the same sampling block.
         sd = {k: v for k, v in raw_sampling.items()
