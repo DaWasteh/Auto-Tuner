@@ -12,6 +12,7 @@ Public API:
     get_fork_path()        -> Optional[Path]
     set_fork_path(Path)
 """
+
 from __future__ import annotations
 
 import json
@@ -60,8 +61,7 @@ def save_settings(data: Dict[str, Any]) -> bool:
     f = _settings_file()
     tmp = f.with_suffix(f.suffix + ".tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                       encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, f)
         return True
     except OSError:
@@ -80,6 +80,7 @@ def _update(key: str, value: Any) -> None:
 
 # ---------------------------------------------------------------------------
 # Convenience accessors
+
 
 def get_models_path() -> Optional[Path]:
     p = load_settings().get("models_path")
@@ -118,6 +119,7 @@ def set_fork_path(path: Path) -> None:
 # `fork_path` keeps tracking the *currently active* build for things
 # like `LLAMA_CPP_DIR`; `fork_container_path` is the root the GUI
 # expanded the combo from.
+
 
 def get_fork_container_path() -> Optional[Path]:
     p = load_settings().get("fork_container_path")

@@ -19,6 +19,7 @@ Environment variables:
   LLAMA_SERVER        path to the llama-server binary
   LLAMA_CPP_DIR       llama.cpp checkout (build/bin/[Release/]llama-server is auto-found)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -107,20 +108,22 @@ def _print_menu(groups: dict) -> List[ModelEntry]:
             ctx = ""
             if e.native_context:
                 ctx = f"  ({e.native_context // 1024}k native)"
-            print(f"    {idx:>2}.{_capability_markers(e)} {e.name:<55} "
-                  f"{size}{ctx}")
+            print(f"    {idx:>2}.{_capability_markers(e)} {e.name:<55} {size}{ctx}")
             flat.append(e)
             idx += 1
     print()
     return flat
 
 
-def _print_config(model: ModelEntry, profile: ModelProfile,
-                  cfg: TunedConfig, system: SystemInfo) -> None:
+def _print_config(
+    model: ModelEntry, profile: ModelProfile, cfg: TunedConfig, system: SystemInfo
+) -> None:
     print(_BAR)
     print(f"Model:    {model.name}")
-    print(f"Profile:  {profile.display_name}"
-          + (f"  ({profile.source_file})" if profile.source_file else ""))
+    print(
+        f"Profile:  {profile.display_name}"
+        + (f"  ({profile.source_file})" if profile.source_file else "")
+    )
     if profile.notes:
         print(f"Notes:    {profile.notes}")
     if model.mmproj is not None:
@@ -154,20 +157,27 @@ def _print_config(model: ModelEntry, profile: ModelProfile,
         print(f"  Main GPU        : {cfg.main_gpu}")
 
     s = cfg.sampling
-    print(f"  Sampling        : temp={s.get('temperature')} "
-          f"top_k={s.get('top_k')} top_p={s.get('top_p')} "
-          f"min_p={s.get('min_p')} rep={s.get('repeat_penalty')}")
+    print(
+        f"  Sampling        : temp={s.get('temperature')} "
+        f"top_k={s.get('top_k')} top_p={s.get('top_p')} "
+        f"min_p={s.get('min_p')} rep={s.get('repeat_penalty')}"
+    )
 
     print()
     print("  Memory estimate (with current options):")
-    print(f"    Model GPU : ~ {cfg.estimated_model_vram_gb:5.1f} GB   (free VRAM: {system.free_vram_gb:5.1f} GB)")
-    print(f"    Model CPU : ~ {cfg.estimated_model_ram_gb:5.1f} GB   (free RAM:  {system.free_ram_gb:5.1f} GB)")
+    print(
+        f"    Model GPU : ~ {cfg.estimated_model_vram_gb:5.1f} GB   (free VRAM: {system.free_vram_gb:5.1f} GB)"
+    )
+    print(
+        f"    Model CPU : ~ {cfg.estimated_model_ram_gb:5.1f} GB   (free RAM:  {system.free_ram_gb:5.1f} GB)"
+    )
     print(f"    KV cache  : ~ {cfg.estimated_kv_gb:5.1f} GB")
     print(_BAR)
 
 
 # ---------------------------------------------------------------------------
 # Selection
+
 
 def _confirm(prompt: str, default_yes: bool = True) -> bool:
     suffix = "[Y/n]" if default_yes else "[y/N]"
@@ -270,7 +280,9 @@ def _pick_model(
                 flags.append(p.lower().lstrip("-"))
 
         if model_idx_str is None:
-            print("  please enter a number (optionally followed by flags like '--novision').")
+            print(
+                "  please enter a number (optionally followed by flags like '--novision')."
+            )
             continue
         n = int(model_idx_str)
         if not 1 <= n <= len(flat):
@@ -317,7 +329,9 @@ def _candidate_search_roots() -> List[Path]:
         # Also add siblings: other forks next to the selected one
         try:
             for sibling in parent.parent.iterdir():
-                if sibling.is_dir() and re.search(r"llama", sibling.name, re.IGNORECASE):
+                if sibling.is_dir() and re.search(
+                    r"llama", sibling.name, re.IGNORECASE
+                ):
                     add(sibling)
         except (OSError, PermissionError):
             pass
@@ -325,10 +339,16 @@ def _candidate_search_roots() -> List[Path]:
 
     bases = [Path(__file__).resolve().parent, Path.cwd()]
     common_subs = (
-        "llama.cpp", "1b_llama.cpp", "ik_llama.cpp", "tq_llama.cpp",
-        "atq_llama.cpp", "BitNet",
-        "ai-local/llama.cpp", "ai-local/1b_llama.cpp",
-        "ai-local/ik_llama.cpp", "ai-local/tq_llama.cpp",
+        "llama.cpp",
+        "1b_llama.cpp",
+        "ik_llama.cpp",
+        "tq_llama.cpp",
+        "atq_llama.cpp",
+        "BitNet",
+        "ai-local/llama.cpp",
+        "ai-local/1b_llama.cpp",
+        "ai-local/ik_llama.cpp",
+        "ai-local/tq_llama.cpp",
     )
     for base in bases:
         chain = [base, *list(base.parents)[:5]]
@@ -344,9 +364,8 @@ def _resolve_server_binary(user_value: str) -> str:
     if p.is_absolute() and p.is_file():
         return str(p)
 
-    has_sep = (
-        os.sep in user_value
-        or (os.altsep is not None and os.altsep in user_value)
+    has_sep = os.sep in user_value or (
+        os.altsep is not None and os.altsep in user_value
     )
 
     if has_sep and not p.is_absolute():
@@ -367,11 +386,15 @@ def _resolve_server_binary(user_value: str) -> str:
                     for sub in _SERVER_SUBPATHS:
                         candidate = root / sub
                         if candidate.is_file():
-                            _debug_print(f"Found candidate in fork subpath: {candidate}")
+                            _debug_print(
+                                f"Found candidate in fork subpath: {candidate}"
+                            )
                             return str(candidate)
                         candidate_with_inner = (root / sub) / inner
                         if candidate_with_inner.is_file():
-                            _debug_print(f"Found candidate in fork subpath with inner: {candidate_with_inner}")
+                            _debug_print(
+                                f"Found candidate in fork subpath with inner: {candidate_with_inner}"
+                            )
                             return str(candidate_with_inner)
 
     anchors: List[Path] = []
@@ -428,6 +451,7 @@ def _resolve_server_binary(user_value: str) -> str:
 
 # ---------------------------------------------------------------------------
 # llama.cpp fork discovery
+
 
 def _discover_llama_forks() -> List[Tuple[str, Path]]:
     """Scan the filesystem for llama.cpp fork directories.
@@ -517,7 +541,7 @@ def _discover_llama_forks() -> List[Tuple[str, Path]]:
         # Strip common prefixes like "1b_", "atq_" etc for better sorting
         stripped = re.sub(r"^[\w-]+(?=_llama\.cpp)", "", name_lower)
         return (not is_bare, stripped)
-    
+
     forks.sort(key=_fork_sort_key)
     return forks
 
@@ -592,8 +616,8 @@ def _required_fork_name(profile: ModelProfile) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Client settings hint
 
-def _print_client_settings(host: str, port: int, ctx: int,
-                            model: ModelEntry) -> None:
+
+def _print_client_settings(host: str, port: int, ctx: int, model: ModelEntry) -> None:
     """Print a copy-pasteable block for OpenAI-API clients."""
     base_url = f"http://{host}:{port}/v1"
     print()
@@ -610,17 +634,18 @@ def _print_client_settings(host: str, port: int, ctx: int,
 # ---------------------------------------------------------------------------
 # Argument parsing
 
+
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="auto_tuner",
         description="Interactive launcher for llama-server with auto-tuned "
-                    "config based on free RAM/VRAM.",
+        "config based on free RAM/VRAM.",
     )
     p.add_argument(
         "--models-path",
         default=os.environ.get("AUTOTUNER_MODELS", "./models"),
         help="Folder to scan for *.gguf models "
-             "(default: ./models, env AUTOTUNER_MODELS)",
+        "(default: ./models, env AUTOTUNER_MODELS)",
     )
     p.add_argument(
         "--settings-path",
@@ -631,39 +656,55 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--server",
         default=os.environ.get("LLAMA_SERVER", "llama-server"),
         help="Path to the llama-server binary "
-             "(default: llama-server, env LLAMA_SERVER)",
+        "(default: llama-server, env LLAMA_SERVER)",
     )
     p.add_argument(
         "--llama-cpp-dir",
         default=os.environ.get("LLAMA_CPP_DIR"),
         help="Path to your llama.cpp checkout (env LLAMA_CPP_DIR). "
-             "All forks in the same parent folder are discovered automatically. "
-             "Useful when llama.cpp lives outside the standard search paths "
-             "(e.g. C:\\LAB\\ai-local\\llama.cpp).",
+        "All forks in the same parent folder are discovered automatically. "
+        "Useful when llama.cpp lives outside the standard search paths "
+        "(e.g. C:\\LAB\\ai-local\\llama.cpp).",
     )
-    p.add_argument("--host", default="127.0.0.1",
-                   help="Server bind host (default: 127.0.0.1)")
-    p.add_argument("--port", type=int, default=1234,
-                   help="Server port (default: 1234)")
-    p.add_argument("--ctx", type=int, default=None,
-                   help="Override context length (otherwise auto-tuned)")
-    p.add_argument("--model", default=None,
-                   help="Pick model by substring without showing the menu")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the command but don't start the server")
-    p.add_argument("--yes", "-y", action="store_true",
-                   help="Skip the launch confirmation prompt")
-    p.add_argument("--novision", action="store_true",
-                   help="Disable vision (mmproj) even if available")
-    p.add_argument("--nodraft", action="store_true",
-                   help="Disable speculative decoding/draft model")
-    p.add_argument("--nothinking", action="store_true",
-                   help="Disable thinking/reasoning output")
+    p.add_argument(
+        "--host", default="127.0.0.1", help="Server bind host (default: 127.0.0.1)"
+    )
+    p.add_argument("--port", type=int, default=1234, help="Server port (default: 1234)")
+    p.add_argument(
+        "--ctx",
+        type=int,
+        default=None,
+        help="Override context length (otherwise auto-tuned)",
+    )
+    p.add_argument(
+        "--model", default=None, help="Pick model by substring without showing the menu"
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the command but don't start the server",
+    )
+    p.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the launch confirmation prompt"
+    )
+    p.add_argument(
+        "--novision",
+        action="store_true",
+        help="Disable vision (mmproj) even if available",
+    )
+    p.add_argument(
+        "--nodraft",
+        action="store_true",
+        help="Disable speculative decoding/draft model",
+    )
+    p.add_argument(
+        "--nothinking", action="store_true", help="Disable thinking/reasoning output"
+    )
     p.add_argument(
         "--force-mlock",
         action="store_true",
         help="Force --mlock / --no-mmap even for full-GPU-offload models "
-             "(prevents VRAM paging when enough free VRAM is available)",
+        "(prevents VRAM paging when enough free VRAM is available)",
     )
     p.add_argument(
         "--performance-target",
@@ -671,13 +712,13 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         default=None,
         metavar="{safe,balanced,throughput}",
         help="VRAM utilisation preset. Overrides any 'performance_target:' "
-             "in the YAML profile. Tiers:\n" + describe_targets(),
+        "in the YAML profile. Tiers:\n" + describe_targets(),
     )
     p.add_argument(
         "--gui",
         action="store_true",
         help="Open the Qt log-viewer window after the server starts "
-             "(requires PyQt6; server stdout/stderr stream into the window).",
+        "(requires PyQt6; server stdout/stderr stream into the window).",
     )
     p.add_argument(
         "--",
@@ -690,6 +731,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
 # ---------------------------------------------------------------------------
 # main
+
 
 def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but intentional)
     args = _parse_args(argv if argv is not None else sys.argv[1:])
@@ -742,8 +784,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
     # user (i.e. it is still the default "llama-server" or from LLAMA_SERVER).
     # An explicit --server path overrides everything.
     user_specified_server = (
-        "--server" in (argv or sys.argv[1:])
-        or "LLAMA_SERVER" in os.environ
+        "--server" in (argv or sys.argv[1:]) or "LLAMA_SERVER" in os.environ
     )
 
     discovered_forks: List[Tuple[str, Path]] = []
@@ -758,8 +799,10 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             os.environ["LLAMA_CPP_DIR"] = str(selected_fork_path)
             print(f"[AutoTuner] LLAMA_CPP_DIR → {selected_fork_path}\n")
         else:
-            print("[AutoTuner] No llama.cpp forks found on disk — "
-                  "set LLAMA_CPP_DIR or pass --server.\n")
+            print(
+                "[AutoTuner] No llama.cpp forks found on disk — "
+                "set LLAMA_CPP_DIR or pass --server.\n"
+            )
 
     # ── System detection ────────────────────────────────────────────────────
     system = detect_system()
@@ -814,8 +857,10 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 args.nothinking = True
 
         if args.novision and model.mmproj is not None:
-            print(f"[AutoTuner] Vision disabled per --novision "
-                  f"(ignoring {model.mmproj.name})")
+            print(
+                f"[AutoTuner] Vision disabled per --novision "
+                f"(ignoring {model.mmproj.name})"
+            )
             model.mmproj = None
 
         profile = match_profile(model.name, profiles)
@@ -830,13 +875,14 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 selected_name = selected_fork_path.name.lower()
                 req_lower = required_fork.lower()
                 if selected_name != req_lower:
-                    print(f"\n[AutoTuner] ⚠  Profile '{profile.display_name}' "
-                          f"requires: {required_fork}")
+                    print(
+                        f"\n[AutoTuner] ⚠  Profile '{profile.display_name}' "
+                        f"requires: {required_fork}"
+                    )
                     print(f"             You selected:  {selected_fork_path.name}")
                     # Look for the required fork among already-discovered forks
                     matching = [
-                        (n, p) for n, p in discovered_forks
-                        if n.lower() == req_lower
+                        (n, p) for n, p in discovered_forks if n.lower() == req_lower
                     ]
                     if matching:
                         switch = _confirm(
@@ -848,12 +894,18 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                             os.environ["LLAMA_CPP_DIR"] = str(selected_fork_path)
                             print(f"[AutoTuner] Switched to: {selected_fork_path.name}")
                         else:
-                            print(f"[AutoTuner] Keeping {selected_fork_path.name} "
-                                  "— the model may not load correctly.")
+                            print(
+                                f"[AutoTuner] Keeping {selected_fork_path.name} "
+                                "— the model may not load correctly."
+                            )
                     else:
-                        print(f"[AutoTuner] ⚠  {required_fork} not found on this system.")
-                        print("             Continuing with current fork "
-                              "— the model may not load correctly.")
+                        print(
+                            f"[AutoTuner] ⚠  {required_fork} not found on this system."
+                        )
+                        print(
+                            "             Continuing with current fork "
+                            "— the model may not load correctly."
+                        )
 
         # ── Draft model detection ────────────────────────────────────────
         # scanner.py already paired each main model with its assistant /
@@ -891,7 +943,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         )
 
         cfg = compute_config(
-            model, system, profile,
+            model,
+            system,
+            profile,
             draft_model=effective_draft,
             user_ctx=args.ctx,
             force_mlock=getattr(args, "force_mlock", False),
@@ -899,15 +953,21 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         )
 
         print(f"\n  [mlock] decision: model={model.name}")
-        print(f"         full_offload={cfg.full_offload}  "
-              f"vram={cfg.estimated_model_vram_gb:.1f}GB  "
-              f"ram={cfg.estimated_model_ram_gb:.1f}GB")
-        print(f"         sys: total_vram={system.total_vram_gb:.1f}GB  "
-              f"free_vram={system.free_vram_gb:.1f}GB  "
-              f"total_ram={system.total_ram_gb:.1f}GB  "
-              f"free_ram={system.free_ram_gb:.1f}GB")
-        print(f"         force_mlock={getattr(args, 'force_mlock', False)}  "
-              f"-> mlock={cfg.mlock}  no_mmap={cfg.no_mmap}")
+        print(
+            f"         full_offload={cfg.full_offload}  "
+            f"vram={cfg.estimated_model_vram_gb:.1f}GB  "
+            f"ram={cfg.estimated_model_ram_gb:.1f}GB"
+        )
+        print(
+            f"         sys: total_vram={system.total_vram_gb:.1f}GB  "
+            f"free_vram={system.free_vram_gb:.1f}GB  "
+            f"total_ram={system.total_ram_gb:.1f}GB  "
+            f"free_ram={system.free_ram_gb:.1f}GB"
+        )
+        print(
+            f"         force_mlock={getattr(args, 'force_mlock', False)}  "
+            f"-> mlock={cfg.mlock}  no_mmap={cfg.no_mmap}"
+        )
 
         _print_config(model, profile, cfg, system)
 
@@ -927,9 +987,11 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             # Gemma 4 needs ik_llama.cpp only when speculative decoding is active
             if "gemma-4" in model_name.lower() or "gemma4" in model_name.lower():
                 if use_draft_flag:
-                    return (profile.server_binary
-                            if profile.server_binary
-                            else "ik_llama.cpp/llama-server")
+                    return (
+                        profile.server_binary
+                        if profile.server_binary
+                        else "ik_llama.cpp/llama-server"
+                    )
                 # Without draft, use whichever fork the user selected
 
             # Explicit server_binary in YAML always wins
@@ -983,8 +1045,10 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             continue
 
         _print_client_settings(args.host, args.port, cfg.ctx, model)
-        print(f"\n[AutoTuner] Web UI will be available at "
-              f"http://{args.host}:{args.port}\n")
+        print(
+            f"\n[AutoTuner] Web UI will be available at "
+            f"http://{args.host}:{args.port}\n"
+        )
 
         # ── Launch (terminal or GUI) ─────────────────────────────────────
         if args.gui:
@@ -1010,8 +1074,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
         print()
         try:
-            keep_going = _confirm("Server stopped. Pick another model?",
-                                  default_yes=True)
+            keep_going = _confirm(
+                "Server stopped. Pick another model?", default_yes=True
+            )
         except KeyboardInterrupt:
             print("\n[AutoTuner] Goodbye.")
             return 0

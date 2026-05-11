@@ -7,6 +7,7 @@ runner. They cover:
   - compute_config produces sensible values across hardware shapes
   - hardware detection doesn't crash on a runner without GPUs
 """
+
 from __future__ import annotations
 
 import struct
@@ -31,6 +32,7 @@ SETTINGS_DIR = ROOT / "settings"
 # ---------------------------------------------------------------------------
 # Hardware detection
 
+
 def test_detect_system_does_not_raise():
     info = detect_system()
     assert info.total_ram_gb > 0
@@ -48,6 +50,7 @@ def test_format_system_produces_text():
 # ---------------------------------------------------------------------------
 # Profile loading + pattern matching
 
+
 def test_all_profiles_load():
     profiles = load_profiles(SETTINGS_DIR)
     assert len(profiles) >= 8, "expected the 8 shipped YAML profiles"
@@ -57,49 +60,61 @@ def test_all_profiles_load():
     assert "gemma-4.yaml" in files
     assert "devstral.yaml" in files
 
-@pytest.mark.parametrize("filename, expected_display", [
-    ("Qwen3.5-9B-Q8_0",                       "Qwen3.5 / Qwen3.6 (Alibaba)"),
-    ("Qwen3.6-27B-UD-Q3_K_XL",                "Qwen3.5 / Qwen3.6 (Alibaba)"),
-    ("Qwen3.6-35B-A3B-UD-IQ3_S",              "Qwen3.5 / Qwen3.6 (Alibaba)"),
-    ("Gemma-4-26B-A4B-IQ3_M",                 "Gemma 4 (Google)"),
-    ("gemma-4-E2B-it-BF16",                   "Gemma 4 (Google)"),
-    ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
-    ("Ministral-3-14B-Reasoning-2512-Q6_K",   "Ministral 3 (Mistral, reasoning)"),
-    ("Mistral-Medium-3.5-128B-UD-IQ3_XXS",    "Mistral Medium 3.x"),
-    ("Bonsai-8B",                             "Bonsai 8B (PrismML, 1-bit)"),
-    ("Ternary-Bonsai-8B-Q2_0",                "Ternary-Bonsai (PrismML, 1.58-bit)"),
-    ("Archon-14B.Q6_K",                       "Frankenmerger / community merge"),
-    ("voldemort-10b-dpo.Q8_0",                "Frankenmerger / community merge"),
-    ("Some-Random-LLM.gguf",                  "Generic / fallback"),
-])
+
+@pytest.mark.parametrize(
+    "filename, expected_display",
+    [
+        ("Qwen3.5-9B-Q8_0", "Qwen3.5 / Qwen3.6 (Alibaba)"),
+        ("Qwen3.6-27B-UD-Q3_K_XL", "Qwen3.5 / Qwen3.6 (Alibaba)"),
+        ("Qwen3.6-35B-A3B-UD-IQ3_S", "Qwen3.5 / Qwen3.6 (Alibaba)"),
+        ("Gemma-4-26B-A4B-IQ3_M", "Gemma 4 (Google)"),
+        ("gemma-4-E2B-it-BF16", "Gemma 4 (Google)"),
+        ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
+        ("Ministral-3-14B-Reasoning-2512-Q6_K", "Ministral 3 (Mistral, reasoning)"),
+        ("Mistral-Medium-3.5-128B-UD-IQ3_XXS", "Mistral Medium 3.x"),
+        ("Bonsai-8B", "Bonsai 8B (PrismML, 1-bit)"),
+        ("Ternary-Bonsai-8B-Q2_0", "Ternary-Bonsai (PrismML, 1.58-bit)"),
+        ("Archon-14B.Q6_K", "Frankenmerger / community merge"),
+        ("voldemort-10b-dpo.Q8_0", "Frankenmerger / community merge"),
+        ("Some-Random-LLM.gguf", "Generic / fallback"),
+    ],
+)
 def test_pattern_matching(filename, expected_display):
     profiles = load_profiles(SETTINGS_DIR)
     p = match_profile(filename, profiles)
     assert p.display_name == expected_display, (
-        f"{filename!r} matched {p.display_name!r}, "
-        f"expected {expected_display!r}")
+        f"{filename!r} matched {p.display_name!r}, expected {expected_display!r}"
+    )
 
 
 def test_ministral_does_not_collide_with_mistral_medium():
     """The ministral pattern has no overlap with mistral-medium."""
     profiles = load_profiles(SETTINGS_DIR)
-    assert match_profile("Ministral-3-14B", profiles).display_name \
+    assert (
+        match_profile("Ministral-3-14B", profiles).display_name
         == "Ministral 3 (Mistral, reasoning)"
-    assert match_profile("Mistral-Medium-3.5-128B", profiles).display_name \
+    )
+    assert (
+        match_profile("Mistral-Medium-3.5-128B", profiles).display_name
         == "Mistral Medium 3.x"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Param extraction
 
-@pytest.mark.parametrize("name, expected", [
-    ("Qwen3.5-9B-Q8_0", 9.0),
-    ("Qwen3.6-35B-A3B-UD-IQ3_S", 35.0),       # MoE: total params, not active
-    ("Mistral-Medium-3.5-128B-UD-IQ3_XXS", 128.0),
-    ("gemma-4-E2B-it-BF16", 2.0),             # Gemma "effective" size
-    ("gemma-4-E4B-it-Q8_0", 4.0),
-    ("Qwen3.5-0.8B-Q8_0", 0.8),
-])
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("Qwen3.5-9B-Q8_0", 9.0),
+        ("Qwen3.6-35B-A3B-UD-IQ3_S", 35.0),  # MoE: total params, not active
+        ("Mistral-Medium-3.5-128B-UD-IQ3_XXS", 128.0),
+        ("gemma-4-E2B-it-BF16", 2.0),  # Gemma "effective" size
+        ("gemma-4-E4B-it-Q8_0", 4.0),
+        ("Qwen3.5-0.8B-Q8_0", 0.8),
+    ],
+)
 def test_extract_params_billion(name, expected):
     assert extract_params_billion(name) == pytest.approx(expected)
 
@@ -107,23 +122,27 @@ def test_extract_params_billion(name, expected):
 # ---------------------------------------------------------------------------
 # Scanner + mmproj pairing
 
+
 def _write_minimal_gguf(path: Path) -> None:
     """Write a valid empty-metadata GGUF header so the scanner accepts it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
         f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))   # version
-        f.write(struct.pack("<Q", 0))   # tensor count
-        f.write(struct.pack("<Q", 0))   # kv count
+        f.write(struct.pack("<I", 3))  # version
+        f.write(struct.pack("<Q", 0))  # tensor count
+        f.write(struct.pack("<Q", 0))  # kv count
 
 
 def test_scanner_pairs_mmproj_by_size(tmp_path):
     """Each Qwen3.5 sub-model must get its own size-matched mmproj."""
     folder = tmp_path / "Alibaba" / "Qwen3.5"
     files = [
-        "mmproj-Qwen3.5-0.8B-BF16.gguf", "Qwen3.5-0.8B-Q8_0.gguf",
-        "mmproj-Qwen3.5-2B-BF16.gguf",   "Qwen3.5-2B-Q8_0.gguf",
-        "mmproj-Qwen3.5-9B-BF16.gguf",   "Qwen3.5-9B-Q8_0.gguf",
+        "mmproj-Qwen3.5-0.8B-BF16.gguf",
+        "Qwen3.5-0.8B-Q8_0.gguf",
+        "mmproj-Qwen3.5-2B-BF16.gguf",
+        "Qwen3.5-2B-Q8_0.gguf",
+        "mmproj-Qwen3.5-9B-BF16.gguf",
+        "Qwen3.5-9B-Q8_0.gguf",
     ]
     for f in files:
         _write_minimal_gguf(folder / f)
@@ -133,8 +152,8 @@ def test_scanner_pairs_mmproj_by_size(tmp_path):
 
     expected = [
         ("Qwen3.5-0.8B-Q8_0", "mmproj-Qwen3.5-0.8B-BF16.gguf"),
-        ("Qwen3.5-2B-Q8_0",   "mmproj-Qwen3.5-2B-BF16.gguf"),
-        ("Qwen3.5-9B-Q8_0",   "mmproj-Qwen3.5-9B-BF16.gguf"),
+        ("Qwen3.5-2B-Q8_0", "mmproj-Qwen3.5-2B-BF16.gguf"),
+        ("Qwen3.5-9B-Q8_0", "mmproj-Qwen3.5-9B-BF16.gguf"),
     ]
     for stem, expected_name in expected:
         mmproj = by_name[stem].mmproj
@@ -167,8 +186,13 @@ def test_group_entries_buckets_by_folder(tmp_path):
 # ---------------------------------------------------------------------------
 # Tuner
 
-def _fake_system(ram_total: float = 64, ram_free: float = 48,
-                 vram_total: float = 24, vram_free: float = 22):
+
+def _fake_system(
+    ram_total: float = 64,
+    ram_free: float = 48,
+    vram_total: float = 24,
+    vram_free: float = 22,
+):
     """Build a synthetic SystemInfo for tuner tests."""
     return SystemInfo(
         os_name="Linux test",
@@ -177,11 +201,17 @@ def _fake_system(ram_total: float = 64, ram_free: float = 48,
         cpu_cores_logical=32,
         total_ram_gb=ram_total,
         free_ram_gb=ram_free,
-        gpus=[GPUInfo(
-            index=0, name="Test GPU", vendor="amd",
-            total_vram_mb=int(vram_total * 1024),
-            free_vram_mb=int(vram_free * 1024),
-        )] if vram_total > 0 else [],
+        gpus=[
+            GPUInfo(
+                index=0,
+                name="Test GPU",
+                vendor="amd",
+                total_vram_mb=int(vram_total * 1024),
+                free_vram_mb=int(vram_free * 1024),
+            )
+        ]
+        if vram_total > 0
+        else [],
     )
 
 
@@ -189,9 +219,12 @@ def _fake_model(tmp_path, name, size_gb):
     p = tmp_path / f"{name}.gguf"
     _write_minimal_gguf(p)
     from scanner import ModelEntry
+
     return ModelEntry(
-        path=p, name=name, group=".",
-        size_bytes=int(size_gb * 1024 ** 3),
+        path=p,
+        name=name,
+        group=".",
+        size_bytes=int(size_gb * 1024**3),
     )
 
 
@@ -209,13 +242,11 @@ def test_small_model_full_offload(tmp_path):
 def test_huge_model_falls_back_to_partial_or_cpu(tmp_path):
     """A 50 GB model on a 24 GB GPU → not a full offload."""
     profiles = load_profiles(SETTINGS_DIR)
-    model = _fake_model(tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS",
-                        size_gb=50.0)
+    model = _fake_model(tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS", size_gb=50.0)
     profile = match_profile(model.name, profiles)
-    cfg = compute_config(model, _fake_system(ram_total=96, ram_free=80),
-                         profile)
+    cfg = compute_config(model, _fake_system(ram_total=96, ram_free=80), profile)
     assert cfg.full_offload is False
-    assert cfg.ctx >= 2048   # always at least the floor
+    assert cfg.ctx >= 2048  # always at least the floor
 
 
 def test_no_gpu_falls_back_to_cpu(tmp_path):
@@ -223,8 +254,7 @@ def test_no_gpu_falls_back_to_cpu(tmp_path):
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
     profile = match_profile(model.name, profiles)
-    cfg = compute_config(model, _fake_system(vram_total=0, vram_free=0),
-                         profile)
+    cfg = compute_config(model, _fake_system(vram_total=0, vram_free=0), profile)
     assert cfg.ngl == 0
     assert cfg.full_offload is False
 
@@ -242,19 +272,21 @@ def test_devstral_uses_high_context_when_ram_is_plenty(tmp_path):
     even with tons of free RAM. With a roomy system it must now reach far
     above that."""
     profiles = load_profiles(SETTINGS_DIR)
-    model = _fake_model(tmp_path,
-                        "Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL",
-                        size_gb=13.5)
+    model = _fake_model(
+        tmp_path, "Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL", size_gb=13.5
+    )
     profile = match_profile(model.name, profiles)
-    cfg = compute_config(model,
-                         _fake_system(ram_total=96, ram_free=71,
-                                      vram_total=24, vram_free=22.8),
-                         profile)
+    cfg = compute_config(
+        model,
+        _fake_system(ram_total=96, ram_free=71, vram_total=24, vram_free=22.8),
+        profile,
+    )
     assert cfg.ctx > 16384, f"v1 bug regression — got only {cfg.ctx}"
 
 
 # ---------------------------------------------------------------------------
 # Command builder
+
 
 def test_build_command_includes_essentials(tmp_path):
     profiles = load_profiles(SETTINGS_DIR)
@@ -274,8 +306,7 @@ def test_build_command_passes_extra_args(tmp_path):
     model = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
     profile = match_profile(model.name, profiles)
     cfg = compute_config(model, _fake_system(), profile)
-    cmd = build_command(model, cfg, profile,
-                        extra_args=["--metrics", "--log-disable"])
+    cmd = build_command(model, cfg, profile, extra_args=["--metrics", "--log-disable"])
     assert "--metrics" in cmd
     assert "--log-disable" in cmd
 
@@ -283,16 +314,27 @@ def test_build_command_passes_extra_args(tmp_path):
 # ---------------------------------------------------------------------------
 # GPU detection / iGPU filtering
 
+
 def test_filter_drops_igpu_next_to_dgpu():
     """User's exact scenario: Intel iGPU + AMD RX 9070 XT.
     The iGPU must be ignored so the tuner doesn't underuse the dGPU."""
     from hardware import _filter_inference_gpus
 
     gpus = [
-        GPUInfo(index=0, name="Intel(R) Graphics", vendor="intel",
-                total_vram_mb=2048, free_vram_mb=1900),
-        GPUInfo(index=1, name="AMD Radeon RX 9070 XT", vendor="amd",
-                total_vram_mb=16 * 1024, free_vram_mb=int(15.2 * 1024)),
+        GPUInfo(
+            index=0,
+            name="Intel(R) Graphics",
+            vendor="intel",
+            total_vram_mb=2048,
+            free_vram_mb=1900,
+        ),
+        GPUInfo(
+            index=1,
+            name="AMD Radeon RX 9070 XT",
+            vendor="amd",
+            total_vram_mb=16 * 1024,
+            free_vram_mb=int(15.2 * 1024),
+        ),
     ]
     used, ignored = _filter_inference_gpus(gpus)
     assert len(used) == 1
@@ -306,10 +348,20 @@ def test_filter_keeps_matched_dual_gpus():
     from hardware import _filter_inference_gpus
 
     gpus = [
-        GPUInfo(index=0, name="RTX 4090", vendor="nvidia",
-                total_vram_mb=24 * 1024, free_vram_mb=23 * 1024),
-        GPUInfo(index=1, name="RTX 4090", vendor="nvidia",
-                total_vram_mb=24 * 1024, free_vram_mb=23 * 1024),
+        GPUInfo(
+            index=0,
+            name="RTX 4090",
+            vendor="nvidia",
+            total_vram_mb=24 * 1024,
+            free_vram_mb=23 * 1024,
+        ),
+        GPUInfo(
+            index=1,
+            name="RTX 4090",
+            vendor="nvidia",
+            total_vram_mb=24 * 1024,
+            free_vram_mb=23 * 1024,
+        ),
     ]
     used, ignored = _filter_inference_gpus(gpus)
     assert len(used) == 2 and not ignored
@@ -327,6 +379,7 @@ def test_vendor_inference():
 
 # ---------------------------------------------------------------------------
 # llama-server resolver
+
 
 def test_resolver_returns_input_when_nothing_matches(tmp_path, monkeypatch):
     """When the binary can't be found anywhere, the resolver echoes the
@@ -348,8 +401,15 @@ def test_resolver_finds_binary_in_sibling_llama_cpp(tmp_path, monkeypatch):
     # Build the tree: tmp/Auto Tuner/, tmp/ai-local/llama.cpp/build/...
     auto_dir = tmp_path / "Auto Tuner"
     auto_dir.mkdir()
-    server = (tmp_path / "ai-local" / "llama.cpp"
-              / "build" / "bin" / "Release" / "llama-server.exe")
+    server = (
+        tmp_path
+        / "ai-local"
+        / "llama.cpp"
+        / "build"
+        / "bin"
+        / "Release"
+        / "llama-server.exe"
+    )
     server.parent.mkdir(parents=True)
     server.write_text("")
 
@@ -358,22 +418,36 @@ def test_resolver_finds_binary_in_sibling_llama_cpp(tmp_path, monkeypatch):
 
     resolved = _resolve_server_binary("llama-server")
     assert Path(resolved).resolve() == server.resolve(), (
-        f"expected {server}, got {resolved}")
+        f"expected {server}, got {resolved}"
+    )
 
 
-def test_resolver_distinguishes_between_llama_and_1b_llama(tmp_path,
-                                                          monkeypatch):
+def test_resolver_distinguishes_between_llama_and_1b_llama(tmp_path, monkeypatch):
     """The Bonsai-Ternary profile uses a relative path starting with the
     fork's directory name. The resolver must respect that and pick the
     1b_llama.cpp checkout, not the regular one sitting next to it."""
     from auto_tuner import _resolve_server_binary
-    
+
     auto_dir = tmp_path / "Auto Tuner"
     auto_dir.mkdir()
-    regular = (tmp_path / "ai-local" / "llama.cpp" / "build" / "bin"
-               / "Release" / "llama-server.exe")
-    bitnet = (tmp_path / "ai-local" / "1b_llama.cpp" / "build" / "bin"
-              / "Release" / "llama-server.exe")
+    regular = (
+        tmp_path
+        / "ai-local"
+        / "llama.cpp"
+        / "build"
+        / "bin"
+        / "Release"
+        / "llama-server.exe"
+    )
+    bitnet = (
+        tmp_path
+        / "ai-local"
+        / "1b_llama.cpp"
+        / "build"
+        / "bin"
+        / "Release"
+        / "llama-server.exe"
+    )
     for s in (regular, bitnet):
         s.parent.mkdir(parents=True)
         s.write_text("")
@@ -386,9 +460,9 @@ def test_resolver_distinguishes_between_llama_and_1b_llama(tmp_path,
     assert Path(res1).resolve() == regular.resolve()
 
     # Profile-style relative path must hit the BitNet fork
-    res2 = _resolve_server_binary(
-        "1b_llama.cpp/build/bin/Release/llama-server.exe")
+    res2 = _resolve_server_binary("1b_llama.cpp/build/bin/Release/llama-server.exe")
     assert Path(res2).resolve() == bitnet.resolve()
+
 
 def test_turbo_quant_mode_selection(tmp_path, monkeypatch):
     """Test that the turbo mode selection logic works (mocking input)."""
@@ -398,20 +472,21 @@ def test_turbo_quant_mode_selection(tmp_path, monkeypatch):
 
     # Mocking sys.argv to avoid command line arguments
     sys.argv = ["auto_tuner.py"]
-    
+
     # We can't easily test the interactive input in a pure unit test
     # without complex mocking, but we can verify the logic if we
     # were to refactor main. For now, we ensure no crashes occur
     # when simulating different inputs.
-    with patch('builtins.input', side_effect=["2", KeyboardInterrupt]):
+    with patch("builtins.input", side_effect=["2", KeyboardInterrupt]):
         try:
             main([])
         except (KeyboardInterrupt, SystemExit):
-            pass # Expected behavior for testing exit
+            pass  # Expected behavior for testing exit
 
 
 # ---------------------------------------------------------------------------
 # Profile schema (server_binary field)
+
 
 def test_profile_supports_server_binary_field():
     """Bonsai-Ternary should declare its preferred server binary."""
@@ -436,9 +511,11 @@ def test_ternary_bonsai_pattern_beats_regular_bonsai():
 # ---------------------------------------------------------------------------
 # Performance targets
 
+
 def test_performance_target_registry_has_three_tiers():
     """Sanity: the three documented tiers exist and are well-ordered."""
     from performance_target import PERFORMANCE_TARGETS, list_target_names
+
     names = list_target_names()
     assert names == ["safe", "balanced", "throughput"]
     safe = PERFORMANCE_TARGETS["safe"]
@@ -455,6 +532,7 @@ def test_performance_target_registry_has_three_tiers():
 def test_resolve_performance_target_priority():
     """CLI choice beats profile choice beats default."""
     from performance_target import resolve_performance_target
+
     # CLI wins
     assert resolve_performance_target("safe", "throughput").name == "safe"
     # Profile wins when CLI is empty
@@ -485,6 +563,7 @@ def test_throughput_places_more_moe_layers_on_gpu_than_safe(tmp_path):
     must produce different cpu_moe counts.
     """
     from performance_target import PERFORMANCE_TARGETS
+
     # Use a real MoE profile — Qwen3.6 ships expert_count via GGUF in the
     # wild, but our fake_model has empty metadata. So we hand-craft a
     # ModelEntry with metadata that tells the tuner "this is MoE".
@@ -496,7 +575,7 @@ def test_throughput_places_more_moe_layers_on_gpu_than_safe(tmp_path):
         path=p,
         name="Qwen3.6-35B-A3B-UD-Q6_K",
         group=".",
-        size_bytes=int(28.0 * 1024 ** 3),
+        size_bytes=int(28.0 * 1024**3),
         metadata={
             "general.architecture": "qwen3moe",
             "qwen3moe.expert_count": 128,
@@ -507,13 +586,14 @@ def test_throughput_places_more_moe_layers_on_gpu_than_safe(tmp_path):
 
     profiles = load_profiles(SETTINGS_DIR)
     profile = match_profile(model.name, profiles)
-    sys_info = _fake_system(ram_total=64, ram_free=48,
-                            vram_total=16, vram_free=14)
+    sys_info = _fake_system(ram_total=64, ram_free=48, vram_total=16, vram_free=14)
 
-    cfg_safe = compute_config(model, sys_info, profile,
-                              perf_target=PERFORMANCE_TARGETS["safe"])
-    cfg_thr = compute_config(model, sys_info, profile,
-                             perf_target=PERFORMANCE_TARGETS["throughput"])
+    cfg_safe = compute_config(
+        model, sys_info, profile, perf_target=PERFORMANCE_TARGETS["safe"]
+    )
+    cfg_thr = compute_config(
+        model, sys_info, profile, perf_target=PERFORMANCE_TARGETS["throughput"]
+    )
 
     # Both should detect the MoE
     assert cfg_safe.is_moe and cfg_thr.is_moe
@@ -537,8 +617,7 @@ def test_perf_target_default_balanced_when_profile_has_none(tmp_path):
     """A profile without performance_target: falls back to balanced."""
     profiles = load_profiles(SETTINGS_DIR)
     # Pick a profile that we know has no perf_target set
-    p_default = next((pr for pr in profiles
-                      if pr.source_file == "_default.yaml"), None)
+    p_default = next((pr for pr in profiles if pr.source_file == "_default.yaml"), None)
     assert p_default is not None
     assert p_default.performance_target == ""
 
@@ -550,23 +629,26 @@ def test_perf_target_default_balanced_when_profile_has_none(tmp_path):
 # ---------------------------------------------------------------------------
 # Hybrid Mamba/Transformer detection (Punkt 3)
 
+
 def test_hybrid_architecture_detection_by_name():
     """Architecture name matches a known hybrid → True."""
     from scanner import metadata_is_hybrid_architecture
-    assert metadata_is_hybrid_architecture(
-        {"general.architecture": "nemotron_h"}) is True
-    assert metadata_is_hybrid_architecture(
-        {"general.architecture": "jamba"}) is True
+
+    assert (
+        metadata_is_hybrid_architecture({"general.architecture": "nemotron_h"}) is True
+    )
+    assert metadata_is_hybrid_architecture({"general.architecture": "jamba"}) is True
     # Pure Transformer
-    assert metadata_is_hybrid_architecture(
-        {"general.architecture": "qwen3moe"}) is False
-    assert metadata_is_hybrid_architecture(
-        {"general.architecture": "llama"}) is False
+    assert (
+        metadata_is_hybrid_architecture({"general.architecture": "qwen3moe"}) is False
+    )
+    assert metadata_is_hybrid_architecture({"general.architecture": "llama"}) is False
 
 
 def test_hybrid_detection_via_ssm_keys():
     """Generic SSM key catches new hybrid archs not on the allow-list."""
     from scanner import metadata_is_hybrid_architecture
+
     md = {
         "general.architecture": "future_hybrid_arch",
         "future_hybrid_arch.ssm.state_size": 16,
@@ -577,6 +659,7 @@ def test_hybrid_detection_via_ssm_keys():
 def test_attention_layer_count_pure_transformer():
     """For pure Transformer, attention count == block count."""
     from scanner import metadata_attention_layer_count
+
     md = {
         "general.architecture": "qwen3moe",
         "qwen3moe.block_count": 64,
@@ -587,6 +670,7 @@ def test_attention_layer_count_pure_transformer():
 def test_attention_layer_count_hybrid_with_explicit_metadata():
     """Hybrid with explicit attention count uses that, not the heuristic."""
     from scanner import metadata_attention_layer_count
+
     md = {
         "general.architecture": "nemotron_h",
         "nemotron_h.block_count": 50,
@@ -598,6 +682,7 @@ def test_attention_layer_count_hybrid_with_explicit_metadata():
 def test_attention_layer_count_hybrid_with_heuristic():
     """Hybrid without explicit count falls back to per-arch ratio."""
     from scanner import metadata_attention_layer_count
+
     md = {
         "general.architecture": "nemotron_h",
         "nemotron_h.block_count": 50,
@@ -618,19 +703,21 @@ def test_kv_per_token_estimate_smaller_for_hybrid(tmp_path):
         "embedding_length": 4096,
         "block_count": 50,
     }
-    pure = {"general.architecture": "llama",
-            **{f"llama.{k}": v for k, v in common.items()}}
-    hybrid = {"general.architecture": "nemotron_h",
-              **{f"nemotron_h.{k}": v for k, v in common.items()}}
+    pure = {
+        "general.architecture": "llama",
+        **{f"llama.{k}": v for k, v in common.items()},
+    }
+    hybrid = {
+        "general.architecture": "nemotron_h",
+        **{f"nemotron_h.{k}": v for k, v in common.items()},
+    }
 
     pure_kv = kv_per_token_mb_from_metadata(pure)
     hybrid_kv = kv_per_token_mb_from_metadata(hybrid)
     assert pure_kv > 0 and hybrid_kv > 0
     # Hybrid should be roughly 25% of pure (Nemotron heuristic).
     ratio = hybrid_kv / pure_kv
-    assert 0.15 <= ratio <= 0.35, (
-        f"expected hybrid KV ≈ 25% of pure, got {ratio:.2%}"
-    )
+    assert 0.15 <= ratio <= 0.35, f"expected hybrid KV ≈ 25% of pure, got {ratio:.2%}"
 
 
 def test_two_pass_placement_recovers_when_first_pass_dumps_to_cpu(tmp_path):
@@ -648,8 +735,10 @@ def test_two_pass_placement_recovers_when_first_pass_dumps_to_cpu(tmp_path):
     p = tmp_path / "FakeMoE-35B-A3B.gguf"
     _write_minimal_gguf(p)
     model = ModelEntry(
-        path=p, name="FakeMoE-35B-A3B", group=".",
-        size_bytes=int(28.0 * 1024 ** 3),
+        path=p,
+        name="FakeMoE-35B-A3B",
+        group=".",
+        size_bytes=int(28.0 * 1024**3),
         metadata={
             "general.architecture": "qwen3moe",
             "qwen3moe.expert_count": 128,
@@ -660,11 +749,11 @@ def test_two_pass_placement_recovers_when_first_pass_dumps_to_cpu(tmp_path):
     )
     profiles = load_profiles(SETTINGS_DIR)
     profile = match_profile(model.name, profiles)
-    sys_info = _fake_system(ram_total=64, ram_free=48,
-                            vram_total=16, vram_free=14)
+    sys_info = _fake_system(ram_total=64, ram_free=48, vram_total=16, vram_free=14)
 
-    cfg_safe = compute_config(model, sys_info, profile,
-                              perf_target=PERFORMANCE_TARGETS["safe"])
+    cfg_safe = compute_config(
+        model, sys_info, profile, perf_target=PERFORMANCE_TARGETS["safe"]
+    )
     # Even safe (128k target) should not dump all 64 layers to CPU when
     # the two-pass kicks in.
     assert (cfg_safe.n_cpu_moe or 0) < 64, (
@@ -676,10 +765,12 @@ def test_two_pass_placement_recovers_when_first_pass_dumps_to_cpu(tmp_path):
 # ---------------------------------------------------------------------------
 # Reasoning / thinking detection (Punkt 2)
 
+
 def test_thinking_detection_qwen3_coder_is_false():
     """Qwen3-Coder must NOT be flagged as a thinking model just because
     its filename contains 'qwen3' — that's the bug we're fixing."""
     from scanner import metadata_supports_thinking
+
     # No metadata at all — pure filename heuristic.
     assert metadata_supports_thinking({}, "Qwen3-Coder-30B-A3B-Q6_K") is False
 
@@ -687,6 +778,7 @@ def test_thinking_detection_qwen3_coder_is_false():
 def test_thinking_detection_uses_chat_template():
     """When the chat template contains thinking markers, return True."""
     from scanner import metadata_supports_thinking
+
     md_with_think = {
         "tokenizer.chat_template": "{% if enable_thinking %}<think>\n{% endif %}"
     }
@@ -697,6 +789,7 @@ def test_thinking_detection_template_without_marker_is_false():
     """A model that ships a chat template without <think> markers is not
     a thinking model — even if its name contains 'qwen3'."""
     from scanner import metadata_supports_thinking
+
     md_no_think = {
         "tokenizer.chat_template": "<|im_start|>user\n{{ messages }}<|im_end|>"
     }
@@ -707,6 +800,7 @@ def test_thinking_detection_template_without_marker_is_false():
 def test_thinking_detection_falls_back_to_filename_when_no_template():
     """No metadata at all → use filename keywords."""
     from scanner import metadata_supports_thinking
+
     assert metadata_supports_thinking({}, "Gemma-3-27B-it") is True
     assert metadata_supports_thinking({}, "DeepSeek-R1-Distill-Llama-70B") is True
     assert metadata_supports_thinking({}, "QwQ-32B-Preview") is True
@@ -719,8 +813,9 @@ def test_thinking_detection_excludes_qwen3_2507_instruct():
     if it inherits a generic template that mentions <think>, the filename
     exclusion must win."""
     from scanner import metadata_supports_thinking
-    md_with_think = {
-        "tokenizer.chat_template": "<think>{{ content }}</think>"
-    }
-    assert metadata_supports_thinking(
-        md_with_think, "Qwen3-7B-Instruct-2507-Q6_K") is False
+
+    md_with_think = {"tokenizer.chat_template": "<think>{{ content }}</think>"}
+    assert (
+        metadata_supports_thinking(md_with_think, "Qwen3-7B-Instruct-2507-Q6_K")
+        is False
+    )

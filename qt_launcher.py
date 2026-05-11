@@ -7,6 +7,7 @@ Run with:
   python qt_launcher.py
   python qt_launcher.py --models-path D:/models
 """
+
 from __future__ import annotations
 
 import copy
@@ -22,11 +23,31 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QSpinBox, QSplitter, QStackedWidget, QStatusBar,
-    QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QStatusBar,
+    QTextEdit,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from hardware import detect_system, SystemInfo
@@ -45,6 +66,7 @@ import app_settings
 def _get_fork_tools():
     """Lazy import — never triggers auto_tuner.main()."""
     from auto_tuner import _discover_llama_forks, _resolve_server_binary
+
     return _discover_llama_forks, _resolve_server_binary
 
 
@@ -78,6 +100,7 @@ def _default_models_path() -> Path:
 
 # ---------------------------------------------------------------------------
 # Terminal process — spawns llama-server in its own visible terminal window
+
 
 class _TerminalProcess:
     """Spawn llama-server in an independent terminal (CREATE_NEW_CONSOLE on
@@ -134,8 +157,10 @@ class _TerminalProcess:
 # ---------------------------------------------------------------------------
 # Hardware detection worker with global timeout
 
+
 class _HwDetectWorker(QObject):
     """Runs detect_system() in a background thread with a global timeout."""
+
     finished = pyqtSignal(object, str)  # SystemInfo|None, error_msg
 
     def __init__(self, timeout: float = 30.0) -> None:
@@ -153,9 +178,10 @@ class _HwDetectWorker(QObject):
 # ---------------------------------------------------------------------------
 # Background scanner
 
+
 class _ScanWorker(QObject):
     finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
+    error = pyqtSignal(str)
 
     def __init__(self, root: Path) -> None:
         super().__init__()
@@ -179,6 +205,7 @@ class _ScanWorker(QObject):
 # wrap that path in a ModelEntry so the rest of the launcher (which
 # expects a ModelEntry with `.path` and `.size_gb`) keeps working.
 
+
 def _find_draft_model(
     entry: ModelEntry, all_entries: List[ModelEntry]
 ) -> Optional[ModelEntry]:
@@ -193,7 +220,7 @@ def _find_draft_model(
     return ModelEntry(
         path=p,
         name=p.stem,
-        group=entry.group,   # same parent folder
+        group=entry.group,  # same parent folder
         size_bytes=size,
         mmproj=None,
         draft=None,
@@ -208,6 +235,7 @@ def _find_draft_model(
 #   ⚡  draft      (assistant/draft sibling found → speculative decoding)
 #   🧠  thinking   (chat template emits <think> / reasoning_content)
 #   🛠  tool-use   (chat template advertises tool_calls / function_call)
+
 
 def _capability_markers(entry: ModelEntry) -> str:
     """Return a small symbol string summarising what this model supports."""
@@ -226,10 +254,13 @@ def _capability_markers(entry: ModelEntry) -> str:
 def _clean_model_name(name: str) -> str:
     """Strip quant/distributor suffixes for a clean --alias name."""
     import re as _re
+
     clean = _re.sub(
         r"[-_]?(?:iq\d+(?:_+[a-z\d]+)*(?:[-_]\d+[.\d]*bpw)?|"
         r"q\d+(?:_+[a-z\d]+)*|tf\d+|bf16|f16|f32)$",
-        "", name, flags=_re.IGNORECASE,
+        "",
+        name,
+        flags=_re.IGNORECASE,
     ).strip("-_")
     return _re.sub(r"[-_](?:ud|unsloth)$", "", clean, flags=_re.IGNORECASE).strip("-_")
 
@@ -237,6 +268,7 @@ def _clean_model_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Expert panel — editable settings overlay
 # ---------------------------------------------------------------------------
+
 
 class ExpertPanel(QWidget):
     """Editable replacement for the read-only config preview.
@@ -263,9 +295,9 @@ class ExpertPanel(QWidget):
 
     # Emitted with the current configuration after any cascading recompute,
     # so the parent window can refresh its memory-estimate footer.
-    configChanged = pyqtSignal(object)   # TunedConfig
+    configChanged = pyqtSignal(object)  # TunedConfig
     # Emitted with the new mode name when the user toggles Auto/Manual.
-    modeChanged = pyqtSignal(str)        # "auto" | "manual"
+    modeChanged = pyqtSignal(str)  # "auto" | "manual"
     # Emitted when the user clicks the close (×) button.
     closeRequested = pyqtSignal()
 
@@ -294,7 +326,7 @@ class ExpertPanel(QWidget):
         # Hardware snapshot used to clamp ctx slider etc. Set by parent
         # on every mode switch.
         self._system: Optional[SystemInfo] = None
-        self._native_ctx: int = 0      # native_context from GGUF (0 = unknown)
+        self._native_ctx: int = 0  # native_context from GGUF (0 = unknown)
         self._profile_max: int = 8192  # YAML max_context
 
         # Guard flag — when True we are programmatically setting widget
@@ -391,36 +423,57 @@ class ExpertPanel(QWidget):
         self._sp_ctx.setSingleStep(1024)
         self._sp_ctx.setGroupSeparatorShown(True)
         self._sp_ctx.valueChanged.connect(lambda _: self._on_edit("user_ctx"))
-        _add("Context tokens", self._sp_ctx,
-             "Maximum context length. Auto mode: changing this re-picks "
-             "KV quants and placement to fit.")
+        _add(
+            "Context tokens",
+            self._sp_ctx,
+            "Maximum context length. Auto mode: changing this re-picks "
+            "KV quants and placement to fit.",
+        )
 
         self._cb_cache_k = QComboBox()
         self._cb_cache_k.addItems(self._KV_QUANT_OPTIONS)
-        self._cb_cache_k.currentTextChanged.connect(lambda _: self._on_edit("force_cache_k"))
-        _add("K-quant", self._cb_cache_k,
-             "K-cache quantisation. Higher = better attention recall.")
+        self._cb_cache_k.currentTextChanged.connect(
+            lambda _: self._on_edit("force_cache_k")
+        )
+        _add(
+            "K-quant",
+            self._cb_cache_k,
+            "K-cache quantisation. Higher = better attention recall.",
+        )
 
         self._cb_cache_v = QComboBox()
         self._cb_cache_v.addItems(self._KV_QUANT_OPTIONS)
-        self._cb_cache_v.currentTextChanged.connect(lambda _: self._on_edit("force_cache_v"))
-        _add("V-quant", self._cb_cache_v,
-             "V-cache quantisation. May be lower than K-quant (asymmetric FA).")
+        self._cb_cache_v.currentTextChanged.connect(
+            lambda _: self._on_edit("force_cache_v")
+        )
+        _add(
+            "V-quant",
+            self._cb_cache_v,
+            "V-cache quantisation. May be lower than K-quant (asymmetric FA).",
+        )
 
         # Layer placement
         _section("Layer placement")
         self._sp_ngl = QSpinBox()
         self._sp_ngl.setRange(0, 999)
         self._sp_ngl.valueChanged.connect(lambda _: self._on_edit("force_ngl"))
-        _add("GPU layers (ngl)", self._sp_ngl,
-             "Dense models: how many layers go on GPU. 999 = all. "
-             "Ignored for MoE — use n_cpu_moe.")
+        _add(
+            "GPU layers (ngl)",
+            self._sp_ngl,
+            "Dense models: how many layers go on GPU. 999 = all. "
+            "Ignored for MoE — use n_cpu_moe.",
+        )
 
         self._sp_ncpumoe = QSpinBox()
         self._sp_ncpumoe.setRange(0, 999)
-        self._sp_ncpumoe.valueChanged.connect(lambda _: self._on_edit("force_n_cpu_moe"))
-        _add("n_cpu_moe", self._sp_ncpumoe,
-             "MoE only: how many expert layers run on CPU.")
+        self._sp_ncpumoe.valueChanged.connect(
+            lambda _: self._on_edit("force_n_cpu_moe")
+        )
+        _add(
+            "n_cpu_moe",
+            self._sp_ncpumoe,
+            "MoE only: how many expert layers run on CPU.",
+        )
 
         # Threads & batching
         _section("Threads & batching")
@@ -448,15 +501,21 @@ class ExpertPanel(QWidget):
         _add("", self._chk_fa, "Flash Attention — required for KV-quantisation.")
 
         self._chk_mlock = QCheckBox("--mlock")
-        _add("", self._chk_mlock,
-             "Lock model in memory. Windows: needs SeLockMemoryPrivilege.")
+        _add(
+            "",
+            self._chk_mlock,
+            "Lock model in memory. Windows: needs SeLockMemoryPrivilege.",
+        )
 
         self._chk_no_mmap = QCheckBox("--no-mmap")
         _add("", self._chk_no_mmap, "Load model fully into memory at startup.")
 
         self._chk_jinja = QCheckBox("--jinja")
-        _add("", self._chk_jinja,
-             "Use the embedded chat template (separates <think> tags into reasoning_content).")
+        _add(
+            "",
+            self._chk_jinja,
+            "Use the embedded chat template (separates <think> tags into reasoning_content).",
+        )
 
         self._chk_verbose = QCheckBox("--verbose")
         _add("", self._chk_verbose, "Verbose llama-server logging.")
@@ -467,8 +526,11 @@ class ExpertPanel(QWidget):
 
         self._chk_rope = QCheckBox("RoPE scaling (YaRN)")
         self._chk_rope.toggled.connect(lambda _: self._on_edit("force_rope_scale"))
-        _add("", self._chk_rope,
-             "Force YaRN context extension on/off (overrides profile default).")
+        _add(
+            "",
+            self._chk_rope,
+            "Force YaRN context extension on/off (overrides profile default).",
+        )
 
         self._sp_rope_factor = QDoubleSpinBox()
         self._sp_rope_factor.setRange(1.0, 32.0)
@@ -479,7 +541,9 @@ class ExpertPanel(QWidget):
         # Sampling
         _section("Sampling")
         self._sp_temp = QDoubleSpinBox()
-        self._sp_temp.setRange(0.0, 5.0); self._sp_temp.setSingleStep(0.05); self._sp_temp.setDecimals(2)
+        self._sp_temp.setRange(0.0, 5.0)
+        self._sp_temp.setSingleStep(0.05)
+        self._sp_temp.setDecimals(2)
         _add("temperature", self._sp_temp, "--temp")
 
         self._sp_top_k = QSpinBox()
@@ -487,27 +551,40 @@ class ExpertPanel(QWidget):
         _add("top_k", self._sp_top_k, "--top-k  (0 = disabled)")
 
         self._sp_top_p = QDoubleSpinBox()
-        self._sp_top_p.setRange(0.0, 1.0); self._sp_top_p.setSingleStep(0.01); self._sp_top_p.setDecimals(3)
+        self._sp_top_p.setRange(0.0, 1.0)
+        self._sp_top_p.setSingleStep(0.01)
+        self._sp_top_p.setDecimals(3)
         _add("top_p", self._sp_top_p, "--top-p")
 
         self._sp_min_p = QDoubleSpinBox()
-        self._sp_min_p.setRange(0.0, 1.0); self._sp_min_p.setSingleStep(0.01); self._sp_min_p.setDecimals(3)
+        self._sp_min_p.setRange(0.0, 1.0)
+        self._sp_min_p.setSingleStep(0.01)
+        self._sp_min_p.setDecimals(3)
         _add("min_p", self._sp_min_p, "--min-p")
 
         self._sp_rep = QDoubleSpinBox()
-        self._sp_rep.setRange(0.5, 2.5); self._sp_rep.setSingleStep(0.01); self._sp_rep.setDecimals(3)
+        self._sp_rep.setRange(0.5, 2.5)
+        self._sp_rep.setSingleStep(0.01)
+        self._sp_rep.setDecimals(3)
         _add("repeat_penalty", self._sp_rep, "--repeat-penalty")
 
         self._sp_presence = QDoubleSpinBox()
-        self._sp_presence.setRange(-2.0, 2.0); self._sp_presence.setSingleStep(0.1); self._sp_presence.setDecimals(2)
+        self._sp_presence.setRange(-2.0, 2.0)
+        self._sp_presence.setSingleStep(0.1)
+        self._sp_presence.setDecimals(2)
         _add("presence_penalty", self._sp_presence, "--presence-penalty")
 
         # Extra free-form CLI flags
         _section("Extra CLI flags")
         self._le_extra = QLineEdit()
-        self._le_extra.setPlaceholderText("e.g.  --chat-template-kwargs '{\"reasoning_effort\":\"high\"}'")
-        _add("extras", self._le_extra,
-             "Appended verbatim to the llama-server command line.")
+        self._le_extra.setPlaceholderText(
+            'e.g.  --chat-template-kwargs \'{"reasoning_effort":"high"}\''
+        )
+        _add(
+            "extras",
+            self._le_extra,
+            "Appended verbatim to the llama-server command line.",
+        )
 
         grid.setRowStretch(row, 1)
         self._widgets_created = True
@@ -618,9 +695,7 @@ class ExpertPanel(QWidget):
 
             # Extra CLI: filter out the flags we already model as checkboxes
             modeled = {"--jinja", "--verbose"}
-            free_flags = [
-                f for f in (cfg.extra_cli_flags or []) if f not in modeled
-            ]
+            free_flags = [f for f in (cfg.extra_cli_flags or []) if f not in modeled]
             self._le_extra.setText(" ".join(free_flags))
         finally:
             self._populating = False
@@ -720,6 +795,7 @@ class ExpertPanel(QWidget):
         # Clone the auto-cfg then overwrite every field with the live widget value.
         # Using copy() keeps the unmodelled fields (tensor_split, main_gpu, etc.)
         import copy as _copy
+
         cfg = _copy.copy(base)
         cfg.ctx = self._sp_ctx.value()
         cfg.cache_k = self._cb_cache_k.currentText()
@@ -762,28 +838,29 @@ class ExpertPanel(QWidget):
 # ---------------------------------------------------------------------------
 # Main window
 
+
 class MainWindow(QMainWindow):
     # Signal carrying SystemInfo updates from the background sysinfo thread.
     # Qt widgets are NOT thread-safe — touching a QLabel from a daemon
     # thread produced sporadic random crashes ("GUI just closed itself").
     # Background work emits this signal; the slot runs on the GUI thread.
-    _sysinfo_ready = pyqtSignal(object)   # SystemInfo
-    _bg_log       = pyqtSignal(str)       # log message from background thread
+    _sysinfo_ready = pyqtSignal(object)  # SystemInfo
+    _bg_log = pyqtSignal(str)  # log message from background thread
 
     def __init__(self, models_path: Path, settings_path: Path) -> None:
         super().__init__()
         self.setWindowTitle("AutoTuner Qt Launcher")
         self.resize(1320, 840)
 
-        self.models_path   = models_path
+        self.models_path = models_path
         self.settings_path = settings_path
 
         self._server: Optional[_TerminalProcess] = None
-        self._all_entries: List[ModelEntry]      = []
-        self._system:      Optional[SystemInfo]  = None
-        self._profiles:    List[ModelProfile]    = []
-        self._forks:       List[Tuple[str, Path]] = []
-        self._fork_path:   Optional[Path]      = None  # manueller Fork-Ordner
+        self._all_entries: List[ModelEntry] = []
+        self._system: Optional[SystemInfo] = None
+        self._profiles: List[ModelProfile] = []
+        self._forks: List[Tuple[str, Path]] = []
+        self._fork_path: Optional[Path] = None  # manueller Fork-Ordner
 
         # Currently selected model + its draft (set in _show_config)
         self._current_entry: Optional[ModelEntry] = None
@@ -805,10 +882,10 @@ class MainWindow(QMainWindow):
         # from the currently active fork in `self._fork_path`.
         self._fork_container: Optional[Path] = None
 
-        self._scan_thread: Optional[QThread]     = None
+        self._scan_thread: Optional[QThread] = None
         self._scan_worker: Optional[_ScanWorker] = None
         self._sysinfo_busy = False
-        self._font_size    = 10
+        self._font_size = 10
 
         self._build_ui()
         # Wire background → GUI signals BEFORE the first scan kicks off,
@@ -844,7 +921,7 @@ class MainWindow(QMainWindow):
 
         for label, slot in (
             ("📂 Models folder", self._browse_models),
-            ("🔄 Refresh",       self._start_scan),
+            ("🔄 Refresh", self._start_scan),
         ):
             btn = QPushButton(label)
             btn.clicked.connect(slot)
@@ -856,16 +933,18 @@ class MainWindow(QMainWindow):
         tb.addWidget(QLabel(" Fork:"))
         self._fork_combo = QComboBox()
         self._fork_combo.setMinimumWidth(140)
-        self._fork_combo.setToolTip("Default llama.cpp fork (auto-overridden by profile)")
+        self._fork_combo.setToolTip(
+            "Default llama.cpp fork (auto-overridden by profile)"
+        )
         self._fork_combo.currentIndexChanged.connect(self._on_fork_changed)
         tb.addWidget(self._fork_combo)
-        
+
         self._fork_path_lbl = QLabel()
         self._fork_path_lbl.setStyleSheet("color:#aaa;font-size:9pt;")
         self._fork_path_lbl.setMaximumWidth(120)
         self._fork_path_lbl.setText("")
         tb.addWidget(self._fork_path_lbl)
-        
+
         self._btn_fork_folder = QPushButton("📂")
         self._btn_fork_folder.setFixedWidth(28)
         self._btn_fork_folder.setToolTip("Manuellen Fork-Ordner auswählen")
@@ -907,10 +986,10 @@ class MainWindow(QMainWindow):
         sysbar = QWidget()
         sl = QHBoxLayout(sysbar)
         sl.setContentsMargins(6, 1, 6, 1)
-        self._cpu_lbl  = QLabel("CPU: —")
+        self._cpu_lbl = QLabel("CPU: —")
         self._vram_lbl = QLabel("VRAM: —")
-        self._ram_lbl  = QLabel("RAM: —")
-        self._gpu_lbl  = QLabel("GPU: —")
+        self._ram_lbl = QLabel("RAM: —")
+        self._gpu_lbl = QLabel("GPU: —")
         for lbl in (self._cpu_lbl, self._vram_lbl, self._ram_lbl, self._gpu_lbl):
             lbl.setStyleSheet("color:#8be;padding:0 12px;")
             sl.addWidget(lbl)
@@ -953,8 +1032,8 @@ class MainWindow(QMainWindow):
         self._expert_panel.closeRequested.connect(self._exit_expert_mode)
 
         self._config_stack = QStackedWidget()
-        self._config_stack.addWidget(self._config_preview)   # index 0 — preview
-        self._config_stack.addWidget(self._expert_panel)     # index 1 — expert
+        self._config_stack.addWidget(self._config_preview)  # index 0 — preview
+        self._config_stack.addWidget(self._expert_panel)  # index 1 — expert
         self._config_stack.setCurrentIndex(0)
 
         # ── Expert button row (sits between preview and Launch options) ─
@@ -980,8 +1059,8 @@ class MainWindow(QMainWindow):
         ol = QVBoxLayout(opts)
         ol.setSpacing(4)
 
-        self._chk_vision   = QCheckBox("Vision (mmproj)")
-        self._chk_draft    = QCheckBox("Draft model (speculative decoding)")
+        self._chk_vision = QCheckBox("Vision (mmproj)")
+        self._chk_draft = QCheckBox("Draft model (speculative decoding)")
         # NEW: Turbo KV-quant toggle. Sits between Draft and Thinking,
         # as requested. When on, the AutoTuner maps the chosen KV
         # quants to their TurboQuant equivalents (denser packing on
@@ -990,7 +1069,12 @@ class MainWindow(QMainWindow):
         self._chk_turbo_kv = QCheckBox("Turbo KV-quant (TurboQuant forks)")
         self._chk_thinking = QCheckBox("Thinking / Reasoning")
 
-        for chk in (self._chk_vision, self._chk_draft, self._chk_turbo_kv, self._chk_thinking):
+        for chk in (
+            self._chk_vision,
+            self._chk_draft,
+            self._chk_turbo_kv,
+            self._chk_thinking,
+        ):
             chk.setEnabled(False)
             ol.addWidget(chk)
 
@@ -1139,8 +1223,8 @@ class MainWindow(QMainWindow):
         n = len(self._profiles)
         self._log(
             f"Loaded {n} profile(s) from {self.settings_path}"
-            if n else
-            f"[Warning] No profiles found in {self.settings_path}"
+            if n
+            else f"[Warning] No profiles found in {self.settings_path}"
         )
 
         try:
@@ -1157,8 +1241,8 @@ class MainWindow(QMainWindow):
         # the last selection within that container, used to restore
         # the combo's current index.
         persisted_container = app_settings.get_fork_container_path()
-        persisted_active    = app_settings.get_fork_path()
-        env_fork            = os.environ.get("LLAMA_CPP_DIR", "")
+        persisted_active = app_settings.get_fork_path()
+        env_fork = os.environ.get("LLAMA_CPP_DIR", "")
 
         # If no container was ever explicitly stored but a manual fork
         # path is, peek at its parent: if that parent itself contains
@@ -1175,7 +1259,7 @@ class MainWindow(QMainWindow):
                     )
 
         manual_path: Optional[Path] = None
-        manual_source = ""    # "container" | "settings" | "env" | ""
+        manual_source = ""  # "container" | "settings" | "env" | ""
         if persisted_container is not None:
             manual_path = persisted_container.resolve()
             manual_source = "container"
@@ -1219,17 +1303,22 @@ class MainWindow(QMainWindow):
             self._fork_combo.setCurrentIndex(matched_idx)
             self._fork_path = self._forks[matched_idx][1]
             self._fork_path_lbl.setText(manual_path.name)
-            src_label = ("persisted settings" if manual_source == "settings"
-                         else "LLAMA_CPP_DIR")
-            self._log(f"[Fork] Restored from {src_label}: "
-                      f"{self._forks[matched_idx][0]}  →  {manual_path}")
+            src_label = (
+                "persisted settings" if manual_source == "settings" else "LLAMA_CPP_DIR"
+            )
+            self._log(
+                f"[Fork] Restored from {src_label}: "
+                f"{self._forks[matched_idx][0]}  →  {manual_path}"
+            )
             self._apply_fork(matched_idx)
         elif env_contains_forks and manual_path is not None:
             # Container with multiple llama.cpp builds — this is the
             # "remember the parent folder" case. Show every sibling.
             self._fork_container = manual_path
-            self._log(f"[Fork] Container '{manual_path.name}' "
-                      f"contains {len(container_children)} fork(s):")
+            self._log(
+                f"[Fork] Container '{manual_path.name}' "
+                f"contains {len(container_children)} fork(s):"
+            )
             for name, fork_path in container_children:
                 self._log(f"  - {name} → {fork_path}")
                 self._fork_combo.addItem(name, userData=fork_path)
@@ -1259,8 +1348,9 @@ class MainWindow(QMainWindow):
             self._fork_path = manual_path
             self._fork_combo.setCurrentIndex(0)
             self._fork_path_lbl.setText(manual_path.name)
-            src_label = ("persisted settings" if manual_source == "settings"
-                         else "LLAMA_CPP_DIR")
+            src_label = (
+                "persisted settings" if manual_source == "settings" else "LLAMA_CPP_DIR"
+            )
             self._log(f"[Fork] Using manual path from {src_label}: {manual_path}")
         elif self._forks:
             # No manual choice — auto-discovered forks.
@@ -1346,21 +1436,25 @@ class MainWindow(QMainWindow):
         if the user hasn't picked anything (which currently never happens
         because the combo is initialised to "balanced", but stay robust).
         """
-        gui_choice = self._perf_combo.currentText().strip() if hasattr(self, "_perf_combo") else None
+        gui_choice = (
+            self._perf_combo.currentText().strip()
+            if hasattr(self, "_perf_combo")
+            else None
+        )
         return resolve_performance_target(
             cli_choice=gui_choice,
             profile_choice=getattr(profile, "performance_target", "") or None,
         )
 
-    def _hw_detect_done(
-        self, s: Optional[SystemInfo], err: str = ""
-    ) -> None:
+    def _hw_detect_done(self, s: Optional[SystemInfo], err: str = "") -> None:
         """Callback from hardware detection worker thread (via signal/slot)."""
         if s is not None:
             self._system = s
             self._update_sysinfo_labels(s)
-            self._log(f"Hardware detected ({s.total_ram_gb:.0f}GB RAM, "
-                      f"{s.total_vram_gb:.0f}GB VRAM, {len(s.gpus)} GPU(s)).")
+            self._log(
+                f"Hardware detected ({s.total_ram_gb:.0f}GB RAM, "
+                f"{s.total_vram_gb:.0f}GB VRAM, {len(s.gpus)} GPU(s))."
+            )
         else:
             self._log(f"[Warning] Hardware detection failed: {err}")
             # Still allow model selection even without sysinfo
@@ -1371,19 +1465,19 @@ class MainWindow(QMainWindow):
         dialog = QFileDialog(self, "LLama.cpp Fork-Ordner auswählen")
         dialog.setFileMode(QFileDialog.FileMode.Directory)
         dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
-        
+
         # Vorgabepfad: aktueller Fork oder Workspace
         if self._fork_path is not None:
             dialog.setDirectory(str(self._fork_path))
         elif self._forks:
             dialog.setDirectory(str(self._forks[0][1]))
-        
+
         if dialog.exec() == QFileDialog.DialogCode.Accepted:
             selected = dialog.selectedFiles()
             if selected:
                 new_path = Path(selected[0])
                 self._set_manual_fork_path(new_path)
-    
+
     def _set_manual_fork_path(self, path: Path) -> None:
         r"""Manuellen Fork-Pfad setzen und UI aktualisieren.
 
@@ -1394,8 +1488,9 @@ class MainWindow(QMainWindow):
         of builds instead of dropping the user back to a single child.
         """
         if not path.is_dir():
-            QMessageBox.warning(self, "Ungültiger Ordner",
-                              f"Der Ordner existiert nicht:\n{path}")
+            QMessageBox.warning(
+                self, "Ungültiger Ordner", f"Der Ordner existiert nicht:\n{path}"
+            )
             return
 
         path = path.resolve()
@@ -1539,7 +1634,8 @@ class MainWindow(QMainWindow):
     def _apply_filter(self, text: str) -> None:
         q = text.strip().lower()
         self._populate_list(
-            self._all_entries if not q
+            self._all_entries
+            if not q
             else [e for e in self._all_entries if q in e.name.lower()]
         )
 
@@ -1613,7 +1709,7 @@ class MainWindow(QMainWindow):
         # honours last session's choices. The in-memory cache wins if
         # both exist, since the user may have toggled mid-session.
         persisted = app_settings.get_model_overrides(entry.name)
-        cached    = self._option_overrides.get(entry.name, {})
+        cached = self._option_overrides.get(entry.name, {})
         ov = {**persisted, **cached}
 
         # ── Vision ──────────────────────────────────────────────────
@@ -1624,7 +1720,8 @@ class MainWindow(QMainWindow):
         self._chk_vision.setEnabled(has_vision)
         self._chk_vision.setChecked(has_vision and vision_state)
         self._chk_vision.setText(
-            f"Vision  ({mmproj.name})" if mmproj is not None
+            f"Vision  ({mmproj.name})"
+            if mmproj is not None
             else "Vision (no mmproj found)"
         )
         self._chk_vision.blockSignals(False)
@@ -1638,7 +1735,8 @@ class MainWindow(QMainWindow):
         self._chk_draft.setChecked(has_draft and draft_state)
         self._chk_draft.setText(
             f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
-            if draft is not None else "Draft (no assistant model found)"
+            if draft is not None
+            else "Draft (no assistant model found)"
         )
         self._chk_draft.blockSignals(False)
 
@@ -1709,7 +1807,9 @@ class MainWindow(QMainWindow):
                         self._fork_combo.setCurrentIndex(i)
                         self._fork_combo.blockSignals(False)
                         self._apply_fork(i)
-                        self._log(f"[Fork] Auto-selected: {self._fork_combo.itemText(i)}")
+                        self._log(
+                            f"[Fork] Auto-selected: {self._fork_combo.itemText(i)}"
+                        )
                     return
         else:
             # No specific fork required — keep current selection, don't reset
@@ -1787,8 +1887,8 @@ class MainWindow(QMainWindow):
             return None
 
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
-        use_draft  = self._chk_draft.isChecked()  and self._chk_draft.isEnabled()
-        turbo_kv   = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
+        use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
+        turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
 
         entry_for_cfg = copy.copy(entry)
         if not use_vision:
@@ -1802,7 +1902,9 @@ class MainWindow(QMainWindow):
 
         try:
             return compute_config(
-                model=entry_for_cfg, system=self._system, profile=profile,
+                model=entry_for_cfg,
+                system=self._system,
+                profile=profile,
                 draft_model=self._current_draft if use_draft else None,
                 force_mlock=False,
                 perf_target=self._resolve_perf_target_for_profile(profile),
@@ -1828,18 +1930,22 @@ class MainWindow(QMainWindow):
                 system=self._system,
                 native_ctx=entry.native_context,
                 profile_max=profile.max_context,
-                recompute_cb=lambda overrides:
-                    self._build_auto_config(entry, profile, overrides),
+                recompute_cb=lambda overrides: self._build_auto_config(
+                    entry, profile, overrides
+                ),
             )
 
     def _render_cfg_to_preview(
-        self, entry: ModelEntry, profile: ModelProfile, cfg: TunedConfig,
+        self,
+        entry: ModelEntry,
+        profile: ModelProfile,
+        cfg: TunedConfig,
     ) -> None:
         """Format ``cfg`` into the read-only preview QTextEdit."""
         assert self._system is not None
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
-        use_draft  = self._chk_draft.isChecked()  and self._chk_draft.isEnabled()
-        turbo_kv   = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
+        use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
+        turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
 
         W = 64
         bar = "─" * W
@@ -1852,7 +1958,7 @@ class MainWindow(QMainWindow):
         if profile.notes:
             for i in range(0, len(profile.notes.strip()), W - 10):
                 prefix = "Notes   : " if i == 0 else "          "
-                lines.append(f"{prefix}{profile.notes.strip()[i:i+W-10]}")
+                lines.append(f"{prefix}{profile.notes.strip()[i : i + W - 10]}")
         if entry.mmproj:
             vis = "✓" if use_vision else "✗"
             lines.append(f"Vision  : {entry.mmproj.name}  [{vis}]")
@@ -1866,8 +1972,10 @@ class MainWindow(QMainWindow):
         if cfg.full_offload:
             placement = f"GPU full offload  ({entry.n_layers or '?'} layers)"
         elif cfg.is_moe and cfg.n_cpu_moe:
-            placement = (f"MoE hybrid — {cfg.n_cpu_moe} CPU expert layer(s) "
-                         f"of {entry.n_layers or '?'} total")
+            placement = (
+                f"MoE hybrid — {cfg.n_cpu_moe} CPU expert layer(s) "
+                f"of {entry.n_layers or '?'} total"
+            )
         elif cfg.ngl > 0:
             placement = f"Hybrid — {cfg.ngl}/{entry.n_layers or '?'} layers GPU + CPU"
         else:
@@ -1894,9 +2002,7 @@ class MainWindow(QMainWindow):
         if cfg.mlock:
             lines.append("mlock           : on")
         if cfg.rope_scaling:
-            lines.append(
-                f"RoPE scaling    : on (factor {cfg.rope_scale_factor:.1f}×)"
-            )
+            lines.append(f"RoPE scaling    : on (factor {cfg.rope_scale_factor:.1f}×)")
         s = cfg.sampling
         lines.append(
             f"Sampling        : temp={s.get('temperature')}  "
@@ -1910,8 +2016,12 @@ class MainWindow(QMainWindow):
         # main number went down while total GPU usage went up). We now
         # show every component plus a `Total GPU` row so the user sees
         # exactly what fits where.
-        total_gpu = (cfg.estimated_model_vram_gb + cfg.vision_vram_gb
-                     + cfg.draft_vram_gb + cfg.kv_vram_gb)
+        total_gpu = (
+            cfg.estimated_model_vram_gb
+            + cfg.vision_vram_gb
+            + cfg.draft_vram_gb
+            + cfg.kv_vram_gb
+        )
         total_cpu = cfg.estimated_model_ram_gb + cfg.kv_ram_gb
         lines += [bar, "Memory estimate (with current options):"]
         lines.append(
@@ -1953,9 +2063,10 @@ class MainWindow(QMainWindow):
         """Swap the read-only preview for the editable Expert panel."""
         if self._current_entry is None or self._system is None:
             QMessageBox.information(
-                self, "No model selected",
+                self,
+                "No model selected",
                 "Select a model first — the Expert panel needs a current "
-                "configuration to start from."
+                "configuration to start from.",
             )
             return
         profile = match_profile(self._current_entry.name, self._profiles)
@@ -1968,8 +2079,9 @@ class MainWindow(QMainWindow):
             system=self._system,
             native_ctx=entry.native_context,
             profile_max=profile.max_context,
-            recompute_cb=lambda overrides:
-                self._build_auto_config(entry, profile, overrides),
+            recompute_cb=lambda overrides: self._build_auto_config(
+                entry, profile, overrides
+            ),
         )
         self._config_stack.setCurrentIndex(1)
         # Hide the Expert button (it's now "covered" by the panel — the
@@ -2024,6 +2136,7 @@ class MainWindow(QMainWindow):
         thread). We now emit signals; their slots run on the GUI thread.
         """
         import time
+
         try:
             start = time.monotonic()
             s = detect_system()
@@ -2042,7 +2155,7 @@ class MainWindow(QMainWindow):
         preview work even if hardware detection happened after startup.
         """
         self._system = s
-        
+
         # VRAM-Anzeige
         if s.total_vram_gb > 0:
             self._vram_lbl.setText(
@@ -2050,16 +2163,16 @@ class MainWindow(QMainWindow):
             )
         else:
             self._vram_lbl.setText("VRAM: keine GPU")
-        
+
         # RAM-Anzeige
         self._ram_lbl.setText(
             f"RAM: {s.free_ram_gb:.1f} / {s.total_ram_gb:.1f} GB free"
         )
-        
+
         # CPU-Anzeige
         if s.cpu_name:
             self._cpu_lbl.setText(f"CPU: {s.cpu_name}")
-        
+
         # GPU-Anzeige mit Utilization
         if s.gpus:
             gpu_parts = []
@@ -2069,19 +2182,24 @@ class MainWindow(QMainWindow):
             self._gpu_lbl.setText("GPU: " + ", ".join(gpu_parts))
         else:
             self._gpu_lbl.setText("GPU: keine")
-        
-        self._log(f"[SysInfo] CPU={s.cpu_name}, VRAM={s.free_vram_gb:.1f}/{s.total_vram_gb:.1f}GB, RAM={s.free_ram_gb:.1f}/{s.total_ram_gb:.1f}GB, GPU={[g.name for g in s.gpus]}")
+
+        self._log(
+            f"[SysInfo] CPU={s.cpu_name}, VRAM={s.free_vram_gb:.1f}/{s.total_vram_gb:.1f}GB, RAM={s.free_ram_gb:.1f}/{s.total_ram_gb:.1f}GB, GPU={[g.name for g in s.gpus]}"
+        )
 
     # ------------------------------------------------------------------
     # Binary resolution
     # ------------------------------------------------------------------
-    def _resolve_binary(self, profile: ModelProfile, use_draft: bool,
-                         model_name: str) -> str:
+    def _resolve_binary(
+        self, profile: ModelProfile, use_draft: bool, model_name: str
+    ) -> str:
         try:
             _, resolve = _get_fork_tools()
         except Exception:
             return "llama-server"
-        if ("gemma-4" in model_name.lower() or "gemma4" in model_name.lower()) and use_draft:
+        if (
+            "gemma-4" in model_name.lower() or "gemma4" in model_name.lower()
+        ) and use_draft:
             spec = profile.server_binary or "ik_llama.cpp/llama-server"
         elif profile.server_binary:
             spec = profile.server_binary
@@ -2109,15 +2227,16 @@ class MainWindow(QMainWindow):
 
         if self._system is None:
             QMessageBox.warning(
-                self, "System info unavailable",
-                "Hardware detection has not completed yet. Please wait a moment and try again."
+                self,
+                "System info unavailable",
+                "Hardware detection has not completed yet. Please wait a moment and try again.",
             )
             return
 
-        use_vision   = self._chk_vision.isChecked()   and self._chk_vision.isEnabled()
-        use_draft    = self._chk_draft.isChecked()    and self._chk_draft.isEnabled()
+        use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
+        use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
         use_thinking = self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
-        turbo_kv     = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
+        turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
 
         # Build a copy of entry so we can control mmproj inclusion
         entry = copy.copy(self._current_entry)
@@ -2130,7 +2249,7 @@ class MainWindow(QMainWindow):
         # (Manual mode = literal widget values; Auto mode = the last
         # cascaded result the user can see in the panel). Otherwise we
         # rebuild via compute_config from scratch.
-        expert_open = (self._config_stack.currentIndex() == 1)
+        expert_open = self._config_stack.currentIndex() == 1
         cfg: Optional[TunedConfig] = None
         if expert_open:
             cfg = self._expert_panel.current_config()
@@ -2138,9 +2257,12 @@ class MainWindow(QMainWindow):
                 self._log("[Warning] Expert panel had no config; falling back to auto.")
         if cfg is None:
             cfg = compute_config(
-                model=entry, system=self._system, profile=profile,
+                model=entry,
+                system=self._system,
+                profile=profile,
                 draft_model=self._current_draft if use_draft else None,
-                user_ctx=None, force_mlock=False,
+                user_ctx=None,
+                force_mlock=False,
                 perf_target=self._resolve_perf_target_for_profile(profile),
                 turbo_kv=turbo_kv,
             )
@@ -2155,15 +2277,22 @@ class MainWindow(QMainWindow):
         # Clean alias so RooCode/clients show a readable name, not the file path
         alias = _clean_model_name(entry.name)
         cmd = build_command(
-            model=entry, config=cfg, profile=profile,
+            model=entry,
+            config=cfg,
+            profile=profile,
             draft_model=self._current_draft if use_draft else None,
-            server_binary=server_binary, host=host, port=port,
-            extra_args=["-a", alias], use_thinking=use_thinking,
+            server_binary=server_binary,
+            host=host,
+            port=port,
+            extra_args=["-a", alias],
+            use_thinking=use_thinking,
         )
 
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
-        self._log(f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking}")
+        self._log(
+            f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking}"
+        )
 
         self._server = _TerminalProcess(cmd)
         try:
@@ -2189,7 +2318,7 @@ class MainWindow(QMainWindow):
         self._log("[AutoTuner] Stopping server…")
         srv = self._server
         self._server = None
-        srv.stop()   # sends signal + waits in daemon thread
+        srv.stop()  # sends signal + waits in daemon thread
         self._btn_launch.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._status.showMessage("Server stopped.")
@@ -2233,7 +2362,8 @@ class MainWindow(QMainWindow):
 
         if self._server is not None and self._server.is_running():
             reply = QMessageBox.question(
-                self, "Server still running",
+                self,
+                "Server still running",
                 "Stop the server and quit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
@@ -2250,9 +2380,11 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> None:
     import argparse
-    p = argparse.ArgumentParser(prog="qt_launcher",
-                                description="AutoTuner Qt GUI launcher")
-    p.add_argument("--models-path",   default=str(_default_models_path()))
+
+    p = argparse.ArgumentParser(
+        prog="qt_launcher", description="AutoTuner Qt GUI launcher"
+    )
+    p.add_argument("--models-path", default=str(_default_models_path()))
     p.add_argument("--settings-path", default=str(_default_settings_path()))
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -2260,6 +2392,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if os.name == "nt":
         try:
             import ctypes
+
             hwnd = ctypes.windll.kernel32.GetConsoleWindow()
             if hwnd:
                 ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE

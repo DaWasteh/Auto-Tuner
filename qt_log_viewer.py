@@ -3,6 +3,7 @@
 Opens alongside a running ServerProcess and streams stdout/stderr into a
 read-only text widget.  A system-tray icon provides Stop/Quit actions.
 """
+
 from __future__ import annotations
 
 from PyQt6.QtCore import QTimer
@@ -78,9 +79,7 @@ class LogViewerWindow(QMainWindow):
         self._stop_server()
         QApplication.quit()
 
-    def _on_tray_activated(
-        self, reason: QSystemTrayIcon.ActivationReason
-    ) -> None:
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         """Double-click tray icon → show/raise the window."""
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.show()

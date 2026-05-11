@@ -27,6 +27,7 @@ Resolution priority (highest wins)
 Unknown values fall back silently to the default — we never want a
 typo in YAML to crash the tuner.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -55,7 +56,7 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
     "safe": PerformanceTarget(
         name="safe",
         moe_vram_safety_gb=0.30,
-        moe_placement_ctx_target=131072,   # 128k — full long-context budget
+        moe_placement_ctx_target=131072,  # 128k — full long-context budget
         dense_vram_safety_gb=0.30,
         ram_safety_gb=1.50,
         description=(
@@ -66,7 +67,7 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
     "balanced": PerformanceTarget(
         name="balanced",
         moe_vram_safety_gb=0.25,
-        moe_placement_ctx_target=65536,    # 64k — typical working ceiling
+        moe_placement_ctx_target=65536,  # 64k — typical working ceiling
         dense_vram_safety_gb=0.25,
         ram_safety_gb=1.25,
         description=(
@@ -77,7 +78,7 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
     "throughput": PerformanceTarget(
         name="throughput",
         moe_vram_safety_gb=0.15,
-        moe_placement_ctx_target=32768,    # 32k — short reasoning / coding
+        moe_placement_ctx_target=32768,  # 32k — short reasoning / coding
         dense_vram_safety_gb=0.15,
         ram_safety_gb=1.00,
         description=(
@@ -93,6 +94,7 @@ DEFAULT_TARGET_NAME = "balanced"
 
 # ---------------------------------------------------------------------------
 # Public API
+
 
 def list_target_names() -> List[str]:
     """Return target names in display order (safe → balanced → throughput)."""

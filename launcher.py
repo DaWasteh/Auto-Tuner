@@ -26,6 +26,7 @@ llama-server:
    returns to the interpreter, the SIGINT flag is checked, and
    ``KeyboardInterrupt`` fires immediately.
 """
+
 from __future__ import annotations
 
 import os
@@ -120,8 +121,9 @@ def launch(cmd: List[str]) -> int:
 
     Returns the child's exit code (or 130 if it had to be killed).
     """
-    print(f"\n[AutoTuner] Starting:\n  {' '.join(_quote(c) for c in cmd)}\n",
-          flush=True)
+    print(
+        f"\n[AutoTuner] Starting:\n  {' '.join(_quote(c) for c in cmd)}\n", flush=True
+    )
     try:
         proc = _spawn(cmd)
     except FileNotFoundError:
@@ -133,8 +135,10 @@ def launch(cmd: List[str]) -> int:
         return 127
 
     print(f"[AutoTuner] llama-server PID: {proc.pid}")
-    print("[AutoTuner] Press Ctrl+C to stop the server "
-          "(twice to force-kill).\n", flush=True)
+    print(
+        "[AutoTuner] Press Ctrl+C to stop the server (twice to force-kill).\n",
+        flush=True,
+    )
 
     # ---- Main wait loop ---------------------------------------------------
     # Polling — see the module docstring for why we can't use plain
@@ -167,8 +171,9 @@ def launch(cmd: List[str]) -> int:
             pass
         return 130
 
-    print(f"[AutoTuner] Did not exit within {_GRACEFUL_TIMEOUT_SECONDS}s — "
-          "forcing kill.")
+    print(
+        f"[AutoTuner] Did not exit within {_GRACEFUL_TIMEOUT_SECONDS}s — forcing kill."
+    )
     _force_kill(proc)
     try:
         proc.wait(timeout=3)

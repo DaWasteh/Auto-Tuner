@@ -5,6 +5,7 @@ Apple Silicon (sysctl), and Windows Registry-based VRAM detection.
 Multi-GPU aware. Uses subprocess, winreg, and vendor SDKs for accurate
 free VRAM reporting on all platforms.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Windows Registry-Helper f\u00fcr 64-bit VRAM
 # ---------------------------------------------------------------------------
+
 
 def _get_vram_from_registry() -> Dict[str, int]:
     """Lese DedicatedVRAM aus der Windows Registry (64-bit sicher).
@@ -58,9 +60,7 @@ def _get_vram_from_registry() -> Dict[str, int]:
         vram_qw = 0
         try:
             driver_desc, _ = winreg.QueryValueEx(key, "DriverDesc")
-            qw_mem, _ = winreg.QueryValueEx(
-                key, "HardwareInformation.qwMemorySize"
-            )
+            qw_mem, _ = winreg.QueryValueEx(key, "HardwareInformation.qwMemorySize")
             vram_qw = int(qw_mem)
         except (FileNotFoundError, OSError, ValueError):
             pass
@@ -74,10 +74,17 @@ def _get_vram_from_registry() -> Dict[str, int]:
             continue
 
         desc_lower = driver_desc.lower()
-        if any(skip in desc_lower for skip in (
-            "basic render", "remote display", "hyper-v",
-            "rdp", "microsoft", "mirror",
-        )):
+        if any(
+            skip in desc_lower
+            for skip in (
+                "basic render",
+                "remote display",
+                "hyper-v",
+                "rdp",
+                "microsoft",
+                "mirror",
+            )
+        ):
             continue
 
         # AMD RX 9000 Series (RDNA 5) und andere echte GPUs nicht filtern
@@ -115,21 +122,31 @@ def _get_gpu_vram_used_via_wmi() -> Dict[str, float]:
         # VideoProcessor enthält z.B. "AMD Radeon Graphics Processor (0x7550)"
         devid_to_name: Dict[str, str] = {}
         try:
-            for vc in wmi.ExecQuery("SELECT Name, VideoProcessor FROM Win32_VideoController"):
+            for vc in wmi.ExecQuery(
+                "SELECT Name, VideoProcessor FROM Win32_VideoController"
+            ):
                 name = (vc.Name or "").strip()
                 processor = (vc.VideoProcessor or "").strip()
                 if not name or not processor:
                     continue
                 # Filter out virtual/auxiliary adapters
                 lower = name.lower()
-                if any(skip in lower for skip in (
-                    "basic render", "remote display", "hyper-v",
-                    "rdp", "microsoft", "mirror",
-                )):
+                if any(
+                    skip in lower
+                    for skip in (
+                        "basic render",
+                        "remote display",
+                        "hyper-v",
+                        "rdp",
+                        "microsoft",
+                        "mirror",
+                    )
+                ):
                     continue
                 # Extrahiere DeviceId aus Klammern, z.B. "(0x7550)" -> "7550"
                 import re
-                m = re.search(r'\(0x([0-9a-fA-F]+)\)', processor)
+
+                m = re.search(r"\(0x([0-9a-fA-F]+)\)", processor)
                 if m:
                     dev_id = m.group(1).lower()
                     devid_to_name[dev_id] = name
@@ -161,7 +178,7 @@ def _get_gpu_vram_used_via_wmi() -> Dict[str, float]:
 
             # Versuche, über DeviceId den GPU-Namen zu finden
             gpu_name = None
-            
+
             # Methode 1: Direkter Match (LUID == DeviceId)
             if luid_dev in devid_to_name:
                 gpu_name = devid_to_name[luid_dev]
@@ -217,18 +234,24 @@ def _get_gpu_vram_free_via_wmi() -> Dict[str, float]:
         pythoncom.CoInitialize()
         wmi = win32com.client.GetObject("winmgmts:\\\\root\\\\cimv2")
         for obj in wmi.ExecQuery(
-            "SELECT Name, AvailableVideoMemory "
-            "FROM Win32_VideoController"
+            "SELECT Name, AvailableVideoMemory FROM Win32_VideoController"
         ):
             name = str(obj.Name or "").strip()
             if not name:
                 continue
             # Filter out virtual/auxiliary adapters
             lower = name.lower()
-            if any(skip in lower for skip in (
-                "basic render", "remote display", "hyper-v",
-                "rdp", "microsoft", "mirror",
-            )):
+            if any(
+                skip in lower
+                for skip in (
+                    "basic render",
+                    "remote display",
+                    "hyper-v",
+                    "rdp",
+                    "microsoft",
+                    "mirror",
+                )
+            ):
                 continue
             free_bytes = int(obj.AvailableVideoMemory or 0)
             if free_bytes < 0:
@@ -250,28 +273,28 @@ def _get_gpu_vram_via_dxgi_powershell() -> Dict[str, float]:
     """PowerShell-Fallback für VRAM-Usage-Erkennung (AMD RX 9000 Series).
 
     Returns mapping of GPU name (lowercased) -> used_vram_mb.
-    
+
     Bei AMD RX 9000 Series (RDNA 5) sind DedicatedVideoMemory und
     AvailableVideoMemory in Win32_VideoController leer. Daher wird eine
     kombinierte PowerShell-Abfrage verwendet die:
-    
+
     1. Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory
        für DedicatedUsage (VRAM-Nutzung) ausliest
     2. Über Win32_VideoController.VideoProcessor die DeviceId mit dem
        GPU-Namen verknüpft
     3. Bei fehlendem LUID-Match: GPU mit der höchsten VRAM-Nutzung als
        diskrete GPU verwendet (Fallback für AMD RX 9000)
-    
+
     WICHTIG: Diese Funktion gibt NUR die genutzte VRAM-Menge zurück.
     Total VRAM muss über _get_vram_from_registry() bezogen werden!
-    
+
     Returns empty dict if PowerShell is unavailable or fails.
     """
     result: Dict[str, float] = {}
-    
+
     # Registry-VRAM für DeviceId-Mapping holen
     registry_vram = _get_vram_from_registry()
-    
+
     ps_script = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -380,19 +403,26 @@ if ($results) {
     Write-Output "[]"
 }
 """
-    
+
     try:
-        out = _run([
-            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-Command", ps_script,
-        ], timeout=15)
+        out = _run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ],
+            timeout=15,
+        )
         if not out:
             return result
-        
+
         data = json.loads(out)
         if isinstance(data, dict):
             data = [data]
-        
+
         # Mapping: controller_name_lower -> used_mb
         wmi_used_map: Dict[str, float] = {}
         for d in data:
@@ -400,24 +430,38 @@ if ($results) {
             if not name:
                 continue
             lower = name.lower()
-            if any(skip in lower for skip in (
-                "basic render", "remote display", "hyper-v",
-                "rdp", "microsoft", "mirror",
-            )):
+            if any(
+                skip in lower
+                for skip in (
+                    "basic render",
+                    "remote display",
+                    "hyper-v",
+                    "rdp",
+                    "microsoft",
+                    "mirror",
+                )
+            ):
                 continue
             try:
                 used_mb = float(d.get("UsedMB") or 0)
                 wmi_used_map[lower] = used_mb
             except (TypeError, ValueError):
                 continue
-        
+
         # Jetzt mit Registry-VRAM free_mb berechnen
         for reg_name, vram_bytes in registry_vram.items():
             reg_lower = reg_name.lower()
-            if any(skip in reg_lower for skip in (
-                "basic render", "remote display", "hyper-v",
-                "rdp", "microsoft", "mirror",
-            )):
+            if any(
+                skip in reg_lower
+                for skip in (
+                    "basic render",
+                    "remote display",
+                    "hyper-v",
+                    "rdp",
+                    "microsoft",
+                    "mirror",
+                )
+            ):
                 continue
             total_mb = vram_bytes / (1024 * 1024)
             used_mb = wmi_used_map.get(reg_lower, 0)
@@ -425,7 +469,7 @@ if ($results) {
                 result[reg_lower] = used_mb
     except Exception:
         pass
-    
+
     return result
 
 
@@ -483,6 +527,7 @@ class SystemInfo:
 # ---------------------------------------------------------------------------
 # Helpers
 
+
 def _run(cmd: List[str], timeout: float = 5) -> Optional[str]:
     """Run a command and return stdout, or None on any failure.
 
@@ -514,14 +559,17 @@ def _run(cmd: List[str], timeout: float = 5) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # GPU detection per vendor
 
+
 def _detect_nvidia() -> List[GPUInfo]:
     if not shutil.which("nvidia-smi"):
         return []
-    out = _run([
-        "nvidia-smi",
-        "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
-        "--format=csv,noheader,nounits",
-    ])
+    out = _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     if not out:
         return []
     gpus: List[GPUInfo] = []
@@ -533,14 +581,16 @@ def _detect_nvidia() -> List[GPUInfo]:
             except (ValueError, IndexError):
                 gpu_util = 0.0
             try:
-                gpus.append(GPUInfo(
-                    index=int(parts[0]),
-                    name=parts[1],
-                    vendor="nvidia",
-                    total_vram_mb=int(parts[2]),
-                    free_vram_mb=int(parts[3]),
-                    gpu_util_percent=gpu_util,
-                ))
+                gpus.append(
+                    GPUInfo(
+                        index=int(parts[0]),
+                        name=parts[1],
+                        vendor="nvidia",
+                        total_vram_mb=int(parts[2]),
+                        free_vram_mb=int(parts[3]),
+                        gpu_util_percent=gpu_util,
+                    )
+                )
             except ValueError:
                 continue
     return gpus
@@ -548,17 +598,19 @@ def _detect_nvidia() -> List[GPUInfo]:
 
 def _get_nvidia_gpu_utilization() -> Dict[str, float]:
     """Ermittle GPU-Auslastung über nvidia-smi.
-    
+
     Returns mapping of GPU name (lowercased) -> utilization %.
     """
     result: Dict[str, float] = {}
     if not shutil.which("nvidia-smi"):
         return result
-    out = _run([
-        "nvidia-smi",
-        "--query-gpu=index,name,utilization.gpu",
-        "--format=csv,noheader,nounits",
-    ])
+    out = _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     if not out:
         return result
     for line in out.strip().splitlines():
@@ -578,8 +630,7 @@ def _detect_amd_rocm() -> List[GPUInfo]:
         return []
 
     # Try JSON first - more reliable across rocm-smi versions
-    out = _run(["rocm-smi", "--showmeminfo", "vram",
-                "--showproductname", "--json"])
+    out = _run(["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--json"])
     if out:
         try:
             data = json.loads(out)
@@ -592,10 +643,12 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                 total_b = 0
                 used_b = 0
                 gpu_pct = 0.0
-                name = (info.get("Card Series")
-                        or info.get("Card model")
-                        or info.get("Card SKU")
-                        or f"AMD GPU {idx}")
+                name = (
+                    info.get("Card Series")
+                    or info.get("Card model")
+                    or info.get("Card SKU")
+                    or f"AMD GPU {idx}"
+                )
                 for k, v in info.items():
                     if "VRAM Total Memory" in k or k == "Total Memory (B)":
                         try:
@@ -608,7 +661,11 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                         except (ValueError, IndexError):
                             pass
                     # GPU-Utilization aus verschiedenen möglichen Feldnamen
-                    elif "GPU Item" in k or "System Total" in k or "GPU utilization" in k.lower():
+                    elif (
+                        "GPU Item" in k
+                        or "System Total" in k
+                        or "GPU utilization" in k.lower()
+                    ):
                         try:
                             val_str = str(v).strip().replace("%", "")
                             gpu_pct = float(val_str)
@@ -616,14 +673,16 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                             pass
                 total_mb = total_b // (1024 * 1024)
                 used_mb = used_b // (1024 * 1024)
-                gpus.append(GPUInfo(
-                    index=idx,
-                    name=name,
-                    vendor="amd",
-                    total_vram_mb=total_mb,
-                    free_vram_mb=max(0, total_mb - used_mb),
-                    gpu_util_percent=gpu_pct,
-                ))
+                gpus.append(
+                    GPUInfo(
+                        index=idx,
+                        name=name,
+                        vendor="amd",
+                        total_vram_mb=total_mb,
+                        free_vram_mb=max(0, total_mb - used_mb),
+                        gpu_util_percent=gpu_pct,
+                    )
+                )
             if gpus:
                 return gpus
         except (json.JSONDecodeError, KeyError, TypeError):
@@ -635,8 +694,7 @@ def _detect_amd_rocm() -> List[GPUInfo]:
         return []
     by_idx: dict = {}
     for line in out.splitlines():
-        m = re.match(r"GPU\[(\d+)\].*?Total\s+Memory.*?(\d+)\s*$", line,
-                     re.IGNORECASE)
+        m = re.match(r"GPU\[(\d+)\].*?Total\s+Memory.*?(\d+)\s*$", line, re.IGNORECASE)
         if m:
             by_idx.setdefault(int(m.group(1)), {})["total"] = int(m.group(2))
     return [
@@ -864,21 +922,30 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
                 free_mb = 0
             # GPU-Auslastung holen
             gpu_util = gpu_util_map.get(name.lower(), 0.0)
-            gpus.append(GPUInfo(
-                index=len(gpus),
-                name=name,
-                vendor=_vendor_from_name(name),
-                total_vram_mb=total_mb,
-                free_vram_mb=free_mb,
-                gpu_util_percent=gpu_util,
-            ))
+            gpus.append(
+                GPUInfo(
+                    index=len(gpus),
+                    name=name,
+                    vendor=_vendor_from_name(name),
+                    total_vram_mb=total_mb,
+                    free_vram_mb=free_mb,
+                    gpu_util_percent=gpu_util,
+                )
+            )
         return gpus
 
     # Fallback: PowerShell-WMI-Ansatz
-    out = _run([
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-Command", _WIN_GPU_PS,
-    ], timeout=12)
+    out = _run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            _WIN_GPU_PS,
+        ],
+        timeout=12,
+    )
     if not out:
         return []
 
@@ -900,7 +967,7 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         if vram < 0:  # paranoia: 32-bit overflow
             vram = 0
         total_mb = vram // (1024 * 1024)
-        
+
         # Verwende FreeMB aus PowerShell (berechnet als total - used) direkt,
         # da der PowerShell-Skript bereits DedicatedUsage korrekt verwendet
         ps_free = d.get("FreeMB")
@@ -920,14 +987,16 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             free_mb = int(min(vram_free_map[name.lower()], total_mb))
         else:
             free_mb = 0
-        gpus.append(GPUInfo(
-            index=len(gpus),
-            name=name,
-            vendor=_vendor_from_name(name),
-            total_vram_mb=total_mb,
-            free_vram_mb=free_mb,
-            gpu_util_percent=0.0,
-        ))
+        gpus.append(
+            GPUInfo(
+                index=len(gpus),
+                name=name,
+                vendor=_vendor_from_name(name),
+                total_vram_mb=total_mb,
+                free_vram_mb=free_mb,
+                gpu_util_percent=0.0,
+            )
+        )
     return gpus
 
 
@@ -954,14 +1023,16 @@ def _detect_linux_other_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         name = parts[2]
         if name.lower() in skip:
             continue
-        gpus.append(GPUInfo(
-            index=len(gpus),
-            name=f"{vendor_str} {name}".strip(),
-            vendor=_vendor_from_name(f"{vendor_str} {name}"),
-            total_vram_mb=0,
-            free_vram_mb=0,
-            gpu_util_percent=0.0,
-        ))
+        gpus.append(
+            GPUInfo(
+                index=len(gpus),
+                name=f"{vendor_str} {name}".strip(),
+                vendor=_vendor_from_name(f"{vendor_str} {name}"),
+                total_vram_mb=0,
+                free_vram_mb=0,
+                gpu_util_percent=0.0,
+            )
+        )
     return gpus
 
 
@@ -979,14 +1050,16 @@ def _detect_apple() -> List[GPUInfo]:
     mem_mb = mem_b // (1024 * 1024)
     name_out = _run(["sysctl", "-n", "machdep.cpu.brand_string"]) or ""
     label = f"Apple Silicon ({name_out.strip()})" if name_out else "Apple Silicon"
-    return [GPUInfo(
-        index=0,
-        name=label,
-        vendor="apple",
-        total_vram_mb=mem_mb,
-        free_vram_mb=mem_mb,
-        gpu_util_percent=0.0,
-    )]
+    return [
+        GPUInfo(
+            index=0,
+            name=label,
+            vendor="apple",
+            total_vram_mb=mem_mb,
+            free_vram_mb=mem_mb,
+            gpu_util_percent=0.0,
+        )
+    ]
 
 
 def _detect_cpu_name() -> str:
@@ -1011,10 +1084,15 @@ def _detect_cpu_name() -> str:
                 return env_cpu
             # PowerShell-Command mit Timeout-Schutz
             try:
-                out = _run([
-                    "powershell", "-NoProfile", "-Command",
-                    "(Get-CimInstance Win32_Processor).Name",
-                ], timeout=5)
+                out = _run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-CimInstance Win32_Processor).Name",
+                    ],
+                    timeout=5,
+                )
                 if out:
                     return out.strip()
             except Exception:
@@ -1026,6 +1104,7 @@ def _detect_cpu_name() -> str:
 
 # ---------------------------------------------------------------------------
 # Public API
+
 
 def _filter_inference_gpus(
     gpus: List[GPUInfo],
@@ -1125,8 +1204,8 @@ def detect_system() -> SystemInfo:
         cpu_cores_logical = 1
 
     if vm is not None:
-        total_ram_gb = vm.total / (1024 ** 3)
-        free_ram_gb = vm.available / (1024 ** 3)
+        total_ram_gb = vm.total / (1024**3)
+        free_ram_gb = vm.available / (1024**3)
     else:
         total_ram_gb = 0.0
         free_ram_gb = 0.0
@@ -1147,10 +1226,8 @@ def format_system(info: SystemInfo) -> str:
     """Human-readable summary, used for the menu header."""
     lines = [
         f"OS:   {info.os_name}",
-        f"CPU:  {info.cpu_name} "
-        f"({info.cpu_cores_physical}C/{info.cpu_cores_logical}T)",
-        f"RAM:  {info.total_ram_gb:.1f} GB total, "
-        f"{info.free_ram_gb:.1f} GB free",
+        f"CPU:  {info.cpu_name} ({info.cpu_cores_physical}C/{info.cpu_cores_logical}T)",
+        f"RAM:  {info.total_ram_gb:.1f} GB total, {info.free_ram_gb:.1f} GB free",
     ]
     if info.gpus:
         for g in info.gpus:
@@ -1167,10 +1244,8 @@ def format_system(info: SystemInfo) -> str:
         lines.append("GPU:  none detected (CPU-only inference)")
 
     for g in info.ignored_gpus:
-        size = (f"{g.total_vram_gb:.1f} GB" if g.total_vram_mb > 0
-                else "VRAM unknown")
+        size = f"{g.total_vram_gb:.1f} GB" if g.total_vram_mb > 0 else "VRAM unknown"
         lines.append(
-            f"      (ignored: [{g.vendor}] {g.name}, {size} — "
-            f"too small or auxiliary)"
+            f"      (ignored: [{g.vendor}] {g.name}, {size} — too small or auxiliary)"
         )
     return "\n".join(lines)

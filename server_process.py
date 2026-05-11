@@ -10,6 +10,7 @@ import queue
 import time
 from typing import List, Optional
 
+
 class ServerProcess:
     """Manage a llama-server subprocess, capture stdout/stderr, and provide clean start/stop."""
 

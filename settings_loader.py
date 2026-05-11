@@ -1,5 +1,6 @@
 """Load YAML profiles from the settings/ folder and match them
 against model filenames."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -31,8 +32,8 @@ class ModelProfile:
     draft_p_min: float = 0.0
     # RoPE-Scaling (YaRN): aktiviert wenn ctx > native_ctx und genügend Speicher
     rope_scale_enabled: bool = False  # YAML-Konfiguration: rope_scale: true
-    rope_scale_max_ctx: int = 0       # maximales Context mit RoPE-Scaling (0=auto 1M)
-    rope_scale_factor: float = 4.0    # Standard Scaling-Faktor für Qwen3.5/3.6
+    rope_scale_max_ctx: int = 0  # maximales Context mit RoPE-Scaling (0=auto 1M)
+    rope_scale_factor: float = 4.0  # Standard Scaling-Faktor für Qwen3.5/3.6
 
     # Performance target preset suggested by the profile author.
     # Empty string = no profile-level recommendation, use the global
@@ -47,8 +48,7 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
     if not settings_dir.exists():
         return profiles
 
-    files = sorted(list(settings_dir.glob("*.yaml"))
-                   + list(settings_dir.glob("*.yml")))
+    files = sorted(list(settings_dir.glob("*.yaml")) + list(settings_dir.glob("*.yml")))
     for yml in files:
         try:
             with yml.open("r", encoding="utf-8") as f:
@@ -76,28 +76,35 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         # other than the three known names is treated as "use global default".
         perf_target_raw = str(data.get("performance_target", "") or "").lower().strip()
         if perf_target_raw not in ("safe", "balanced", "throughput", ""):
-            print(f"[AutoTuner] {yml.name}: unknown performance_target "
-                  f"'{perf_target_raw}', ignoring (using global default).")
+            print(
+                f"[AutoTuner] {yml.name}: unknown performance_target "
+                f"'{perf_target_raw}', ignoring (using global default)."
+            )
             perf_target_raw = ""
 
-        profiles.append(ModelProfile(
-            display_name=str(data.get("display_name", yml.stem)),
-            patterns=[str(p).lower() for p in (data.get("patterns") or [])],
-            max_context=int(data.get("max_context", 8192)),
-            sampling=sampling,
-            recommended_kv_quant=str(data.get("recommended_kv_quant", "q5_0")),
-            extra_args=[str(x) for x in extra],
-            notes=str(data.get("notes", "") or ""),
-            source_file=yml.name,
-            server_binary=(str(data["server_binary"])
-                           if data.get("server_binary") else None),
-            draft_max=int(data.get("draft_max", 16)),
-            draft_p_min=float(data.get("draft_p_min", 0.0)),
-            rope_scale_enabled=rope_scale_enabled,
-            rope_scale_max_ctx=rope_scale_max_ctx if rope_scale_max_ctx > 0 else 1048576,
-            rope_scale_factor=rope_scale_factor,
-            performance_target=perf_target_raw,
-        ))
+        profiles.append(
+            ModelProfile(
+                display_name=str(data.get("display_name", yml.stem)),
+                patterns=[str(p).lower() for p in (data.get("patterns") or [])],
+                max_context=int(data.get("max_context", 8192)),
+                sampling=sampling,
+                recommended_kv_quant=str(data.get("recommended_kv_quant", "q5_0")),
+                extra_args=[str(x) for x in extra],
+                notes=str(data.get("notes", "") or ""),
+                source_file=yml.name,
+                server_binary=(
+                    str(data["server_binary"]) if data.get("server_binary") else None
+                ),
+                draft_max=int(data.get("draft_max", 16)),
+                draft_p_min=float(data.get("draft_p_min", 0.0)),
+                rope_scale_enabled=rope_scale_enabled,
+                rope_scale_max_ctx=rope_scale_max_ctx
+                if rope_scale_max_ctx > 0
+                else 1048576,
+                rope_scale_factor=rope_scale_factor,
+                performance_target=perf_target_raw,
+            )
+        )
     return profiles
 
 
@@ -126,14 +133,18 @@ def match_profile(
                 best_len = len(pat)
                 # Don't break — a later pattern in the same file might be longer
 
-    return best or fallback or ModelProfile(
-        display_name="builtin-default",
-        max_context=8192,
-        sampling={
-            "temperature": 0.7,
-            "top_k": 40,
-            "top_p": 0.9,
-            "min_p": 0.05,
-            "repeat_penalty": 1.05,
-        },
+    return (
+        best
+        or fallback
+        or ModelProfile(
+            display_name="builtin-default",
+            max_context=8192,
+            sampling={
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.9,
+                "min_p": 0.05,
+                "repeat_penalty": 1.05,
+            },
+        )
     )

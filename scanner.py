@@ -5,6 +5,7 @@ GGUF format reference (v3): https://github.com/ggerganov/ggml/blob/master/docs/g
 We read only the header (KV pairs), never tensor data, so this is fast even
 for 100+ GB files.
 """
+
 from __future__ import annotations
 
 import re
@@ -31,17 +32,17 @@ _GT_UINT64, _GT_INT64 = 10, 11
 _GT_FLOAT64 = 12
 
 _SCALAR_FMT = {
-    _GT_UINT8:  ("<B", 1),
-    _GT_INT8:   ("<b", 1),
+    _GT_UINT8: ("<B", 1),
+    _GT_INT8: ("<b", 1),
     _GT_UINT16: ("<H", 2),
-    _GT_INT16:  ("<h", 2),
+    _GT_INT16: ("<h", 2),
     _GT_UINT32: ("<I", 4),
-    _GT_INT32:  ("<i", 4),
-    _GT_FLOAT32:("<f", 4),
-    _GT_BOOL:   ("<?", 1),
+    _GT_INT32: ("<i", 4),
+    _GT_FLOAT32: ("<f", 4),
+    _GT_BOOL: ("<?", 1),
     _GT_UINT64: ("<Q", 8),
-    _GT_INT64:  ("<q", 8),
-    _GT_FLOAT64:("<d", 8),
+    _GT_INT64: ("<q", 8),
+    _GT_FLOAT64: ("<d", 8),
 }
 
 
@@ -137,14 +138,16 @@ def metadata_native_context(md: Dict[str, Any]) -> int:
 
 
 # Architektur-Namen die RoPE-Scaling (YaRN) unterstützen bis zu 1M tokens
-_ROPE_SCALE_SUPPORTED_ARCHS = frozenset({
-    "qwen2",   # Qwen2/Qwen2.5/Qwen3/Qwen3.5/Qwen3.6 Familie
-})
+_ROPE_SCALE_SUPPORTED_ARCHS = frozenset(
+    {
+        "qwen2",  # Qwen2/Qwen2.5/Qwen3/Qwen3.5/Qwen3.6 Familie
+    }
+)
 
 
 def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
     """Prüft ob das Modell RoPE-Scaling (YaRN) unterstützt.
-    
+
     Returns True wenn die Architektur RoPE-Scaling bis zu 1M tokens unterstützt.
     """
     if not md:
@@ -169,20 +172,22 @@ def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
 # unless we know the real attention-layer count.
 
 # Architectures known to be hybrid (Mamba/SSM + Transformer).
-_HYBRID_ARCHS = frozenset({
-    "nemotron_h",
-    "nemotron-h",
-    "granitemoehybrid",
-    "granite-h",
-    "granite_h",
-    "jamba",
-    "bamba",
-    "falcon_h1",
-    "plamo2",       # Plamo-2 hybrid
-    "zamba2",       # Zamba2 hybrid
-    "rwkv6",        # RWKV — pure SSM, but treated similarly for KV
-    "rwkv7",
-})
+_HYBRID_ARCHS = frozenset(
+    {
+        "nemotron_h",
+        "nemotron-h",
+        "granitemoehybrid",
+        "granite-h",
+        "granite_h",
+        "jamba",
+        "bamba",
+        "falcon_h1",
+        "plamo2",  # Plamo-2 hybrid
+        "zamba2",  # Zamba2 hybrid
+        "rwkv6",  # RWKV — pure SSM, but treated similarly for KV
+        "rwkv7",
+    }
+)
 
 
 def metadata_is_hybrid_architecture(md: Dict[str, Any]) -> bool:
@@ -286,7 +291,7 @@ _NON_THINKING_NAME_HINTS = (
     "embedding",
     "reranker",
     "captioner",
-    "instruct-2507",   # Qwen3-2507-Instruct is the non-thinking branch
+    "instruct-2507",  # Qwen3-2507-Instruct is the non-thinking branch
     "non-thinking",
 )
 
@@ -328,8 +333,7 @@ def metadata_supports_thinking(md: Dict[str, Any], filename: str = "") -> bool:
         return False
 
     if md:
-        for key in ("tokenizer.chat_template",
-                    "tokenizer.chat_template.default"):
+        for key in ("tokenizer.chat_template", "tokenizer.chat_template.default"):
             template = md.get(key)
             if isinstance(template, str) and template:
                 if any(m in template for m in _THINKING_TEMPLATE_MARKERS):
@@ -356,16 +360,16 @@ def metadata_supports_thinking(md: Dict[str, Any], filename: str = "") -> bool:
 _TOOLUSE_TEMPLATE_MARKERS = (
     "<tool_call>",
     "</tool_call>",
-    "<|tool_call_begin|>",     # DeepSeek
-    "<|tool_calls_begin|>",    # DeepSeek-V3
+    "<|tool_call_begin|>",  # DeepSeek
+    "<|tool_calls_begin|>",  # DeepSeek-V3
     "<|tool|>",
     "<|tool_results|>",
-    "tool_calls",              # OpenAI-style; common in modern templates
+    "tool_calls",  # OpenAI-style; common in modern templates
     "function_call",
-    "<|im_start|>tool",        # Hermes / Qwen tool role
-    "[TOOL_CALLS]",            # Mistral
-    "[AVAILABLE_TOOLS]",       # Mistral
-    "{{ tools }}",             # Jinja variable — only present when supported
+    "<|im_start|>tool",  # Hermes / Qwen tool role
+    "[TOOL_CALLS]",  # Mistral
+    "[AVAILABLE_TOOLS]",  # Mistral
+    "{{ tools }}",  # Jinja variable — only present when supported
     "{%- if tools",
     "{% if tools",
     "if tools is defined",
@@ -385,7 +389,7 @@ _NON_TOOLUSE_NAME_HINTS = (
     "embedding",
     "reranker",
     "captioner",
-    "base",                    # raw-base completion models
+    "base",  # raw-base completion models
 )
 
 
@@ -404,8 +408,7 @@ def metadata_supports_tool_use(md: Dict[str, Any], filename: str = "") -> bool:
         return False
 
     if md:
-        for key in ("tokenizer.chat_template",
-                    "tokenizer.chat_template.default"):
+        for key in ("tokenizer.chat_template", "tokenizer.chat_template.default"):
             template = md.get(key)
             if isinstance(template, str) and template:
                 if any(m in template for m in _TOOLUSE_TEMPLATE_MARKERS):
@@ -424,7 +427,7 @@ def metadata_supports_tool_use(md: Dict[str, Any], filename: str = "") -> bool:
 _QUANT_PATTERN = re.compile(
     r"[-.]"
     r"(?:UD-)?"
-    r"(?:i\d+-)?"           # i1- prefix (imatrix variants)
+    r"(?:i\d+-)?"  # i1- prefix (imatrix variants)
     r"(?:Q\d+(?:_[A-Z0-9]+)*"
     r"|IQ\d+(?:_[A-Z0-9]+)*"
     r"|BF16|F16|F32"
@@ -439,16 +442,16 @@ _QUANT_PATTERN = re.compile(
 @dataclass
 class ModelEntry:
     path: Path
-    name: str          # display name (filename stem)
-    group: str         # parent folder relative to scan root (e.g. "Alibaba/Qwen3.6")
+    name: str  # display name (filename stem)
+    group: str  # parent folder relative to scan root (e.g. "Alibaba/Qwen3.6")
     size_bytes: int
     mmproj: Optional[Path] = None
-    draft:  Optional[Path] = None     # paired assistant/draft model (if any)
+    draft: Optional[Path] = None  # paired assistant/draft model (if any)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def size_gb(self) -> float:
-        return self.size_bytes / (1024 ** 3)
+        return self.size_bytes / (1024**3)
 
     @property
     def has_vision(self) -> bool:
@@ -512,9 +515,9 @@ def _normalize_mmproj(filename: str) -> str:
     base = _strip_quant(filename)
     low = base.lower()
     if low.startswith("mmproj-"):
-        base = base[len("mmproj-"):]
+        base = base[len("mmproj-") :]
     elif low.startswith("mmproj_"):
-        base = base[len("mmproj_"):]
+        base = base[len("mmproj_") :]
     return base.lower().rstrip(".-_")
 
 
@@ -562,8 +565,11 @@ def _is_draft_filename(name: str) -> bool:
     #  "rooks_assistant_v2.gguf" — a fictional case — would also match,
     #  which is acceptable, false-positives just cost a draft pairing).
     for tok in _DRAFT_FILENAME_TOKENS:
-        if re.search(rf"[-_.]{tok}[-_.]", n) or n.startswith(tok + "-") \
-                or n.startswith(tok + "_"):
+        if (
+            re.search(rf"[-_.]{tok}[-_.]", n)
+            or n.startswith(tok + "-")
+            or n.startswith(tok + "_")
+        ):
             return True
     return False
 
@@ -630,8 +636,8 @@ def scan_models(
 
     all_gguf = list(root.rglob("*.gguf"))
     mmprojs: List[Path] = []
-    drafts:  List[Path] = []
-    models:  List[Path] = []
+    drafts: List[Path] = []
+    models: List[Path] = []
     for f in all_gguf:
         nm = f.name.lower()
         if nm.startswith("mmproj-") or nm.startswith("mmproj_"):
@@ -654,15 +660,17 @@ def scan_models(
         except ValueError:
             group = str(m.parent)
         md = read_gguf_metadata(m) if read_metadata else {}
-        entries.append(ModelEntry(
-            path=m,
-            name=m.stem,
-            group=group,
-            size_bytes=size,
-            mmproj=_find_mmproj(m, mmprojs),
-            draft=_find_draft(m, drafts),
-            metadata=md,
-        ))
+        entries.append(
+            ModelEntry(
+                path=m,
+                name=m.stem,
+                group=group,
+                size_bytes=size,
+                mmproj=_find_mmproj(m, mmprojs),
+                draft=_find_draft(m, drafts),
+                metadata=md,
+            )
+        )
     return entries
 
 

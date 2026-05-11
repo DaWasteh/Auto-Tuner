@@ -18,6 +18,7 @@ from performance_target import (
 ctypes: Any = None
 try:
     import ctypes as _ctypes
+
     ctypes = _ctypes
 except ImportError:
     pass
@@ -36,17 +37,19 @@ DEFAULT_RAM_SAFETY_GB = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].ram_safety_gb
 
 # MoE-specific knobs. Read from the "balanced" preset for back-compat.
 MOE_VRAM_SAFETY_GB = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].moe_vram_safety_gb
-MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[DEFAULT_TARGET_NAME].moe_placement_ctx_target
+MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[
+    DEFAULT_TARGET_NAME
+].moe_placement_ctx_target
 MOE_KV_RESERVE_FRAC = 0.06
 
 
 # ---------------------------------------------------------------------------
 # Model-size helpers
 
+
 def extract_params_billion(name: str) -> float:
     """Extract parameter count in billions from a model filename."""
-    matches = re.findall(r"(?<![A-Za-z])(\d+(?:\.\d+)?)\s*B(?![a-zA-Z0-9_])",
-                         name)
+    matches = re.findall(r"(?<![A-Za-z])(\d+(?:\.\d+)?)\s*B(?![a-zA-Z0-9_])", name)
     if matches:
         return max(float(m) for m in matches)
     m = re.search(r"E(\d+(?:\.\d+)?)B", name, re.IGNORECASE)
@@ -82,7 +85,9 @@ def kv_per_token_mb_f16(params_billion: float) -> float:
 
 
 def _kv_per_token_for_interleaved_attention(
-    md: Dict[str, Any], arch: str, n_kv_heads_per_layer: List[Any],
+    md: Dict[str, Any],
+    arch: str,
+    n_kv_heads_per_layer: List[Any],
 ) -> float:
     """KV per-token (MB) for models with per-layer KV-head arrays.
 
@@ -112,6 +117,7 @@ def _kv_per_token_for_interleaved_attention(
     That overshoots, but on the safe side — better the AutoTuner
     reserves too much KV than too little.
     """
+
     def _int_md(key: str) -> int:
         v = md.get(f"{arch}.{key}", 0)
         try:
@@ -215,6 +221,7 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
     # Use the attention-bearing layer count for hybrids; for pure
     # Transformer this equals block_count and behaves as before.
     from scanner import metadata_attention_layer_count
+
     n_layers = metadata_attention_layer_count(md)
     if n_layers <= 0:
         # Fallback for older models / incomplete metadata: use total blocks.
@@ -248,9 +255,7 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
     return bytes_per_token / (1024.0 * 1024.0)
 
 
-def _resolve_kv_per_token_mb(
-    model: ModelEntry, params_billion: float
-) -> float:
+def _resolve_kv_per_token_mb(model: ModelEntry, params_billion: float) -> float:
     """Pick the best KV-per-token estimate available.
 
     Preference: exact GGUF metadata first (precise; works for MoE),
@@ -283,10 +288,10 @@ def kv_quant_factor(quant: str) -> float:
 # Common alternate metadata keys some quantizers emit instead of the
 # canonical "<arch>.expert_count". Order matters: more specific first.
 _MOE_ALT_KEY_SUFFIXES = (
-    ".expert_count",        # canonical (qwen3moe.expert_count, etc.)
-    ".num_local_experts",   # HF-style fallback
-    ".num_experts",         # plain
-    ".moe.expert_count",    # some hybrid/MTP forks
+    ".expert_count",  # canonical (qwen3moe.expert_count, etc.)
+    ".num_local_experts",  # HF-style fallback
+    ".num_experts",  # plain
+    ".moe.expert_count",  # some hybrid/MTP forks
 )
 
 # Filename-level MoE marker: the "A{N}B" suffix that vendors use to
@@ -297,8 +302,8 @@ _MOE_ALT_KEY_SUFFIXES = (
 # filename and route the model through the MoE placement path.
 _MOE_FILENAME_RE = re.compile(
     r"(?<![A-Za-z0-9])"
-    r"(\d+(?:\.\d+)?)B"          # total params, e.g. "30B"
-    r"[-_.]?A(\d+(?:\.\d+)?)B"   # active params, e.g. "A3B"
+    r"(\d+(?:\.\d+)?)B"  # total params, e.g. "30B"
+    r"[-_.]?A(\d+(?:\.\d+)?)B"  # active params, e.g. "A3B"
     r"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
@@ -353,6 +358,7 @@ def _moe_expert_count(model: ModelEntry) -> int:
 # ---------------------------------------------------------------------------
 # Configuration result
 
+
 @dataclass
 class TunedConfig:
     ctx: int
@@ -398,7 +404,9 @@ class TunedConfig:
     kv_ram_gb: float = 0.0
     # KV-quant labels actually applied (may differ from cache_k/cache_v
     # when an explicit Expert override was used — kept for diagnostics).
-    kv_quant_strategy: str = "symmetric"   # "symmetric" | "asymmetric" | "manual" | "turbo"
+    kv_quant_strategy: str = (
+        "symmetric"  # "symmetric" | "asymmetric" | "manual" | "turbo"
+    )
 
     no_context_shift: bool = False
 
@@ -421,6 +429,7 @@ class TunedConfig:
 
 # ---------------------------------------------------------------------------
 # Internal helpers
+
 
 def _decide_offload(
     model_size_gb: float,
@@ -488,28 +497,32 @@ def _decide_moe_offload(
         base_kv_per_token_mb = kv_per_token_mb_f16(params_billion)
 
     shared_overhead_gb = model_size_gb * 0.08
-    per_layer_expert_gb = max(0.001,
-                              (model_size_gb - shared_overhead_gb) / n_layers)
+    per_layer_expert_gb = max(0.001, (model_size_gb - shared_overhead_gb) / n_layers)
 
     # ---- KV reservation in VRAM (q5_0 assumption) -----------------------
     # Cap at moe_placement_ctx_target so we don't pessimise layer placement
     # for huge profile_max values (Qwen3.6 → 262k, but most users run 32k).
-    kv_reservation_ctx = max(2048, min(target_ctx,
-                                       moe_placement_ctx_target))
+    kv_reservation_ctx = max(2048, min(target_ctx, moe_placement_ctx_target))
     kv_reserve_gb = (
         kv_reservation_ctx * base_kv_per_token_mb * kv_quant_factor("q5_0")
     ) / 1024.0
 
     # Layer placement uses VRAM left over AFTER KV + shared overhead.
-    usable_for_experts = (free_vram_gb - moe_vram_safety_gb
-                          - shared_overhead_gb - kv_reserve_gb)
+    usable_for_experts = (
+        free_vram_gb - moe_vram_safety_gb - shared_overhead_gb - kv_reserve_gb
+    )
 
     if usable_for_experts < 0:
         # Not even the shared overhead + KV fits → everything via mmap/RAM.
         if free_ram_gb - ram_safety_gb < model_size_gb - shared_overhead_gb:
             return 999, n_layers, shared_overhead_gb, model_size_gb, False
-        return 999, n_layers, shared_overhead_gb, \
-            model_size_gb - shared_overhead_gb, False
+        return (
+            999,
+            n_layers,
+            shared_overhead_gb,
+            model_size_gb - shared_overhead_gb,
+            False,
+        )
 
     layers_on_gpu = int(usable_for_experts / per_layer_expert_gb)
     layers_on_gpu = max(0, min(n_layers, layers_on_gpu))
@@ -535,9 +548,9 @@ def _decide_moe_offload(
 # label that is widely accepted; if a build rejects it the user sees an
 # immediate error from llama-server and can override in Expert/Manual mode.
 _TURBO_QUANT_MAP: Dict[str, str] = {
-    "q8_0": "q8_0",     # already optimal — no turbo equivalent needed
-    "q5_0": "q5_1",     # asymmetric q5 with shared scale, denser packing
-    "q4_0": "q4_1",     # asymmetric q4 with shared scale (~10% less memory)
+    "q8_0": "q8_0",  # already optimal — no turbo equivalent needed
+    "q5_0": "q5_1",  # asymmetric q5 with shared scale, denser packing
+    "q4_0": "q4_1",  # asymmetric q4 with shared scale (~10% less memory)
 }
 
 
@@ -555,10 +568,10 @@ def _pick_kv_quant(
     target_ctx: int,
     base_kv_per_token_mb: float,
     kv_budget_gb: float,
-    model_max_ctx: int = 0,        # native_ctx aus GGUF-Metadata (0 = keine Begrenzung)
+    model_max_ctx: int = 0,  # native_ctx aus GGUF-Metadata (0 = keine Begrenzung)
     *,
     turbo: bool = False,
-    asymmetric: bool = True,       # Vulkan b9106+ supports asymmetric FA
+    asymmetric: bool = True,  # Vulkan b9106+ supports asymmetric FA
 ) -> Tuple[str, str]:
     """Pick best (K, V) quants that fit target_ctx into kv_budget_gb.
 
@@ -616,13 +629,11 @@ def _pick_kv_quant(
         rec_rank = order_rank[rec]
         pairs = [p for p in pairs if order_rank[p[0]] <= rec_rank]
         if not pairs:
-            pairs = [(rec, rec)]   # defensive — should never happen
+            pairs = [(rec, rec)]  # defensive — should never happen
 
     budget_mb = kv_budget_gb * 1024 * 0.98
     for k, v in pairs:
-        per_tok = base_kv_per_token_mb * (
-            kv_quant_factor(k) + kv_quant_factor(v)
-        ) / 2
+        per_tok = base_kv_per_token_mb * (kv_quant_factor(k) + kv_quant_factor(v)) / 2
         if per_tok <= 0:
             continue
         max_fit = int(budget_mb / per_tok)
@@ -643,6 +654,7 @@ def _pick_kv_quant(
 # ---------------------------------------------------------------------------
 # Main entry
 
+
 def compute_config(
     model: ModelEntry,
     system: SystemInfo,
@@ -661,12 +673,12 @@ def compute_config(
     # Manual mode bypasses compute_config entirely and builds a
     # TunedConfig directly from widget values, so these only apply to
     # the cascading Auto branch of the Expert panel.
-    turbo_kv: bool = False,                  # Map quants → TurboQuant equivalents
-    force_cache_k: Optional[str] = None,     # Pin K-quant; ctx adjusts
-    force_cache_v: Optional[str] = None,     # Pin V-quant; ctx adjusts
-    force_ngl: Optional[int] = None,         # Pin layer offload count
-    force_n_cpu_moe: Optional[int] = None,   # Pin MoE CPU-layer count
-    force_rope_scale: Optional[bool] = None, # Force YaRN on/off
+    turbo_kv: bool = False,  # Map quants → TurboQuant equivalents
+    force_cache_k: Optional[str] = None,  # Pin K-quant; ctx adjusts
+    force_cache_v: Optional[str] = None,  # Pin V-quant; ctx adjusts
+    force_ngl: Optional[int] = None,  # Pin layer offload count
+    force_n_cpu_moe: Optional[int] = None,  # Pin MoE CPU-layer count
+    force_rope_scale: Optional[bool] = None,  # Force YaRN on/off
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system.
 
@@ -722,35 +734,36 @@ def compute_config(
     base_kv_mb = _resolve_kv_per_token_mb(model, params_b)
 
     native_ctx = model.native_context  # GGUF metadata: model's native ctx
-    
+
     # RoPE-Scaling Konfiguration aus Profil lesen
     profile_rope_scale = profile.rope_scale_enabled
     profile_rope_max = profile.rope_scale_max_ctx  # Standard: 1M
     profile_rope_factor = profile.rope_scale_factor  # Standard: 4.0
-    
-    rope_scaled_ctx = 0  # Wird später berechnet (braucht free_vram_after/free_ram_after)
+
+    rope_scaled_ctx = (
+        0  # Wird später berechnet (braucht free_vram_after/free_ram_after)
+    )
     rope_scaling_active = False  # Flag für build_command
-    
+
     profile_max = profile.max_context
     if native_ctx > 0:
         profile_max = min(profile_max, native_ctx)
-    target_ctx_for_placement = (user_ctx if user_ctx is not None
-                                else profile_max)
+    target_ctx_for_placement = user_ctx if user_ctx is not None else profile_max
 
     # ---- (0.5) Calculate VRAM reserved for Vision + Draft models
     # These MUST be on GPU for optimal performance.
     vision_vram_gb = 0.0
     draft_vram_gb = 0.0
-    
+
     if model.mmproj is not None:
         # Vision model (mmproj) — estimate from file size
         try:
             mmproj_size_bytes = model.mmproj.stat().st_size
-            vision_vram_gb = mmproj_size_bytes / (1024 ** 3)
+            vision_vram_gb = mmproj_size_bytes / (1024**3)
         except (OSError, AttributeError):
             # Fallback: ~6 GB for typical F16 mmproj files
             vision_vram_gb = 6.0
-    
+
     if draft_model is not None:
         # Draft model — must fit in VRAM for speculative decoding to work well
         draft_vram_gb = draft_model.size_gb
@@ -784,13 +797,14 @@ def compute_config(
         # target halved (down to a 16k floor). This is a defensive net
         # for hybrid architectures we don't recognise yet, or for
         # quantisations where our heuristic mis-estimates KV footprint.
-        if (n_cpu_moe is not None
-                and n_layers > 0
-                and n_cpu_moe >= n_layers
-                and effective_free_vram > 4.0
-                and perf_target.moe_placement_ctx_target > 16384):
-            shrunk_target = max(
-                16384, perf_target.moe_placement_ctx_target // 2)
+        if (
+            n_cpu_moe is not None
+            and n_layers > 0
+            and n_cpu_moe >= n_layers
+            and effective_free_vram > 4.0
+            and perf_target.moe_placement_ctx_target > 16384
+        ):
+            shrunk_target = max(16384, perf_target.moe_placement_ctx_target // 2)
             ngl_2, cpu_moe_2, vram_2, ram_2, full_2 = _decide_moe_offload(
                 model_size_gb=model.size_gb,
                 free_vram_gb=effective_free_vram,
@@ -807,7 +821,12 @@ def compute_config(
             # Only adopt the second pass if it actually placed layers on GPU.
             if cpu_moe_2 is not None and cpu_moe_2 < n_cpu_moe:
                 ngl, n_cpu_moe, model_vram, model_ram, full_off = (
-                    ngl_2, cpu_moe_2, vram_2, ram_2, full_2)
+                    ngl_2,
+                    cpu_moe_2,
+                    vram_2,
+                    ram_2,
+                    full_2,
+                )
 
         if n_cpu_moe == 0:
             n_cpu_moe = None
@@ -831,13 +850,14 @@ def compute_config(
         # overhead constant (it scales with model size, not layer
         # placement).
         shared_overhead_gb = model.size_gb * 0.08
-        per_layer_expert_gb = max(0.001,
-                                  (model.size_gb - shared_overhead_gb) / n_layers)
+        per_layer_expert_gb = max(
+            0.001, (model.size_gb - shared_overhead_gb) / n_layers
+        )
         layers_on_gpu = n_layers - new_cpu_moe
         model_vram = shared_overhead_gb + layers_on_gpu * per_layer_expert_gb
         model_ram = new_cpu_moe * per_layer_expert_gb
         n_cpu_moe = new_cpu_moe if new_cpu_moe > 0 else None
-        full_off = (new_cpu_moe == 0)
+        full_off = new_cpu_moe == 0
         ngl = 999
 
     if force_ngl is not None and n_layers > 0 and not (is_moe and has_gpu):
@@ -855,11 +875,13 @@ def compute_config(
             full_off = False
 
     # ---- (2) Remaining KV budget — include vision/draft VRAM in total
-    effective_vram_safety = (perf_target.moe_vram_safety_gb
-                             if n_cpu_moe is not None
-                             else vram_safety_gb)
-    free_vram_after = max(0.0, free_vram - effective_vram_safety
-                          - model_vram - vision_vram_gb - draft_vram_gb)
+    effective_vram_safety = (
+        perf_target.moe_vram_safety_gb if n_cpu_moe is not None else vram_safety_gb
+    )
+    free_vram_after = max(
+        0.0,
+        free_vram - effective_vram_safety - model_vram - vision_vram_gb - draft_vram_gb,
+    )
     free_ram_after = max(0.0, system.free_ram_gb - ram_safety_gb - model_ram)
 
     # KV-cache placement rules:
@@ -901,8 +923,9 @@ def compute_config(
             # Total KV that fits if we max out the (capped) RAM portion:
             cpu_layer_fraction = 1.0 - gpu_layer_fraction
             ram_share_cap = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
-            max_total_via_ram = (ram_share_cap / cpu_layer_fraction
-                                 if cpu_layer_fraction > 0 else 1e9)
+            max_total_via_ram = (
+                ram_share_cap / cpu_layer_fraction if cpu_layer_fraction > 0 else 1e9
+            )
             kv_budget_gb = min(max_total_via_vram, max_total_via_ram)
     else:
         # CPU-only — KV lives entirely in RAM.
@@ -917,9 +940,7 @@ def compute_config(
     rope_scaled_ctx = 0
     rope_scaling_active = False
 
-    if (model.supports_rope_scale
-            and native_ctx > 0
-            and native_ctx < profile_rope_max):
+    if model.supports_rope_scale and native_ctx > 0 and native_ctx < profile_rope_max:
         # KV-Speicherbedarf pro Token (q5_0 als Entscheidungsgrundlage)
         kv_per_tok_q5 = base_kv_mb * kv_quant_factor("q5_0")
 
@@ -936,7 +957,7 @@ def compute_config(
             total_available = free_vram_after + free_ram_after
 
             # Aktiviere RoPE-Scaling wenn >= 90% des Bedarfs verfügbar
-            if (profile_rope_scale or total_available >= rope_kv_gb * 1.1):
+            if profile_rope_scale or total_available >= rope_kv_gb * 1.1:
                 rope_scaled_ctx = min(desired_ctx, profile_rope_max)
                 rope_scaling_active = True
 
@@ -977,7 +998,10 @@ def compute_config(
             kv_quant_strategy = "manual"
     else:
         cache_k, cache_v = _pick_kv_quant(
-            profile.recommended_kv_quant, target_ctx, base_kv_mb, kv_budget_gb,
+            profile.recommended_kv_quant,
+            target_ctx,
+            base_kv_mb,
+            kv_budget_gb,
             model_ctx_limit,
             turbo=turbo_kv,
             asymmetric=True,
@@ -991,12 +1015,13 @@ def compute_config(
         if turbo_kv:
             kv_quant_strategy = (
                 f"{kv_quant_strategy}+turbo"
-                if kv_quant_strategy != "symmetric" else "turbo"
+                if kv_quant_strategy != "symmetric"
+                else "turbo"
             )
 
-    actual_per_tok_mb = base_kv_mb * (
-        kv_quant_factor(cache_k) + kv_quant_factor(cache_v)
-    ) / 2
+    actual_per_tok_mb = (
+        base_kv_mb * (kv_quant_factor(cache_k) + kv_quant_factor(cache_v)) / 2
+    )
 
     if user_ctx is not None:
         # User-specified context — respect it but clamp to model limits
@@ -1012,7 +1037,7 @@ def compute_config(
             max_fit_ctx = int((kv_budget_gb * 1024 * 0.995) / actual_per_tok_mb)
         else:
             max_fit_ctx = profile_max
-        
+
         # Beschränke auf das Modell-Maximum (native oder rope-scaled)
         if model_ctx_limit > 0:
             ctx = min(max_fit_ctx, model_ctx_limit)
@@ -1039,7 +1064,7 @@ def compute_config(
     physical = system.cpu_cores_physical
     logical = system.cpu_cores_logical
     optimal_threads = (logical // 2) if logical > 8 else logical
-    
+
     if full_off:
         threads = min(optimal_threads, 16)
         batch_threads = min(physical, 16)
@@ -1063,7 +1088,7 @@ def compute_config(
 
     # ---- (4c) mlock + no_mmap (Windows Admin Check)
     ram_resident_gb = model_ram
-    
+
     is_windows = platform.system() == "Windows"
     is_admin = False
     if is_windows:
@@ -1086,12 +1111,11 @@ def compute_config(
     # trotzdem sinnvoll sein, um VRAM-Paging zu verhindern.
     vram_resident_gb = model_vram
     has_enough_vram = system.total_vram_gb > 8
-    
+
     if force_mlock:
         # Option B: User-Override — aktiviert mlock/no-mmap wenn System-Ressourcen reichen
-        mlock = (
-            (has_enough_vram or vram_resident_gb > 0)
-            and (is_windows and is_admin or not is_windows)
+        mlock = (has_enough_vram or vram_resident_gb > 0) and (
+            is_windows and is_admin or not is_windows
         )
     else:
         # Automatische Logik: zwei Fälle
@@ -1120,9 +1144,10 @@ def compute_config(
         sizes = [g.total_vram_mb for g in system.gpus]
         total = sum(sizes)
         if total > 0:
-            tensor_split = ",".join(f"{s/total:.3f}" for s in sizes)
-            main_gpu = max(range(len(system.gpus)),
-                           key=lambda i: system.gpus[i].total_vram_mb)
+            tensor_split = ",".join(f"{s / total:.3f}" for s in sizes)
+            main_gpu = max(
+                range(len(system.gpus)), key=lambda i: system.gpus[i].total_vram_mb
+            )
 
     # ---- (4d) NUMA — immer aktivieren bei genügend Kernen für bessere Performance
     numa = None
@@ -1161,8 +1186,7 @@ def compute_config(
                 sd = other_block
     else:
         # Old flat format: every mode shares the same sampling block.
-        sd = {k: v for k, v in raw_sampling.items()
-              if not isinstance(v, dict)}
+        sd = {k: v for k, v in raw_sampling.items() if not isinstance(v, dict)}
 
     sampling = {
         "temperature": float(sd.get("temperature", 0.7)),
@@ -1227,7 +1251,8 @@ def compute_config(
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
         performance_target=perf_target.name,
         warning=warning,
-   )
+    )
+
 
 def _has_integrated_mtp(model: ModelEntry) -> bool:
     """Detect models that ship an integrated MTP drafter inside the GGUF.
@@ -1278,17 +1303,28 @@ def build_command(
     """
     cmd: List[str] = [
         server_binary,
-        "-m", str(model.path),
-        "-c", str(config.ctx),
-        "-ngl", str(config.ngl),
-        "-t", str(config.threads),
-        "-tb", str(config.batch_threads),
-        "-b", str(config.batch),
-        "-ub", str(config.ubatch),
-        "-ctk", config.cache_k,
-        "-ctv", config.cache_v,
-        "--host", host,
-        "--port", str(port),
+        "-m",
+        str(model.path),
+        "-c",
+        str(config.ctx),
+        "-ngl",
+        str(config.ngl),
+        "-t",
+        str(config.threads),
+        "-tb",
+        str(config.batch_threads),
+        "-b",
+        str(config.batch),
+        "-ub",
+        str(config.ubatch),
+        "-ctk",
+        config.cache_k,
+        "-ctv",
+        config.cache_v,
+        "--host",
+        host,
+        "--port",
+        str(port),
     ]
 
     # Speculative decoding — three states:
@@ -1296,8 +1332,8 @@ def build_command(
     #   - integrated MTP filename          → Path B (--spec-draft-n-max)
     #   - enable_speculative=False         → emit nothing, even if the
     #                                        filename suggests MTP
-    draft_val = getattr(profile, 'draft_max', 0) or 3
-    draft_p_min = getattr(profile, 'draft_p_min', 0.0) or 0.0
+    draft_val = getattr(profile, "draft_max", 0) or 3
+    draft_p_min = getattr(profile, "draft_p_min", 0.0) or 0.0
     if enable_speculative and draft_model is not None:
         # Path A — sibling drafter file.
         # NOTE: -md MUST come BEFORE --spec-type because llama-server
@@ -1339,11 +1375,16 @@ def build_command(
 
     s = config.sampling
     cmd += [
-        "--temp", str(s["temperature"]),
-        "--top-k", str(s["top_k"]),
-        "--top-p", str(s["top_p"]),
-        "--min-p", str(s["min_p"]),
-        "--repeat-penalty", str(s["repeat_penalty"]),
+        "--temp",
+        str(s["temperature"]),
+        "--top-k",
+        str(s["top_k"]),
+        "--top-p",
+        str(s["top_p"]),
+        "--min-p",
+        str(s["min_p"]),
+        "--repeat-penalty",
+        str(s["repeat_penalty"]),
     ]
     pp = s.get("presence_penalty", 0.0)
     if pp:
