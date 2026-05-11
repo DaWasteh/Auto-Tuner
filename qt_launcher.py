@@ -400,20 +400,20 @@ class ExpertPanel(QWidget):
 
         def _add(label: str, widget: QWidget, tip: str = "") -> None:
             nonlocal row
-            l = QLabel(label)
-            l.setStyleSheet("color:#bbb;")
-            grid.addWidget(l, row, 0)
+            label_widget = QLabel(label)
+            label_widget.setStyleSheet("color:#bbb;")
+            grid.addWidget(label_widget, row, 0)
             grid.addWidget(widget, row, 1)
             if tip:
                 widget.setToolTip(tip)
-                l.setToolTip(tip)
+                label_widget.setToolTip(tip)
             row += 1
 
         def _section(title: str) -> None:
             nonlocal row
-            l = QLabel(f"── {title} ──")
-            l.setStyleSheet("color:#8be;padding-top:4px;")
-            grid.addWidget(l, row, 0, 1, 2)
+            section_label = QLabel(f"── {title} ──")
+            section_label.setStyleSheet("color:#8be;padding-top:4px;")
+            grid.addWidget(section_label, row, 0, 1, 2)
             row += 1
 
         # Context length
