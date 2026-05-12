@@ -148,6 +148,16 @@ Launch llama-server now? [Y/n]
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
   the next launch re-expands the same set of builds in the dropdown.
   No more re-navigating one folder up after every restart.
+- **Window geometry & state** — QMainWindow `saveGeometry()` (base64
+  in JSON) und `saveState()` (Toolbars, Dock-Positionen) werden
+  persistiert. Fenstergröße, -position, Maximize-State und
+  Toolbar-Status bleiben über Neustarts erhalten.
+- **Globale Schriftgröße** — peristente Schriftgröße (Clamp 7..22),
+  wird beim App-Start sofort angewendet (kein Flash von Default).
+- **Reasoning-Effort** — pro-Modell wählbar: `auto` / `off` /
+  `minimal` / `low` / `medium` / `high` / `extra_high`. Think-Budget
+  (Spin-Box, -1 = aus, 0 = sofort stop, N = Token-Budget) im
+  Expert-Panel.
 
   
 ### Vision control
@@ -215,6 +225,19 @@ that only make sense with persistent state:
 - **Live config preview.** The right pane recomputes
   context / KV / placement whenever you tick a checkbox or change the
   performance target — no need to launch first.
+- **Window geometry persistence.** Fenstergöße, -position,
+  Maximize-State und Toolbar-Status werden gespeichert und beim
+  nächsten Start wiederhergestellt (`_restore_window_geometry`).
+- **Font persistence.** Globale QApplication-Schriftgröße wird
+  persistiert und beim Start sofort angewendet (`_change_font`).
+  Kein Flash von der Default-Schriftgröße mehr.
+- **Reasoning-Panel (Expert-Panel).** Neue Sektion mit:
+    - Dropdown "Effort": `auto` / `off` / `minimal` / `low` /
+      `medium` / `high` / `extra_high`
+    - SpinBox "Think budget": `-1` = aus, `0` = sofort stop, `N` =
+      Token-Budget
+  Die Werte werden als `--reasoning`, `--think-budget` und
+  `--chat-template-kwargs` in `cfg.extra_cli_flags` übersetzt.
 
 ### Useful flags
 
@@ -331,6 +354,29 @@ When you start the tuner, you can choose between:
 
 1.  **Standard-Quant**: Uses standard `llama.cpp` binaries.
 2.  **Turbo-Quant**: Uses the `tq_llama.cpp` binary for faster inference.
+
+#### Turbo-Quant Labels & KV-Quant-Options
+
+`kv_quant_factor()` unterstützt jetzt folgende Turbo-Quant-Labels:
+`turbo2`, `turbo3`, `turbo4`, `iq4_nl`, `tq3_0`, `turbo3_tcq`.
+
+`_TURBO_QUANT_MAP` korrigiert die echten Labels:
+
+| Label   | Turbo-Quant | Faktor (vs F16) |
+|---------|-------------|-----------------|
+| `q8_0`  | `turbo4`    | ~3.8x           |
+| `q5_0`  | `turbo3`    | ~4.3x           |
+| `q4_0`  | `turbo3`    | ~4.3x           |
+
+(Vorher mappte es fälschlich auf `q4_1`/`q5_1`, was Mainline-Labels
+sind, NICHT TurboQuant.)
+
+`_pick_kv_quant` rechnet das Budget jetzt mit Turbo-Faktoren — beim
+Umschalten zeigt sich die echte Token-Zahl-Erhöhung (gemessen: 48k →
+63k bei Qwen3.6-35B-A3B).
+
+Die KV-Dropdowns in der GUI zeigen die volle Auswahl: `iq4_nl`,
+`q4_1`, `q5_1`, `turbo2`, `turbo3`, `turbo4`.
 
 #### Specialized Binary Logic
 
@@ -483,6 +529,25 @@ if (Test-Path build) { Remove-Item -Recurse -Force build }
 cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
 cmake --build build --config Release --parallel 20
 ```
+
+## Server-Features (Stand b9118)
+
+Die folgenden `llama-server` Features werden aus der b9118-Aera
+unterstützt (aus `tools/server/README.md`):
+
+| Flag | Unterstützung |
+|------|---------------|
+| `-fa [on\|off\|auto]` | ✅ Form `-fa on` wird emittiert |
+| `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ Alle im Dropdown |
+| `--reasoning on/off/auto` | ✅ Via Dropdown |
+| `--think-budget N` | ✅ Via SpinBox |
+| `--chat-template-kwargs ...` | ✅ Dropdown produziert das automatisch |
+| `--jinja` | ✅ Wird sichtbar angehakt |
+| `--mlock` / `--no-mmap` | ✅ Windows-Guard; manuell überschreibbar |
+| `--n-cpu-moe` / `--override-tensor` | ✅ Bereits vorhanden |
+| `--rope-scaling yarn` | ✅ Bereits vorhanden |
+| `--numa` | ✅ Bereits vorhanden |
+| `--no-context-shift` | ✅ Wird nicht mehr dupliziert (Dedup via seen-Set) |
 
 ## License
 

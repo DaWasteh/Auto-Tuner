@@ -10,6 +10,7 @@ Run with:
 
 from __future__ import annotations
 
+import base64
 import copy
 import os
 import re
@@ -18,9 +19,9 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, cast, Tuple
 
-from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QByteArray, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -301,7 +302,16 @@ class ExpertPanel(QWidget):
     # Emitted when the user clicks the close (×) button.
     closeRequested = pyqtSignal()
 
-    _KV_QUANT_OPTIONS = ["q4_0", "q5_0", "q8_0", "f16"]
+    # Upstream supports the first six; turbo3/turbo4 only resolve on the
+    # TurboQuant forks (TheTom/turboquant_plus, AtomicBot, spiritbuun).
+    # The combo accepts both either way — a fork that doesn't understand
+    # turbo3 will refuse to start and surface a clear error.
+    _KV_QUANT_OPTIONS = [
+        "q4_0", "q4_1", "iq4_nl",
+        "q5_0", "q5_1",
+        "q8_0", "f16",
+        "turbo4", "turbo3", "turbo2",
+    ]
     _NUMA_OPTIONS = ["off", "distribute", "isolate", "numactl"]
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -574,6 +584,43 @@ class ExpertPanel(QWidget):
         self._sp_presence.setDecimals(2)
         _add("presence_penalty", self._sp_presence, "--presence-penalty")
 
+        # Reasoning controls (llama-server b9118 era).
+        # The five settings here cover three different mechanisms the
+        # server understands, all wired to the same dropdown to keep the
+        # UI simple:
+        #   "auto"        — emit no reasoning flag; model/template decide
+        #   "off"         — --reasoning off  (silence thinking traces)
+        #   "minimal"     — --chat-template-kwargs '{"reasoning_effort":"minimal"}'
+        #   "low"/"med"/"high"/"extra_high" — same kwarg with that value
+        # "extra_high" is not standardised upstream but several Qwen3.6
+        # community templates accept it; falls back to "high" on builds
+        # that reject it.
+        _section("Reasoning / thinking")
+        self._cb_reasoning = QComboBox()
+        self._cb_reasoning.addItems(
+            ["auto", "off", "minimal", "low", "medium", "high", "extra_high"]
+        )
+        _add(
+            "Effort",
+            self._cb_reasoning,
+            "Reasoning effort passed to the chat template via "
+            "--chat-template-kwargs (or --reasoning off for 'off'). "
+            "'auto' emits no flag so the model template decides.",
+        )
+
+        self._sp_think_budget = QSpinBox()
+        self._sp_think_budget.setRange(-1, 1_048_576)
+        self._sp_think_budget.setSingleStep(256)
+        self._sp_think_budget.setValue(-1)
+        self._sp_think_budget.setGroupSeparatorShown(True)
+        _add(
+            "Think budget",
+            self._sp_think_budget,
+            "--think-budget N. -1 = unlimited (no flag), 0 = stop "
+            "thinking immediately, N>0 = token budget for the "
+            "thinking phase.",
+        )
+
         # Extra free-form CLI flags
         _section("Extra CLI flags")
         self._le_extra = QLineEdit()
@@ -693,12 +740,97 @@ class ExpertPanel(QWidget):
             self._sp_rep.setValue(float(s.get("repeat_penalty", 1.05)))
             self._sp_presence.setValue(float(s.get("presence_penalty", 0.0)))
 
-            # Extra CLI: filter out the flags we already model as checkboxes
+            # Reasoning + think-budget: parse them out of extra_cli_flags
+            # so the dedicated dropdowns show the right state and the
+            # free-form field below doesn't display the raw flags.
+            extras_in = list(cfg.extra_cli_flags or [])
+            reasoning_value, think_budget_value, leftover_extras = (
+                self._parse_reasoning_from_extras(extras_in)
+            )
+            self._set_combo(self._cb_reasoning, reasoning_value)
+            self._sp_think_budget.setValue(think_budget_value)
+
+            # Extra CLI: filter out the flags we already model as
+            # checkboxes / dedicated widgets so they don't appear twice.
             modeled = {"--jinja", "--verbose"}
-            free_flags = [f for f in (cfg.extra_cli_flags or []) if f not in modeled]
+            free_flags = [f for f in leftover_extras if f not in modeled]
             self._le_extra.setText(" ".join(free_flags))
         finally:
             self._populating = False
+
+    @staticmethod
+    def _parse_reasoning_from_extras(
+        extras: List[str],
+    ) -> Tuple[str, int, List[str]]:
+        """Pull reasoning + think-budget out of a flat CLI-flags list.
+
+        Returns (reasoning_value, think_budget_value, leftover_extras)
+        where leftover_extras drops every flag we successfully decoded.
+
+        Recognises four shapes:
+          * ``--reasoning off`` / ``--reasoning on`` / ``--reasoning auto``
+          * ``--chat-template-kwargs '{"reasoning_effort":"high"}'``
+          * ``--think-budget N``
+          * ``--think 0``  (synonym for budget=0)
+        Anything we cannot parse is preserved verbatim in leftover.
+        """
+        reasoning = "auto"
+        budget = -1
+        leftover: List[str] = []
+
+        i = 0
+        n = len(extras)
+        while i < n:
+            arg = extras[i]
+            low = arg.lower()
+            if low in ("--reasoning", "--think") and i + 1 < n:
+                val = extras[i + 1].strip().lower()
+                if low == "--reasoning":
+                    if val in ("off", "false", "0", "no", "disable"):
+                        reasoning = "off"
+                    # We intentionally collapse on/auto into "auto" —
+                    # the GUI only distinguishes "off" from "leave it
+                    # to the template", which "auto" expresses.
+                else:  # --think
+                    try:
+                        budget = int(val)
+                    except ValueError:
+                        leftover.extend([arg, extras[i + 1]])
+                i += 2
+                continue
+            if low == "--think-budget" and i + 1 < n:
+                try:
+                    budget = int(extras[i + 1])
+                except ValueError:
+                    leftover.extend([arg, extras[i + 1]])
+                i += 2
+                continue
+            if low == "--chat-template-kwargs" and i + 1 < n:
+                payload = extras[i + 1]
+                # Quick-and-dirty extraction without a full JSON parse:
+                # the canonical form is '{"reasoning_effort":"<value>"}'.
+                m = re.search(
+                    r'"reasoning_effort"\s*:\s*"([^"]+)"', payload
+                )
+                if m:
+                    candidate = m.group(1).strip().lower()
+                    valid = {
+                        "off", "none", "minimal", "low",
+                        "medium", "high", "extra_high",
+                    }
+                    if candidate in valid:
+                        reasoning = (
+                            "off" if candidate == "none" else candidate
+                        )
+                    i += 2
+                    continue
+                # Not a reasoning kwarg — keep the original flag pair.
+                leftover.extend([arg, payload])
+                i += 2
+                continue
+            leftover.append(arg)
+            i += 1
+        return reasoning, budget, leftover
 
     @staticmethod
     def _set_combo(combo: QComboBox, value: str) -> None:
@@ -773,12 +905,13 @@ class ExpertPanel(QWidget):
                 "repeat_penalty": float(self._sp_rep.value()),
                 "presence_penalty": float(self._sp_presence.value()),
             }
-            # Free-form extras + the two modelled flags
+            # Free-form extras + the two modelled flags + reasoning dropdown
             extras: List[str] = []
             if self._chk_jinja.isChecked():
                 extras.append("--jinja")
             if self._chk_verbose.isChecked():
                 extras.append("--verbose")
+            extras.extend(self._reasoning_flags_from_widgets())
             free = self._le_extra.text().strip()
             if free:
                 extras.extend(free.split())
@@ -827,12 +960,47 @@ class ExpertPanel(QWidget):
             extras.append("--jinja")
         if self._chk_verbose.isChecked():
             extras.append("--verbose")
+        extras.extend(self._reasoning_flags_from_widgets())
         free = self._le_extra.text().strip()
         if free:
             extras.extend(free.split())
         cfg.extra_cli_flags = extras
         cfg.kv_quant_strategy = "manual"
         return cfg
+
+    # ------------------------------------------------------------------
+    # Reasoning helper
+    # ------------------------------------------------------------------
+    def _reasoning_flags_from_widgets(self) -> List[str]:
+        """Translate the two reasoning widgets into llama-server flags.
+
+        Mapping rules:
+          dropdown == "auto"   → no flag (let the template decide)
+          dropdown == "off"    → --reasoning off  (silence thinking)
+          dropdown == anything else → --chat-template-kwargs
+                                       '{"reasoning_effort":"<value>"}'
+          spinbox  == -1        → no flag
+          spinbox  >=  0        → --think-budget <N>
+
+        We emit a SINGLE flat list. Duplicates are harmless because
+        build_cmd de-dupes, but we still avoid emitting "auto" since
+        that means "no override".
+        """
+        out: List[str] = []
+        choice = self._cb_reasoning.currentText().strip().lower()
+        if choice == "off":
+            out += ["--reasoning", "off"]
+        elif choice and choice != "auto":
+            # "extra_high" intentionally kept with underscore — that's
+            # the spelling Qwen3.6 community templates use. Builds that
+            # don't recognise it will just ignore the kwarg.
+            payload = '{"reasoning_effort":"' + choice + '"}'
+            out += ["--chat-template-kwargs", payload]
+
+        budget = int(self._sp_think_budget.value())
+        if budget >= 0:
+            out += ["--think-budget", str(budget)]
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +1018,12 @@ class MainWindow(QMainWindow):
     def __init__(self, models_path: Path, settings_path: Path) -> None:
         super().__init__()
         self.setWindowTitle("AutoTuner Qt Launcher")
+        # Hard-coded default size — only kicks in when no persisted
+        # geometry exists (first launch on this machine, or the JSON
+        # was wiped). `restoreGeometry` below replaces this when a
+        # blob is on disk.
         self.resize(1320, 840)
+        self._restore_window_geometry()
 
         self.models_path = models_path
         self.settings_path = settings_path
@@ -885,7 +1058,8 @@ class MainWindow(QMainWindow):
         self._scan_thread: Optional[QThread] = None
         self._scan_worker: Optional[_ScanWorker] = None
         self._sysinfo_busy = False
-        self._font_size = 10
+        # Persisted font size — falls back to 10pt on first launch.
+        self._font_size = app_settings.get_font_size()
 
         self._build_ui()
         # Wire background → GUI signals BEFORE the first scan kicks off,
@@ -1165,6 +1339,52 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Starting…")
 
     # ------------------------------------------------------------------
+    # Window geometry persistence
+    # ------------------------------------------------------------------
+    def _restore_window_geometry(self) -> None:
+        """Re-apply the last QMainWindow geometry+state if persisted.
+
+        Qt's saveGeometry/saveState produce opaque QByteArrays. We
+        store them as base64 strings in autotuner_settings.json. If
+        decoding or restoring fails for any reason (corrupt JSON,
+        Qt version mismatch, screen layout no longer valid) we just
+        keep the hard-coded default — no crash, no warning.
+        """
+        b64_geom = app_settings.get_window_geometry()
+        if b64_geom:
+            try:
+                raw = base64.b64decode(b64_geom)
+                self.restoreGeometry(QByteArray(raw))
+            except (ValueError, TypeError, OSError):
+                pass
+        b64_state = app_settings.get_window_state()
+        if b64_state:
+            try:
+                raw = base64.b64decode(b64_state)
+                self.restoreState(QByteArray(raw))
+            except (ValueError, TypeError, OSError):
+                pass
+
+    def _persist_window_geometry(self) -> None:
+        """Snapshot the current window layout into settings JSON.
+
+        Called from closeEvent. Errors here are non-fatal — losing
+        the persisted layout is annoying but not a reason to refuse
+        to quit.
+        """
+        try:
+            geom_bytes = self.saveGeometry().data() or b""
+            app_settings.set_window_geometry(
+                base64.b64encode(geom_bytes).decode("ascii")
+            )
+            state_bytes = self.saveState().data() or b""
+            app_settings.set_window_state(
+                base64.b64encode(state_bytes).decode("ascii")
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"[Warning] Could not save window layout: {exc}")
+
+    # ------------------------------------------------------------------
     def _apply_mono_font(self, w: QTextEdit) -> None:
         f = QFont("Consolas")
         f.setStyleHint(QFont.StyleHint.Monospace)
@@ -1172,11 +1392,43 @@ class MainWindow(QMainWindow):
         w.setFont(f)
 
     def _change_font(self, delta: int) -> None:
-        self._font_size = max(7, min(22, self._font_size + delta))
-        for w in (self._config_preview, self._log_panel):
-            f = w.font()
+        """A+/A- handler — scale the WHOLE UI, not just two text panels.
+
+        Until v3.1 the font buttons only resized self._config_preview
+        and self._log_panel, which left the toolbar / model list /
+        Expert panel labels stuck at whatever Qt's default was. Going
+        through QApplication.setFont scales every widget that hasn't
+        been explicitly assigned its own font — including future widgets
+        added after this call — and we re-apply the monospace font to
+        the two text panels afterwards so they keep their Consolas /
+        monospace styling at the new size.
+        """
+        new_size = max(7, min(22, self._font_size + delta))
+        if new_size == self._font_size:
+            return
+        self._font_size = new_size
+
+        app = QApplication.instance()
+        if app is not None:
+            # QApplication.instance() returns QCoreApplication | None per stubs,
+            # but at runtime it IS a QApplication which has font()/setFont().
+            qapp = cast("QApplication", app)
+            f = qapp.font()
             f.setPointSize(self._font_size)
-            w.setFont(f)
+            qapp.setFont(f)
+        # The two monospace text panels need an explicit refresh: they
+        # have their own QFont (Consolas / Monospace style hint), which
+        # overrides the app-wide font, so QApplication.setFont alone
+        # would skip them.
+        for w in (self._config_preview, self._log_panel):
+            wf = w.font()
+            wf.setPointSize(self._font_size)
+            w.setFont(wf)
+
+        try:
+            app_settings.set_font_size(self._font_size)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"[Warning] Could not save font size: {exc}")
 
     # ------------------------------------------------------------------
     # Fork-container helpers
@@ -2351,6 +2603,11 @@ class MainWindow(QMainWindow):
     # Window close
     # ------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent | None) -> None:  # noqa: N802
+        # Snapshot the current window layout BEFORE any potential
+        # "are you sure?" dialog, so even an Escape-out of that dialog
+        # has saved state. The save itself never blocks the close.
+        self._persist_window_geometry()
+
         # Guard against already-deleted QThread (deleteLater race)
         try:
             if self._scan_thread is not None and self._scan_thread.isRunning():
@@ -2401,6 +2658,17 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("AutoTuner")
+    # Apply persisted font size to the WHOLE app before we build any
+    # widgets — that way every QLabel / QPushButton / dropdown picks
+    # up the user's chosen size on the very first paint instead of
+    # flashing the Qt default and then resizing.
+    try:
+        base_font = app.font()
+        base_font.setPointSize(app_settings.get_font_size())
+        app.setFont(base_font)
+    except Exception:
+        pass
+
     window = MainWindow(
         models_path=Path(args.models_path),
         settings_path=Path(args.settings_path),

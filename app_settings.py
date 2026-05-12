@@ -11,6 +11,14 @@ Public API:
     set_models_path(Path)
     get_fork_path()        -> Optional[Path]
     set_fork_path(Path)
+    get_window_geometry()  -> Optional[str]   # base64 of QByteArray
+    set_window_geometry(str)
+    get_window_state()     -> Optional[str]   # base64 of QByteArray (toolbars/docks)
+    set_window_state(str)
+    get_font_size()        -> Optional[int]
+    set_font_size(int)
+    get_reasoning_effort(model_name) -> Optional[str]
+    set_reasoning_effort(model_name, value)
 """
 
 from __future__ import annotations
@@ -264,6 +272,146 @@ def set_mode(name: str) -> None:
     name = (name or "").lower().strip()
     if name in _VALID_MODES + ("",):
         _update("mode", name)
+
+
+# ---------------------------------------------------------------------------
+# Window geometry & state
+#
+# Qt's QMainWindow can hand us two opaque QByteArrays:
+#   * saveGeometry()  → size, position, screen, maximize/fullscreen state
+#   * saveState()     → toolbar/dock/splitter positions
+#
+# We persist them as base64 strings (the only safe round-trip for
+# arbitrary bytes inside JSON). On restart the GUI passes the bytes
+# back to restoreGeometry/restoreState; if anything is corrupted or
+# from an incompatible Qt version, those calls just return False and
+# the GUI falls back to the hard-coded default size.
+
+import base64
+
+
+def _get_b64(key: str) -> Optional[str]:
+    val = load_settings().get(key)
+    if not isinstance(val, str) or not val:
+        return None
+    # Defensive: ignore obviously-broken payloads so a corrupt JSON
+    # never crashes the GUI launch path.
+    try:
+        base64.b64decode(val, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return val
+
+
+def get_window_geometry() -> Optional[str]:
+    """Return the persisted QMainWindow.saveGeometry() blob (base64)."""
+    return _get_b64("window_geometry")
+
+
+def set_window_geometry(b64_value: str) -> None:
+    """Persist the base64-encoded saveGeometry() output."""
+    if isinstance(b64_value, str):
+        _update("window_geometry", b64_value)
+
+
+def get_window_state() -> Optional[str]:
+    """Return the persisted QMainWindow.saveState() blob (base64)."""
+    return _get_b64("window_state")
+
+
+def set_window_state(b64_value: str) -> None:
+    """Persist the base64-encoded saveState() output."""
+    if isinstance(b64_value, str):
+        _update("window_state", b64_value)
+
+
+# ---------------------------------------------------------------------------
+# Global font size
+#
+# The A+/A- toolbar buttons should affect the whole UI, not just the
+# config preview and the log panel. We persist the chosen point size
+# so a user who picked size 14 keeps size 14 across restarts.
+
+_FONT_SIZE_MIN = 7
+_FONT_SIZE_MAX = 22
+_FONT_SIZE_DEFAULT = 10
+
+
+def get_font_size() -> int:
+    """Return the persisted GUI point size; clamped to a sane range."""
+    val = load_settings().get("font_size")
+    try:
+        n = int(val) if val is not None else _FONT_SIZE_DEFAULT
+    except (TypeError, ValueError):
+        return _FONT_SIZE_DEFAULT
+    return max(_FONT_SIZE_MIN, min(_FONT_SIZE_MAX, n))
+
+
+def set_font_size(size: int) -> None:
+    """Persist the GUI point size (clamped to the safe range)."""
+    try:
+        n = int(size)
+    except (TypeError, ValueError):
+        return
+    n = max(_FONT_SIZE_MIN, min(_FONT_SIZE_MAX, n))
+    _update("font_size", n)
+
+
+# ---------------------------------------------------------------------------
+# Reasoning effort (per model)
+#
+# Some models (gpt-oss, certain Nemotron / Qwen3.5+ variants) honour a
+# ``reasoning_effort`` kwarg that controls how much the model "thinks"
+# before answering. Llama-server passes the value through to the chat
+# template via ``--chat-template-kwargs '{"reasoning_effort":"high"}'``.
+#
+# Officially recognised values across the ecosystem:
+#   * "low" / "medium" / "high"  — gpt-oss + Qwen3.5+ canonical set
+#   * "minimal"                  — some Qwen3.6 builds
+#   * "auto"                     — sentinel meaning "no flag, let the
+#                                   chat template / model decide"
+#
+# "extra high" is not standardised upstream but several recent Qwen3.6
+# community builds accept it; we keep it as an option and let the user
+# discover whether their build supports it.
+#
+# Storage: per-model, alongside vision/draft/thinking overrides.
+
+_VALID_REASONING = ("auto", "off", "minimal", "low", "medium", "high", "extra_high")
+
+
+def get_reasoning_effort(model_name: str) -> Optional[str]:
+    """Return the persisted reasoning_effort for ``model_name`` or None."""
+    if not model_name:
+        return None
+    val = (load_settings().get("reasoning_effort") or {}).get(model_name)
+    if not isinstance(val, str):
+        return None
+    val = val.lower().strip()
+    return val if val in _VALID_REASONING else None
+
+
+def set_reasoning_effort(model_name: str, value: Optional[str]) -> None:
+    """Persist (or clear) the reasoning_effort for ``model_name``.
+
+    Pass ``None`` or an empty string to drop the override (model falls
+    back to "auto" — i.e. no CLI flag at all).
+    """
+    if not model_name:
+        return
+    s = load_settings()
+    bucket = s.get("reasoning_effort")
+    if not isinstance(bucket, dict):
+        bucket = {}
+    if not value:
+        bucket.pop(model_name, None)
+    else:
+        v = value.lower().strip()
+        if v not in _VALID_REASONING:
+            return
+        bucket[model_name] = v
+    s["reasoning_effort"] = bucket
+    save_settings(s)
 
 
 def settings_file_location() -> Path:

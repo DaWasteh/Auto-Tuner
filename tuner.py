@@ -269,7 +269,14 @@ def _resolve_kv_per_token_mb(model: ModelEntry, params_billion: float) -> float:
 
 
 def kv_quant_factor(quant: str) -> float:
-    """Memory factor of a given KV-cache quant, relative to f16."""
+    """Memory factor of a given KV-cache quant, relative to f16.
+
+    Covers the upstream cache types (f16/q8/q5/q4 + iq4_nl) plus the
+    TurboQuant-fork labels (turbo2/turbo3/turbo4). The turbo factors
+    come from Google's TurboQuant paper + the TheTom/AtomicBot fork
+    measurements (ICLR 2026 / b9082+ branches): turbo3 ≈ 4.3× vs f16,
+    turbo4 ≈ 3.8×, turbo2 ≈ 6.4×.
+    """
     q = quant.lower()
     if q in ("f16", "fp16", "bf16"):
         return 1.0
@@ -277,8 +284,23 @@ def kv_quant_factor(quant: str) -> float:
         return 0.55
     if q in ("q5_0", "q5_1", "q5"):
         return 0.40
-    if q in ("q4_0", "q4_1", "q4"):
+    if q in ("q4_0", "q4_1", "q4", "iq4_nl"):
         return 0.32
+    # TurboQuant labels (TheTom/turboquant_plus, AtomicBot, spiritbuun).
+    # The Google paper quotes compression ratios vs F16; we convert
+    # 1 / ratio = factor. Slightly conservative (rounded up) so the
+    # auto-tuner does not over-promise context length.
+    if q == "turbo4":
+        return 0.27  # ~3.8× → 1/3.8 = 0.263, rounded up
+    if q in ("turbo3", "tq3_0"):
+        return 0.24  # ~4.3× → 1/4.3 = 0.233
+    if q in ("turbo3_tcq",):
+        # 3-bit Viterbi-coded, ~5x at same quality as turbo3 scalar.
+        return 0.20
+    if q == "turbo2":
+        return 0.16  # ~6.4× → 1/6.4 = 0.156
+    if q in ("turbo2_tcq",):
+        return 0.13  # ~7-8× in spiritbuun benchmarks
     return 0.55
 
 
@@ -540,17 +562,29 @@ def _decide_moe_offload(
 
 
 # ---- Turbo-Quant labels --------------------------------------------------
-# The TurboQuant forks (TheTom/llama-cpp-turboquant, AtomicBot's
-# atomic-llama-cpp-turboquant) accept additional K-quant labels that pack
-# the KV-cache tighter than the stock q4_0/q5_0/q8_0 set. The exact label
-# strings differ between forks, so we keep a simple mapping the user can
-# refine via the Expert panel. Defaults below pick the most aggressive
-# label that is widely accepted; if a build rejects it the user sees an
-# immediate error from llama-server and can override in Expert/Manual mode.
+# The TurboQuant family of forks (TheTom/turboquant_plus,
+# AtomicBot/atomic-llama-cpp-turboquant, spiritbuun/buun-llama-cpp)
+# adds three new -ctk / -ctv labels that pack the KV-cache much
+# tighter than the stock f16 → q4_0 ladder:
+#
+#     turbo4   ~3.8× vs F16   (4-bit, highest accuracy, default fallback)
+#     turbo3   ~4.3× vs F16   (3-bit, the "sweet spot" — recommended default)
+#     turbo2   ~6.4× vs F16   (2-bit, max compression, quality drops)
+#
+# We map upstream quant choices to their turbo equivalent **at the
+# bit-width tier the algorithm already picked** — q8_0 → turbo4 (both
+# are the "high-accuracy" tier), q5_0 → turbo3 (mid), q4_0 → turbo3
+# (low, but turbo3 is still measurably better than q4_0 at long ctx).
+# turbo2 is intentionally not auto-selected; users who really want it
+# pick it manually in the Expert panel.
 _TURBO_QUANT_MAP: Dict[str, str] = {
-    "q8_0": "q8_0",  # already optimal — no turbo equivalent needed
-    "q5_0": "q5_1",  # asymmetric q5 with shared scale, denser packing
-    "q4_0": "q4_1",  # asymmetric q4 with shared scale (~10% less memory)
+    "f16": "turbo4",  # if someone runs f16 on a turbo fork, give them headroom
+    "q8_0": "turbo4",  # 4-bit, ~3.8x, highest-accuracy turbo tier
+    "q5_0": "turbo3",  # 3-bit, ~4.3x, the canonical default
+    "q5_1": "turbo3",
+    "q4_0": "turbo3",  # 3-bit beats q4_0 noticeably at long context
+    "q4_1": "turbo3",
+    "iq4_nl": "turbo3",
 }
 
 
@@ -632,8 +666,22 @@ def _pick_kv_quant(
             pairs = [(rec, rec)]  # defensive — should never happen
 
     budget_mb = kv_budget_gb * 1024 * 0.98
+
+    # When the user enabled Turbo-KV, the quants we are about to test
+    # are NOT the labels that will actually end up in the cmd line —
+    # we map (q8_0, q5_0, q4_0) → (turbo4, turbo3, turbo3) just below.
+    # The Turbo labels are denser than their q-counterparts, so the
+    # budget check has to use the turbo factor or the AutoTuner will
+    # leave a lot of context on the table (Basti's complaint: "the
+    # token count doesn't change when switching to Turbo").
+    def _factor_for_pair(k_label: str, v_label: str) -> float:
+        if turbo:
+            k_label = _turbo_quant_for(k_label)
+            v_label = _turbo_quant_for(v_label)
+        return (kv_quant_factor(k_label) + kv_quant_factor(v_label)) / 2
+
     for k, v in pairs:
-        per_tok = base_kv_per_token_mb * (kv_quant_factor(k) + kv_quant_factor(v)) / 2
+        per_tok = base_kv_per_token_mb * _factor_for_pair(k, v)
         if per_tok <= 0:
             continue
         max_fit = int(budget_mb / per_tok)
@@ -1218,6 +1266,17 @@ def compute_config(
         kv_vram_gb = 0.0
         kv_ram_gb = estimated_kv_gb
 
+    # ---- Seed extra_cli_flags with whatever the profile declares ------
+    # Until now, profile.extra_args (e.g. "--jinja" for the reasoning
+    # families) were appended directly in build_cmd, never landing in
+    # cfg.extra_cli_flags. Result: the Expert panel's "--jinja" checkbox
+    # stayed unchecked even for models whose profile demands it. We
+    # surface them here so the GUI reflects the truth, and build_cmd
+    # de-dupes when it emits the final argv.
+    seed_extras: List[str] = []
+    if getattr(profile, "extra_args", None):
+        seed_extras = [str(a) for a in profile.extra_args if a]
+
     return TunedConfig(
         ctx=ctx,
         ngl=ngl,
@@ -1251,6 +1310,7 @@ def compute_config(
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
         performance_target=perf_target.name,
         warning=warning,
+        extra_cli_flags=seed_extras,
     )
 
 
@@ -1397,13 +1457,33 @@ def build_command(
     # Thinking wird über Prompt-Tags gesteuert (<|think|>), nicht über CLI-Argumente.
     # use_thinking ist ein internes Flag - extra_args werden immer angehängt:
 
-    if profile.extra_args:
-        cmd.extend(profile.extra_args)
-    # Expert-mode extras (--jinja, --verbose, …). Injected before the
-    # caller-passed extra_args so a caller can still override.
-    if config.extra_cli_flags:
-        cmd.extend(config.extra_cli_flags)
-    if extra_args:
-        cmd.extend(extra_args)
+    # ---- Extra-flag merge (de-duplicated, order-preserving) -----------
+    # Two sources feed `cmd` here:
+    #   1. profile.extra_args  — declared in the YAML (e.g. "--jinja")
+    #   2. cfg.extra_cli_flags — what the GUI's Expert panel emitted
+    # Until v3.1 we appended both blindly, which produced duplicate
+    # flags whenever compute_config (correctly) seeded extra_cli_flags
+    # from profile.extra_args so the Expert checkbox would reflect it.
+    # Walk both lists with a "seen" set so a flag appears at most once,
+    # and the relative ordering of first occurrences is preserved.
+    #
+    # The seen set is pre-populated with the entire cmd built so far —
+    # this also catches the case where a profile lists "--no-context-shift"
+    # in extra_args *and* the tuner separately decided to emit it (line
+    # 1408): without prepopulating, the same flag would land twice.
+    seen: set = set(cmd)
+
+    def _append_unique(src: Optional[List[str]]) -> None:
+        if not src:
+            return
+        for arg in src:
+            if arg in seen:
+                continue
+            seen.add(arg)
+            cmd.append(arg)
+
+    _append_unique(getattr(profile, "extra_args", None))
+    _append_unique(config.extra_cli_flags)
+    _append_unique(extra_args)
 
     return cmd
