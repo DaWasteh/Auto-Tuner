@@ -23,6 +23,7 @@ Public API:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -286,8 +287,6 @@ def set_mode(name: str) -> None:
 # back to restoreGeometry/restoreState; if anything is corrupted or
 # from an incompatible Qt version, those calls just return False and
 # the GUI falls back to the hard-coded default size.
-
-import base64
 
 
 def _get_b64(key: str) -> Optional[str]:
