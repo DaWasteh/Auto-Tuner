@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -1211,21 +1213,31 @@ class MainWindow(QMainWindow):
         self._config_stack.setCurrentIndex(0)
 
         # ── Expert button row (sits between preview and Launch options) ─
-        # In normal mode this row shows a single "🔧 Expert" button.
-        # When Expert mode is active the button is replaced by an
-        # [Auto] [Manual] pair (the Expert panel itself owns those
-        # toggle buttons — see ExpertPanel — but we still mirror the
-        # state here in the bottom row for parallel access).
+        # In normal mode this row shows a "🔧 Expert" button plus a
+        # "🔍 Diagnose" button. When Expert mode is active the Expert
+        # button is replaced by an [Auto] [Manual] pair (the Expert
+        # panel itself owns those toggle buttons — see ExpertPanel — but
+        # we still mirror the state here in the bottom row for parallel
+        # access). The Diagnose button stays visible in both modes.
         self._btn_expert = QPushButton("🔧 Expert settings")
         self._btn_expert.setToolTip(
             "Open the Expert panel to override AutoTuner decisions."
         )
         self._btn_expert.clicked.connect(self._enter_expert_mode)
+        self._btn_diagnose = QPushButton("🔍 Diagnose")
+        self._btn_diagnose.setToolTip(
+            "Show the metadata diagnostic report for the selected model — "
+            "KV size estimate, hybrid/MoE detection inputs, capacity "
+            "estimates, and any warnings."
+        )
+        self._btn_diagnose.clicked.connect(self._show_diagnostic_report)
+        self._btn_diagnose.setEnabled(False)  # disabled until a model is picked
         self._btn_expert_row = QWidget()
         bex = QHBoxLayout(self._btn_expert_row)
         bex.setContentsMargins(0, 0, 0, 0)
         bex.addStretch(1)
         bex.addWidget(self._btn_expert)
+        bex.addWidget(self._btn_diagnose)
         bex.addStretch(1)
 
         # ── Launch options (checkboxes) ────────────────────────────────
@@ -1942,6 +1954,7 @@ class MainWindow(QMainWindow):
             self._btn_expert_row.setVisible(True)
         self._current_entry = entry
         self._current_draft = _find_draft_model(entry, self._all_entries)
+        self._btn_diagnose.setEnabled(True)
         self._update_checkboxes(entry)
         profile = match_profile(entry.name, self._profiles)
         self._auto_select_fork(profile)
@@ -2368,6 +2381,71 @@ class MainWindow(QMainWindow):
 
     def _on_expert_mode_changed(self, mode: str) -> None:
         self._log(f"[Expert] Mode → {mode}.")
+
+    # ------------------------------------------------------------------
+    # Diagnostic report
+    # ------------------------------------------------------------------
+    def _show_diagnostic_report(self) -> None:
+        """Open a modal dialog showing the metadata diagnostic for the
+        currently selected model.
+
+        Reuses the same ``diagnostics`` module the CLI ``--diagnose``
+        path uses, so the output is identical and there's no second
+        place to maintain.
+        """
+        if self._current_entry is None:
+            QMessageBox.information(
+                self,
+                "No model selected",
+                "Select a model first — the diagnostic report needs a "
+                "model to analyse.",
+            )
+            return
+
+        # Import lazily so the GUI module does not pay the cost on
+        # startup, and so missing diagnostics.py degrades to a
+        # graceful error message rather than refusing to launch.
+        try:
+            from diagnostics import format_diagnostic_report
+        except ImportError as exc:  # pragma: no cover — defensive
+            QMessageBox.warning(
+                self,
+                "Diagnostics module missing",
+                f"Could not load diagnostics.py:\n{exc}",
+            )
+            return
+
+        report = format_diagnostic_report(self._current_entry)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Diagnose — {self._current_entry.name}")
+        dlg.resize(720, 560)
+        layout = QVBoxLayout(dlg)
+
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(report)
+        self._apply_mono_font(view)
+        layout.addWidget(view, 1)
+
+        # Single OK button — this is a read-only inspector, no actions.
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        # QDialogButtonBox.Close emits the `rejected` signal by default;
+        # wire both so either path closes cleanly.
+        close_btn: QPushButton | None = bb.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(bb)
+
+        dlg.exec()
+        # Also mirror a short notice into the main log so the user has
+        # a record that they consulted the diagnostic (helpful when
+        # debugging support tickets later).
+        self._log(
+            f"[Diagnose] Inspected metadata for {self._current_entry.name}"
+        )
 
     # ------------------------------------------------------------------
     # System info — non-blocking (daemon thread → signal/slot)

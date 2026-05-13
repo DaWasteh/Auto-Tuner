@@ -721,6 +721,16 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "(requires PyQt6; server stdout/stderr stream into the window).",
     )
     p.add_argument(
+        "--diagnose",
+        metavar="SUBSTR",
+        nargs="?",
+        const="",  # bare --diagnose (no arg) → empty string → all models
+        default=None,
+        help="Print a metadata diagnostic report for matching model(s) "
+        "and exit without launching. With a substring: filters by name "
+        "(case-insensitive contains-match). Without: reports all models.",
+    )
+    p.add_argument(
         "--",
         dest="passthrough",
         nargs=argparse.REMAINDER,
@@ -822,6 +832,30 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
     profiles = load_profiles(Path(args.settings_path))
     print(f"[AutoTuner] Loaded {len(profiles)} profile(s) from {args.settings_path}")
+
+    # ── Diagnose-only path ─────────────────────────────────────────────
+    # `--diagnose` (with optional substring) prints a metadata audit for
+    # the matching models and exits without launching anything. Reuses
+    # the diagnostics module so CLI and (future) GUI button share the
+    # same formatting and warning catalogue.
+    if args.diagnose is not None:
+        from diagnostics import format_diagnostic_report, find_model_by_substring
+
+        matches = find_model_by_substring(entries, args.diagnose)
+        if not matches:
+            print(
+                f"\n[AutoTuner] --diagnose: no model matches "
+                f"'{args.diagnose}'. Scanned {len(entries)} file(s)."
+            )
+            return 2
+        print(
+            f"\n[AutoTuner] --diagnose: reporting on {len(matches)} "
+            f"model(s) (of {len(entries)} scanned).\n"
+        )
+        for m in matches:
+            print(format_diagnostic_report(m))
+            print()
+        return 0
 
     # ── Main loop ───────────────────────────────────────────────────────────
     first_iteration = True
