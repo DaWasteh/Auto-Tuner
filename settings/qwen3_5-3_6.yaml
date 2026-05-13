@@ -9,7 +9,15 @@ patterns:
 # HF-Card Qwen3.6: "Context Length: 262,144 natively and extensible up
 # to 1,010,000 tokens" - daher hier den größten nativen Wert.
 max_context: 262144
-recommended_kv_quant: q8_0
+# KV-Quant-Empfehlung: q5_0 (asymmetrisch mit cv=q4_0 wenn der Tuner Platz
+# sucht) ist für die A3B/A10B/A17B-MoE-Varianten der Sweet-Spot. Q8_0 wäre
+# qualitativ marginal besser, kostet aber +37% KV-VRAM gegenüber q5_0
+# (Faktoren 0.55 vs 0.40 von f16) — auf 16-GB-Klassen-GPUs landet damit
+# ein Expert-Layer extra auf der CPU statt im VRAM, was die TG-Speed
+# spürbar drückt. Wer für reine 27B-Dense-Sessions q8_0 will, kann es im
+# Expert-Panel manuell pinnen — die Cascade rechnet den ctx dann
+# automatisch entsprechend kleiner.
+recommended_kv_quant: q5_0
 
 # RoPE-Scaling (YaRN): Optional aktivierbar wenn genügend Speicher frei ist
 # und der berechnete Context das native Limit überschreitet.
@@ -85,3 +93,4 @@ notes: >
   Trennung von <think>-Blöcken ins reasoning_content-API-Feld
   (statt sie inline im content zu lassen):
     -- --jinja
+    

@@ -485,49 +485,24 @@ Recommended build settings for this system:
 
 
 # Main-Fork
-cd C:\LAB\ai-local
-git clone https://github.com/ggml-org/llama.cpp llama.cpp
+cd C:\LAB\ai-local                                                  # Where to Clone llama.cpp into
+git clone https://github.com/ggml-org/llama.cpp llama.cpp           # Link to Main-llama.cpp and Foldername for llama
 cd llama.cpp
-if (Test-Path build) { Remove-Item -Recurse -Force build }
+if (Test-Path build) { Remove-Item -Recurse -Force build }          # If previous llama-build exists delete it
 cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 20
+cmake --build build --config Release --parallel 20                  # Alternative to "--parallel" is "-j", Number are CPU-Cores the build-process uses
 
-# PrismML-Fork
-cd C:\LAB\ai-local
-git clone https://github.com/PrismML-Eng/llama.cpp 1b_llama.cpp
-cd 1b_llama.cpp
+# additional Command-Examples that might be helpful for some Forks of llama
 git checkout prism
-if (Test-Path build) { Remove-Item -Recurse -Force build }
-cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 20
-
-# Ikawrakow MTP-Fork
-cd C:\LAB\ai-local
-git clone https://github.com/ikawrakow/ik_llama.cpp ik_llama.cpp
-cd ik_llama.cpp
+--
 git fetch origin
 git checkout ik/gemma4
-if (Test-Path build) { Remove-Item -Recurse -Force build }
-cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 20
-
-# TurboQuant-Fork
-cd C:\LAB\ai-local
-git clone https://github.com/TheTom/llama-cpp-turboquant tq_llama.cpp
-cd tq_llama.cpp
-git checkout thetom
-if (Test-Path build) { Remove-Item -Recurse -Force build }
-cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 20
-
-# Atomic MTP-Fork
-cd C:\LAB\ai-local
-git clone https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant atq_llama.cpp
-cd atq_llama.cpp
-git checkout Atomic
-if (Test-Path build) { Remove-Item -Recurse -Force build }
-cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 20
+--
+git fetch origin
+git fetch origin pull/22673/head:pr-22673
+git checkout master
+git reset --hard origin/master
+git merge --no-ff pr-22673 -m "Merge [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673): llama + spec: MTP Support"
 ```
 
 ## Server-Features (Stand b9118)

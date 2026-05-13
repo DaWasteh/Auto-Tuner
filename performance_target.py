@@ -45,6 +45,19 @@ class PerformanceTarget:
     ram_safety_gb: float
     description: str
 
+    # Batch sizes for MoE + CPU hybrid placements. Pure GPU and CPU-only
+    # placements keep the legacy 1024/1024 path (see tuner.py step 4b).
+    # Rationale: the HuggingFace MoE-offload guide (Doctor-Shotgun, Feb
+    # 2026) and the gfx1151 ROCm/Vulkan benchmark in llama.cpp issue
+    # #21284 both demonstrate near-linear PP scaling up to -ub 2048 on
+    # MoE-hybrid setups, because op-offload batches the CPU-resident
+    # expert tensors as a single GPU operation. With -b 1024 the
+    # round-trip overhead dominates. Larger batches cost ~0.5–1.5 GB
+    # extra compute buffer, so we only step up when the perf target
+    # already accepts a tighter VRAM safety band.
+    moe_hybrid_batch: int = 2048
+    moe_hybrid_ubatch: int = 2048
+
     def __str__(self) -> str:  # pragma: no cover — trivial
         return self.name
 
@@ -59,6 +72,11 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         moe_placement_ctx_target=131072,  # 128k — full long-context budget
         dense_vram_safety_gb=0.30,
         ram_safety_gb=1.50,
+        # Safe keeps the legacy 1024/1024 to maximise headroom for the
+        # 128k KV reservation. Users who care about throughput pick a
+        # different tier anyway.
+        moe_hybrid_batch=1024,
+        moe_hybrid_ubatch=1024,
         description=(
             "Conservative. KV reserved for 128k context, generous "
             "safety bands. Pick this for long-context sessions."
@@ -70,6 +88,10 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         moe_placement_ctx_target=65536,  # 64k — typical working ceiling
         dense_vram_safety_gb=0.25,
         ram_safety_gb=1.25,
+        # Balanced bumps to 2048/2048 — empirically the sweet spot for
+        # 16 GB-class GPUs on Qwen3.6-A3B / Gemma-4-26B-A4B / GLM-4.7-MoE.
+        moe_hybrid_batch=2048,
+        moe_hybrid_ubatch=2048,
         description=(
             "Default. KV reserved for 64k context — enough headroom "
             "for most chats while letting more expert layers fit on GPU."
@@ -81,6 +103,12 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         moe_placement_ctx_target=32768,  # 32k — short reasoning / coding
         dense_vram_safety_gb=0.15,
         ram_safety_gb=1.00,
+        # Throughput goes all-in: 4096/4096 maximises op-offload prompt
+        # processing on MoE-hybrid setups. Costs ~1.5 GB extra VRAM for
+        # the compute buffer but throughput already reserves the
+        # smallest KV budget (32k) so there's room.
+        moe_hybrid_batch=4096,
+        moe_hybrid_ubatch=4096,
         description=(
             "Aggressive. KV reserved for only 32k — every spare GB "
             "of VRAM goes to expert layers. Best tokens/s on tight "

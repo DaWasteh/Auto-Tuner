@@ -1126,10 +1126,28 @@ def compute_config(
         threads = min(optimal_threads, 32)
         batch_threads = min(logical, 64)
 
-    # ---- (4b) Batch — ubatch=1024 für bessere Performance bei großen Kontexten
-    if model.size_gb > 30:
-        batch, ubatch = 1024, 1024
-    elif ctx > 32768 or model.size_gb > 10:
+    # ---- (4b) Batch / ubatch sizing
+    # Three regimes, picked in order:
+    #
+    #   1. MoE with CPU-resident experts (`--n-cpu-moe` > 0): use the
+    #      perf_target's moe_hybrid_batch/ubatch. Larger batches let
+    #      llama.cpp's op-offload prompt processing copy CPU-resident
+    #      expert tensors to the GPU as a single batched operation,
+    #      which is much faster than per-token round-trips. Reference:
+    #      HuggingFace MoE-offload guide (Doctor-Shotgun, Feb 2026) and
+    #      the gfx1151 ROCm/Vulkan benchmark in llama.cpp issue #21284,
+    #      both showing near-linear PP scaling up to -ub 2048/4096.
+    #
+    #   2. Full GPU offload of a large dense model (>30 GB) OR long
+    #      context (>32k): 1024/1024 — keeps the compute buffer modest
+    #      so the model itself doesn't get squeezed.
+    #
+    #   3. Everything else (small-to-mid dense, short ctx): 2048/512 —
+    #      the historical default that's optimal for pure GPU inference.
+    if n_cpu_moe is not None and n_cpu_moe > 0:
+        batch = perf_target.moe_hybrid_batch
+        ubatch = perf_target.moe_hybrid_ubatch
+    elif model.size_gb > 30 or ctx > 32768 or model.size_gb > 10:
         batch, ubatch = 1024, 1024
     else:
         batch, ubatch = 2048, 512
@@ -1392,9 +1410,21 @@ def build_command(
     #   - integrated MTP filename          → Path B (--spec-draft-n-max)
     #   - enable_speculative=False         → emit nothing, even if the
     #                                        filename suggests MTP
+    #
+    # Vision guard: PR #22673 (the upstream MTP merge) currently crashes
+    # when --spec-type mtp is combined with a loaded --mmproj projector.
+    # Bug confirmed on all platforms by the maintainer team and tracked
+    # by the GGUF distributors (e.g. froggeric/Qwen3.6-27B-MTP-GGUF).
+    # Until that bug is fixed upstream, we silently drop the MTP flags
+    # whenever a vision projector will be loaded — text-only MTP keeps
+    # working, vision keeps working, just not both at once. The user is
+    # informed via the launcher's log line, not by aborting the start.
     draft_val = getattr(profile, "draft_max", 0) or 3
     draft_p_min = getattr(profile, "draft_p_min", 0.0) or 0.0
-    if enable_speculative and draft_model is not None:
+    vision_loaded = model.mmproj is not None
+    use_speculative = enable_speculative and not vision_loaded
+
+    if use_speculative and draft_model is not None:
         # Path A — sibling drafter file.
         # NOTE: -md MUST come BEFORE --spec-type because llama-server
         # parses arguments left-to-right; otherwise the server aborts
@@ -1404,10 +1434,15 @@ def build_command(
         cmd += ["-ngld", "99"]
         cmd += ["--draft-max", str(draft_val)]
         cmd += ["--draft-p-min", str(draft_p_min)]
-    elif enable_speculative and _has_integrated_mtp(model):
+    elif use_speculative and _has_integrated_mtp(model):
         # Path B — integrated MTP drafter inside the main GGUF.
+        # `--spec-draft-ngl 99` keeps the MTP head on GPU; without it
+        # the drafter layers fall back to CPU and the speedup vanishes.
+        # Matches the working PR #22673 benchmark configurations on both
+        # AMD ROCm and NVIDIA CUDA.
         cmd += ["--spec-type", "mtp"]
         cmd += ["--spec-draft-n-max", str(draft_val)]
+        cmd += ["--spec-draft-ngl", "99"]
 
     if config.flash_attn:
         cmd += ["-fa", "on"]
@@ -1432,6 +1467,24 @@ def build_command(
         cmd += ["--tensor-split", config.tensor_split]
     if config.main_gpu is not None:
         cmd += ["--main-gpu", str(config.main_gpu)]
+
+    # --cache-ram 0 — explicit "no RAM-resident KV cache".
+    # We already enforce VRAM-only KV via the placement logic in
+    # compute_config (Vulkan MoE crashes with GGML_ASSERT(addr) if any
+    # of the KV spills to RAM), but the explicit flag is belt-and-
+    # suspenders: defends against future llama.cpp defaults that might
+    # allow RAM spill, and makes the policy auditable in the launch log.
+    # Only emit for placements where KV definitely lives entirely on GPU:
+    #   - MoE with `--n-cpu-moe` (KV is on GPU, only experts on CPU)
+    #   - Dense full-offload (whole model on GPU)
+    # Skipped for dense-hybrid (where KV intentionally splits with the
+    # layer split) and CPU-only (where KV must live in RAM).
+    needs_vram_only_kv = (
+        (config.n_cpu_moe is not None and config.n_cpu_moe > 0)
+        or config.full_offload
+    )
+    if needs_vram_only_kv:
+        cmd += ["--cache-ram", "0"]
 
     s = config.sampling
     cmd += [
