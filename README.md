@@ -483,11 +483,34 @@ Recommended build settings for this system:
 # - AMD Radeon RX 9070 XT 16GB
 # - G.Skill Trident Z 48GB DDR5-8400MHz (2x24GB)
 
+# Main-Fork b9151 and later
+cd C:\LAB\ai-local
+git clone https://github.com/ggml-org/llama.cpp llama.cpp
+cd llama.cpp
+$repo = "C:\LAB\ai-local\llama.cpp"
+Set-Location $repo
+git clean -fdx
+Push-Location .\tools\server\webui
+npm ci
+npm run build
+Pop-Location
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+  -DGGML_VULKAN=ON `
+  -DGGML_NATIVE=ON `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DLLAMA_BUILD_SERVER=ON `
+  -DLLAMA_BUILD_WEBUI=ON `
+  -DLLAMA_USE_PREBUILT_WEBUI=OFF `
+  -DLLAMA_CURL=OFF `
+  -DGGML_CCACHE=OFF
+cmake --build build --config Release --parallel 24
 
-# Main-Fork
+
+# Main-Fork up to b9150
 cd C:\LAB\ai-local                                                  # Where to Clone llama.cpp into
 git clone https://github.com/ggml-org/llama.cpp llama.cpp           # Link to Main-llama.cpp and Foldername for llama
 cd llama.cpp
+git checkout b9150
 if (Test-Path build) { Remove-Item -Recurse -Force build }          # If previous llama-build exists delete it
 cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
 cmake --build build --config Release --parallel 20                  # Alternative to "--parallel" is "-j", Number are CPU-Cores the build-process uses
