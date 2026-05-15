@@ -1149,6 +1149,27 @@ class MainWindow(QMainWindow):
         self._perf_combo.currentIndexChanged.connect(self._on_perf_changed)
         tb.addWidget(self._perf_combo)
 
+        # ── Mode (chat / coding) ───────────────────────────────────────
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.setMinimumWidth(90)
+        self._mode_combo.setToolTip(
+            "Sampling profile:\n"
+            "  • chat   — conversational defaults (higher temperature,\n"
+            "             more diverse output)\n"
+            "  • coding — deterministic defaults from each model's\n"
+            "             official coding/agentic-bench setup\n"
+            "Profiles without a coding block fall back to chat values."
+        )
+        for m in ("chat", "coding"):
+            self._mode_combo.addItem(m)
+        persisted_mode = app_settings.get_mode() or "chat"
+        idx = self._mode_combo.findText(persisted_mode)
+        self._mode_combo.setCurrentIndex(max(0, idx))
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        tb.addWidget(self._mode_combo)
+
         tb.addSeparator()
         tb.addWidget(QLabel(" Font:"))
         for delta, label in ((-1, "A−"), (+1, "A+")):
@@ -1693,6 +1714,36 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._log(f"[Warning] Config refresh failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # Mode (chat / coding) selection
+    # ------------------------------------------------------------------
+    def _current_mode(self) -> str:
+        """Return the active sampling mode ("chat" / "coding")."""
+        if not hasattr(self, "_mode_combo"):
+            return "chat"
+        m = self._mode_combo.currentText().strip().lower()
+        return m if m in ("chat", "coding") else "chat"
+
+    def _on_mode_changed(self, index: int) -> None:
+        """User flipped chat ↔ coding — persist + refresh preview only.
+
+        This does NOT touch checkboxes; only the config text and the
+        persisted setting are updated.
+        """
+        name = self._mode_combo.itemText(index).strip()
+        try:
+            app_settings.set_mode(name)
+        except Exception as exc:
+            self._log(f"[Warning] Could not save mode: {exc}")
+        self._log(f"[Mode] → {name}")
+        entry = getattr(self, "_current_entry", None)
+        if entry is not None and self._system is not None:
+            try:
+                profile = match_profile(entry.name, self._profiles)
+                self._update_config_text(entry, profile)
+            except Exception as exc:
+                self._log(f"[Warning] Config refresh failed: {exc}")
+
     def _resolve_perf_target_for_profile(self, profile: ModelProfile):
         """Combine GUI choice with profile-level recommendation.
 
@@ -2173,6 +2224,7 @@ class MainWindow(QMainWindow):
                 draft_model=self._current_draft if use_draft else None,
                 force_mlock=False,
                 perf_target=self._resolve_perf_target_for_profile(profile),
+                mode=self._current_mode(),
                 turbo_kv=turbo_kv,
                 **kwargs,
             )
@@ -2258,6 +2310,7 @@ class MainWindow(QMainWindow):
         lines += [
             f"Placement       : {placement}",
             f"Perf target     : {cfg.performance_target}",
+            f"Mode            : {self._current_mode()}",
             f"Context         : {cfg.ctx:,} tokens",
             kv_line,
             f"Threads         : {cfg.threads}  (batch: {cfg.batch_threads})",
@@ -2594,6 +2647,7 @@ class MainWindow(QMainWindow):
                 user_ctx=None,
                 force_mlock=False,
                 perf_target=self._resolve_perf_target_for_profile(profile),
+                mode=self._current_mode(),
                 turbo_kv=turbo_kv,
             )
 
@@ -2621,7 +2675,8 @@ class MainWindow(QMainWindow):
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
         self._log(
-            f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking}"
+            f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking} "
+            f"mode={self._current_mode()}"
         )
 
         self._server = _TerminalProcess(cmd)

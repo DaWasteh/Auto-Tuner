@@ -11,7 +11,7 @@
       "vision": false
     },
     "gemma-4-26B-A4B-it-UD-Q8_K_XL": {
-      "vision": true,
+      "vision": false,
       "draft": false
     },
     "Qwen3.6-27B-UD-Q3_K_XL": {
@@ -38,6 +38,6 @@
   },
   "fork_container_path": "C:\\LAB\\ai-local",
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAANlAAABCAAAB4UAAASzAAADZQAAAScAAAeFAAAEswAAAAAAAAAADXAAAANlAAABJwAAB4UAAASz",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABCEAAANYAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA="
+  "window_geometry": "AdnQywADAAAAAAAYAAAAKwAABbAAAAQoAAAAGAAAAEoAAAWwAAAEKAAAAAAAAAAADXAAAAAYAAAASgAABbAAAAQo",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAAOqAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA="
 }
