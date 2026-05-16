@@ -245,7 +245,7 @@ def _capability_markers(entry: ModelEntry) -> str:
     syms: List[str] = []
     if entry.has_vision:
         syms.append("👁")
-    if entry.has_draft:
+    if entry.has_speculative_draft:  # covers both external GGUF and embedded MTP
         syms.append("⚡")
     if entry.supports_thinking:
         syms.append("🧠")
@@ -1496,7 +1496,9 @@ class MainWindow(QMainWindow):
             for child in sorted(path.iterdir(), key=lambda c: c.name.lower()):
                 if not child.is_dir():
                     continue
-                if not re.search(r"llama\.cpp", child.name, re.IGNORECASE):
+                if not re.search(
+                    r"(?:(?:^|[-_.])llama(?:[-_.]|$)|llama\.cpp)", child.name, re.IGNORECASE
+                ):
                     continue
                 has_binary = any(
                     (child / sub).is_file() for sub in _BINARY_SUBPATHS
@@ -2040,30 +2042,56 @@ class MainWindow(QMainWindow):
 
         # ── Vision ──────────────────────────────────────────────────
         mmproj = entry.mmproj
-        has_vision = mmproj is not None
-        vision_state = ov["vision"] if "vision" in ov else has_vision
+        has_external_draft = self._current_draft is not None
+        is_embedded_mtp = entry.has_embedded_mtp
+        # Determine whether the external draft will actually be used.
+        # Having an external draft file available but draft unchecked does
+        # NOT block vision — only an active (checked) external draft does.
+        # The override dict already contains "draft": False when the user
+        # has unticked the Draft checkbox for this model.
+        draft_override = ov.get("draft", None)
+        draft_default = has_external_draft  # default: enabled when file exists
+        draft_effectively_on = has_external_draft and (
+            draft_override if draft_override is not None else draft_default
+        )
+        # External draft (-md) conflicts with --mmproj in llama.cpp: both
+        # try to load a second model and the server aborts. Integrated MTP
+        # lives inside the main GGUF — no second-model conflict, so vision
+        # is safe (and Qwen3.6-MTP models require it to work correctly).
+        vision_blocked = draft_effectively_on and not is_embedded_mtp
+        has_vision = mmproj is not None and not vision_blocked
+        # Default: enable vision when mmproj is present and not blocked.
+        # For embedded-MTP models default to True (they need vision).
+        default_vision = has_vision
+        vision_state = ov["vision"] if "vision" in ov else default_vision
         self._chk_vision.blockSignals(True)
         self._chk_vision.setEnabled(has_vision)
         self._chk_vision.setChecked(has_vision and vision_state)
-        self._chk_vision.setText(
-            f"Vision  ({mmproj.name})"
-            if mmproj is not None
-            else "Vision (no mmproj found)"
-        )
+        if mmproj is not None and vision_blocked:
+            self._chk_vision.setText(
+                f"Vision  ({mmproj.name})  [blocked: external draft active]"
+            )
+        elif mmproj is not None:
+            self._chk_vision.setText(f"Vision  ({mmproj.name})")
+        else:
+            self._chk_vision.setText("Vision (no mmproj found)")
         self._chk_vision.blockSignals(False)
 
         # ── Draft ───────────────────────────────────────────────────
         draft = self._current_draft
-        has_draft = draft is not None
+        has_draft = draft is not None or is_embedded_mtp
         draft_state = ov["draft"] if "draft" in ov else has_draft
         self._chk_draft.blockSignals(True)
         self._chk_draft.setEnabled(has_draft)
         self._chk_draft.setChecked(has_draft and draft_state)
-        self._chk_draft.setText(
-            f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
-            if draft is not None
-            else "Draft (no assistant model found)"
-        )
+        if draft is not None:
+            self._chk_draft.setText(
+                f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
+            )
+        elif is_embedded_mtp:
+            self._chk_draft.setText("Draft   MTP (embedded in GGUF)")
+        else:
+            self._chk_draft.setText("Draft (no assistant model found)")
         self._chk_draft.blockSignals(False)
 
         # ── Thinking / Reasoning ────────────────────────────────────
@@ -2171,6 +2199,11 @@ class MainWindow(QMainWindow):
 
     def _on_draft_toggled(self, checked: bool) -> None:
         self._record_override("draft", checked)
+        # Toggling draft changes whether vision is blocked (external draft
+        # conflicts with --mmproj). Re-evaluate the vision checkbox state
+        # before rebuilding the config preview.
+        if self._current_entry is not None:
+            self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
     def _on_turbo_toggled(self, checked: bool) -> None:

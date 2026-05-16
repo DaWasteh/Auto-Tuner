@@ -1,6 +1,6 @@
 {
   "models_path": "C:\\LAB\\ai-local\\models",
-  "fork_path": "C:\\LAB\\ai-local\\llama.cpp-b9174-bin-win-vulkan-x64",
+  "fork_path": "C:\\LAB\\ai-local\\llama.cpp",
   "performance_target": "throughput",
   "model_overrides": {
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": {
@@ -15,7 +15,7 @@
       "draft": false
     },
     "Qwen3.6-27B-UD-Q3_K_XL": {
-      "vision": false
+      "vision": true
     },
     "Mistral-Medium-3.5-128B-UD-IQ3_XXS": {
       "vision": false
@@ -29,21 +29,23 @@
       "thinking": true
     },
     "Qwen3.6-27B-MTP-UD-Q3_K_XL": {
-      "vision": false
+      "vision": true,
+      "draft": true
     },
     "gemma-4-31B-it-Q3_K_S": {
-      "draft": false,
+      "draft": true,
       "vision": true
     },
     "Qwen3.6-27B-MTP-IQ4_XS": {
-      "vision": true
+      "vision": true,
+      "draft": true
     },
     "Qwen3.6-35B-A3B-UD-MTP-Q6_K": {
-      "vision": false
+      "vision": true
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAFFAAAAOQAABt0AAAUtAAABRQAAAFgAAAbdAAAFLQAAAAAAAAAADXAAAAFFAAAAWAAABt0AAAUt",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAAShAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAAAAAFFAAAAOQAABt0AAATwAAABRQAAAFgAAAbdAAAE8AAAAAAAAAAADXAAAAFFAAAAWAAABt0AAATw",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAARkAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "C:\\LAB\\ai-local"
 }

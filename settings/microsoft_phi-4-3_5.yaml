@@ -6,6 +6,17 @@ patterns:
 max_context: 131072
 recommended_kv_quant: q8_0
 
+# Phi-4 / Phi-4.5 hat einen nativen Trainings-Kontext von 16.384 Tokens,
+# unterstützt aber via RoPE-Scaling (LongRoPE / SuScaledRotaryEmbedding)
+# bis zu 128k Tokens. llama.cpp liest die Scaling-Parameter direkt aus den
+# GGUF-Metadaten — kein manuelles Eingreifen nötig. Da die phi3-Architektur
+# nicht in der automatischen RoPE-Erkennungsliste steht, aktivieren wir
+# Scaling hier explizit über das Profil.
+rope_scale:
+  enabled: true
+  max_context: 131072
+  scale_factor: 4.0
+
 # Sampling-Profile pro Modus.
 sampling:
   chat:
@@ -34,3 +45,4 @@ notes: >
   Coding-Default. Chat-Modus erlaubt etwas Variation (temp 0.5), bleibt
   aber deutlich konservativer als bei größeren Modellen, weil Phi bei
   hoher Temperatur schneller halluziniert als 30B+ Modelle.
+  

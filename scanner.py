@@ -500,6 +500,30 @@ class ModelEntry:
         """True if the chat template signals tool-call / function support."""
         return metadata_supports_tool_use(self.metadata, self.name)
 
+    @property
+    def has_embedded_mtp(self) -> bool:
+        """True if the filename contains 'MTP' as a standalone token.
+
+        MTP (Multi-Token Prediction) variants bundle the speculative-decoding
+        drafter as extra tensors inside the main GGUF — no sibling assistant
+        file needed. Speculative decoding uses ``--spec-type mtp`` flags rather
+        than ``-md``. Detection is filename-only because metadata key naming
+        differs across forks.
+
+        Examples that match: ``Qwen3.6-27B-MTP-UD-Q3_K_XL``, ``model-mtp-q4``.
+        Examples that don't: ``prometheus`` (contains 'mtp' but not bounded).
+        """
+        return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", self.name, re.IGNORECASE))
+
+    @property
+    def has_speculative_draft(self) -> bool:
+        """True when any form of speculative decoding is available.
+
+        Covers both an external sibling-assistant GGUF (``self.draft``) and
+        an embedded MTP drafter detected from the filename.
+        """
+        return self.draft is not None or self.has_embedded_mtp
+
 
 def _strip_quant(filename: str) -> str:
     if filename.lower().endswith(".gguf"):

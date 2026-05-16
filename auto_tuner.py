@@ -516,8 +516,14 @@ def _discover_llama_forks() -> List[Tuple[str, Path]]:
             if not child.is_dir():
                 continue
             name = child.name
-            # Match: "llama.cpp", "*_llama.cpp", "*llama.cpp*"
-            if not re.search(r"llama\.cpp", name, re.IGNORECASE):
+            # Match: "llama.cpp", "*_llama.cpp", "llama" (plain),
+            # "llama-b9150-bin-win-vulkan-x64" (GitHub release ZIPs),
+            # "1b_llama", etc.  The binary check below is the real guard
+            # against false-positives (e.g. "llama-3-8b" model folders
+            # won't contain llama-server.exe and are skipped silently).
+            if not re.search(
+                r"(?:(?:^|[-_.])llama(?:[-_.]|$)|llama\.cpp)", name, re.IGNORECASE
+            ):
                 continue
             try:
                 rp = child.resolve()
@@ -1124,3 +1130,4 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
 if __name__ == "__main__":
     sys.exit(main())
+    

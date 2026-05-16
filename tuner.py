@@ -945,15 +945,29 @@ def compute_config(
     #   - CPU-only: KV lives entirely in RAM.
     #
     # Cap RAM-resident KV at this many GB for hybrid placements. The
-    # value is chosen so a small (≤10 %) CPU-resident layer slice can
-    # still carry a useful context while preventing the 10-GB-KV-in-RAM
-    # trap. Override via the perf_target if a future tier needs it.
-    HYBRID_KV_RAM_CAP_GB = 2.0
+    # value is chosen so even a tight 30B hybrid (free_vram_after ≈ 0.25 GB)
+    # can reach the 32k context floor when enough system RAM is available.
+    # (2 GB was too small: 0.25 + 2.0 = 2.25 GB → ~27k tokens for a
+    # 64-layer model with 8 GQA heads at q4_0, just below the 32k target.)
+    # 4 GB raises that to ~53k so the floor clamps correctly to 32k.
+    # The cap still prevents the multi-GB-KV-in-RAM trap from the old
+    # uncapped formula.
+    HYBRID_KV_RAM_CAP_GB = 4.0
 
     if is_moe and has_gpu:
         kv_budget_gb = free_vram_after
     elif full_off:
-        kv_budget_gb = free_vram_after
+        # Dense model fully on GPU, but the model may nearly fill VRAM
+        # (e.g. a 27B Q3 occupying 14 of 16 GB), leaving almost nothing
+        # for KV. Layer computation stays on GPU; allow the KV cache to
+        # use system RAM so the server reaches a useful context length.
+        # Cap prevents consuming all available RAM for KV alone.
+        # The VRAM share is always included — if VRAM has headroom, KV
+        # goes there first and is fast; the RAM portion only matters when
+        # VRAM is nearly full.
+        DENSE_FULL_KV_RAM_CAP_GB = 8.0
+        ram_supplement = min(free_ram_after, DENSE_FULL_KV_RAM_CAP_GB)
+        kv_budget_gb = free_vram_after + ram_supplement
     elif ngl > 0 and n_layers > 0:
         # Dense hybrid: derive max total-KV budget so neither the GPU
         # nor the (capped) RAM share blows past its limit. The actual
@@ -966,37 +980,49 @@ def compute_config(
             # No GPU layers — should not happen (ngl > 0) but stay defensive.
             kv_budget_gb = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
         else:
-            # Total KV that fits if we max out the VRAM portion:
-            max_total_via_vram = free_vram_after / gpu_layer_fraction
-            # Total KV that fits if we max out the (capped) RAM portion:
-            cpu_layer_fraction = 1.0 - gpu_layer_fraction
-            ram_share_cap = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
-            max_total_via_ram = (
-                ram_share_cap / cpu_layer_fraction if cpu_layer_fraction > 0 else 1e9
-            )
-            kv_budget_gb = min(max_total_via_vram, max_total_via_ram)
+            # Dense hybrid: KV budget = whatever VRAM headroom remains
+            # PLUS a capped RAM supplement.
+            #
+            # Old formula: min(free_vram/gpu_frac, ram_cap/cpu_frac)
+            # Problem: when VRAM is nearly full (e.g. model + vision leaves
+            # only 0.05 GB), the VRAM term collapses to 0.06 GB and the
+            # min drives kv_budget to ~0 → context 2048. The proportional
+            # formula assumed VRAM is never the exhausted resource.
+            #
+            # Additive approach: use every byte of remaining VRAM for KV,
+            # then top up with up to HYBRID_KV_RAM_CAP_GB from system RAM.
+            # The cap still prevents the "10 GB KV in RAM" trap that
+            # motivated the previous formula; it just handles the VRAM-
+            # exhausted case gracefully.
+            ram_supplement = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
+            kv_budget_gb = free_vram_after + ram_supplement
     else:
         # CPU-only — KV lives entirely in RAM.
         kv_budget_gb = free_ram_after
 
     # ---- (2.5) RoPE-Scaling (YaRN) auto-detection
     # Aktiviere RoPE-Scaling automatisch wenn:
-    # 1. Modell RoPE-Scaling unterstützt (qwen2 etc.)
+    # 1. Modell RoPE-Scaling unterstützt (qwen2 etc.) ODER das YAML-Profil
+    #    rope_scale.enabled=true setzt (erlaubt Profil-Autoren, RoPE-Scaling
+    #    für Architekturen zu aktivieren die nicht in _ROPE_SCALE_SUPPORTED_ARCHS
+    #    stehen — z.B. phi3/Phi-4 mit nativem 16k-Kontext aber 128k-Kapazität)
     # 2. Genügend Speicher für Context > native_ctx vorhanden ist
     # 3. Entweder profil-configured (rope_scale.enabled=true) ODER
     #    berechneter max_fit_ctx überschreitet native_ctx
     rope_scaled_ctx = 0
     rope_scaling_active = False
 
-    if model.supports_rope_scale and native_ctx > 0 and native_ctx < profile_rope_max:
+    if (model.supports_rope_scale or profile_rope_scale) and native_ctx > 0 and native_ctx < profile_rope_max:
         # KV-Speicherbedarf pro Token (q5_0 als Entscheidungsgrundlage)
         kv_per_tok_q5 = base_kv_mb * kv_quant_factor("q5_0")
 
-        # Bestimme gewünschten Context (user-specified oder profile-basiert)
-        effective_profile_max = profile.max_context
-        if native_ctx > 0:
-            effective_profile_max = min(effective_profile_max, native_ctx)
-        desired_ctx = user_ctx if user_ctx is not None else effective_profile_max
+        # Gewünschter Context: user-specified oder Profil-Maximum.
+        # WICHTIG: Hier das UNCAPPED profile.max_context verwenden (nicht das
+        # native_ctx-beschränkte profile_max), denn der Sinn von RoPE-Scaling
+        # ist ja, über native_ctx hinaus zu gehen. Wenn profile.max_context
+        # bereits <= native_ctx ist, wird desired_ctx <= native_ctx und die
+        # Aktivierungsbedingung unten bleibt False (korrekt).
+        desired_ctx = user_ctx if user_ctx is not None else profile.max_context
 
         # Wenn gewünschter Context das native Limit überschreitet
         if desired_ctx > native_ctx:
@@ -1347,23 +1373,11 @@ def compute_config(
 def _has_integrated_mtp(model: ModelEntry) -> bool:
     """Detect models that ship an integrated MTP drafter inside the GGUF.
 
-    Integrated-MTP variants (e.g. ``Qwen3.6-27B-MTP-UD-Q3_K_XL.gguf``)
-    bundle the speculative-decoding drafter as extra tensors in the main
-    file — no sibling ``-Assistant`` GGUF, no ``-md`` flag, just
-    ``--spec-type mtp`` and ``--spec-draft-n-max N`` against the main
-    binary on a fork that supports it.
-
-    Detection is filename-only on purpose: the metadata key naming
-    differs between forks (mtp_llama.cpp uses ``<arch>.mtp.*``,
-    ik_llama.cpp uses different keys) and the filename marker is
-    universal across distributors. False positives here are cheap —
-    the worst case is the server starts without speculative decoding
-    when a misnamed file slipped through.
+    Delegates to ``ModelEntry.has_embedded_mtp`` in scanner.py, which is
+    the canonical source of truth for this detection. See that property for
+    the full rationale and examples.
     """
-    name = model.name.lower()
-    # Match "MTP" as a token surrounded by separators or at boundaries —
-    # avoids matching arbitrary substrings inside other words.
-    return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", name))
+    return model.has_embedded_mtp
 
 
 def build_command(
@@ -1423,30 +1437,33 @@ def build_command(
     #   - enable_speculative=False         → emit nothing, even if the
     #                                        filename suggests MTP
     #
-    # Vision guard: PR #22673 (the upstream MTP merge) currently crashes
-    # when --spec-type mtp is combined with a loaded --mmproj projector.
-    # Bug confirmed on all platforms by the maintainer team and tracked
-    # by the GGUF distributors (e.g. froggeric/Qwen3.6-27B-MTP-GGUF).
-    # Until that bug is fixed upstream, we silently drop the MTP flags
-    # whenever a vision projector will be loaded — text-only MTP keeps
-    # working, vision keeps working, just not both at once. The user is
-    # informed via the launcher's log line, not by aborting the start.
+    # Vision / draft compatibility:
+    #   - External draft (Path A, -md) conflicts with --mmproj in llama.cpp:
+    #     both try to load a second model and the server aborts. When vision
+    #     is loaded, we skip Path A entirely.
+    #   - Integrated MTP (Path B) embeds the drafter inside the main GGUF —
+    #     no second model-load conflict. Vision and embedded MTP can coexist;
+    #     Qwen3.6-MTP models in fact require the mmproj to work correctly.
     draft_val = getattr(profile, "draft_max", 0) or 3
     draft_p_min = getattr(profile, "draft_p_min", 0.0) or 0.0
     vision_loaded = model.mmproj is not None
-    use_speculative = enable_speculative and not vision_loaded
+    # Path A: sibling drafter — skip when vision is active (conflict).
+    use_external = enable_speculative and draft_model is not None and not vision_loaded
+    # Path B: integrated MTP — compatible with vision; no conflict.
+    use_integrated = enable_speculative and _has_integrated_mtp(model) and draft_model is None
 
-    if use_speculative and draft_model is not None:
+    if use_external:
         # Path A — sibling drafter file.
         # NOTE: -md MUST come BEFORE --spec-type because llama-server
         # parses arguments left-to-right; otherwise the server aborts
         # with "unknown speculative decoding type without draft model".
+        assert draft_model is not None  # guaranteed by use_external condition
         cmd += ["-md", str(draft_model.path)]
         cmd += ["--spec-type", "mtp"]
         cmd += ["-ngld", "99"]
         cmd += ["--draft-max", str(draft_val)]
         cmd += ["--draft-p-min", str(draft_p_min)]
-    elif use_speculative and _has_integrated_mtp(model):
+    elif use_integrated:
         # Path B — integrated MTP drafter inside the main GGUF.
         # `--spec-draft-ngl 99` keeps the MTP head on GPU; without it
         # the drafter layers fall back to CPU and the speedup vanishes.
