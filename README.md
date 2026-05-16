@@ -490,7 +490,7 @@ cd llama.cpp
 $repo = "C:\LAB\ai-local\llama.cpp"
 Set-Location $repo
 git clean -fdx
-Push-Location .\tools\server\webui
+Push-Location .\tools\ui
 npm ci
 npm run build
 Pop-Location
@@ -499,12 +499,11 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
   -DGGML_NATIVE=ON `
   -DBUILD_SHARED_LIBS=OFF `
   -DLLAMA_BUILD_SERVER=ON `
-  -DLLAMA_BUILD_WEBUI=ON `
-  -DLLAMA_USE_PREBUILT_WEBUI=OFF `
+  -DLLAMA_BUILD_UI=ON `
+  -DLLAMA_USE_PREBUILT_UI=OFF `
   -DLLAMA_CURL=OFF `
   -DGGML_CCACHE=OFF
 cmake --build build --config Release --parallel 24
-
 
 # Main-Fork up to b9150
 cd C:\LAB\ai-local                                                  # Where to Clone llama.cpp into
@@ -515,17 +514,32 @@ if (Test-Path build) { Remove-Item -Recurse -Force build }          # If previou
 cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_COMPILER="cl.exe" -DGGML_CCACHE=OFF
 cmake --build build --config Release --parallel 20                  # Alternative to "--parallel" is "-j", Number are CPU-Cores the build-process uses
 
-# additional Command-Examples that might be helpful for some Forks of llama
-git checkout prism
---
-git fetch origin
-git checkout ik/gemma4
---
+# Main-Fork locally merged with MTP-Fork
+cd C:\LAB\ai-local
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
 git fetch origin
 git fetch origin pull/22673/head:pr-22673
 git checkout master
 git reset --hard origin/master
 git merge --no-ff pr-22673 -m "Merge [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673): llama + spec: MTP Support"
+$repo = "C:\LAB\ai-local\llama.cpp"
+Set-Location $repo
+Push-Location .\tools\server\webui
+npm ci
+npm run build
+Pop-Location
+cmake -S . -B build `
+  -G "Visual Studio 18 2026" -A x64 `
+  -DGGML_VULKAN=ON `
+  -DGGML_NATIVE=ON `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DLLAMA_BUILD_SERVER=ON `
+  -DLLAMA_BUILD_WEBUI=ON `
+  -DLLAMA_USE_PREBUILT_WEBUI=OFF `
+  -DLLAMA_CURL=OFF `
+  -DGGML_CCACHE=OFF
+cmake --build build --config Release --parallel 24
 ```
 
 ## Server-Features (Stand b9118)

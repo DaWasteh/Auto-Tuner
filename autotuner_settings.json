@@ -15,7 +15,7 @@
       "draft": false
     },
     "Qwen3.6-27B-UD-Q3_K_XL": {
-      "vision": true
+      "vision": false
     },
     "Mistral-Medium-3.5-128B-UD-IQ3_XXS": {
       "vision": false
@@ -25,7 +25,7 @@
       "vision": true
     },
     "Qwen3.6-35B-A3B-UD-Q6_K": {
-      "vision": false,
+      "vision": true,
       "thinking": true
     },
     "Qwen3.6-27B-MTP-UD-Q3_K_XL": {
@@ -34,10 +34,16 @@
     "gemma-4-31B-it-Q3_K_S": {
       "draft": false,
       "vision": true
+    },
+    "Qwen3.6-27B-MTP-IQ4_XS": {
+      "vision": true
+    },
+    "Qwen3.6-35B-A3B-UD-MTP-Q6_K": {
+      "vision": true
     }
   },
-  "fork_container_path": "C:\\LAB\\ai-local",
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAAYAAAAKwAABbAAAAQoAAAAGAAAAEoAAAWwAAAEKAAAAAAAAAAADXAAAAAYAAAASgAABbAAAAQo",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAAOqAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA="
+  "window_geometry": "AdnQywADAAAAAARNAAAAHwAACeUAAAUIAAAETQAAAD4AAAnlAAAFCAAAAAAAAAAADXAAAARNAAAAPgAACeUAAAUI",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAASWAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "fork_container_path": "C:\\LAB\\ai-local"
 }
