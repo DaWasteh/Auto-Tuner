@@ -16,9 +16,6 @@ rope_scale:
   max_context: 524288   # 0.5M tokens mit YaRN möglich
   scale_factor: 4.0     # yarn scaling factor (4x für Gemma-4-E2B/E4B, 2x für 26B-A4B/31B)
 
-# Zwingend erforderlich für MTP-Support (gemma4_mtp Architektur)
-server_binary: "ik_llama/llama-server"
-
 # Performance-Target-Empfehlung des Profils.
 # Gemma-4-26B-A4B ist ein MoE-Modell (4B aktiv von 26B total), das auf
 # 16-GB-GPUs nicht voll in VRAM passt. Gleiche Logik wie bei Qwen3.6-A3B:

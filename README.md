@@ -483,7 +483,7 @@ Recommended build settings for this system:
 # - AMD Radeon RX 9070 XT 16GB
 # - G.Skill Trident Z 48GB DDR5-8400MHz (2x24GB)
 
-# Main-Fork b9174+
+# Main-Fork b9181+ (MPT now natively supportet)
 cd C:\LAB\ai-local
 git clone https://github.com/ggml-org/llama.cpp llama.cpp
 cd llama.cpp
@@ -501,33 +501,6 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
   -DLLAMA_BUILD_SERVER=ON `
   -DLLAMA_BUILD_UI=ON `
   -DLLAMA_USE_PREBUILT_UI=OFF `
-  -DLLAMA_CURL=OFF `
-  -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 24
-
-# Main-Fork b9174+ locally merged with MTP-Fork
-cd C:\LAB\ai-local
-git clone https://github.com/ggml-org/llama.cpp.git
-cd llama.cpp
-git fetch origin
-git fetch origin pull/22673/head:pr-22673
-git checkout master
-git reset --hard origin/master
-git merge --no-ff pr-22673 -m "Merge [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673): llama + spec: MTP Support"
-$repo = "C:\LAB\ai-local\llama.cpp"
-Set-Location $repo
-Push-Location .\tools\ui
-npm ci
-npm run build
-Pop-Location
-cmake -S . -B build `
-  -G "Visual Studio 18 2026" -A x64 `
-  -DGGML_VULKAN=ON `
-  -DGGML_NATIVE=ON `
-  -DBUILD_SHARED_LIBS=OFF `
-  -DLLAMA_BUILD_SERVER=ON `
-  -DLLAMA_BUILD_WEBUI=ON `
-  -DLLAMA_USE_PREBUILT_WEBUI=OFF `
   -DLLAMA_CURL=OFF `
   -DGGML_CCACHE=OFF
 cmake --build build --config Release --parallel 24
