@@ -1,6 +1,6 @@
 {
   "models_path": "C:\\LAB\\ai-local\\models",
-  "fork_path": "C:\\LAB\\ai-local\\new_llama.cpp",
+  "fork_path": "C:\\LAB\\ai-local\\llama.cpp",
   "performance_target": "throughput",
   "model_overrides": {
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": {
@@ -12,7 +12,7 @@
     },
     "gemma-4-26B-A4B-it-UD-Q8_K_XL": {
       "vision": false,
-      "draft": false
+      "draft": true
     },
     "Qwen3.6-27B-UD-Q3_K_XL": {
       "vision": true
@@ -29,7 +29,7 @@
       "thinking": true
     },
     "Qwen3.6-27B-MTP-UD-Q3_K_XL": {
-      "vision": true,
+      "vision": false,
       "draft": true
     },
     "gemma-4-31B-it-Q3_K_S": {
@@ -37,7 +37,7 @@
       "vision": true
     },
     "Qwen3.6-27B-MTP-IQ4_XS": {
-      "vision": true,
+      "vision": false,
       "draft": true
     },
     "Qwen3.6-35B-A3B-UD-MTP-Q6_K": {

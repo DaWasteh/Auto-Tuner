@@ -1456,27 +1456,38 @@ def build_command(
     vision_loaded = model.mmproj is not None
     # Path A: sibling drafter — skip when vision is active (conflict).
     use_external = enable_speculative and draft_model is not None and not vision_loaded
-    # Path B: integrated MTP — compatible with vision; no conflict.
-    use_integrated = enable_speculative and _has_integrated_mtp(model) and draft_model is None
+    # Path B: integrated MTP — NOT compatible with vision (--mmproj + --spec-type mtp
+    # is explicitly unsupported in mainline llama.cpp; the server exits immediately).
+    # Skip when vision is loaded, same as Path A.
+    use_integrated = (
+        enable_speculative
+        and _has_integrated_mtp(model)
+        and draft_model is None
+        and not vision_loaded
+    )
 
     if use_external:
         # Path A — sibling drafter file.
-        # NOTE: -md MUST come BEFORE --spec-type because llama-server
-        # parses arguments left-to-right; otherwise the server aborts
-        # with "unknown speculative decoding type without draft model".
+        # NOTE: -md MUST come BEFORE --spec-draft-n-max because llama-server
+        # parses arguments left-to-right.
+        # In mainline llama.cpp (b9180+), --draft-max was REMOVED; the correct
+        # flag is --spec-draft-n-max. --spec-type is NOT emitted here — mainline
+        # auto-detects the draft path from -md; passing --spec-type mtp alongside
+        # -md was ik_llama.cpp-specific behavior.
         assert draft_model is not None  # guaranteed by use_external condition
         cmd += ["-md", str(draft_model.path)]
-        cmd += ["--spec-type", "mtp"]
-        cmd += ["-ngld", "99"]
-        cmd += ["--draft-max", str(draft_val)]
-        cmd += ["--draft-p-min", str(draft_p_min)]
+        cmd += ["--spec-draft-ngl", "99"]
+        cmd += ["--spec-draft-n-max", str(draft_val)]
+        cmd += ["--spec-draft-p-min", str(draft_p_min)]
     elif use_integrated:
-        # Path B — embedded MTP. Die MTP-Head-Layer sind Teil des Haupt-GGUF
-        # und werden via -ngl 999 mitgeladen — kein separates --spec-draft-ngl.
+        # Path B — integrated MTP drafter inside the main GGUF.
+        # `--spec-draft-ngl 99` keeps the MTP head on GPU; without it
+        # the drafter layers fall back to CPU and the speedup vanishes.
+        # Matches the working PR #22673 benchmark configurations on both
+        # AMD ROCm and NVIDIA CUDA.
         cmd += ["--spec-type", "mtp"]
         cmd += ["--spec-draft-n-max", str(draft_val)]
-        # --spec-draft-ngl entfernt: bei embedded MTP nicht relevant,
-        # kann je nach Fork-Version zu exit code 1 führen.
+        cmd += ["--spec-draft-ngl", "99"]
 
     if config.flash_attn:
         cmd += ["-fa", "on"]
@@ -1497,33 +1508,10 @@ def build_command(
 
     if config.n_cpu_moe is not None and config.n_cpu_moe > 0:
         cmd += ["--n-cpu-moe", str(config.n_cpu_moe)]
-        # --parallel 1 — verhindert stille Kontext-Division durch Clients.
-        # Ohne dieses Flag teilt llama-server den KV-Cache durch n_parallel
-        # (Default je nach Build: 1–4), was den nutzbaren Kontext pro Request
-        # auf total_ctx / n_parallel reduziert — ohne jede Warnung im AutoTuner.
-        cmd += ["--parallel", "1"]
     if config.tensor_split:
         cmd += ["--tensor-split", config.tensor_split]
     if config.main_gpu is not None:
         cmd += ["--main-gpu", str(config.main_gpu)]
-
-    # --cache-ram 0 — explicit "no RAM-resident KV cache".
-    # We already enforce VRAM-only KV via the placement logic in
-    # compute_config (Vulkan MoE crashes with GGML_ASSERT(addr) if any
-    # of the KV spills to RAM), but the explicit flag is belt-and-
-    # suspenders: defends against future llama.cpp defaults that might
-    # allow RAM spill, and makes the policy auditable in the launch log.
-    # Only emit for placements where KV definitely lives entirely on GPU:
-    #   - MoE with `--n-cpu-moe` (KV is on GPU, only experts on CPU)
-    #   - Dense full-offload (whole model on GPU)
-    # Skipped for dense-hybrid (where KV intentionally splits with the
-    # layer split) and CPU-only (where KV must live in RAM).
-    needs_vram_only_kv = (
-        (config.n_cpu_moe is not None and config.n_cpu_moe > 0)
-        or config.full_offload
-    )
-    if needs_vram_only_kv:
-        cmd += ["--cache-ram", "0"]
 
     s = config.sampling
     cmd += [
