@@ -14,8 +14,6 @@ wheels/
 pip-wheel-metadata/
 .installed.cfg
 MANIFEST
-diag_kv_v2.py
-diag_kv.py
 
 # =============================================================================
 # Virtual environments
@@ -68,3 +66,4 @@ BitNet/
 .env.local
 *.local
 autotuner_settings.json
+llama.log

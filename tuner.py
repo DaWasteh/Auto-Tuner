@@ -1471,14 +1471,12 @@ def build_command(
         cmd += ["--draft-max", str(draft_val)]
         cmd += ["--draft-p-min", str(draft_p_min)]
     elif use_integrated:
-        # Path B — integrated MTP drafter inside the main GGUF.
-        # `--spec-draft-ngl 99` keeps the MTP head on GPU; without it
-        # the drafter layers fall back to CPU and the speedup vanishes.
-        # Matches the working PR #22673 benchmark configurations on both
-        # AMD ROCm and NVIDIA CUDA.
+        # Path B — embedded MTP. Die MTP-Head-Layer sind Teil des Haupt-GGUF
+        # und werden via -ngl 999 mitgeladen — kein separates --spec-draft-ngl.
         cmd += ["--spec-type", "mtp"]
         cmd += ["--spec-draft-n-max", str(draft_val)]
-        cmd += ["--spec-draft-ngl", "99"]
+        # --spec-draft-ngl entfernt: bei embedded MTP nicht relevant,
+        # kann je nach Fork-Version zu exit code 1 führen.
 
     if config.flash_attn:
         cmd += ["-fa", "on"]
@@ -1499,6 +1497,11 @@ def build_command(
 
     if config.n_cpu_moe is not None and config.n_cpu_moe > 0:
         cmd += ["--n-cpu-moe", str(config.n_cpu_moe)]
+        # --parallel 1 — verhindert stille Kontext-Division durch Clients.
+        # Ohne dieses Flag teilt llama-server den KV-Cache durch n_parallel
+        # (Default je nach Build: 1–4), was den nutzbaren Kontext pro Request
+        # auf total_ctx / n_parallel reduziert — ohne jede Warnung im AutoTuner.
+        cmd += ["--parallel", "1"]
     if config.tensor_split:
         cmd += ["--tensor-split", config.tensor_split]
     if config.main_gpu is not None:
