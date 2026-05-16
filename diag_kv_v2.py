@@ -43,7 +43,7 @@ def main(argv):
     print(f"━━━ {path.name} ━━━")
     print(f"  architecture: {arch}")
     print()
-    print(f"  ── ALL metadata keys matching attention/head/kv/embed/rope ──")
+    print("  ── ALL metadata keys matching attention/head/kv/embed/rope ──")
 
     # Sort so canonical keys appear first, alternates underneath.
     matches = []
