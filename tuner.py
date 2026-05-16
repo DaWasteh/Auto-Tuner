@@ -1119,18 +1119,25 @@ def compute_config(
         else:
             ctx = min(max_fit_ctx, profile_max * 3)
 
-    # Minimum context floor: 32k for comfortable system-prompt + tool use
-    # headroom (e.g. Zoo-Code lands at ~10-12k before the first user turn).
-    # Two guards prevent over-promising:
+    # Minimum context floor — AUTO MODE ONLY.
+    # When the user explicitly sets a context (user_ctx is not None) we
+    # respect that value as-is (already clamped to model limits above).
+    # The 32k floor is a quality-of-life default for the auto calculation
+    # so that system-prompts + tool scaffolding (e.g. zoo-code starts at
+    # ~10-12k) leave meaningful room for the actual conversation.
+    # Two guards prevent over-promising in auto mode:
     #   (a) model cap  — if the model's native context is below 32k, use that
-    #   (b) VRAM cap   — in auto mode, never exceed what the KV budget fits
-    _PREF_MIN_CTX = 32768
-    effective_min = _PREF_MIN_CTX
-    if model_ctx_limit > 0 and model_ctx_limit < effective_min:
-        effective_min = (model_ctx_limit // 1024) * 1024  # model too small for 32k
-    if user_ctx is None and max_fit_ctx > 0 and max_fit_ctx < effective_min:
-        effective_min = max(2048, (max_fit_ctx // 1024) * 1024)  # VRAM too tight
-    ctx = max(effective_min, (ctx // 1024) * 1024)
+    #   (b) VRAM cap   — never exceed what the KV budget can actually fit
+    if user_ctx is None:
+        _PREF_MIN_CTX = 32768
+        effective_min = _PREF_MIN_CTX
+        if model_ctx_limit > 0 and model_ctx_limit < effective_min:
+            effective_min = (model_ctx_limit // 1024) * 1024  # model too small for 32k
+        if max_fit_ctx > 0 and max_fit_ctx < effective_min:
+            effective_min = max(2048, (max_fit_ctx // 1024) * 1024)  # budget too tight
+        ctx = max(effective_min, (ctx // 1024) * 1024)
+    else:
+        ctx = max(2048, (ctx // 1024) * 1024)  # absolute safety floor only
     estimated_kv_gb = (ctx * actual_per_tok_mb) / 1024
 
     # ---- (3b) VRAM Overcommit Warning
