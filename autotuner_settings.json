@@ -1,6 +1,6 @@
 {
   "models_path": "C:\\LAB\\ai-local\\models",
-  "fork_path": "C:\\LAB\\ai-local\\llama.cpp",
+  "fork_path": "C:\\LAB\\ai-local\\llama.cpp-b9174-bin-win-vulkan-x64",
   "performance_target": "throughput",
   "model_overrides": {
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": {
@@ -39,11 +39,11 @@
       "vision": true
     },
     "Qwen3.6-35B-A3B-UD-MTP-Q6_K": {
-      "vision": true
+      "vision": false
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAARNAAAAHwAACeUAAAUIAAAETQAAAD4AAAnlAAAFCAAAAAAAAAAADXAAAARNAAAAPgAACeUAAAUI",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAASWAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAAAAAFFAAAAOQAABt0AAAUtAAABRQAAAFgAAAbdAAAFLQAAAAAAAAAADXAAAAFFAAAAWAAABt0AAAUt",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABZkAAAShAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "C:\\LAB\\ai-local"
 }

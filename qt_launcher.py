@@ -1474,7 +1474,23 @@ class MainWindow(QMainWindow):
         immediate child whose name contains "llama.cpp" and which has
         a built llama-server binary. Empty list when `path` is not a
         container (e.g. it IS a single build folder).
+
+        The subpath list is intentionally kept in sync with
+        ``auto_tuner._SERVER_SUBPATHS`` — both cmake build layouts
+        (``build/bin/[Release/]llama-server[.exe]``) and prebuilt
+        binary drops (``llama-server[.exe]`` at the folder root) are
+        recognised.
         """
+        # Mirrors auto_tuner._SERVER_SUBPATHS — update both if paths change.
+        _BINARY_SUBPATHS = (
+            "build/bin/Release/llama-server.exe",
+            "build/bin/Debug/llama-server.exe",
+            "build/bin/llama-server.exe",
+            "build/bin/llama-server",
+            "build/llama-server",
+            "llama-server.exe",   # prebuilt / release-zip drops
+            "llama-server",
+        )
         result: List[Tuple[str, Path]] = []
         try:
             for child in sorted(path.iterdir(), key=lambda c: c.name.lower()):
@@ -1483,13 +1499,7 @@ class MainWindow(QMainWindow):
                 if not re.search(r"llama\.cpp", child.name, re.IGNORECASE):
                     continue
                 has_binary = any(
-                    (child / sub).is_file()
-                    for sub in (
-                        "build/bin/Release/llama-server.exe",
-                        "build/bin/Debug/llama-server.exe",
-                        "build/bin/llama-server.exe",
-                        "build/bin/llama-server",
-                    )
+                    (child / sub).is_file() for sub in _BINARY_SUBPATHS
                 )
                 if has_binary:
                     result.append((child.name, child))
@@ -2812,3 +2822,4 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+    
