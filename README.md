@@ -484,18 +484,23 @@ Recommended build settings for this system:
 # - AMD Radeon RX 9070 XT 16GB
 # - G.Skill Trident Z 48GB DDR5-8400MHz (2x24GB)
 
-# Main-Fork b9190+ (MTP für integrierte Drafter nativ unterstützt)
+# Main-Fork b9194+ (SPIRV-Headers now required)
 cd C:\LAB\ai-local
-git clone https://github.com/ggml-org/llama.cpp llama.cpp
-cd llama.cpp
-$repo = "C:\LAB\ai-local\llama.cpp"
-Set-Location $repo
-git clean -fdx
-Push-Location .\tools\ui
+git clone https://github.com/KhronosGroup/SPIRV-Headers.git
+cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
+  -G "Visual Studio 18 2026" `
+  -A x64 `
+  -DCMAKE_INSTALL_PREFIX="C:/LAB/ai-local/SPIRV-Headers/install"
+cmake --build .\SPIRV-Headers\build --config Release
+cmake --install .\SPIRV-Headers\build --config Release
+git clone https://github.com/ggml-org/llama.cpp.git
+Push-Location .\llama.cpp\tools\ui
 npm ci
 npm run build
 Pop-Location
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+cmake -S .\llama.cpp -B .\llama.cpp\build `
+  -G "Visual Studio 18 2026" `
+  -A x64 `
   -DGGML_VULKAN=ON `
   -DGGML_NATIVE=ON `
   -DBUILD_SHARED_LIBS=OFF `
@@ -503,8 +508,9 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
   -DLLAMA_BUILD_UI=ON `
   -DLLAMA_USE_PREBUILT_UI=OFF `
   -DLLAMA_CURL=OFF `
-  -DGGML_CCACHE=OFF
-cmake --build build --config Release --parallel 24
+  -DGGML_CCACHE=OFF `
+  -DCMAKE_PREFIX_PATH="C:/LAB/ai-local/SPIRV-Headers/install"
+cmake --build .\llama.cpp\build --config Release --parallel 24
 ```
 
 ## Server-Features (Stand b9190)
