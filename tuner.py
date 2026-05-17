@@ -1012,7 +1012,11 @@ def compute_config(
     rope_scaled_ctx = 0
     rope_scaling_active = False
 
-    if (model.supports_rope_scale or profile_rope_scale) and native_ctx > 0 and native_ctx < profile_rope_max:
+    if (
+        (model.supports_rope_scale or profile_rope_scale)
+        and native_ctx > 0
+        and native_ctx < profile_rope_max
+    ):
         # KV-Speicherbedarf pro Token (q5_0 als Entscheidungsgrundlage)
         kv_per_tok_q5 = base_kv_mb * kv_quant_factor("q5_0")
 
@@ -1404,9 +1408,9 @@ def build_command(
     Speculative decoding paths
     --------------------------
     * ``draft_model`` is set → sibling-drafter path. Adds ``-md`` plus
-      ``--spec-type mtp`` and ``--draft-max``.
+      ``--spec-draft-n-max`` (no ``--spec-type``; mainline auto-detects from ``-md``).
     * ``draft_model`` is None and the main filename contains ``MTP`` →
-      integrated-drafter path. Adds ``--spec-type mtp`` and
+      integrated-drafter path. Adds ``--spec-type draft-mtp`` and
       ``--spec-draft-n-max`` only (the drafter rides inside the GGUF).
     * ``enable_speculative=False`` overrides both paths and emits no
       speculative flags at all — for the case where the user explicitly
@@ -1456,7 +1460,7 @@ def build_command(
     vision_loaded = model.mmproj is not None
     # Path A: sibling drafter — skip when vision is active (conflict).
     use_external = enable_speculative and draft_model is not None and not vision_loaded
-    # Path B: integrated MTP — NOT compatible with vision (--mmproj + --spec-type mtp
+    # Path B: integrated MTP — NOT compatible with vision (--mmproj + --spec-type draft-mtp
     # is explicitly unsupported in mainline llama.cpp; the server exits immediately).
     # Skip when vision is loaded, same as Path A.
     use_integrated = (
@@ -1483,9 +1487,9 @@ def build_command(
         # Path B — integrated MTP drafter inside the main GGUF.
         # `--spec-draft-ngl 99` keeps the MTP head on GPU; without it
         # the drafter layers fall back to CPU and the speedup vanishes.
-        # Matches the working PR #22673 benchmark configurations on both
-        # AMD ROCm and NVIDIA CUDA.
-        cmd += ["--spec-type", "mtp"]
+        # In mainline b9190+ the flag value was renamed from "mtp" to
+        # "draft-mtp" (see tools/server/README.md --spec-type enum).
+        cmd += ["--spec-type", "draft-mtp"]
         cmd += ["--spec-draft-n-max", str(draft_val)]
         cmd += ["--spec-draft-ngl", "99"]
 

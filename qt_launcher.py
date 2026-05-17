@@ -309,10 +309,16 @@ class ExpertPanel(QWidget):
     # The combo accepts both either way — a fork that doesn't understand
     # turbo3 will refuse to start and surface a clear error.
     _KV_QUANT_OPTIONS = [
-        "q4_0", "q4_1", "iq4_nl",
-        "q5_0", "q5_1",
-        "q8_0", "f16",
-        "turbo4", "turbo3", "turbo2",
+        "q4_0",
+        "q4_1",
+        "iq4_nl",
+        "q5_0",
+        "q5_1",
+        "q8_0",
+        "f16",
+        "turbo4",
+        "turbo3",
+        "turbo2",
     ]
     _NUMA_OPTIONS = ["off", "distribute", "isolate", "numactl"]
 
@@ -811,19 +817,20 @@ class ExpertPanel(QWidget):
                 payload = extras[i + 1]
                 # Quick-and-dirty extraction without a full JSON parse:
                 # the canonical form is '{"reasoning_effort":"<value>"}'.
-                m = re.search(
-                    r'"reasoning_effort"\s*:\s*"([^"]+)"', payload
-                )
+                m = re.search(r'"reasoning_effort"\s*:\s*"([^"]+)"', payload)
                 if m:
                     candidate = m.group(1).strip().lower()
                     valid = {
-                        "off", "none", "minimal", "low",
-                        "medium", "high", "extra_high",
+                        "off",
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "extra_high",
                     }
                     if candidate in valid:
-                        reasoning = (
-                            "off" if candidate == "none" else candidate
-                        )
+                        reasoning = "off" if candidate == "none" else candidate
                     i += 2
                     continue
                 # Not a reasoning kwarg — keep the original flag pair.
@@ -1411,9 +1418,7 @@ class MainWindow(QMainWindow):
                 base64.b64encode(geom_bytes).decode("ascii")
             )
             state_bytes = self.saveState().data() or b""
-            app_settings.set_window_state(
-                base64.b64encode(state_bytes).decode("ascii")
-            )
+            app_settings.set_window_state(base64.b64encode(state_bytes).decode("ascii"))
         except Exception as exc:  # pragma: no cover - defensive
             self._log(f"[Warning] Could not save window layout: {exc}")
 
@@ -1488,7 +1493,7 @@ class MainWindow(QMainWindow):
             "build/bin/llama-server.exe",
             "build/bin/llama-server",
             "build/llama-server",
-            "llama-server.exe",   # prebuilt / release-zip drops
+            "llama-server.exe",  # prebuilt / release-zip drops
             "llama-server",
         )
         result: List[Tuple[str, Path]] = []
@@ -1497,12 +1502,12 @@ class MainWindow(QMainWindow):
                 if not child.is_dir():
                     continue
                 if not re.search(
-                    r"(?:(?:^|[-_.])llama(?:[-_.]|$)|llama\.cpp)", child.name, re.IGNORECASE
+                    r"(?:(?:^|[-_.])llama(?:[-_.]|$)|llama\.cpp)",
+                    child.name,
+                    re.IGNORECASE,
                 ):
                     continue
-                has_binary = any(
-                    (child / sub).is_file() for sub in _BINARY_SUBPATHS
-                )
+                has_binary = any((child / sub).is_file() for sub in _BINARY_SUBPATHS)
                 if has_binary:
                     result.append((child.name, child))
         except (OSError, PermissionError):
@@ -2085,9 +2090,7 @@ class MainWindow(QMainWindow):
         self._chk_draft.setEnabled(has_draft)
         self._chk_draft.setChecked(has_draft and draft_state)
         if draft is not None:
-            self._chk_draft.setText(
-                f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)"
-            )
+            self._chk_draft.setText(f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)")
         elif is_embedded_mtp:
             self._chk_draft.setText("Draft   MTP (embedded in GGUF)")
         else:
@@ -2539,9 +2542,7 @@ class MainWindow(QMainWindow):
         # Also mirror a short notice into the main log so the user has
         # a record that they consulted the diagnostic (helpful when
         # debugging support tickets later).
-        self._log(
-            f"[Diagnose] Inspected metadata for {self._current_entry.name}"
-        )
+        self._log(f"[Diagnose] Inspected metadata for {self._current_entry.name}")
 
     # ------------------------------------------------------------------
     # System info — non-blocking (daemon thread → signal/slot)
@@ -2619,6 +2620,8 @@ class MainWindow(QMainWindow):
     def _resolve_binary(
         self, profile: ModelProfile, use_draft: bool, model_name: str
     ) -> str:
+        # ik_llama.cpp is only required for Gemma 4 with an *external* sibling drafter.
+        # Integrated MTP (Qwen3.6-MTP) uses --spec-type draft-mtp and works in mainline b9190+.
         try:
             _, resolve = _get_fork_tools()
         except Exception:
@@ -2855,4 +2858,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-    

@@ -7,7 +7,7 @@ the RAM/VRAM you actually have free — without manual edits.
 
 # GUI-Design
 
-![v0.8_GUI](image.png)
+![GUI](image.png)
 
 # Terminal-Design
 ```
@@ -341,7 +341,7 @@ C:\LAB\
 └── ai-local\
     ├── llama.cpp\      ← standard build
     ├── tq_llama.cpp\   ← Turbo-Quant build
-    ├── ik_llama.cpp\   ← Gemma 4 (MTP) build
+    ├── ik_llama.cpp\   ← Gemma 4 externer Drafter (Fork noch nötig)
     ├── 1b_llama.cpp\   ← BitNet fork (Ternary-Bonsai)
     └── models\         ← your models
 ```
@@ -381,8 +381,9 @@ Die KV-Dropdowns in der GUI zeigen die volle Auswahl: `iq4_nl`,
 #### Specialized Binary Logic
 
 The tuner intelligently selects the best binary based on your model and settings:
-- **Gemma 4 (with Draft)** $\rightarrow$ uses `ik_llama.cpp` (MTP support).
-- **Gemma 4 (without Draft)** $\rightarrow$ uses standard `llama.cpp`.
+- **Gemma 4 (with external draft)** $\rightarrow$ uses `ik_llama.cpp` (external sibling drafter still requires the fork).
+- **Gemma 4 (without draft)** $\rightarrow$ uses standard `llama.cpp`.
+- **Integriertes MTP (z.B. Qwen3.6-27B-MTP)** $\rightarrow$ uses standard `llama.cpp` (b9190+ nativ; kein Fork nötig).
 - **Ternary-Bonsai** $\rightarrow$ uses `1b_llama.cpp`.
 - **Turbo-Quant Mode** $\rightarrow$ uses `tq_llama.cpp`.
 
@@ -483,7 +484,7 @@ Recommended build settings for this system:
 # - AMD Radeon RX 9070 XT 16GB
 # - G.Skill Trident Z 48GB DDR5-8400MHz (2x24GB)
 
-# Main-Fork b9181+ (MPT now natively supportet)
+# Main-Fork b9190+ (MTP für integrierte Drafter nativ unterstützt)
 cd C:\LAB\ai-local
 git clone https://github.com/ggml-org/llama.cpp llama.cpp
 cd llama.cpp
@@ -506,9 +507,9 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
 cmake --build build --config Release --parallel 24
 ```
 
-## Server-Features (Stand b9118)
+## Server-Features (Stand b9190)
 
-Die folgenden `llama-server` Features werden aus der b9118-Aera
+Die folgenden `llama-server` Features werden aus der b9190-Ära
 unterstützt (aus `tools/server/README.md`):
 
 | Flag | Unterstützung |
@@ -520,6 +521,7 @@ unterstützt (aus `tools/server/README.md`):
 | `--chat-template-kwargs ...` | ✅ Dropdown produziert das automatisch |
 | `--jinja` | ✅ Wird sichtbar angehakt |
 | `--mlock` / `--no-mmap` | ✅ Windows-Guard; manuell überschreibbar |
+| `--spec-type draft-mtp` | ✅ Integriertes MTP (Qwen3.6-MTP u.a.) — Wert seit b9190 `draft-mtp` statt `mtp` |
 | `--n-cpu-moe` / `--override-tensor` | ✅ Bereits vorhanden |
 | `--rope-scaling yarn` | ✅ Bereits vorhanden |
 | `--numa` | ✅ Bereits vorhanden |

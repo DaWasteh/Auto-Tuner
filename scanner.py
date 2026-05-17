@@ -506,7 +506,7 @@ class ModelEntry:
 
         MTP (Multi-Token Prediction) variants bundle the speculative-decoding
         drafter as extra tensors inside the main GGUF — no sibling assistant
-        file needed. Speculative decoding uses ``--spec-type mtp`` flags rather
+        file needed. Speculative decoding uses ``--spec-type draft-mtp`` flags rather
         than ``-md``. Detection is filename-only because metadata key naming
         differs across forks.
 

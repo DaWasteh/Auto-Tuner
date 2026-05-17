@@ -1020,11 +1020,14 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             """Choose the llama-server binary for this model.
 
             Priority:
-              1. Gemma 4 WITH draft  → ik_llama.cpp (MTP support required)
+              1. Gemma 4 WITH external draft  → ik_llama.cpp (external drafter
+                 still requires the fork; integrated MTP now works in mainline b9190+)
               2. server_binary from YAML profile
               3. Fallback: whatever the user selected / args.server
             """
-            # Gemma 4 needs ik_llama.cpp only when speculative decoding is active
+            # Gemma 4 needs ik_llama.cpp only when an external sibling drafter is active.
+            # Integrated MTP (Qwen3.6-MTP filenames) uses --spec-type draft-mtp and
+            # works in mainline llama.cpp b9190+ without any special fork.
             if "gemma-4" in model_name.lower() or "gemma4" in model_name.lower():
                 if use_draft_flag:
                     return (
@@ -1130,4 +1133,3 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
 if __name__ == "__main__":
     sys.exit(main())
-    
