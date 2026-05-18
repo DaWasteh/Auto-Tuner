@@ -493,8 +493,6 @@ cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
   -DCMAKE_INSTALL_PREFIX="C:/LAB/ai-local/SPIRV-Headers/install"
 cmake --build .\SPIRV-Headers\build --config Release
 cmake --install .\SPIRV-Headers\build --config Release
-
-cd C:\LAB\ai-local
 git clone https://github.com/ggml-org/llama.cpp.git
 Push-Location .\llama.cpp\tools\ui
 npm ci
@@ -511,6 +509,7 @@ cmake -S .\llama.cpp -B .\llama.cpp\build `
   -DLLAMA_USE_PREBUILT_UI=OFF `
   -DLLAMA_CURL=OFF `
   -DGGML_CCACHE=OFF `
+  -DGGML_VULKAN_CHECK_RESULTS=OFF `
   -DCMAKE_PREFIX_PATH="C:/LAB/ai-local/SPIRV-Headers/install"
 cmake --build .\llama.cpp\build --config Release --parallel 24
 ```

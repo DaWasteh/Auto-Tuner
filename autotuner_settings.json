@@ -11,8 +11,8 @@
       "vision": false
     },
     "gemma-4-26B-A4B-it-UD-Q8_K_XL": {
-      "vision": false,
-      "draft": true
+      "vision": true,
+      "draft": false
     },
     "Qwen3.6-27B-UD-Q3_K_XL": {
       "vision": false
@@ -25,7 +25,7 @@
       "vision": true
     },
     "Qwen3.6-35B-A3B-UD-Q6_K": {
-      "vision": true,
+      "vision": false,
       "thinking": true
     },
     "Qwen3.6-27B-MTP-UD-Q3_K_XL": {
@@ -41,12 +41,12 @@
       "draft": true
     },
     "Qwen3.6-35B-A3B-UD-MTP-Q6_K": {
-      "vision": true,
+      "vision": false,
       "draft": true
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAQaAAAAhAAACKEAAARQAAAEGgAAAKMAAAihAAAEUAAAAAAAAAAADXAAAAQaAAAAowAACKEAAARQ",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABIgAAAN5AAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAAAAAPFAAAA2QAACMoAAASfAAADxQAAAPgAAAjKAAAEnwAAAAAAAAAADXAAAAPFAAAA+AAACMoAAASf",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABQYAAANzAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "C:\\LAB\\ai-local"
 }
