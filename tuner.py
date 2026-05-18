@@ -1260,17 +1260,42 @@ def compute_config(
             )
     no_mmap = mlock
 
-    # ---- (4d) Multi-GPU tensor split. Skipped for MoE.
+    # ---- (4d) Multi-GPU placement. Skipped for MoE (handled via n_cpu_moe).
+    #
+    # Strategy: if the model + KV + safety fits on the largest GPU alone,
+    # pin everything there and zero out the other GPU(s). This preserves a
+    # secondary card (e.g. for OBS / desktop / monitors) when its VRAM is
+    # not needed for inference. Only spread tensors across all GPUs when
+    # the largest one alone is too small.
     tensor_split: Optional[str] = None
     main_gpu: Optional[int] = None
     if has_gpu and len(system.gpus) > 1 and n_cpu_moe is None:
-        sizes = [g.total_vram_mb for g in system.gpus]
-        total = sum(sizes)
-        if total > 0:
-            tensor_split = ",".join(f"{s / total:.3f}" for s in sizes)
-            main_gpu = max(
-                range(len(system.gpus)), key=lambda i: system.gpus[i].total_vram_mb
+        sizes_mb = [g.total_vram_mb for g in system.gpus]
+        free_mb_per_gpu = [g.free_vram_mb for g in system.gpus]
+        total_mb = sum(sizes_mb)
+        if total_mb > 0:
+            largest_idx = max(range(len(sizes_mb)), key=lambda i: sizes_mb[i])
+            largest_free_gb = free_mb_per_gpu[largest_idx] / 1024.0
+
+            # Everything that has to live in VRAM on the main card for full offload:
+            needed_gb = (
+                model_vram
+                + estimated_kv_gb
+                + vision_vram_gb
+                + draft_vram_gb
+                + effective_vram_safety
             )
+
+            if full_off and needed_gb <= largest_free_gb:
+                # Fits on the biggest card alone — pin it, free the others.
+                parts = ["0.000"] * len(sizes_mb)
+                parts[largest_idx] = "1.000"
+                tensor_split = ",".join(parts)
+                main_gpu = largest_idx
+            else:
+                # Doesn't fit alone — spread proportionally to total VRAM.
+                tensor_split = ",".join(f"{s / total_mb:.3f}" for s in sizes_mb)
+                main_gpu = largest_idx
 
     # ---- (4d) NUMA — immer aktivieren bei genügend Kernen für bessere Performance
     numa = None

@@ -2606,7 +2606,20 @@ class MainWindow(QMainWindow):
             for g in s.gpus:
                 util = f"{g.gpu_util_percent:.0f}%" if g.gpu_util_percent > 0 else "—"
                 gpu_parts.append(f"{g.name} ({util})")
-            self._gpu_lbl.setText("GPU: " + ", ".join(gpu_parts))
+            txt = "GPU: " + ", ".join(gpu_parts)
+            # Ignorierte GPUs (iGPU etc.) auch zeigen — Transparenz darüber, was
+            # erkannt aber bewusst nicht für Inference verwendet wird.
+            if s.ignored_gpus:
+                ign_parts = []
+                for g in s.ignored_gpus:
+                    size = (
+                        f"{g.total_vram_gb:.1f} GB"
+                        if g.total_vram_mb > 0
+                        else "VRAM unknown"
+                    )
+                    ign_parts.append(f"{g.name} ({size}, ignored)")
+                txt += "  ·  " + ", ".join(ign_parts)
+            self._gpu_lbl.setText(txt)
         else:
             self._gpu_lbl.setText("GPU: keine")
 

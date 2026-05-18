@@ -41,12 +41,12 @@
       "draft": true
     },
     "Qwen3.6-35B-A3B-UD-MTP-Q6_K": {
-      "vision": false,
+      "vision": true,
       "draft": true
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAPFAAAA2QAACMoAAASfAAADxQAAAPgAAAjKAAAEnwAAAAAAAAAADXAAAAPFAAAA+AAACMoAAASf",
+  "window_geometry": "AdnQywADAAAAAALBAAAA6wAAB8YAAASxAAACwQAAAQoAAAfGAAAEsQAAAAAAAAAADXAAAALBAAABCgAAB8YAAASx",
   "window_state": "AAAA/wAAAAD9AAAAAAAABQYAAANzAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "C:\\LAB\\ai-local"
 }

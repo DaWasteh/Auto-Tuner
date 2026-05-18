@@ -377,6 +377,132 @@ def test_vendor_inference():
     assert _vendor_from_name("some-mystery-card") == "unknown"
 
 
+def test_filter_3gpu_workstation_setup():
+    """Basti's workstation: 9700 Pro 32GB + 9070 XT 16GB + Intel iGPU.
+
+    Both Radeons must be kept (16 is exactly half of 32 → still a peer
+    under the >= half-of-largest rule); the iGPU must be ignored; the
+    9700 Pro must end up as the first entry (largest), so main_gpu
+    selection later picks it.
+    """
+    from hardware import _filter_inference_gpus
+
+    gpus = [
+        GPUInfo(
+            index=0,
+            name="Intel(R) Graphics",
+            vendor="intel",
+            total_vram_mb=2048,
+            free_vram_mb=1900,
+        ),
+        GPUInfo(
+            index=1,
+            name="AMD Radeon RX 9070 XT",
+            vendor="amd",
+            total_vram_mb=16 * 1024,
+            free_vram_mb=14 * 1024,
+        ),
+        GPUInfo(
+            index=2,
+            name="AMD Radeon AI PRO R9700",
+            vendor="amd",
+            total_vram_mb=32 * 1024,
+            free_vram_mb=31 * 1024,
+        ),
+    ]
+    used, ignored = _filter_inference_gpus(gpus)
+    assert len(used) == 2
+    assert used[0].total_vram_mb == 32 * 1024  # 9700 Pro first (largest)
+    assert used[1].total_vram_mb == 16 * 1024  # 9070 XT kept as peer
+    assert len(ignored) == 1
+    assert ignored[0].vendor == "intel"
+
+
+def test_vendor_inference_r9700_workstation_card():
+    """The new Radeon AI PRO R9700 must register as AMD (was untested)."""
+    from hardware import _vendor_from_name
+
+    assert _vendor_from_name("AMD Radeon AI PRO R9700") == "amd"
+    assert _vendor_from_name("Radeon AI PRO R9700 AI TOP") == "amd"
+
+
+def _fake_dual_gpu_system(
+    large_total: float = 32,
+    large_free: float = 31,
+    small_total: float = 16,
+    small_free: float = 14,
+    ram_total: float = 96,
+    ram_free: float = 80,
+) -> SystemInfo:
+    """Synthetic two-GPU SystemInfo (large + small) for placement tests."""
+    return SystemInfo(
+        os_name="Linux test",
+        cpu_name="Test CPU",
+        cpu_cores_physical=24,
+        cpu_cores_logical=24,
+        total_ram_gb=ram_total,
+        free_ram_gb=ram_free,
+        gpus=[
+            GPUInfo(
+                index=0,
+                name="AMD Radeon AI PRO R9700",
+                vendor="amd",
+                total_vram_mb=int(large_total * 1024),
+                free_vram_mb=int(large_free * 1024),
+            ),
+            GPUInfo(
+                index=1,
+                name="AMD Radeon RX 9070 XT",
+                vendor="amd",
+                total_vram_mb=int(small_total * 1024),
+                free_vram_mb=int(small_free * 1024),
+            ),
+        ],
+    )
+
+
+def test_multi_gpu_pins_to_largest_when_model_fits(tmp_path):
+    """Smart placement: a model that fits on the 9700 Pro (32 GB) alone
+    must NOT be tensor-split across the 9070 XT. Tensor-split should be
+    "1.000,0.000" so the 9070 XT stays free for OBS/desktop work."""
+    profiles = load_profiles(SETTINGS_DIR)
+    # 9B model, easily fits on a 32GB GPU even with full KV cache.
+    model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_dual_gpu_system(), profile)
+
+    assert cfg.tensor_split is not None, "Expected tensor_split to be set"
+    assert cfg.main_gpu == 0, f"Expected main_gpu=0 (largest), got {cfg.main_gpu}"
+
+    parts = [float(x) for x in cfg.tensor_split.split(",")]
+    assert len(parts) == 2
+    assert parts[0] > 0.99, f"Expected ~1.0 on GPU 0, got {parts[0]}"
+    assert parts[1] < 0.01, f"Expected ~0.0 on GPU 1, got {parts[1]}"
+
+
+def test_multi_gpu_spreads_when_model_too_large_for_single_gpu(tmp_path):
+    """Smart placement: a model too big for the 9700 Pro alone (with KV +
+    safety) must spread across both GPUs proportionally to total VRAM."""
+    profiles = load_profiles(SETTINGS_DIR)
+    # 40 GB model — well over the 32 GB single-GPU budget once KV/safety
+    # are added; must use both GPUs.
+    model = _fake_model(tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS", size_gb=40.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_dual_gpu_system(), profile)
+
+    assert cfg.tensor_split is not None
+    assert cfg.main_gpu == 0  # still the largest
+
+    parts = [float(x) for x in cfg.tensor_split.split(",")]
+    assert len(parts) == 2
+    # Proportional split: 32/48 ≈ 0.667 and 16/48 ≈ 0.333. Either both
+    # are non-trivial (true spread), OR the model didn't fit at all and
+    # we offloaded to RAM — but in that case the split is still set,
+    # so we only assert it's not the pinned form.
+    pinned = parts[0] > 0.99 and parts[1] < 0.01
+    assert not pinned, f"Expected proportional split, got pinned: {cfg.tensor_split}"
+
+
 # ---------------------------------------------------------------------------
 # llama-server resolver
 
