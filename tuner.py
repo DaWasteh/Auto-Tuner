@@ -1277,10 +1277,14 @@ def compute_config(
             largest_idx = max(range(len(sizes_mb)), key=lambda i: sizes_mb[i])
             largest_free_gb = free_mb_per_gpu[largest_idx] / 1024.0
 
-            # Everything that has to live in VRAM on the main card for full offload:
+            # Ask: do the MODEL WEIGHTS (plus mmproj / draft overhead + safety)
+            # fit on the largest GPU alone?  KV cache is NOT included here
+            # because llama.cpp allocates it dynamically from whatever VRAM
+            # remains after loading the weights — adding the full KV estimate
+            # (sized for the combined-VRAM ctx budget) would incorrectly force
+            # a tensor-split even when the model trivially fits on one card.
             needed_gb = (
                 model_vram
-                + estimated_kv_gb
                 + vision_vram_gb
                 + draft_vram_gb
                 + effective_vram_safety
