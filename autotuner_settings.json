@@ -45,11 +45,11 @@
       "draft": true
     },
     "Qwen3.5-122B-A10B-UD-Q3_K_XL": {
-      "vision": false
+      "vision": true
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAANjAAAAhwAACGgAAASUAAADYwAAAKYAAAhoAAAElAAAAAAAAAAADXAAAANjAAAApgAACGgAAASU",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABQYAAAO6AAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAAAAANVAAAAQAAACFoAAAT5AAADVQAAAF8AAAhaAAAE+QAAAAAAAAAADXAAAANVAAAAXwAACFoAAAT5",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABQYAAARmAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "C:\\LAB\\ai-local"
 }

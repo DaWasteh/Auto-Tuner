@@ -1282,12 +1282,14 @@ class MainWindow(QMainWindow):
         # because the mapping is identity for unknown labels).
         self._chk_turbo_kv = QCheckBox("Turbo KV-quant (TurboQuant forks)")
         self._chk_thinking = QCheckBox("Thinking / Reasoning")
+        self._chk_ngram = QCheckBox("Ngram speculative decoding")
 
         for chk in (
             self._chk_vision,
             self._chk_draft,
             self._chk_turbo_kv,
             self._chk_thinking,
+            self._chk_ngram,
         ):
             chk.setEnabled(False)
             ol.addWidget(chk)
@@ -1299,6 +1301,7 @@ class MainWindow(QMainWindow):
         self._chk_draft.toggled.connect(self._on_draft_toggled)
         self._chk_turbo_kv.toggled.connect(self._on_turbo_toggled)
         self._chk_thinking.toggled.connect(self._on_thinking_toggled)
+        self._chk_ngram.toggled.connect(self._on_ngram_toggled)
 
         opts.setMaximumHeight(140)
 
@@ -2121,6 +2124,17 @@ class MainWindow(QMainWindow):
         # Don't touch the checked state on model switch — Turbo is a
         # session-global preference.
 
+        # ── Ngram speculative decoding ──────────────────────────────
+        # Always available — zero VRAM cost, works with any model.
+        # Particularly effective in coding mode (repeated identifiers,
+        # boilerplate). Combines with MTP as ngram-mod,draft-mtp.
+        # State persisted per-model in model_overrides.
+        self._chk_ngram.setEnabled(True)
+        ngram_state = ov.get("ngram", False)
+        self._chk_ngram.blockSignals(True)
+        self._chk_ngram.setChecked(ngram_state)
+        self._chk_ngram.blockSignals(False)
+
     def _auto_select_fork(self, profile: ModelProfile) -> None:
         """Auto-select fork from combo based on profile requirement.
 
@@ -2224,6 +2238,10 @@ class MainWindow(QMainWindow):
 
     def _on_thinking_toggled(self, checked: bool) -> None:
         self._record_override("thinking", checked)
+        self._refresh_config_preview()
+
+    def _on_ngram_toggled(self, checked: bool) -> None:
+        self._record_override("ngram", checked)
         self._refresh_config_preview()
 
     def _refresh_config_preview(self) -> None:
@@ -2679,6 +2697,7 @@ class MainWindow(QMainWindow):
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
         use_thinking = self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
         turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
+        use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
 
         # Build a copy of entry so we can control mmproj inclusion
         entry = copy.copy(self._current_entry)
@@ -2729,13 +2748,14 @@ class MainWindow(QMainWindow):
             port=port,
             extra_args=["-a", alias],
             use_thinking=use_thinking,
+            use_ngram=use_ngram,
         )
 
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
         self._log(
             f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking} "
-            f"mode={self._current_mode()}"
+            f"ngram={use_ngram} mode={self._current_mode()}"
         )
 
         self._server = _TerminalProcess(cmd)
