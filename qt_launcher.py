@@ -111,16 +111,20 @@ class _TerminalProcess:
     full server output in the separate window; our log panel shows status only.
     """
 
-    def __init__(self, cmd: List[str]) -> None:
+    def __init__(self, cmd: List[str], env_overrides: Optional[dict] = None) -> None:
         self.cmd = cmd
+        self.env_overrides: dict = env_overrides or {}
         self.proc: Optional[subprocess.Popen] = None
 
     def start(self) -> None:
+        env = os.environ.copy()
+        if self.env_overrides:
+            env.update(self.env_overrides)
         if os.name == "nt":
             flags = subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
-            self.proc = subprocess.Popen(self.cmd, creationflags=flags)
+            self.proc = subprocess.Popen(self.cmd, creationflags=flags, env=env)
         else:
-            self.proc = subprocess.Popen(self.cmd, start_new_session=True)
+            self.proc = subprocess.Popen(self.cmd, start_new_session=True, env=env)
 
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -1282,14 +1286,12 @@ class MainWindow(QMainWindow):
         # because the mapping is identity for unknown labels).
         self._chk_turbo_kv = QCheckBox("Turbo KV-quant (TurboQuant forks)")
         self._chk_thinking = QCheckBox("Thinking / Reasoning")
-        self._chk_ngram = QCheckBox("Ngram speculative decoding")
 
         for chk in (
             self._chk_vision,
             self._chk_draft,
             self._chk_turbo_kv,
             self._chk_thinking,
-            self._chk_ngram,
         ):
             chk.setEnabled(False)
             ol.addWidget(chk)
@@ -1301,7 +1303,6 @@ class MainWindow(QMainWindow):
         self._chk_draft.toggled.connect(self._on_draft_toggled)
         self._chk_turbo_kv.toggled.connect(self._on_turbo_toggled)
         self._chk_thinking.toggled.connect(self._on_thinking_toggled)
-        self._chk_ngram.toggled.connect(self._on_ngram_toggled)
 
         opts.setMaximumHeight(140)
 
@@ -2124,17 +2125,6 @@ class MainWindow(QMainWindow):
         # Don't touch the checked state on model switch — Turbo is a
         # session-global preference.
 
-        # ── Ngram speculative decoding ──────────────────────────────
-        # Always available — zero VRAM cost, works with any model.
-        # Particularly effective in coding mode (repeated identifiers,
-        # boilerplate). Combines with MTP as ngram-mod,draft-mtp.
-        # State persisted per-model in model_overrides.
-        self._chk_ngram.setEnabled(True)
-        ngram_state = ov.get("ngram", False)
-        self._chk_ngram.blockSignals(True)
-        self._chk_ngram.setChecked(ngram_state)
-        self._chk_ngram.blockSignals(False)
-
     def _auto_select_fork(self, profile: ModelProfile) -> None:
         """Auto-select fork from combo based on profile requirement.
 
@@ -2238,10 +2228,6 @@ class MainWindow(QMainWindow):
 
     def _on_thinking_toggled(self, checked: bool) -> None:
         self._record_override("thinking", checked)
-        self._refresh_config_preview()
-
-    def _on_ngram_toggled(self, checked: bool) -> None:
-        self._record_override("ngram", checked)
         self._refresh_config_preview()
 
     def _refresh_config_preview(self) -> None:
@@ -2697,7 +2683,6 @@ class MainWindow(QMainWindow):
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
         use_thinking = self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
         turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
-        use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
 
         # Build a copy of entry so we can control mmproj inclusion
         entry = copy.copy(self._current_entry)
@@ -2748,17 +2733,19 @@ class MainWindow(QMainWindow):
             port=port,
             extra_args=["-a", alias],
             use_thinking=use_thinking,
-            use_ngram=use_ngram,
         )
 
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
         self._log(
             f"Options : vision={use_vision} draft={use_draft} thinking={use_thinking} "
-            f"ngram={use_ngram} mode={self._current_mode()}"
+            f"mode={self._current_mode()}"
         )
+        if cfg.env_overrides:
+            for k, v in cfg.env_overrides.items():
+                self._log(f"Env     : {k}={v}")
 
-        self._server = _TerminalProcess(cmd)
+        self._server = _TerminalProcess(cmd, env_overrides=cfg.env_overrides)
         try:
             self._server.start()
         except FileNotFoundError:
@@ -2814,7 +2801,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Window close
     # ------------------------------------------------------------------
-    def closeEvent(self, a0: QCloseEvent | None) -> None:  # noqa: N802
+    def closeEvent(self, event: QCloseEvent | None) -> None:  # noqa: N802
         # Snapshot the current window layout BEFORE any potential
         # "are you sure?" dialog, so even an Escape-out of that dialog
         # has saved state. The save itself never blocks the close.
@@ -2837,13 +2824,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
-                if a0 is not None:
-                    a0.ignore()
+                if event is not None:
+                    event.ignore()
                 return
             self._stop_server()
 
-        if a0 is not None:
-            a0.accept()
+        if event is not None:
+            event.accept()
 
 
 # ---------------------------------------------------------------------------

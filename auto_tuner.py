@@ -1104,16 +1104,16 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             except ImportError as exc:
                 print(f"[AutoTuner] --gui requires PyQt6 and qt_log_viewer.py: {exc}")
                 print("[AutoTuner] Falling back to terminal mode.")
-                last_exit_code = launch(cmd)
+                last_exit_code = launch(cmd, env_overrides=cfg.env_overrides)
             else:
-                srv = ServerProcess(cmd)
+                srv = ServerProcess(cmd, env_overrides=cfg.env_overrides)
                 srv.start()
                 app = QApplication(sys.argv)
                 window = LogViewerWindow(srv)
                 window.show()
                 sys.exit(app.exec())
         else:
-            last_exit_code = launch(cmd)
+            last_exit_code = launch(cmd, env_overrides=cfg.env_overrides)
 
         print()
         try:

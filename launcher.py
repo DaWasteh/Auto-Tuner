@@ -34,7 +34,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 # How long to wait between SIGTERM/CTRL_BREAK and SIGKILL/TerminateProcess.
 _GRACEFUL_TIMEOUT_SECONDS = 10
@@ -48,12 +48,15 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _spawn(cmd: List[str]) -> subprocess.Popen:
+def _spawn(cmd: List[str], env: Optional[dict] = None) -> subprocess.Popen:
     """Start the child process detached enough that we can signal its group."""
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
     if _is_windows():
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-        return subprocess.Popen(cmd, creationflags=flags)
-    return subprocess.Popen(cmd, start_new_session=True)
+        return subprocess.Popen(cmd, creationflags=flags, env=merged_env)
+    return subprocess.Popen(cmd, start_new_session=True, env=merged_env)
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -116,7 +119,7 @@ def _poll_wait(proc: subprocess.Popen, deadline: float) -> bool:
     return proc.poll() is not None
 
 
-def launch(cmd: List[str]) -> int:
+def launch(cmd: List[str], env_overrides: Optional[dict] = None) -> int:
     """Run llama-server until it exits or until the user presses Ctrl+C.
 
     Returns the child's exit code (or 130 if it had to be killed).
@@ -124,8 +127,11 @@ def launch(cmd: List[str]) -> int:
     print(
         f"\n[AutoTuner] Starting:\n  {' '.join(_quote(c) for c in cmd)}\n", flush=True
     )
+    if env_overrides:
+        for k, v in env_overrides.items():
+            print(f"[AutoTuner] Env: {k}={v}")
     try:
-        proc = _spawn(cmd)
+        proc = _spawn(cmd, env=env_overrides)
     except FileNotFoundError:
         print(
             f"[AutoTuner] ERROR: server binary '{cmd[0]}' not found in PATH.\n"

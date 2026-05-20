@@ -14,8 +14,9 @@ from typing import List, Optional
 class ServerProcess:
     """Manage a llama-server subprocess, capture stdout/stderr, and provide clean start/stop."""
 
-    def __init__(self, cmd: List[str]) -> None:
+    def __init__(self, cmd: List[str], env_overrides: Optional[dict] = None) -> None:
         self.cmd = cmd
+        self.env_overrides: dict = env_overrides or {}
         self.proc: Optional[subprocess.Popen] = None
         self.log_queue: queue.Queue[str] = queue.Queue()
         self._reader_thread: Optional[threading.Thread] = None
@@ -44,6 +45,10 @@ class ServerProcess:
         if self.proc is not None:
             return  # already running
 
+        env = os.environ.copy()
+        if self.env_overrides:
+            env.update(self.env_overrides)
+
         if os.name == "nt":
             flags = subprocess.CREATE_NEW_PROCESS_GROUP
             self.proc = subprocess.Popen(
@@ -52,6 +57,7 @@ class ServerProcess:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
             )
         else:
             self.proc = subprocess.Popen(
@@ -60,6 +66,7 @@ class ServerProcess:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
                 text=True,
+                env=env,
             )
 
         self._reader_thread = threading.Thread(target=self._reader, daemon=True)

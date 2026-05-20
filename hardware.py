@@ -481,6 +481,10 @@ class GPUInfo:
     total_vram_mb: int
     free_vram_mb: int
     gpu_util_percent: float = 0.0  # GPU-Auslastung in %
+    # HIP/ROCm device index as seen by llama.cpp (Vulkan enumeration order).
+    # None = unknown (Windows registry order may differ from HIP order).
+    # Set by detect_system() via _detect_vulkan_device_order() when possible.
+    hip_index: Optional[int] = None
 
     @property
     def total_vram_gb(self) -> float:
@@ -1172,6 +1176,86 @@ def _filter_inference_gpus(
     return used, ignored
 
 
+def _detect_vulkan_device_order() -> List[str]:
+    """Return GPU display names in Vulkan / HIP enumeration order (lowercased).
+
+    On AMD Windows, the order in which Vulkan enumerates physical devices
+    matches the HIP device indices used by llama.cpp.  The Windows device
+    manager / registry order often differs, which is why `system.gpus`
+    positions cannot be used directly as `--main-gpu` or `--tensor-split`
+    indices on multi-AMD-GPU Windows systems.
+
+    Uses ``vulkaninfo`` (shipped with the Vulkan SDK).
+    Returns an empty list when the tool is unavailable or fails.
+    """
+    # JSON form (Vulkan SDK ≥ 1.3 — clean, stable)
+    out = _run(["vulkaninfo", "--json"], timeout=10)
+    if out:
+        try:
+            start = out.find("{")
+            if start >= 0:
+                data = json.loads(out[start:])
+                names: List[str] = []
+                for dev in data.get("ArrayOfVkPhysicalDeviceProperties", []):
+                    props = (
+                        dev.get("VkPhysicalDeviceProperties")
+                        or dev.get("properties")
+                        or {}
+                    )
+                    name = props.get("deviceName", "").strip()
+                    if name:
+                        names.append(name.lower())
+                if names:
+                    return names
+        except Exception:
+            pass
+
+    # Plain-text fallback (older vulkaninfo versions)
+    out = _run(["vulkaninfo"], timeout=12)
+    if not out:
+        return []
+    names = []
+    seen: set = set()
+    for line in out.splitlines():
+        stripped = line.strip()
+        # Lines like: "deviceName     = AMD Radeon RX 9070 XT"
+        if "deviceName" in stripped and "=" in stripped:
+            name = stripped.split("=", 1)[1].strip()
+            lname = name.lower()
+            if name and lname not in seen:
+                seen.add(lname)
+                names.append(lname)
+    return names
+
+
+def _match_gpu_to_vulkan(gpu_name: str, vulkan_names: List[str]) -> Optional[int]:
+    """Return the Vulkan device index that best matches *gpu_name*, or None.
+
+    Matching strategy (most → least specific):
+      1. Direct substring: gpu_name in vk_name OR vk_name in gpu_name
+      2. Key-token match: ALL distinguishing tokens of gpu_name appear in vk_name
+         (e.g. ["9070", "xt"] for "AMD Radeon RX 9070 XT")
+    """
+    gpu_lower = gpu_name.lower()
+
+    # Step 1 — direct substring
+    for i, vk in enumerate(vulkan_names):
+        if gpu_lower in vk or vk in gpu_lower:
+            return i
+
+    # Step 2 — key-token match
+    _GENERIC = {"amd", "radeon", "nvidia", "geforce", "intel", "arc",
+                "gpu", "graphics", "processor", "the", "pro", "rx"}
+    tokens = re.findall(r"[a-z0-9]+", gpu_lower)
+    key = [t for t in tokens if t not in _GENERIC and (len(t) > 2 or t.isdigit())]
+    if key:
+        for i, vk in enumerate(vulkan_names):
+            if all(t in vk for t in key):
+                return i
+
+    return None
+
+
 def detect_system() -> SystemInfo:
     """Detect everything in one call. Best-effort; never raises.
 
@@ -1208,7 +1292,29 @@ def detect_system() -> SystemInfo:
 
     used, ignored = _filter_inference_gpus(raw)
 
-    # --- CPU / RAM fallbacks ---
+    # --- HIP device index resolution (Windows AMD multi-GPU only) ----------
+    # On Windows, the Windows device-manager/registry order in which AMD GPUs
+    # appear does NOT reliably match the HIP device index order used by
+    # llama.cpp (ROCm/HIP enumerates by Vulkan order, not registry order).
+    # Assigning wrong HIP indices to --main-gpu / --tensor-split causes
+    # ACCESS_VIOLATION (0xC0000005) crashes when the model lands on the
+    # smaller GPU instead of the intended one.
+    #
+    # Solution: query vulkaninfo (Vulkan SDK) which returns devices in Vulkan
+    # order — identical to HIP enumeration order on AMD Windows.  We set
+    # gpu.hip_index for every GPU (used + ignored) so tuner.py can build
+    # correct HIP_VISIBLE_DEVICES + --main-gpu values.
+    try:
+        if platform.system() == "Windows":
+            vk_names = _detect_vulkan_device_order()
+            if vk_names:
+                for gpu in list(used) + list(ignored):
+                    if gpu.hip_index is None:
+                        idx = _match_gpu_to_vulkan(gpu.name, vk_names)
+                        if idx is not None:
+                            gpu.hip_index = idx
+    except Exception:
+        pass  # non-fatal — falls back to position-based indexing
     os_name = f"{platform.system()} {platform.release()}"
 
     try:
