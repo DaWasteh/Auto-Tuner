@@ -416,3 +416,64 @@ def set_reasoning_effort(model_name: str, value: Optional[str]) -> None:
 def settings_file_location() -> Path:
     """Where settings are (or would be) written. For diagnostic logging."""
     return _settings_file()
+
+
+# ---------------------------------------------------------------------------
+# GPU overrides (enable/disable + inference priority per device)
+#
+# The GUI's GPU control bar lets the user:
+#   * Disable individual GPUs entirely (they are removed from system.gpus
+#     before tuner.py runs — equivalent to the GPU not existing for inference).
+#   * Assign a priority order (1 = main device, 2 = secondary, …).
+#     Priority-1 GPU becomes --main-gpu; lower priorities form tensor-split.
+#
+# Schema in autotuner_settings.json:
+#   "gpu_overrides": {
+#       "AMD Radeon AI PRO R9700":  {"enabled": true,  "priority": 1},
+#       "AMD Radeon RX 9070 XT":    {"enabled": true,  "priority": 2},
+#       "Intel(R) Graphics":        {"enabled": false, "priority": 3}
+#   }
+#
+# Absent keys mean "auto" (no override; tuner falls back to VRAM ranking).
+# Ignored/auxiliary GPUs (already removed by _filter_inference_gpus) may
+# also appear here so the GUI can show them and let the user re-enable them
+# if desired — though re-enabling an iGPU is rarely useful in practice.
+
+
+def get_gpu_overrides() -> Dict[str, Dict[str, Any]]:
+    """Return the stored GPU overrides dict, or {} when nothing is set."""
+    raw = load_settings().get("gpu_overrides")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, v in raw.items():
+        if not isinstance(name, str) or not isinstance(v, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        if "enabled" in v:
+            entry["enabled"] = bool(v["enabled"])
+        if "priority" in v:
+            try:
+                entry["priority"] = max(1, int(v["priority"]))
+            except (TypeError, ValueError):
+                pass
+        out[name] = entry
+    return out
+
+
+def set_gpu_overrides(overrides: Dict[str, Dict[str, Any]]) -> None:
+    """Persist the full GPU overrides mapping.
+
+    ``overrides`` maps GPU display name → {"enabled": bool, "priority": int}.
+    Pass an empty dict to clear all overrides (auto mode).
+    """
+    s = load_settings()
+    s["gpu_overrides"] = {
+        name: {
+            "enabled": bool(v.get("enabled", True)),
+            "priority": max(1, int(v.get("priority", 1))),
+        }
+        for name, v in overrides.items()
+        if isinstance(name, str) and isinstance(v, dict)
+    }
+    save_settings(s)

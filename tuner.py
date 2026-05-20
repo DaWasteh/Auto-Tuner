@@ -443,10 +443,8 @@ class TunedConfig:
     extra_cli_flags: List[str] = field(default_factory=list)
 
     # Environment variables to set when spawning llama-server.
-    # Reserved for future use; multi-GPU selection now uses --main-gpu
-    # with the direct Vulkan device index (hip_index) instead of the
-    # HIP_VISIBLE_DEVICES remapping trick, which only works on ROCm builds
-    # and has no effect on Vulkan builds.
+    # Primarily used to set HIP_VISIBLE_DEVICES on Windows AMD multi-GPU
+    # setups where the Windows registry GPU order differs from HIP order.
     env_overrides: Dict[str, str] = field(default_factory=dict)
 
     # Active performance target name ("safe" / "balanced" / "throughput").
@@ -1270,18 +1268,17 @@ def compute_config(
     # ---- (4d) Multi-GPU placement. Skipped for MoE (handled via n_cpu_moe).
     #
     # Strategy: if the model + KV + safety fits on the largest GPU alone,
-    # select it with --main-gpu <hip_index>.  hip_index is the Vulkan
-    # enumeration order (resolved by hardware.py via vulkaninfo), which is
-    # the same order llama.cpp uses for both Vulkan and ROCm/HIP builds on
-    # AMD Windows.  HIP_VISIBLE_DEVICES is NOT used — it only affects ROCm
-    # runtimes and has no effect on Vulkan builds, causing --main-gpu to
-    # point at the wrong device after the remapping assumption breaks down.
+    # select it with --main-gpu <hip_index>.  hip_index IS the Vulkan
+    # enumeration index (resolved by hardware.py via vulkaninfo), which is
+    # the same ordering llama.cpp uses for both Vulkan and ROCm/HIP builds.
+    # HIP_VISIBLE_DEVICES is NOT set — it only affects ROCm runtimes and
+    # is silently ignored by Vulkan builds, causing --main-gpu=0 to land
+    # on the wrong device after the remapping assumption breaks down.
     #
-    # AMD Windows caveat: the Windows registry order (system.gpus positions)
-    # does NOT reliably match Vulkan/HIP device indices. We use gpu.hip_index
-    # (set by hardware.py via vulkaninfo) to build correct --main-gpu and
-    # --tensor-split values.  When hip_index is unknown we fall back to
-    # registry positions.
+    # GPU priority: when the user pins a GPU via the GUI (user_priority=1),
+    # that GPU is treated as "largest" regardless of raw VRAM size.
+    # Disabled GPUs (removed from system.gpus by the GUI before this call)
+    # never appear here.
     tensor_split: Optional[str] = None
     main_gpu: Optional[int] = None
     env_overrides: Dict[str, str] = {}
@@ -1291,9 +1288,29 @@ def compute_config(
         free_mb_per_gpu = [g.free_vram_mb for g in system.gpus]
         total_mb = sum(sizes_mb)
         if total_mb > 0:
-            largest_pos = max(range(len(sizes_mb)), key=lambda i: sizes_mb[i])
+            # Respect user_priority (set by GUI GPU control bar) before
+            # falling back to VRAM-based ranking.
+            prio_gpus = [
+                i for i, g in enumerate(system.gpus)
+                if getattr(g, "user_priority", 0) == 1
+            ]
+            if prio_gpus:
+                largest_pos = prio_gpus[0]
+            else:
+                largest_pos = max(range(len(sizes_mb)), key=lambda i: sizes_mb[i])
             largest_gpu = system.gpus[largest_pos]
-            largest_free_gb = free_mb_per_gpu[largest_pos] / 1024.0
+
+            # Use free VRAM to check if the model fits alone on the largest
+            # GPU. If free_vram_mb == 0 (WMI couldn't read it — common for
+            # Radeon AI PRO and other workstation cards), fall back to total
+            # VRAM as a conservative estimate (the card is mostly empty when
+            # AutoTuner launches a fresh server).
+            raw_largest_free = free_mb_per_gpu[largest_pos]
+            largest_free_gb = (
+                raw_largest_free / 1024.0
+                if raw_largest_free > 0
+                else sizes_mb[largest_pos] / 1024.0
+            )
 
             # Ask: do the MODEL WEIGHTS (plus mmproj / draft overhead + safety)
             # fit on the largest GPU alone?  KV cache is NOT included here
@@ -1327,8 +1344,7 @@ def compute_config(
                     # hardware.py derives hip_index from vulkaninfo, so it IS
                     # the Vulkan enumeration index. Passing it directly works
                     # correctly for both Vulkan builds (--main-gpu == Vulkan
-                    # device index) and ROCm builds (HIP enumerates in the same
-                    # Vulkan order on AMD Windows).
+                    # device index) and ROCm builds.
                     main_gpu = largest_gpu.hip_index
                     # No tensor_split needed — single GPU target.
                 else:
@@ -1346,7 +1362,7 @@ def compute_config(
                     # actually sees.  HIP_VISIBLE_DEVICES is NOT set — hip_index
                     # IS the Vulkan device index, usable directly on both
                     # Vulkan and ROCm builds.
-                    sorted_gpus = sorted(system.gpus, key=lambda g: g.hip_index)  # type: ignore[arg-type]
+                    sorted_gpus = sorted(system.gpus, key=lambda g: g.hip_index or 0)  # type: ignore[arg-type]
                     total_sorted_mb = sum(g.total_vram_mb for g in sorted_gpus)
                     tensor_split = ",".join(
                         f"{g.total_vram_mb / total_sorted_mb:.3f}"
