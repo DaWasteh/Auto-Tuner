@@ -582,6 +582,40 @@ def test_vulkan_env_var_emitted_for_multi_gpu_spread(tmp_path):
     assert cfg.env_overrides["GGML_VK_VISIBLE_DEVICES"] == expected
 
 
+def test_priority_weighted_tensor_split(tmp_path):
+    """With gpu_priorities R9700=2 / 9070 XT=1, the R9700 must receive
+    a significantly larger share of the tensor_split than a pure
+    VRAM-proportional split would give. This keeps the gaming GPU
+    (9070 XT) mostly free for OBS/desktop while the AI GPU (R9700)
+    does the heavy lifting."""
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS", size_gb=40.0)
+    profile = match_profile(model.name, profiles)
+    sys_info = _fake_dual_gpu_system_with_vk_order(
+        large_free=31, small_free=14,
+    )
+    prio = {
+        "AMD Radeon AI PRO R9700": 2,
+        "AMD Radeon RX 9070 XT": 1,
+    }
+    cfg = compute_config(model, sys_info, profile, gpu_priorities=prio)
+
+    assert cfg.tensor_split is not None
+    parts = [float(x) for x in cfg.tensor_split.split(",")]
+    assert len(parts) == 2
+    # Vulkan order: device 0 = 9070 XT (small_vk_idx=0), device 1 = R9700 (large_vk_idx=1)
+    xt_share = parts[0]   # 9070 XT
+    r97_share = parts[1]  # R9700
+    # R9700 must get the lion's share — at least 75% (it has 2× priority
+    # AND 2× the free VRAM). Pure VRAM-proportional would give only 67%.
+    assert r97_share > 0.75, (
+        f"R9700 should dominate with priority=2; got share={r97_share:.3f}"
+    )
+    assert xt_share < 0.25, (
+        f"9070 XT should be ≤25% with priority=1; got share={xt_share:.3f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # llama-server resolver
 

@@ -1371,6 +1371,26 @@ def compute_config(
                     main_gpu = largest_pos
             else:
                 # Model doesn't fit alone — spread proportionally across GPUs.
+                #
+                # Proportioning strategy: free_vram_mb × user_priority.
+                #
+                # Using *free* VRAM (not total) naturally respects whatever
+                # the OS, display compositor, OBS, or other apps already
+                # occupy on a secondary GPU. The priority multiplier from
+                # gpu_overrides lets the user steer even more load toward
+                # the primary inference GPU (e.g. R9700 priority=2 gets
+                # double the share per free-MB vs the 9070 XT at priority=1).
+                #
+                # Example — R9700 (prio=2, 31 GB free), 9070 XT (prio=1, 14 GB free):
+                #   R9700:   2 × 31 = 62  →  62/76 = 0.816  (81.6%)
+                #   9070 XT: 1 × 14 = 14  →  14/76 = 0.184  (18.4%)
+                # For a 28 GB model: R9700 ~22.8 GB, 9070 XT ~5.2 GB
+                # → leaves ~10.8 GB on the gaming GPU for OBS/desktop.
+
+                def _split_share(gpu: GPUInfo) -> float:
+                    p = max(1, prio_map.get(gpu.name, 1))
+                    return p * max(0, gpu.free_vram_mb)
+
                 all_hip_known = all(g.hip_index is not None for g in system.gpus)
                 if all_hip_known:
                     # Re-order GPUs by ascending HIP/Vulkan index so that the
@@ -1382,20 +1402,34 @@ def compute_config(
                     )
                     env_overrides["HIP_VISIBLE_DEVICES"] = vis_str
                     env_overrides["GGML_VK_VISIBLE_DEVICES"] = vis_str
-                    total_sorted_mb = sum(g.total_vram_mb for g in sorted_gpus)
-                    tensor_split = ",".join(
-                        f"{g.total_vram_mb / total_sorted_mb:.3f}"
-                        for g in sorted_gpus
-                    )
+                    total_share = sum(_split_share(g) for g in sorted_gpus)
+                    if total_share <= 0:
+                        total_share = sum(g.total_vram_mb for g in sorted_gpus)
+                        tensor_split = ",".join(
+                            f"{g.total_vram_mb / total_share:.3f}"
+                            for g in sorted_gpus
+                        )
+                    else:
+                        tensor_split = ",".join(
+                            f"{_split_share(g) / total_share:.3f}"
+                            for g in sorted_gpus
+                        )
                     # main_gpu = position of the largest GPU in the sorted list
                     main_gpu = sorted_gpus.index(largest_gpu)
                 else:
                     # HIP indices unknown — use position-based (may be wrong on
                     # Windows AMD; user should ensure registry order == HIP order
                     # or install the Vulkan SDK so vulkaninfo can resolve it).
-                    tensor_split = ",".join(
-                        f"{s / total_mb:.3f}" for s in sizes_mb
-                    )
+                    total_share = sum(_split_share(g) for g in system.gpus)
+                    if total_share <= 0:
+                        tensor_split = ",".join(
+                            f"{s / total_mb:.3f}" for s in sizes_mb
+                        )
+                    else:
+                        tensor_split = ",".join(
+                            f"{_split_share(g) / total_share:.3f}"
+                            for g in system.gpus
+                        )
                     main_gpu = largest_pos
 
     # ---- (4d) NUMA — immer aktivieren bei genügend Kernen für bessere Performance
