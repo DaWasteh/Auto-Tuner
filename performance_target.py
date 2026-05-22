@@ -58,6 +58,30 @@ class PerformanceTarget:
     moe_hybrid_batch: int = 2048
     moe_hybrid_ubatch: int = 2048
 
+    # --parallel N passed to llama-server.
+    #
+    # llama-server's default is "auto": it infers N from the total KV
+    # budget divided by the per-slot cost at the requested context.  On a
+    # dual-GPU system (e.g. R9700 32 GB + RX 9070 XT 16 GB) with a large
+    # dense model (e.g. Qwen3.6-27B-Q8, ~33 GB) the free VRAM after
+    # weights is ~13 GB plus the 8 GB RAM supplement = ~21 GB.  With a
+    # 262k context at Q8 KV (~0.060 MB/token) that budget fits ~354k
+    # tokens, so "auto" happily sets n_parallel = 4 (354k / 262k ≈ 1.35
+    # rounded up to 4 by llama-server's heuristic).  The result: 4 slots
+    # × 15.4 GB KV/slot = 61.6 GB reserved, filling ALL 47 GB of RAM and
+    # part of VRAM even though the model barely fits.
+    #
+    # Fix: always pass --parallel N explicitly so the server cannot
+    # over-provision KV cache.  The value must also feed into the ctx
+    # calculation (kv_budget_per_slot = kv_budget / n_parallel) so the
+    # auto-tuned context is sized correctly for a SINGLE slot.
+    #
+    # Tier defaults:
+    #   throughput  1  — single-user, every token as fast as possible
+    #   balanced    2  — dual-user or light agentic workflows
+    #   safe        4  — traditional multi-slot, long-context sessions
+    n_parallel: int = 1
+
     def __str__(self) -> str:  # pragma: no cover — trivial
         return self.name
 
@@ -77,9 +101,11 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # different tier anyway.
         moe_hybrid_batch=1024,
         moe_hybrid_ubatch=1024,
+        n_parallel=4,
         description=(
             "Conservative. KV reserved for 128k context, generous "
-            "safety bands. Pick this for long-context sessions."
+            "safety bands. 4 parallel slots. Pick this for long-context "
+            "sessions or multi-user setups."
         ),
     ),
     "balanced": PerformanceTarget(
@@ -92,9 +118,11 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # 16 GB-class GPUs on Qwen3.6-A3B / Gemma-4-26B-A4B / GLM-4.7-MoE.
         moe_hybrid_batch=2048,
         moe_hybrid_ubatch=2048,
+        n_parallel=2,
         description=(
             "Default. KV reserved for 64k context — enough headroom "
-            "for most chats while letting more expert layers fit on GPU."
+            "for most chats while letting more expert layers fit on GPU. "
+            "2 parallel slots."
         ),
     ),
     "throughput": PerformanceTarget(
@@ -109,10 +137,12 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # smallest KV budget (32k) so there's room.
         moe_hybrid_batch=4096,
         moe_hybrid_ubatch=4096,
+        n_parallel=1,
         description=(
             "Aggressive. KV reserved for only 32k — every spare GB "
-            "of VRAM goes to expert layers. Best tokens/s on tight "
-            "MoE setups; not recommended above ~32k context."
+            "of VRAM goes to expert layers. Single parallel slot "
+            "(--parallel 1) for max tokens/s. Not recommended above ~32k "
+            "context or multi-user setups."
         ),
     ),
 }

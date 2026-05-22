@@ -5,7 +5,7 @@ import platform
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from hardware import SystemInfo
+from hardware import SystemInfo, GPUInfo
 from scanner import ModelEntry
 from settings_loader import ModelProfile
 from performance_target import (
@@ -451,6 +451,15 @@ class TunedConfig:
     # Set by compute_config so display code can show what was applied.
     performance_target: str = DEFAULT_TARGET_NAME
 
+    # --parallel N for llama-server.  Controls how many inference slots
+    # the server allocates simultaneously.  Always passed explicitly so
+    # llama-server's "auto" heuristic cannot over-provision KV cache.
+    # Sized by the resolved PerformanceTarget (1 / 2 / 4 for throughput /
+    # balanced / safe).  The ctx calculation in compute_config divides
+    # kv_budget_gb by n_parallel so each slot gets a correctly-sized KV
+    # window instead of the server silently multiplying KV by N slots.
+    n_parallel: int = 1
+
     warning: Optional[str] = None
 
 
@@ -732,6 +741,14 @@ def compute_config(
     force_ngl: Optional[int] = None,  # Pin layer offload count
     force_n_cpu_moe: Optional[int] = None,  # Pin MoE CPU-layer count
     force_rope_scale: Optional[bool] = None,  # Force YaRN on/off
+    # ---- GPU priority overrides ----------------------------------------
+    # Optional mapping of GPU name → user-assigned priority (≥1).
+    # When provided, the GPU with the highest priority×VRAM score is
+    # selected as the primary compute device (main_gpu). Priorities are
+    # read from autotuner_settings.json → gpu_overrides.priority and
+    # exposed through app_settings.get_gpu_priorities(). When absent or
+    # None, pure VRAM size determines the primary GPU (legacy behaviour).
+    gpu_priorities: Optional[Dict[str, int]] = None,
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system.
 
@@ -770,6 +787,10 @@ def compute_config(
         ram_safety_gb = perf_target.ram_safety_gb
     if vram_safety_gb is None:
         vram_safety_gb = perf_target.dense_vram_safety_gb
+
+    # Number of parallel inference slots — always passed as --parallel N
+    # to llama-server to prevent auto-detection from over-provisioning KV.
+    n_parallel: int = max(1, perf_target.n_parallel)
 
     has_gpu = bool(system.gpus) and system.total_vram_gb > 1
     free_vram = max(0.0, system.free_vram_gb)
@@ -1114,11 +1135,17 @@ def compute_config(
             ctx = model_ctx_limit
     else:
         # Berechne den maximal möglichen Kontext basierend auf dem verfügbaren
-        # KV-Cache-Budget. Verwende 99,5% des Budgets um nahe an die physische
-        # Grenze zu kommen — llama.cpp alloziert den KV-cache nur bei
-        # tatsächlicher Nutzung.
+        # KV-Cache-Budget. Dividiere durch n_parallel, da llama-server N Slots
+        # anlegt (jeder Slot braucht einen vollen KV-Buffer der angeforderten
+        # Größe). Ohne diese Division würde llama-server "auto" n_parallel auf
+        # z.B. 4 setzen und 4× das Budget belegen.
+        #
+        # Beispiel: 21 GB KV-Budget, n_parallel=1 →
+        #   max_fit_ctx bei Q8 (0.060 MB/tok) = 356k → cap auf 262k ✓
+        #   RAM-Nutzung ~3 GB statt ~60 GB (bei n_parallel=4 ohne diesen Fix).
+        kv_budget_per_slot_gb = kv_budget_gb / n_parallel
         if actual_per_tok_mb > 0:
-            max_fit_ctx = int((kv_budget_gb * 1024 * 0.995) / actual_per_tok_mb)
+            max_fit_ctx = int((kv_budget_per_slot_gb * 1024 * 0.995) / actual_per_tok_mb)
         else:
             max_fit_ctx = profile_max
 
@@ -1286,7 +1313,18 @@ def compute_config(
         free_mb_per_gpu = [g.free_vram_mb for g in system.gpus]
         total_mb = sum(sizes_mb)
         if total_mb > 0:
-            largest_pos = max(range(len(sizes_mb)), key=lambda i: sizes_mb[i])
+            # Primary GPU selection: highest (user_priority × total_vram_mb) score.
+            # When gpu_priorities is absent or all GPUs have the same priority,
+            # this degenerates to pure VRAM-size ordering (existing behaviour).
+            # Example: R9700 (priority=2, 32 GB) → score=65536; RX 9070 XT
+            # (priority=1, 16 GB) → score=16384 → R9700 wins as primary.
+            prio_map = gpu_priorities or {}
+
+            def _primary_score(gpu: GPUInfo) -> float:
+                p = max(1, prio_map.get(gpu.name, 1))
+                return p * gpu.total_vram_mb
+
+            largest_pos = max(range(len(system.gpus)), key=lambda i: _primary_score(system.gpus[i]))
             largest_gpu = system.gpus[largest_pos]
             largest_free_gb = free_mb_per_gpu[largest_pos] / 1024.0
 
@@ -1460,6 +1498,7 @@ def compute_config(
         rope_scaling=rope_scaling_active,
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
         performance_target=perf_target.name,
+        n_parallel=n_parallel,
         warning=warning,
         extra_cli_flags=seed_extras,
         env_overrides=env_overrides,
@@ -1633,6 +1672,15 @@ def build_command(
         cmd += ["--tensor-split", config.tensor_split]
     if config.main_gpu is not None:
         cmd += ["--main-gpu", str(config.main_gpu)]
+
+    # Always pass --parallel explicitly.  llama-server's "auto" mode infers
+    # n_parallel from the total KV budget ÷ per-slot KV cost.  On large
+    # dual-GPU systems this can produce n_parallel=4 or more, multiplying
+    # the actual KV allocation by that factor and filling all available RAM
+    # (confirmed on R9700 32 GB + RX 9070 XT 16 GB with Qwen3.6-27B-Q8).
+    # Passing the value explicitly prevents the server from picking a
+    # different N than what compute_config budgeted for.
+    cmd += ["--parallel", str(max(1, config.n_parallel))]
 
     s = config.sampling
     cmd += [

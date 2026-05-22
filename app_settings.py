@@ -419,61 +419,75 @@ def settings_file_location() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# GPU overrides (enable/disable + inference priority per device)
+# GPU priority overrides
 #
-# The GUI's GPU control bar lets the user:
-#   * Disable individual GPUs entirely (they are removed from system.gpus
-#     before tuner.py runs — equivalent to the GPU not existing for inference).
-#   * Assign a priority order (1 = main device, 2 = secondary, …).
-#     Priority-1 GPU becomes --main-gpu; lower priorities form tensor-split.
+# The user can mark each GPU with a priority (≥1) via the "gpu_overrides"
+# section of autotuner_settings.json:
 #
-# Schema in autotuner_settings.json:
 #   "gpu_overrides": {
-#       "AMD Radeon AI PRO R9700":  {"enabled": true,  "priority": 1},
-#       "AMD Radeon RX 9070 XT":    {"enabled": true,  "priority": 2},
-#       "Intel(R) Graphics":        {"enabled": false, "priority": 3}
+#       "AMD Radeon AI PRO R9700":   { "enabled": true, "priority": 2 },
+#       "AMD Radeon RX 9070 XT":     { "enabled": true, "priority": 1 }
 #   }
 #
-# Absent keys mean "auto" (no override; tuner falls back to VRAM ranking).
-# Ignored/auxiliary GPUs (already removed by _filter_inference_gpus) may
-# also appear here so the GUI can show them and let the user re-enable them
-# if desired — though re-enabling an iGPU is rarely useful in practice.
+# Higher priority → that GPU is preferred as the primary compute device
+# (main_gpu in --tensor-split / --main-gpu).  When two GPUs have the same
+# VRAM size the priority breaks the tie.  When VRAM sizes differ (e.g.
+# 32 GB vs 16 GB) the score = priority × vram_mb already gives the larger
+# GPU a comfortable lead, so the user can rely on VRAM winning naturally
+# unless they explicitly want to invert the preference.
 
 
-def get_gpu_overrides() -> Dict[str, Dict[str, Any]]:
-    """Return the stored GPU overrides dict, or {} when nothing is set."""
-    raw = load_settings().get("gpu_overrides")
-    if not isinstance(raw, dict):
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    for name, v in raw.items():
-        if not isinstance(name, str) or not isinstance(v, dict):
-            continue
-        entry: Dict[str, Any] = {}
-        if "enabled" in v:
-            entry["enabled"] = bool(v["enabled"])
-        if "priority" in v:
-            try:
-                entry["priority"] = max(1, int(v["priority"]))
-            except (TypeError, ValueError):
-                pass
-        out[name] = entry
-    return out
-
-
-def set_gpu_overrides(overrides: Dict[str, Dict[str, Any]]) -> None:
-    """Persist the full GPU overrides mapping.
-
-    ``overrides`` maps GPU display name → {"enabled": bool, "priority": int}.
-    Pass an empty dict to clear all overrides (auto mode).
+def get_gpu_priorities() -> Dict[str, int]:
+    """Return a mapping of GPU name → user-assigned priority for all GPUs
+    that have a priority entry in gpu_overrides.  Missing keys default to 1.
     """
+    overrides = load_settings().get("gpu_overrides") or {}
+    if not isinstance(overrides, dict):
+        return {}
+    result: Dict[str, int] = {}
+    for gpu_name, entry in overrides.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            result[str(gpu_name)] = max(1, int(entry.get("priority", 1)))
+        except (TypeError, ValueError):
+            result[str(gpu_name)] = 1
+    return result
+
+
+def get_gpu_priority(gpu_name: str) -> int:
+    """Return the user-assigned priority for *gpu_name* (default 1)."""
+    if not gpu_name:
+        return 1
+    overrides = load_settings().get("gpu_overrides") or {}
+    entry = overrides.get(gpu_name) if isinstance(overrides, dict) else None
+    if not isinstance(entry, dict):
+        return 1
+    try:
+        return max(1, int(entry.get("priority", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def set_gpu_priority(gpu_name: str, priority: int) -> None:
+    """Persist *priority* for *gpu_name* in gpu_overrides.
+
+    Creates the entry if it doesn't exist; leaves other fields (e.g.
+    ``enabled``) untouched.
+    """
+    if not gpu_name:
+        return
     s = load_settings()
-    s["gpu_overrides"] = {
-        name: {
-            "enabled": bool(v.get("enabled", True)),
-            "priority": max(1, int(v.get("priority", 1))),
-        }
-        for name, v in overrides.items()
-        if isinstance(name, str) and isinstance(v, dict)
-    }
+    overrides = s.get("gpu_overrides")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    entry = overrides.get(gpu_name)
+    if not isinstance(entry, dict):
+        entry = {}
+    try:
+        entry["priority"] = max(1, int(priority))
+    except (TypeError, ValueError):
+        entry["priority"] = 1
+    overrides[gpu_name] = entry
+    s["gpu_overrides"] = overrides
     save_settings(s)

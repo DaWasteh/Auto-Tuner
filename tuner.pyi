@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hardware import SystemInfo
+from hardware import SystemInfo, GPUInfo
 from performance_target import PerformanceTarget
 from scanner import ModelEntry
 from settings_loader import ModelProfile
@@ -83,11 +83,12 @@ class TunedConfig:
     rope_scale_factor: float = ...
 
     extra_cli_flags: List[str] = field(default_factory=list)
-    # Environment variables forwarded to llama-server (reserved for future
-    # use; the HIP_VISIBLE_DEVICES approach was removed in favour of passing
-    # --main-gpu with the direct Vulkan device index).
     env_overrides: Dict[str, str] = field(default_factory=dict)
     performance_target: str = ...
+    # Number of parallel inference slots (--parallel N).
+    # Sourced from PerformanceTarget.n_parallel; always emitted explicitly
+    # so llama-server cannot over-provision KV cache via its "auto" mode.
+    n_parallel: int = ...
     warning: Optional[str] = ...
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,7 @@ def compute_config(
     force_ngl: Optional[int] = ...,
     force_n_cpu_moe: Optional[int] = ...,
     force_rope_scale: Optional[bool] = ...,
+    gpu_priorities: Optional[Dict[str, int]] = ...,
 ) -> TunedConfig: ...
 
 

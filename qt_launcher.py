@@ -2291,6 +2291,7 @@ class MainWindow(QMainWindow):
                 perf_target=self._resolve_perf_target_for_profile(profile),
                 mode=self._current_mode(),
                 turbo_kv=turbo_kv,
+                gpu_priorities=app_settings.get_gpu_priorities(),
                 **kwargs,
             )
         except Exception as exc:
@@ -2738,7 +2739,12 @@ class MainWindow(QMainWindow):
                 perf_target=self._resolve_perf_target_for_profile(profile),
                 mode=self._current_mode(),
                 turbo_kv=turbo_kv,
+                gpu_priorities=app_settings.get_gpu_priorities(),
             )
+        # cfg is always non-None here: either the expert panel provided it
+        # or compute_config just returned one.  The assert narrows the type
+        # for static checkers (Pylance / mypy) that cannot prove this.
+        assert cfg is not None
 
         host = self._host_edit.text().strip() or "127.0.0.1"
         try:

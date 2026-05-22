@@ -40,6 +40,7 @@ from performance_target import (
     list_target_names,
     describe_targets,
 )
+import app_settings
 
 # ---------------------------------------------------------------------------
 # Pretty-printing helpers
@@ -990,6 +991,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             user_ctx=args.ctx,
             force_mlock=getattr(args, "force_mlock", False),
             perf_target=perf_target,
+            gpu_priorities=app_settings.get_gpu_priorities(),
         )
 
         print(f"\n  [mlock] decision: model={model.name}")

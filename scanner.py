@@ -149,6 +149,10 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
 
             if has_mtp_tensors:
                 md["__mtp_tensors__"] = True
+            else:
+                # Explicitly record False so metadata_has_embedded_mtp can
+                # distinguish "scan ran but found nothing" from "no scan at all".
+                md["__mtp_tensors__"] = False
 
             return md
     except (OSError, struct.error, EOFError, ValueError, UnicodeDecodeError):
@@ -180,13 +184,29 @@ def metadata_has_embedded_mtp(md: Dict[str, Any]) -> bool:
         return False
 
     # 1. Official key: <arch>.nextn_predict_layers
+    #
+    # Cross-check with the tensor scan when available:
+    # read_gguf_metadata always writes __mtp_tensors__ = True/False.
+    # If that key is present and False, the GGUF was scanned and has NO
+    # extra-block tensors → the metadata key alone is unreliable (e.g.
+    # UD/unsloth quantisations that keep the base-architecture metadata
+    # value but strip the actual MTP weights during conversion).
+    # If __mtp_tensors__ is absent the metadata came from an external
+    # source that skipped the tensor scan — fall back to trusting the key.
     arch = str(md.get("general.architecture", "") or "")
     if arch:
         v = md.get(f"{arch}.nextn_predict_layers")
         if v is not None:
             try:
                 if int(v) > 0:
-                    return True
+                    if "__mtp_tensors__" not in md:
+                        # No tensor scan ran — trust the metadata key.
+                        return True
+                    # Tensor scan ran: only return True when it confirmed
+                    # the extra-block tensors actually exist.
+                    if md["__mtp_tensors__"]:
+                        return True
+                    # else: scan ran, found nothing → false-positive, skip.
             except (TypeError, ValueError):
                 pass
 
@@ -194,11 +214,25 @@ def metadata_has_embedded_mtp(md: Dict[str, Any]) -> bool:
     if md.get("__mtp_tensors__"):
         return True
 
-    # 3. Generic scan — forward-compat for new arch prefixes
+    # 3. Generic KV scan — forward-compat for new arch prefixes.
+    # Skip the arch-specific key that check 1 already evaluated and
+    # suppressed (tensor scan ran and found no MTP tensors).  Without this
+    # guard, check 3 would re-fire on the same key and produce the false-
+    # positive that check 1 intentionally prevented (observed with Qwen3.6
+    # UD quantisations where qwen2.nextn_predict_layers=1 is present in
+    # base-architecture metadata but no blk.28.* tensors exist in the GGUF).
+    arch_nextn_key = f"{arch}.nextn_predict_layers" if arch else None
+    tensor_scan_ran     = "__mtp_tensors__" in md
+    tensor_scan_negative = tensor_scan_ran and not md["__mtp_tensors__"]
+
     for key, val in md.items():
         if key.startswith("__"):
             continue  # skip synthetic keys
         if "nextn_predict" in key.lower():
+            # Suppress the arch-specific key when tensor scan ran and
+            # found nothing — its value was already rejected in check 1.
+            if tensor_scan_negative and key == arch_nextn_key:
+                continue
             try:
                 if int(val) > 0:
                     return True
