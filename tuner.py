@@ -1374,16 +1374,16 @@ def compute_config(
         primary_cap = _usable_cap_gb(primary_gpu, True)
 
         # Full GPU footprint we need to place: weights + KV + vision + draft.
-        # KV is INCLUDED here (unlike the old code) so a model whose weights
-        # fit on the primary but whose large KV cache would push it past the
-        # cap correctly spills onto the secondary GPU instead of overcommitting
-        # the primary and crashing.
-        footprint_gb = model_vram + estimated_kv_gb + vision_vram_gb + draft_vram_gb
+        # For pinning decisions, we only consider model_vram (weights) because
+        # the KV cache is dynamically allocated and won't consume the entire
+        # budget. This allows smaller models to be pinned to the primary GPU
+        # even when their theoretical max-KV footprint exceeds the cap.
+        model_footprint_gb = model_vram + vision_vram_gb + draft_vram_gb
 
         # MoE: experts already spilled to CPU via --n-cpu-moe, so model_vram is
         # the GPU-resident portion and it fits on the primary by construction —
-        # pin it. Dense: pin only when the whole footprint fits the primary cap.
-        pin_to_primary = is_moe_cfg or (full_off and footprint_gb <= primary_cap)
+        # pin it. Dense: pin when the model weights fit the primary cap.
+        pin_to_primary = is_moe_cfg or (model_footprint_gb <= primary_cap)
 
         if pin_to_primary:
             if hip_known:
@@ -1405,11 +1405,10 @@ def compute_config(
                 tensor_split = ",".join(parts)
                 main_gpu = primary_pos
         else:
-            # Spread: sequentially fill the primary to its cap, then the
-            # secondary, in priority order. The resulting per-GPU GB amounts
-            # are turned into tensor_split fractions (proportions of the whole
-            # model). llama.cpp distributes BOTH weights and KV by these
-            # fractions, so they target the requested ~30 GB / ~13 GB split.
+            # Spread: priority-weighted allocation across GPUs.
+            # The resulting per-GPU GB amounts are turned into tensor_split
+            # fractions (proportions of the whole model). llama.cpp distributes
+            # BOTH weights and KV by these fractions.
             ordered = sorted(
                 system.gpus,
                 key=lambda g: max(1, _prio_map.get(g.name, 1)) * g.total_vram_mb,
@@ -1418,18 +1417,31 @@ def compute_config(
             caps = [_usable_cap_gb(g, g is primary_gpu) for g in ordered]
             total_cap = sum(caps)
 
-            # Sequential allocation of the footprint across the caps.
-            remaining = footprint_gb
+            # Priority-weighted allocation: each GPU gets a share proportional
+            # to its priority×VRAM score, capped by its usable cap.
+            scores = [max(1, _prio_map.get(g.name, 1)) * g.total_vram_mb for g in ordered]
+            total_score = sum(scores)
+
+            # First pass: allocate proportionally by score, respecting caps.
             alloc: List[float] = []
-            for cap in caps:
-                take = min(cap, max(0.0, remaining))
-                alloc.append(take)
-                remaining -= take
-            # If the footprint exceeds the combined cap (shouldn't happen once
-            # full_off is True, but guard anyway), fall back to filling each
-            # card to its full cap so nothing is left unplaced on the GPUs.
-            if sum(alloc) <= 0:
-                alloc = list(caps)
+            for i, cap in enumerate(caps):
+                proportion = scores[i] / total_score if total_score > 0 else 0
+                alloc.append(min(cap, model_footprint_gb * proportion))
+
+            # Second pass: if there's remaining footprint, distribute it
+            # proportionally among GPUs that haven't hit their cap.
+            remaining = model_footprint_gb - sum(alloc)
+            if remaining > 0.01:  # small epsilon to avoid floating-point noise
+                for _ in range(3):  # iterate a few times to converge
+                    if remaining <= 0.01:
+                        break
+                    for i, cap in enumerate(caps):
+                        if alloc[i] < cap and remaining > 0.01:
+                            space = cap - alloc[i]
+                            take = min(space, remaining * 0.5)  # give half to each available GPU
+                            alloc[i] += take
+                            remaining -= take
+
             denom = sum(alloc) if sum(alloc) > 0 else (total_cap or 1.0)
 
             if hip_known:
