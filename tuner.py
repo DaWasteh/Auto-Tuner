@@ -1673,6 +1673,26 @@ def build_command(
         str(port),
     ]
 
+    # ---- AutoTuner authority over memory placement --------------------
+    # Mainline llama.cpp gained an auto-fit pass (`--fit`, default 'on')
+    # that silently adjusts UNSET arguments to fit device memory. The
+    # AutoTuner deliberately computes ngl / ctx / n-cpu-moe / tensor-split,
+    # so we turn auto-fit OFF: the values we computed and logged are the
+    # ones that run. If they overcommit we want a visible, debuggable OOM
+    # — not a silent ctx/ngl downscale that desyncs the running config
+    # from what the launcher reported.
+    # NOTE: `--fit` is a recent flag. It is present in current mainline
+    # (b9297). If a server binary predates it, this will abort with
+    # "unknown argument"; in that case drop the two tokens below.
+    cmd += ["--fit", "off"]
+
+    # ---- Prometheus metrics endpoint ----------------------------------
+    # Exposes GET /metrics on the SAME host:port as the inference API
+    # (no separate port). Scraped by the System Tricorder for live
+    # tokens/s (llamacpp:predicted_tokens_seconds) and KV-cache fill
+    # (llamacpp:kv_cache_usage_ratio). Negligible overhead.
+    cmd.append("--metrics")
+
     # Speculative decoding — three states:
     #   - sibling drafter passed in        → Path A (-md + --draft-max)
     #   - integrated MTP filename          → Path B (--spec-draft-n-max)

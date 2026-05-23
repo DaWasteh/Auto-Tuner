@@ -10,6 +10,7 @@ the RAM/VRAM you actually have free — without manual edits.
 ![GUI](image.png)
 
 # Terminal-Design
+
 ```
 ────────────────────────────────────────────────────────────────
   AutoTuner for llama.cpp  —  interactive launcher
@@ -45,7 +46,8 @@ Select mode [1/2] (default 1):
 OS:   Windows 11
 CPU:  Intel(R) Core(TM) Ultra 9 285K (24C/24T)
 RAM:  47.4 GB total, 18.1 GB free
-GPU1: [amd] AMD Radeon RX 9070 XT (15.9 GB total, 15.1 GB free)
+GPU1: [amd] AMD Radeon AI PRO R9700 (32.0 GB total, 31.0 GB free)
+GPU2: [amd] AMD Radeon RX 9070 XT (15.9 GB total, 14.0 GB free)
       (ignored: [intel] Intel(R) Graphics, 2.0 GB — too small or auxiliary)
 
 [AutoTuner] Scanning models in: C:\LAB\ai-local\models
@@ -115,7 +117,11 @@ Launch llama-server now? [Y/n]
   models folder, no editing required.
 - **Hardware auto-detection** — works on **AMD (ROCm)**, **NVIDIA**,
   **Intel**, and **Apple Silicon** (unified memory). Multi-GPU is
-  supported via automatic `--tensor-split`.
+  supported via automatic, **priority-weighted** `--tensor-split`: a
+  model that fits the largest card is pinned to it (the second GPU stays
+  free for gaming/OBS); only larger models spread across both. Device
+  visibility is pinned via `HIP_VISIBLE_DEVICES` *and*
+  `GGML_VK_VISIBLE_DEVICES` so it works on both ROCm and Vulkan builds.
 - **Free-memory aware** — context length and KV quant are picked to
   use the RAM/VRAM that's actually free *right now*, not a hard-coded
   cap. The original v1 cap of 16k context is gone.
@@ -124,15 +130,15 @@ Launch llama-server now? [Y/n]
   Easy for contributors to extend without touching Python.
 - **Companion-file auto-pairing** — sibling files don't pollute the
   model menu, they're attached to their main model:
-    - `mmproj-*.gguf` → vision (longest-prefix wins)
-    - `*-assistant-*.gguf` / `*-draft-*.gguf` → speculative decoding
+  - `mmproj-*.gguf` → vision (longest-prefix wins)
+  - `*-assistant-*.gguf` / `*-draft-*.gguf` → speculative decoding
       (smallest matching sibling wins)
 - **Capability badges in the model list** — symbols make it obvious
   what each model can do at a glance:
-    - 👁 vision (mmproj projector paired)
-    - ⚡ draft  (assistant sibling for speculative decoding)
-    - 🧠 thinking (chat template emits `<think>` / `reasoning_content`)
-    - 🛠 tool-use (chat template advertises `tool_calls` / `function_call`)
+  - 👁 vision (mmproj projector paired)
+  - ⚡ draft  (assistant sibling for speculative decoding)
+  - 🧠 thinking (chat template emits `<think>` / `reasoning_content`)
+  - 🛠 tool-use (chat template advertises `tool_calls` / `function_call`)
 
   Detection reads the GGUF chat template directly — no name-based
   guessing — so `Qwen3-Coder` (no thinking) and `Qwen3-Embedding`
@@ -159,7 +165,6 @@ Launch llama-server now? [Y/n]
   (Spin-Box, -1 = aus, 0 = sofort stop, N = Token-Budget) im
   Expert-Panel.
 
-  
 ### Vision control
 
 You can disable vision (mmproj) support in two ways:
@@ -225,6 +230,11 @@ that only make sense with persistent state:
 - **Live config preview.** The right pane recomputes
   context / KV / placement whenever you tick a checkbox or change the
   performance target — no need to launch first.
+- **Honest load status (`/health` handshake).** After launch the status
+  bar shows *Loading model* and only flips to *Ready* once the server's
+  `GET /health` returns 200. Big MoE models can take a while to load (or
+  fail mid graph-build) — the GUI no longer claims "Running" the instant
+  the PID exists. A crash during load is surfaced as *Server exited*.
 - **Window geometry persistence.** Fenstergöße, -position,
   Maximize-State und Toolbar-Status werden gespeichert und beim
   nächsten Start wiederhergestellt (`_restore_window_geometry`).
@@ -232,9 +242,9 @@ that only make sense with persistent state:
   persistiert und beim Start sofort angewendet (`_change_font`).
   Kein Flash von der Default-Schriftgröße mehr.
 - **Reasoning-Panel (Expert-Panel).** Neue Sektion mit:
-    - Dropdown "Effort": `auto` / `off` / `minimal` / `low` /
+  - Dropdown "Effort": `auto` / `off` / `minimal` / `low` /
       `medium` / `high` / `extra_high`
-    - SpinBox "Think budget": `-1` = aus, `0` = sofort stop, `N` =
+  - SpinBox "Think budget": `-1` = aus, `0` = sofort stop, `N` =
       Token-Budget
   Die Werte werden als `--reasoning`, `--think-budget` und
   `--chat-template-kwargs` in `cfg.extra_cli_flags` übersetzt.
@@ -352,8 +362,8 @@ It looks for `llama-server` inside these directories (including `build/bin/...` 
 
 When you start the tuner, you can choose between:
 
-1.  **Standard-Quant**: Uses standard `llama.cpp` binaries.
-2.  **Turbo-Quant**: Uses the `tq_llama.cpp` binary for faster inference.
+1. **Standard-Quant**: Uses standard `llama.cpp` binaries.
+2. **Turbo-Quant**: Uses the `tq_llama.cpp` binary for faster inference.
 
 #### Turbo-Quant Labels & KV-Quant-Options
 
@@ -381,16 +391,18 @@ Die KV-Dropdowns in der GUI zeigen die volle Auswahl: `iq4_nl`,
 #### Specialized Binary Logic
 
 The tuner intelligently selects the best binary based on your model and settings:
+
 - **Gemma 4 (with external draft)** $\rightarrow$ uses `ik_llama.cpp` (external sibling drafter still requires the fork).
 - **Gemma 4 (without draft)** $\rightarrow$ uses standard `llama.cpp`.
 - **Integriertes MTP (z.B. Qwen3.6-27B-MTP)** $\rightarrow$ uses standard `llama.cpp` (b9190+ nativ; PR #22673 seit 16. Mai 2026 in Mainline; kein Fork nötig).
 - **Ternary-Bonsai** $\rightarrow$ uses `1b_llama.cpp`.
 - **Turbo-Quant Mode** $\rightarrow$ uses `tq_llama.cpp`.
 
-Example — run Devstral, override context, and pass an extra flag:
+Example — run Devstral, override context, and pass an extra flag
+(`--metrics` is now added automatically, so this just shows pass-through):
 
 ```bash
-python auto_tuner.py --model Devstral --ctx 131072 -y -- --metrics
+python auto_tuner.py --model Devstral --ctx 131072 -y -- --verbose
 ```
 
 ## Adding profiles for new models
@@ -441,8 +453,15 @@ matches. See `settings/_default.yaml`.
 5. **Threads / batch**: scale with placement (full GPU offload needs
    fewer CPU threads than CPU-only inference; long context wants
    smaller batches to keep prompt-prefill memory bounded).
-6. **Multi-GPU**: split tensors proportionally to free VRAM and pick
-   the GPU with the most free memory as `--main-gpu`.
+6. **Multi-GPU**: a model that fits the largest card alone is pinned to
+   it (other GPUs hidden via the visibility env vars, so they stay free
+   for gaming/OBS); larger models spread across all GPUs with a
+   **priority-weighted** `--tensor-split` (priority × free VRAM), and the
+   highest-scoring card becomes `--main-gpu`.
+7. **Hand authority to the AutoTuner**: `--fit off` is always emitted so
+   llama.cpp's own auto-fit pass never silently re-tunes the values the
+   AutoTuner computed and logged. An overcommit fails loudly (OOM) instead
+   of being quietly downscaled.
 
 ## Project layout
 
@@ -470,11 +489,12 @@ auto_tuner/
 ## Building llama.cpp and forks
 
 Recommended build settings for this system:
- - Ninja generator
- - native CPU optimizations
- - static build
- - Release mode
- - 20 parallel build jobs
+
+- Ninja generator
+- native CPU optimizations
+- static build
+- Release mode
+- 20 parallel build jobs
 
 ```
 ## Building llama.cpp and forks - Example
@@ -521,7 +541,7 @@ rm -rf build
 cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS="gfx1200;gfx1201" -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j $(nproc)```
 
-## Server-Features (Stand b9208)
+## Server-Features (Stand b9297)
 
 Die folgenden `llama-server` Features werden unterstützt (aus `tools/server/README.md`):
 
@@ -529,19 +549,61 @@ Die folgenden `llama-server` Features werden unterstützt (aus `tools/server/REA
 |------|---------------|
 | `-fa [on\|off\|auto]` | ✅ Form `-fa on` wird emittiert |
 | `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ Alle im Dropdown |
+| `--fit off` | ✅ **Neu** — immer emittiert, damit llama.cpps eigener Auto-Fit-Pass (Default `on`) die berechneten Werte nicht still nachjustiert (AutoTuner ist die Autorität) |
+| `--metrics` | ✅ **Neu** — Prometheus-Endpoint `GET /metrics` auf demselben host:port (siehe „Monitoring") |
 | `--reasoning on/off/auto` | ✅ Via Dropdown |
 | `--think-budget N` | ✅ Via SpinBox |
 | `--chat-template-kwargs ...` | ✅ Dropdown produziert das automatisch |
 | `--jinja` | ✅ Wird sichtbar angehakt |
 | `--mlock` / `--no-mmap` | ✅ Windows-Guard; manuell überschreibbar |
+| `-md` externer Drafter | ✅ Ohne `--spec-type` — die Anwesenheit von `-md` aktiviert den Draft-Pfad in Mainline automatisch (verifiziert b9297) |
 | `--spec-type draft-mtp` | ✅ Integriertes MTP (Qwen3.6-MTP u.a.) — `draft-mtp` ist der Mainline-Name seit Merge von PR #22673 (16. Mai 2026) |
 | `--spec-draft-n-max` | ✅ Via `draft_max` im YAML-Profil |
-| `--spec-draft-p-min` | ✅ Via `draft_p_min` im YAML-Profil — Default 0.75; wird jetzt in **beiden** Spec-Paths (extern + integriert) emittiert |
+| `--spec-draft-p-min` | ✅ Via `draft_p_min` im YAML-Profil — Default 0.75; wird in **beiden** Spec-Paths (extern + integriert) emittiert |
 | `--spec-draft-ngl` | ✅ Immer 99 (MTP-Head auf GPU halten) |
-| `--n-cpu-moe` / `--override-tensor` | ✅ Bereits vorhanden |
+| `--n-cpu-moe` / `--override-tensor` | ✅ `--n-cpu-moe` aktiv; `-ot` für gezielte Expert-Platzierung vorbereitet |
+| `--tensor-split` / `--main-gpu` | ✅ Priority-weighted, mit Single-GPU-Pinning |
 | `--rope-scaling yarn` | ✅ Bereits vorhanden |
 | `--numa` | ✅ Bereits vorhanden |
 | `--no-context-shift` | ✅ Wird nicht mehr dupliziert (Dedup via seen-Set) |
+
+### Monitoring (`/health` + `/metrics`)
+
+Beim Start hängt der AutoTuner `--metrics` an, sodass `llama-server` zwei
+HTTP-Endpoints auf demselben `host:port` wie die Inferenz-API bereitstellt
+(es gibt **keinen** separaten Metrics-Port):
+
+- **`GET /health`** — `503` während des Ladens, `200` wenn das Modell
+  bereit ist. Die Qt-GUI pollt diesen Endpoint und schaltet den Status
+  von *Loading model* auf *Ready* (siehe oben).
+- **`GET /metrics`** — Prometheus-Textformat. Die wichtigsten Kennzahlen
+  (Single-Model-Modus, Prefix `llamacpp:`):
+
+  | Metrik | Typ | Bedeutung |
+  |---|---|---|
+  | `llamacpp:predicted_tokens_seconds` | gauge | Generierungs-Durchsatz (tok/s) |
+  | `llamacpp:prompt_tokens_seconds` | gauge | Prompt-/Prefill-Durchsatz (tok/s) |
+  | `llamacpp:kv_cache_usage_ratio` | gauge | KV-Cache-Füllstand (1.0 = 100 %) |
+  | `llamacpp:kv_cache_tokens` | gauge | Tokens im KV-Cache |
+  | `llamacpp:requests_processing` | gauge | Aktive Requests |
+  | `llamacpp:tokens_predicted_total` | counter | Generierte Tokens kumuliert |
+  | `llamacpp:prompt_tokens_total` | counter | Prompt-Tokens kumuliert |
+
+  Scrapen ohne Prometheus-Client (z. B. für den System Tricorder):
+
+  ```python
+  import urllib.request
+  def llama_metrics(base_url: str) -> dict[str, float]:
+      out = {}
+      with urllib.request.urlopen(f"{base_url}/metrics", timeout=0.5) as r:
+          for line in r.read().decode().splitlines():
+              if line and not line.startswith("#"):
+                  name, _, val = line.partition(" ")
+                  try: out[name] = float(val)
+                  except ValueError: pass
+      return out
+  # llama_metrics("http://127.0.0.1:1234")["llamacpp:predicted_tokens_seconds"]
+  ```
 
 ## License
 

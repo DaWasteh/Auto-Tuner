@@ -1057,6 +1057,10 @@ class MainWindow(QMainWindow):
         self.settings_path = settings_path
 
         self._server: Optional[_TerminalProcess] = None
+        # /health handshake state: base URL of the running server and a
+        # latch that flips once GET /health returns 200 (model loaded).
+        self._server_base_url: Optional[str] = None
+        self._server_ready: bool = False
         self._all_entries: List[ModelEntry] = []
         self._system: Optional[SystemInfo] = None
         self._profiles: List[ModelProfile] = []
@@ -2791,9 +2795,18 @@ class MainWindow(QMainWindow):
         self._log("[AutoTuner] Server output → separate terminal window")
         self._log(f"[AutoTuner] Web UI → http://{host}:{port}")
 
+        # Arm the /health handshake. The status flips from "Loading model"
+        # to "Ready" once _poll_server sees GET /health → 200. For big MoE
+        # models this load can take a while (or fail mid graph-build), so
+        # we no longer claim "Running" the instant the PID exists.
+        self._server_base_url = f"http://{host}:{port}"
+        self._server_ready = False
+
         self._btn_launch.setEnabled(False)
         self._btn_stop.setEnabled(True)
-        self._status.showMessage(f"Running — PID {pid} — http://{host}:{port}")
+        self._status.showMessage(
+            f"Loading model — PID {pid} — http://{host}:{port}"
+        )
 
     def _stop_server(self) -> None:
         if self._server is None:
@@ -2801,6 +2814,8 @@ class MainWindow(QMainWindow):
         self._log("[AutoTuner] Stopping server…")
         srv = self._server
         self._server = None
+        self._server_base_url = None
+        self._server_ready = False
         srv.stop()  # sends signal + waits in daemon thread
         self._btn_launch.setEnabled(True)
         self._btn_stop.setEnabled(False)
@@ -2816,10 +2831,40 @@ class MainWindow(QMainWindow):
         if not self._server.is_running():
             code = self._server.returncode()
             self._server = None
+            self._server_base_url = None
+            self._server_ready = False
             self._btn_launch.setEnabled(True)
             self._btn_stop.setEnabled(False)
             self._log(f"[AutoTuner] Server exited (code {code}).")
             self._status.showMessage(f"Server exited (code {code}).")
+            return
+
+        # Process is alive. Until the model has finished loading, probe the
+        # HTTP /health endpoint: it returns 503 while loading and 200 once
+        # the model is ready to serve. We only poll during the load window
+        # — after the first 200 we latch and stop probing (the liveness
+        # check above continues to catch crashes/exits).
+        if self._server_ready or not self._server_base_url:
+            return
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"{self._server_base_url}/health", timeout=0.3
+            ) as resp:
+                ready = resp.status == 200
+        except Exception:
+            # 503 (HTTPError), connection refused, or any transient error
+            # all mean "not ready yet" — keep showing the loading state.
+            ready = False
+
+        if ready:
+            self._server_ready = True
+            pid = self._server.proc.pid if self._server.proc else "?"
+            self._log("[AutoTuner] Server ready (/health → 200).")
+            self._status.showMessage(
+                f"Ready — PID {pid} — {self._server_base_url}"
+            )
 
     # ------------------------------------------------------------------
     # Log helper
