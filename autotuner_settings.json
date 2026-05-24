@@ -49,11 +49,14 @@
     },
     "gemma-4-31B-it-UD-Q8_K_XL": {
       "draft": false
+    },
+    "Qwen3.6-35B-A3B-UD-Q8_K_XL": {
+      "draft": true
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAAxAAAALQAABQ4AAATwAAAAMQAAAEwAAAUOAAAE8AAAAAAAAAAADXAAAAAxAAAATAAABQ4AAATw",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABN4AAARwAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAD///r////65v///9z////t///6////+wX////c////7QAAAAEAAAAACHD///r////7Bf///9z////t",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABN4AAAS0AAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "H:\\LAB\\ai-local",
   "font_size": 10,
   "gpu_overrides": {

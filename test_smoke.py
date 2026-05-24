@@ -416,8 +416,14 @@ def test_ngram_standalone_on_any_model(tmp_path):
     assert "--spec-ngram-mod-n-max" in cmd
 
 
-def test_ngram_combines_with_embedded_mtp(tmp_path):
-    """MTP + ngram → one comma-separated --spec-type list (draft-mtp,ngram-mod)."""
+def test_ngram_suppressed_when_embedded_mtp(tmp_path):
+    """MTP + ngram → ONLY draft-mtp; ngram-mod is dropped.
+
+    Combining draft-mtp,ngram-mod in one --spec-type list crashes
+    mid-generation on MTP models (llama.cpp #23154, open as of b9305). The
+    trained MTP head supersedes a generic ngram hash anyway, so draft-mtp wins
+    and ngram-mod (plus its --spec-ngram-mod-* flags) is suppressed.
+    """
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Qwen3.6-MoE-A3B", size_gb=8.0)
     model.metadata = {
@@ -431,7 +437,10 @@ def test_ngram_combines_with_embedded_mtp(tmp_path):
     cmd = build_command(model, cfg, profile, enable_ngram=True)
     types = _spec_tokens(cmd).split(",")
     assert "draft-mtp" in types
-    assert "ngram-mod" in types
+    assert "ngram-mod" not in types
+    assert "--spec-ngram-mod-n-match" not in cmd
+    assert "--spec-ngram-mod-n-min" not in cmd
+    assert "--spec-ngram-mod-n-max" not in cmd
 
 
 def test_ngram_survives_speculative_disabled(tmp_path):

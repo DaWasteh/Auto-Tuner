@@ -1649,10 +1649,22 @@ def build_command(
       unchecked Draft on an MTP-named model.
     * ``enable_ngram=True`` adds ``ngram-mod`` self-speculative decoding
       (Path C). It is model-agnostic — no draft model required — so it can
-      run standalone on any GGUF, or be combined with Path A/B. ``--spec-type``
-      is a comma-separated list, and llama.cpp explicitly allows mixing a
-      draft-model path with a draftless one, so e.g. ``draft-mtp,ngram-mod``
-      is valid; the draftless path takes precedence when both fire.
+      run standalone on any GGUF, or be combined with an *external* sibling
+      drafter (Path A, ``-md``). ``--spec-type`` is a comma-separated list and
+      llama.cpp allows mixing a draft-model path with a draftless one.
+
+      EXCEPTION — integrated MTP (Path B): ``ngram-mod`` is **not** combined
+      with ``draft-mtp``. The pair ``draft-mtp,ngram-mod`` triggers random
+      mid-generation crashes (CUDA/Vulkan device error, or the model stalling
+      mid-thought) on MTP models such as Qwen3.6-27B-MTP — see llama.cpp issue
+      #23154 (open as of b9305; "issue not reproduced when ngram-mod is
+      removed"). Both speculators feed the same decode graph and corrupt each
+      other's draft state. On an MTP model ``draft-mtp`` therefore wins: it is
+      the trained, model-native draft head (higher acceptance than a generic
+      hash lookup anyway), so suppressing the redundant ``ngram-mod`` loses no
+      real capability. ``ngram-mod`` stays fully active for every other case:
+      standalone on dense / MoE-without-MTP models, and alongside an external
+      drafter (Path A), whose separate context does not exhibit the conflict.
     """
     cmd: List[str] = [
         server_binary,
@@ -1740,13 +1752,30 @@ def build_command(
         and draft_model is None
     )
 
+    # ngram-mod is mutually exclusive with integrated MTP (draft-mtp).
+    # Combining them in one --spec-type list (draft-mtp,ngram-mod) causes
+    # random mid-generation crashes on MTP models (e.g. Qwen3.6-27B-MTP):
+    # CUDA/Vulkan device error, or the model stalling mid-thought. This is
+    # llama.cpp issue #23154, still OPEN as of b9305 — the reporter confirms
+    # "issue not reproduced when ngram-mod is removed". Both speculators write
+    # into the same decode graph and corrupt each other's draft state.
+    #
+    # Resolution: on an MTP model, draft-mtp wins. It is the trained,
+    # model-native draft head (and has a higher acceptance rate than a generic
+    # ngram hash lookup), so dropping the redundant ngram-mod loses no real
+    # capability — it only removes the unstable duplication. ngram-mod remains
+    # fully active wherever it is safe: standalone (dense / MoE-without-MTP)
+    # and alongside an external sibling drafter (Path A, -md), which lives in a
+    # separate context and does not exhibit this conflict.
+    use_ngram_mod = enable_ngram and not use_integrated
+
     # Assemble the --spec-type list (embedded-draft + draftless types) and emit
     # it BEFORE the per-path parameter flags. -md (Path A) is auto-detected by
     # mainline, so it contributes no type token — only its parameter flags.
     spec_types: List[str] = []
     if use_integrated:
         spec_types.append("draft-mtp")
-    if enable_ngram:
+    if use_ngram_mod:
         spec_types.append("ngram-mod")
     if spec_types:
         cmd += ["--spec-type", ",".join(spec_types)]
@@ -1774,11 +1803,13 @@ def build_command(
         cmd += ["--spec-draft-ngl", "99"]
         cmd += ["--spec-draft-p-min", str(draft_p_min)]
 
-    if enable_ngram:
+    if use_ngram_mod:
         # Path C — ngram-mod self-speculative decoding (no draft model).
         # Builds a rolling-hash lookup table from the live context (~16 MB,
         # constant memory). Parameters per llama.cpp docs/speculative.md:
         #   n-match = lookup length, n-min/n-max = draft length bounds.
+        # Gated by use_ngram_mod (not enable_ngram) so these flags are omitted
+        # when integrated MTP is active — see the #23154 note above.
         ngram_match = getattr(profile, "ngram_n_match", 24) or 24
         ngram_min = getattr(profile, "ngram_n_min", 48) or 48
         ngram_max = getattr(profile, "ngram_n_max", 64) or 64
