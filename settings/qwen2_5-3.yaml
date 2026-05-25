@@ -5,22 +5,34 @@ patterns:
   - qwen2.5
   - qwen3-coder
 
-max_context: 131072
+# Angehoben von 131072 -> 262144.
+#
+# Grund: Qwen3-Coder-30B-A3B-Instruct UND Qwen3-Coder-Next melden in der
+# GGUF-Metadata native_context = 262144 (256k). Mit dem alten Wert 131072
+# wurden beide kuenstlich auf die Haelfte ihres nativen Kontexts gedeckelt
+# (effektiv = min(profile.max_context, native_ctx) = min(131072, 262144)).
+#
+# Der Wert ist sicher fuer die echten Qwen2.5-Modelle: deren GGUF-native_ctx
+# ist 32768 bzw. 131072, und der Tuner cappt automatisch auf das Minimum aus
+# profile.max_context und GGUF-native_context (tuner.py: profile_max =
+# min(profile.max_context, native_ctx)). Qwen2.5 bleibt damit unveraendert,
+# nur Qwen3-Coder bekommt seine vollen 256k.
+max_context: 262144
 recommended_kv_quant: q8_0
 
-# RoPE-Scaling (YaRN): Optional aktivierbar wenn genügend Speicher frei ist
-# und der berechnete Context das native Limit überschreitet.
+# RoPE-Scaling (YaRN): Optional aktivierbar wenn genuegend Speicher frei ist
+# und der berechnete Context das native Limit ueberschreitet.
 rope_scale:
-  enabled: false       # Standard aus — User kann in GUI aktivieren
-  max_context: 1048576  # 1M tokens mit YaRN möglich
-  scale_factor: 4.0     # yarn scaling factor (4x für Qwen3.5/3.6)
+  enabled: false       # Standard aus - User kann in GUI aktivieren
+  max_context: 1048576  # 1M tokens mit YaRN moeglich
+  scale_factor: 4.0     # yarn scaling factor (4x fuer Qwen3.5/3.6)
 
 # Sampling-Profile pro Modus.
 sampling:
   chat:
     # Generischer Allround-Default, funktioniert quer durch die Familie
     # (Instruct, Chat, VL). Kein offizieller Qwen-2.5-Empfehlungswert
-    # bekannt — das hier ist die alte Flat-Konfiguration.
+    # bekannt - das hier ist die alte Flat-Konfiguration.
     temperature: 0.7
     top_k: 40
     top_p: 0.9
@@ -28,9 +40,9 @@ sampling:
     repeat_penalty: 1.05
   coding:
     # Qwen3-Coder und die Qwen2.5-Coder-Varianten profitieren stark
-    # von niedriger Temperatur — siehe Notes-Tipp im alten Profil.
+    # von niedriger Temperatur - siehe Notes-Tipp im alten Profil.
     # 0.2 ist der Mittelweg zwischen "deterministic" (0.1) und
-    # "etwas Kreativität bei Algorithmus-Suche" (0.3).
+    # "etwas Kreativitaet bei Algorithmus-Suche" (0.3).
     temperature: 0.2
     top_k: 40
     top_p: 0.9
@@ -38,6 +50,16 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  Hervorragendes Allround-Modell. Coding-Profil läuft mit temp=0.2
-  (vs. 0.7 chat) — die Coder-Varianten können auch mit noch niedrigerer
-  Temperatur (0.1) betrieben werden. Über GUI-Mode auswählbar.
+  Hervorragendes Allround-Modell. Coding-Profil laeuft mit temp=0.2
+  (vs. 0.7 chat) - die Coder-Varianten koennen auch mit noch niedrigerer
+  Temperatur (0.1) betrieben werden. Ueber GUI-Mode auswaehlbar.
+  Faengt auch Qwen3-Coder-30B-A3B-Instruct (arch qwen3moe) und
+  Qwen3-Coder-Next (arch qwen3next) ueber das Pattern "qwen3-coder".
+  Beide haben 256k nativen Kontext - daher max_context 262144 (vorher
+  faelschlich auf 131072 gedeckelt). Qwen3-Coder-Next ist ein Hybrid
+  (Gated DeltaNet + Gated Attention) und braucht eine aktuelle
+  llama.cpp-Version mit den DeltaNet-Operatoren - auf b9310 vorhanden.
+  Hinweis: Qwen3-Coder-Instruct ist ein reines Instruct-Modell ohne
+  Thinking; Alibaba empfiehlt dafuer temp 0.7 / top_p 0.8 (Chat-Modus
+  liegt mit 0.7/0.9 nah dran). Fuer deterministisches Code-Editing den
+  Coding-Modus (temp 0.2) verwenden.

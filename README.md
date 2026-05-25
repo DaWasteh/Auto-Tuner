@@ -345,15 +345,16 @@ The tuner automatically searches for binaries in common local layouts.
 If you have a workspace like this, it "Just Works" without any flags:
 
 ```
-C:\GitHub\
+H:\GitHub\
 └── Auto Tuner\         ← clone of this repo
-C:\LAB\
+H:\LAB\
 └── ai-local\
     ├── llama.cpp\      ← standard build
     ├── tq_llama.cpp\   ← Turbo-Quant build
     ├── ik_llama.cpp\   ← Gemma 4 externer Drafter (Fork noch nötig)
-    ├── 1b_llama.cpp\   ← BitNet fork (Ternary-Bonsai)
-    └── models\         ← your models
+    └── 1b_llama.cpp\   ← BitNet fork (Ternary-Bonsai)
+I:\
+└── models\             ← your models
 ```
 
 It looks for `llama-server` inside these directories (including `build/bin/...` subpaths).
@@ -604,6 +605,9 @@ HTTP-Endpoints auf demselben `host:port` wie die Inferenz-API bereitstellt
                   except ValueError: pass
       return out
   # llama_metrics("http://127.0.0.1:1234")["llamacpp:predicted_tokens_seconds"]
+
+  - **get_metadata.py** — In den Ordner mit den Modellen packen (pip install gguf) und alle Metadaten aller Modelle auslesen und speichern. Für Debugging!
+
   ```
 
 ## License

@@ -1,0 +1,51 @@
+display_name: "Hunyuan / Hunyuan-MT (Tencent)"
+patterns:
+  - hunyuan
+  - hy-mt
+
+# Hunyuan-MT-7B (Sept 2025) und HY-MT2-7B sind dichte Übersetzungs-Modelle
+# (general.architecture = "hunyuan-dense"). Die hunyuan-dense-Architektur ist
+# seit Längerem in llama.cpp-Mainline unterstützt (kein Hybrid, normaler KV-
+# Cache über alle Layer). HY-MT2 trägt einen Trainings-Checkpoint-Namen in
+# general.name ("Global_Step_560") - das ist kein Problem für den Loader,
+# die Architektur entscheidet.
+#
+# Native Kontextlänge der MT-Reihe ist 32768. Wird via GGUF-Metadata
+# automatisch gecappt - daher hier den nativen Wert.
+max_context: 32768
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+# Hunyuan-MT ist KEIN Chat-/Coding-Modell, sondern ein reines
+# Übersetzungs-Modell. Die "chat"-Defaults entsprechen Tencents offizieller
+# Empfehlung für Hunyuan-MT (generation_config: temp=0.7, top_p=0.6,
+# top_k=20, repetition_penalty=1.05). Der "coding"-Modus ist hier als
+# "literal / deterministisch" zu verstehen - nützlich für reproduzierbare
+# Fachübersetzungen, weniger paraphrasierend.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.6
+    min_p: 0.0
+    repeat_penalty: 1.05
+  coding:
+    # Deterministischer für reproduzierbare/literale Übersetzungen.
+    temperature: 0.3
+    top_k: 20
+    top_p: 0.6
+    min_p: 0.0
+    repeat_penalty: 1.05
+
+notes: >
+  Tencent Hunyuan-MT (HY-MT2-7B) - dichtes 7B-Übersetzungsmodell,
+  Architektur "hunyuan-dense" (in llama.cpp-Mainline unterstützt, kein
+  mmproj, kein Hybrid). Die Sampling-Defaults sind Tencents offizielle
+  Hunyuan-MT-Werte (temp 0.7 / top_p 0.6 / top_k 20 / rep 1.05) - bewusst
+  abweichend von den üblichen Chat-Profilen, weil das Modell für
+  Übersetzung statt freies Schreiben trainiert ist.
+  HINWEIS: Falls dieses Profil später auch generische Hunyuan-CHAT-Modelle
+  (z.B. Hunyuan-A13B) fangen sollte, wäre dort eher temp 1.0 sinnvoll -
+  dann ein eigenes Profil mit spezifischerem Pattern anlegen.
+  general.name zeigt bei diesem GGUF einen Checkpoint-Namen
+  ("Global_Step_560"); das ist kosmetisch und beeinflusst das Laden nicht.
