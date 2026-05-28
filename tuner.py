@@ -1702,8 +1702,9 @@ def build_command(
     # ones that run. If they overcommit we want a visible, debuggable OOM
     # — not a silent ctx/ngl downscale that desyncs the running config
     # from what the launcher reported.
-    # NOTE: `--fit` (env LLAMA_ARG_FIT, default 'on') is confirmed present in
-    # b9334. If a server binary predates it, this will abort with
+    # NOTE: `--fit` (env LLAMA_ARG_FIT, default 'on') is confirmed present and
+    # unchanged across b9334–b9371 (re-verified against the b9334→b9371 diff).
+    # If a server binary predates it, this will abort with
     # "unknown argument"; in that case drop the two tokens below.
     cmd += ["--fit", "off"]
 

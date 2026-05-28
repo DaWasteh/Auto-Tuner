@@ -543,7 +543,7 @@ cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS="gfx1200;gfx1201" -DCMAKE_BUILD_TY
 cmake --build build --config Release -j $(nproc)
 ```
 
-## Server-Features (Stand b9334)
+## Server-Features (Stand b9371)
 
 Die folgenden `llama-server` Features werden unterstützt (aus `tools/server/README.md`):
 
@@ -558,9 +558,9 @@ Die folgenden `llama-server` Features werden unterstützt (aus `tools/server/REA
 | `--chat-template-kwargs ...` | ✅ Dropdown produziert das automatisch |
 | `--jinja` | ✅ Wird sichtbar angehakt |
 | `--mlock` / `--no-mmap` | ✅ Windows-Guard; manuell überschreibbar |
-| `-md` externer Drafter | ✅ Ohne `--spec-type` — die Anwesenheit von `-md` aktiviert den Draft-Pfad in Mainline automatisch (verifiziert b9334) |
+| `-md` externer Drafter | ✅ Ohne `--spec-type` — die Anwesenheit von `-md` aktiviert den Draft-Pfad in Mainline automatisch (verifiziert b9371) |
 | `--spec-type draft-mtp` | ✅ Integriertes MTP (Qwen3.6-MTP u.a.) — `draft-mtp` ist der Mainline-Name seit Merge von PR #22673 (16. Mai 2026) |
-| `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (Default). Auf MTP-Modellen unterdrückt, weil `draft-mtp,ngram-mod` mitten in der Generierung crasht (#23154, bei b9334 weiterhin offen) |
+| `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (Default). Auf MTP-Modellen unterdrückt, weil `draft-mtp,ngram-mod` mitten in der Generierung crasht (#23154, im Review-Bereich b9334→b9371 nicht behoben) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ **Neu** — die MTP-**kompatible** ngram-Methode aus ggerganovs MTP-Cleanup (PR #23269). Per `ngram_method: ngram-map-k4v` läuft sie zusammen mit `draft-mtp` → so kombiniert man „MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Wählbar via `ngram_method`; nur das Typ-Token wird emittiert, Sub-Parameter überlässt der Tuner den llama.cpp-Defaults |
 | `--spec-draft-n-max` | ✅ Via `draft_max` im YAML-Profil |
@@ -572,6 +572,32 @@ Die folgenden `llama-server` Features werden unterstützt (aus `tools/server/REA
 | `--rope-scaling yarn` | ✅ Bereits vorhanden |
 | `--numa` | ✅ Bereits vorhanden |
 | `--no-context-shift` | ✅ Wird nicht mehr dupliziert (Dedup via seen-Set) |
+
+### Review b9334 → b9371 (37 Commits)
+
+Vollständige Durchsicht aller 37 Commits zwischen b9334 und b9371. **Ergebnis:
+keine funktionalen AutoTuner-Anpassungen nötig** — alle genutzten Server-Flags
+(`--fit off`, `--metrics`, `--spec-type`, `--spec-draft-*`, `-fa on`,
+`--n-cpu-moe`, YaRN, KV-Cache-Typen) sind unverändert. Relevante Punkte:
+
+- **Env-Rename (#23778):** llama.cpp hat mehrere Environment-Variablen auf den
+  einheitlichen `LLAMA_ARG_`-Präfix gezogen: `LLAMA_LOG_FILE/COLORS/VERBOSITY/PREFIX/TIMESTAMPS`
+  → `LLAMA_ARG_LOG_*`, `LLAMA_OFFLINE` → `LLAMA_ARG_OFFLINE`,
+  `LLAMA_CHAT_TEMPLATE_KWARGS` → `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`. **Die CLI-Flags
+  selbst bleiben gleich.** Der AutoTuner setzt als Env-Overrides nur
+  `HIP_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES` (GGML-Vars, nicht betroffen);
+  `LLAMA_ARG_FIT` trägt den Präfix bereits → kein Einfluss.
+  ⚠️ *Falls künftig llama-Log-/Offline-Env-Overrides ergänzt werden, ab b9371 den
+  `LLAMA_ARG_`-Präfix verwenden.*
+- **Vulkan-Performance:** mehrere transparente Backend-Optimierungen (MUL_MAT_VEC
+  4 K/Iteration für F16/F32 #22887, conv2d + coopmat1 #22620, REPEAT f16→f16 #23298).
+  Profitiert allein durch den Rebuild, keine Flag-Änderung. Der AMD-UMA-Transfer-Queue-Fix
+  (#22455) betrifft nur integrierte GPUs/APUs, nicht die dedizierten R9700 / RX 9070 XT.
+- **Neue Modell-/Konvertierungs-Unterstützung (convert-seitig, nicht Server-Laufzeit):**
+  `Gemma4ForCausalLM`-Konvertierung (#23682), MiniCPM5-Tokenizer (#23384),
+  talkie-1930-13b (#22596), Mistral3-NVFP4-Weight-Scales (#23629). Profil-Pflege
+  nur bei Adoption — Arch wird im Tuner dynamisch aus den Metadaten gelesen.
+- **Server-Code:** nur kosmetisch (SSL-Log-Message #23393, cpp-httplib 0.46.0 #23650).
 
 ### Spekulatives Dekodieren (MTP + n-gram)
 
@@ -593,7 +619,7 @@ Seit b9334 ist die draftless-Familie gewachsen: `ngram-mod` (Default),
 
 **MTP + n-gram zusammen.** Nur `ngram-mod` kollidiert mit `draft-mtp`
 (`draft-mtp,ngram-mod` → zufällige Mid-Generation-Crashes, llama.cpp #23154,
-bei b9334 offen). Darum unterdrückt der Tuner `ngram-mod` neben MTP. Die
+im Review-Bereich b9334→b9371 nicht behoben). Darum unterdrückt der Tuner `ngram-mod` neben MTP. Die
 `ngram-map-*`-Methoden wurden von ggerganovs MTP-Cleanup (PR #23269) gezielt
 für die Koexistenz mit `draft-mtp` gebaut — `ngram-map-k4v` steht dort sogar
 im `--spec-default`. Um „MTP + n-gram" auf einem MTP-Modell zu aktivieren,
@@ -634,8 +660,10 @@ und **SYCL** (Intel GPU), aber:
 1. OpenVINO ist ein **eigenständiges Whole-Model-Backend**, das den
    GGML-Graph komplett ersetzt — es lässt sich **nicht** mit dem Vulkan-/
    ROCm-AMD-Pool in einem Prozess mischen (Entweder/Oder).
-2. Offizielle Windows-Binaries gibt es nur als CPU / CUDA / Vulkan / SYCL /
-   HIP — **kein** Windows-OpenVINO-Build (nur Ubuntu).
+2. Offizielle Windows-Binaries gibt es nur als CPU / CUDA / Vulkan / HIP —
+   **kein** Windows-OpenVINO-Build (nur Ubuntu). Seit b9371 (#23705) werden
+   zudem **keine offiziellen SYCL-Releases** mehr gebaut, SYCL wäre also ein
+   Eigen-Build.
 3. Die Desktop-iGPU (~4 Xe-Cores) und die ~13-TOPS-NPU teilen sich die
    DDR5-Bandbreite mit der CPU, die bereits die MoE-Experten rechnet, und im
    Layer-Split taktet das langsamste Gerät die Pipeline — neben zwei starken
