@@ -1578,7 +1578,21 @@ def test_gpu_short_label_fallbacks() -> None:
 
     assert MainWindow._gpu_short_label("Some Fancy GPU") == "GPU"
     assert MainWindow._gpu_short_label("   ") == ""
-    
+
+
+def test_manual_next_port_not_shifted_by_running_server_count() -> None:
+    """Regression: main server on 8080 must not make a manually entered
+    chatbot port 1235 turn into 1236 just because one server is running."""
+    pytest.importorskip("PyQt6")
+    from qt_launcher import MainWindow
+
+    # _requested_start_port intentionally ignores len(self._servers). It is
+    # called before _next_free_port, which still handles actual collisions.
+    dummy = object()
+    assert MainWindow._requested_start_port(dummy, 8080, 0) == 8080
+    assert MainWindow._requested_start_port(dummy, 1235, 0) == 1235
+    assert MainWindow._requested_start_port(dummy, 1235, 1) == 1236
+
 
 # ---------------------------------------------------------------------------
 # Authoritative VRAM from `llama-server --list-devices`
@@ -1640,3 +1654,51 @@ def test_list_devices_free_never_exceeds_total(monkeypatch) -> None:
     total, free = vram["weird gpu"]
     assert free <= total
     assert (total, free) == (8000, 8000)
+
+
+def test_vulkan_summary_maps_basti_gpu_pci_ids(monkeypatch) -> None:
+    """Basti's workstation: Windows lists R9700 first, but Vulkan/llama.cpp
+    lists RX 9070 XT first. PCI device IDs must resolve the correct indices."""
+    import hardware
+    from hardware import GPUInfo
+
+    summary = """
+Devices:
+========
+GPU0:
+        deviceID           = 0x7550
+        deviceName         = AMD Radeon RX 9070 XT
+GPU1:
+        deviceID           = 0x7551
+        deviceName         = AMD Radeon AI PRO R9700
+GPU2:
+        deviceID           = 0x7d67
+        deviceName         = Intel(R) Graphics
+"""
+    monkeypatch.setattr(hardware, "_run", lambda *a, **k: summary)
+    monkeypatch.setattr(hardware, "_detect_llama_device_order", lambda _binary: [])
+    monkeypatch.setattr(hardware, "_detect_vulkan_device_order", lambda: [])
+
+    gpus = [
+        GPUInfo(
+            index=0,
+            name="AMD Radeon AI PRO R9700",
+            vendor="amd",
+            total_vram_mb=32624,
+            free_vram_mb=31704,
+            pci_device_id=0x7551,
+        ),
+        GPUInfo(
+            index=1,
+            name="AMD Radeon RX 9070 XT",
+            vendor="amd",
+            total_vram_mb=16304,
+            free_vram_mb=15416,
+            pci_device_id=0x7550,
+        ),
+    ]
+
+    hardware._assign_hip_indices(gpus, None)
+
+    assert gpus[0].hip_index == 1  # R9700 is Vulkan1
+    assert gpus[1].hip_index == 0  # 9070 XT is Vulkan0
