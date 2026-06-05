@@ -1,0 +1,72 @@
+display_name: "gpt-oss (OpenAI)"
+patterns:
+  - gpt-oss
+  - gpt_oss
+
+# OpenAI gpt-oss (Aug 2025): zwei offene MoE-Modelle unter Apache 2.0.
+#   * gpt-oss-20b  — 21B total / 3.6B active, läuft in 16 GB VRAM
+#   * gpt-oss-120b — 117B total / 5.1B active (eine H100)
+# Architektur "gpt-oss" ist seit dem Release in llama.cpp-Mainline. Beide
+# Varianten sind nativ MXFP4-quantisiert (die MoE-Layer); deshalb sind die
+# GGUF-Größen über alle "Quant"-Stufen fast identisch (~11–13 GB beim 20B) —
+# die Stufe ändert praktisch nur Embeddings/Attention, nicht die Experten.
+# Native Kontextlänge 131072 (128k). Wird via GGUF-Metadata automatisch
+# gecappt — daher hier den nativen Wert.
+max_context: 131072
+
+# KV-Quant: q8_0. gpt-oss reagiert empfindlich auf aggressive KV-Quantisierung;
+# der harmony-Reasoning-Trace verliert bei q4/q5 spürbar an Kohärenz. Das 20B
+# passt mit q8_0-KV bei 128k locker neben das Modell ins VRAM der 32-GB-Karte.
+recommended_kv_quant: q8_0
+
+# Sampling — WICHTIG: gpt-oss ist auf das harmony-Format trainiert und hat
+# unübliche Sampler-Anforderungen. OpenAI/llama.cpp empfehlen ausdrücklich:
+#   * temperature 1.0, top_p 1.0  (Default; NICHT runterdrehen für Chat)
+#   * KEIN top_k  (0 = deaktiviert) — top_k schneidet harmony-Steuertokens ab
+#   * KEIN repeat_penalty (1.0)    — Penalty bricht den Reasoning-Trace
+#   * KEIN min_p (0.0)
+# Diese Werte sind bewusst "untypisch hoch", weil das Modell sonst aus dem
+# harmony-Format fällt (abgebrochene <|channel|>/<|message|>-Tokens →
+# kaputter Chain-of-Thought → wirres Output).
+sampling:
+  chat:
+    # OpenAI-Default für gpt-oss. Greedy/niedrige Temp funktioniert, ist aber
+    # laut System-Card schwächer bei Reasoning; harmony will den vollen Raum.
+    temperature: 1.0
+    top_k: 0          # deaktiviert — harmony-Steuertokens nicht beschneiden
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    # Etwas deterministischer für Code/strukturierte Ausgabe. top_p leicht
+    # gedrückt statt top_k zu aktivieren (top_k bleibt für harmony tabu).
+    # Wer noch determ. will, NICHT top_k setzen, sondern temp weiter senken.
+    temperature: 0.6
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  # --jinja: gpt-oss MUSS mit seinem eingebetteten harmony-Chat-Template
+  # laufen — ohne --jinja erzeugt llama-server falsch formatierte Prompts
+  # und das Modell antwortet wirr. Das ist hier kein Komfort-Flag sondern
+  # Pflicht. Trennt außerdem die Reasoning-Channel sauber ins
+  # reasoning_content-API-Feld.
+  - --jinja
+
+notes: >
+  OpenAI gpt-oss (20B: 21B total / 3.6B active; 120B: 117B / 5.1B active),
+  Architektur "gpt-oss", nativ MXFP4-MoE (in llama.cpp-Mainline). Das 20B
+  läuft in 16 GB VRAM. ZWINGEND mit harmony-Format betreiben — `--jinja` ist
+  hier Pflicht, sonst wirres Output. Sampling ist bewusst untypisch
+  (temp 1.0 / top_p 1.0 / KEIN top_k / KEIN repeat_penalty): top_k und Penalty
+  beschneiden bzw. brechen die harmony-Steuertokens und zerstören den
+  Chain-of-Thought. Reasoning-Effort wird NICHT per Sampler, sondern über den
+  System-Prompt gesteuert ("Reasoning: low|medium|high"); in der AutoTuner-GUI
+  pro Modell als reasoning_effort (low/medium/high) setzbar — llama-server
+  reicht das via `--chat-template-kwargs '{"reasoning_effort":"high"}'` durch.
+  Voller Chain-of-Thought ist über die API sichtbar, aber laut OpenAI NICHT
+  für Endnutzer gedacht. Native Tool-/Function-Calling-Fähigkeiten vorhanden.
+  Quant-Stufen ändern beim MXFP4-MoE fast nichts an der Dateigröße — die
+  Experten liegen immer in MXFP4; q8_0/F16 betreffen nur Embeddings/Attention.

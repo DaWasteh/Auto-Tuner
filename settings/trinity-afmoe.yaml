@@ -1,0 +1,79 @@
+display_name: "Trinity AFMoE (Arcee / Dolphin-X1)"
+patterns:
+  - trinity-nano
+  - trinity-mini
+  - dolphin-x1
+  - afmoe
+
+# Arcee AI Trinity (Dez 2025): neue "Attention-First MoE" (AFMoE) Familie.
+#   * Trinity-Nano  — 6B total / ~1B active, 128 Experten (8 aktiv, 1 shared)
+#   * Trinity-Mini  — 26B total / ~3B active, gleiche Experten-Topologie
+# general.architecture = "afmoe" (AfmoeForCausalLM). Unterstützt in
+# llama.cpp seit Release b7061 — die b9334-Mainline lädt es problemlos.
+#
+# WICHTIG für die KV-Berechnung: AFMoE ist KEIN Mamba/SSM-Hybrid, sondern
+# ein reines Attention-MoE mit GQA + Gated-Attention + local/global-Pattern.
+# Jeder Layer trägt KV-Cache → der Tuner darf hier NICHT die Hybrid-Logik
+# anwenden (n_attention_layers == block_count). Falls scanner.py das Modell
+# je fälschlich als Hybrid einstuft (z.B. über einen künftigen generischen
+# Key), wäre das hier die Stelle zum Gegensteuern — aktuell sauber.
+#
+# Dolphin-X1-Trinity-Nano (dphn) ist der RL-dezensierte Re-Train von
+# Arcees Trinity-Nano: architektonisch identisch (afmoe, 6B/1B active,
+# 128 Experten), nur das Alignment unterscheidet sich. Teilt deshalb dieses
+# Profil. Beide nutzen das ChatML-Template (<|im_start|>/<|im_end|>).
+#
+# Native Kontextlänge 131072 (128k) für Nano und Mini. Wird via
+# GGUF-Metadata automatisch gecappt — daher hier den nativen Wert.
+max_context: 131072
+
+# KV-Quant: q5_0. Bei nur ~1B (Nano) bzw. ~3B (Mini) aktiven Parametern und
+# 128k Kontext ist der KV-Cache der dominante VRAM-Posten; q5_0 ist der
+# Sweet-Spot. Die kleinen aktiven Parametersätze vertragen q5_0-KV ohne
+# spürbaren Qualitätsverlust. Wer für reine Nano-Sessions q8_0 will, kann
+# es im Expert-Panel pinnen — der ctx wird dann automatisch kleiner gerechnet.
+recommended_kv_quant: q5_0
+
+# Sampling — Arcees offizielle Empfehlung (gilt laut HF-Card identisch für
+# Nano und Mini): temp 0.15, top_k 50, top_p 0.75, min_p 0.06. Das ist
+# deutlich deterministischer als ein typisches Chat-Profil — Arcee tunt
+# Trinity bewusst auf stabile Tool-/Struktur-Ausgaben statt freies Schreiben.
+sampling:
+  chat:
+    # Arcees offizielle Werte aus der HF-Modell-Card / generation_config.
+    temperature: 0.15
+    top_k: 50
+    top_p: 0.75
+    min_p: 0.06
+    repeat_penalty: 1.0
+  coding:
+    # Noch deterministischer für Code/strukturierte Ausgabe. Trinity ist auf
+    # Tool-Calling und Schema-Compliance getrimmt — niedrige Temp hält das JSON
+    # stabil. Greedy (0.0) ginge auch; 0.1 lässt minimal Spielraum.
+    temperature: 0.1
+    top_k: 50
+    top_p: 0.75
+    min_p: 0.06
+    repeat_penalty: 1.0
+
+extra_args:
+  # --jinja: nutzt das eingebettete ChatML-Template korrekt und trennt — bei
+  # Trinity-Mini, das einen Reasoning-Trace fahren kann — die Denk-Blöcke
+  # sauber ins reasoning_content-API-Feld. Für das reine Chat-Nano harmlos.
+  - --jinja
+
+notes: >
+  Arcee AI Trinity (AFMoE / "afmoe", AfmoeForCausalLM) — Attention-First MoE,
+  in llama.cpp seit b7061. Nano = 6B total / ~1B active, Mini = 26B / ~3B,
+  je 128 Experten (8 aktiv, 1 shared), 128k nativer Kontext. KEIN Mamba-Hybrid:
+  voller KV-Cache pro Layer (Tuner-Hybrid-Logik greift hier korrekt NICHT zu).
+  Dieses Profil deckt auch Dolphin-X1-Trinity-Nano (dphn) ab — den
+  RL-dezensierten Re-Train von Trinity-Nano: gleiche Architektur, gleiches
+  ChatML-Template, nur das Alignment unterscheidet sich. Bei Dolphin steuert
+  der System-Prompt Ton und Ausrichtung (z.B. "You are Dolphin, a helpful,
+  unbiased, and uncensored AI assistant.") — ohne gesetzten System-Prompt
+  verhält sich das Modell in einem unspezifischen Default. Sampling = Arcees
+  offizielle Empfehlung (temp 0.15 / top_k 50 / top_p 0.75 / min_p 0.06),
+  bewusst deterministisch für stabile Tool-/Struktur-Ausgaben. Trinity-Mini
+  kann via vLLM mit deepseek_r1-Reasoning-Parser + hermes-Tool-Parser laufen;
+  unter llama.cpp übernimmt `--jinja` die Template-/Channel-Trennung.

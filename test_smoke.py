@@ -1551,11 +1551,26 @@ def test_dense_spread_stays_priority_weighted(tmp_path) -> None:
 # is guarded: on a headless CI runner without PyQt6 the test simply skips.
 
 
+def _import_qt_mainwindow() -> type:
+    """Import qt_launcher.MainWindow, or skip the test if it can't be loaded.
+
+    pytest.importorskip("PyQt6") is not enough: the PyQt6 metapackage imports
+    fine, but pulling in qt_launcher triggers `from PyQt6.QtGui import ...`,
+    which dlopen()s native GUI libraries (e.g. libEGL.so.1). Those are absent
+    on headless Linux CI runners and raise ImportError at import time. Treat any
+    ImportError as "Qt unavailable here" and skip rather than fail.
+    """
+    try:
+        from qt_launcher import MainWindow
+    except ImportError as exc:
+        pytest.skip(f"Qt GUI not importable in this environment: {exc}")
+    return MainWindow
+
+
 def test_gpu_short_label_derivation() -> None:
     """Driver names must reduce to a distinctive, digit-bearing token that is
     a case-insensitive substring of the original (so force_gpu matches)."""
-    pytest.importorskip("PyQt6")
-    from qt_launcher import MainWindow
+    MainWindow = _import_qt_mainwindow()
 
     cases = {
         "AMD Radeon AI PRO R9700": "R9700",
@@ -1573,8 +1588,7 @@ def test_gpu_short_label_derivation() -> None:
 
 def test_gpu_short_label_fallbacks() -> None:
     """Names without a digit fall back to the last word; empty → stripped."""
-    pytest.importorskip("PyQt6")
-    from qt_launcher import MainWindow
+    MainWindow = _import_qt_mainwindow()
 
     assert MainWindow._gpu_short_label("Some Fancy GPU") == "GPU"
     assert MainWindow._gpu_short_label("   ") == ""
