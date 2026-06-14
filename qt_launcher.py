@@ -1506,7 +1506,7 @@ class MainWindow(QMainWindow):
         self._port_offset_combo = QComboBox()
         self._port_offset_combo.setFixedWidth(60)
         self._port_offset_combo.setToolTip(
-            "Manual port offset added to base + running servers."
+            "Manual offset added to the requested base port before collision checks."
         )
         for i in range(11):  # 0 to 10
             self._port_offset_combo.addItem(str(i))
@@ -3141,9 +3141,9 @@ class MainWindow(QMainWindow):
     def _prune_dead_servers(self) -> None:
         """Drop entries whose process has exited from the registry.
 
-        Keeping this tidy is what makes the port counter "reset": the next
-        port is always base_port + number-of-LIVE servers, so when a
-        llama-server is stopped or crashes its port becomes available again.
+        Keeping this tidy is what makes the port assignment "reset":
+        _next_free_port() scans from the requested base port and can reuse a
+        stopped/crashed server's port once it has been pruned from _servers.
         """
         live = []
         for s in self._servers:
@@ -3151,6 +3151,15 @@ class MainWindow(QMainWindow):
             if proc is not None and proc.is_running():
                 live.append(s)
         self._servers = live
+
+    def _requested_start_port(self, base_port: int, offset: int) -> int:
+        """Return the user's requested first port before collision probing.
+
+        Deliberately do *not* add ``len(self._servers)`` here. A manually
+        entered port should stay literal; _next_free_port() is responsible for
+        moving to the next port only when that exact port is already occupied.
+        """
+        return base_port + offset
 
     def _next_free_port(self, host: str, base: int) -> int:
         """Return the lowest base+N not used by a live server or another app.
@@ -3398,9 +3407,11 @@ class MainWindow(QMainWindow):
                 )
 
         host = self._host_edit.text().strip() or "127.0.0.1"
-        # Auto-assign the port: base + offset + number of live servers, skipping any
-        # port already taken. The Port field shows the *base*; the actual
-        # port used is computed here so 0 servers → 1234, 1 → 1235, etc.
+        # Auto-assign the port by starting at the user-requested base+offset
+        # and skipping only ports that are actually taken. This preserves
+        # manual entries (for example 1235 stays 1235 even if another server
+        # is already running on 8080), while the default 1234 still advances
+        # to 1235/1236/... when those previous AutoTuner ports are occupied.
         try:
             base_port = int(self._port_edit.text().strip())
         except ValueError:
@@ -3412,7 +3423,7 @@ class MainWindow(QMainWindow):
         except (ValueError, AttributeError):
             offset = 0
 
-        start_port = base_port + offset + len(self._servers)
+        start_port = self._requested_start_port(base_port, offset)
         port = self._next_free_port(host, start_port)
 
         server_binary = self._resolve_binary(profile, use_draft, entry.name)
