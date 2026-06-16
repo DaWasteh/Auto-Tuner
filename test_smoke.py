@@ -1702,3 +1702,200 @@ GPU2:
 
     assert gpus[0].hip_index == 1  # R9700 is Vulkan1
     assert gpus[1].hip_index == 0  # 9070 XT is Vulkan0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for b9672 hybrid-arch KV sizing + gpt-oss arch fallback
+# ---------------------------------------------------------------------------
+
+
+def test_hybrid_detection_includes_b9672_linear_archs() -> None:
+    """b9672 classifies the linear-/gated-delta-net families as hybrid.
+
+    Qwen3.5/3.6, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next and Kimi-Linear all
+    return True from llama_arch_is_hybrid() in mainline, so only their
+    full-attention layers carry KV. Mirror that here.
+    """
+    from scanner import metadata_is_hybrid_architecture
+
+    for arch in (
+        "qwen35",
+        "qwen35moe",
+        "lfm2moe",
+        "nemotron_h_moe",
+        "qwen3next",
+        "kimi-linear",
+    ):
+        assert (
+            metadata_is_hybrid_architecture({"general.architecture": arch}) is True
+        ), f"{arch} should be detected as hybrid (b9672)"
+
+    # Plain qwen3moe / gpt-oss remain pure Transformer.
+    assert (
+        metadata_is_hybrid_architecture({"general.architecture": "qwen3moe"}) is False
+    )
+    assert metadata_is_hybrid_architecture({"general.architecture": "gpt-oss"}) is False
+
+
+def test_attention_layer_count_uses_recurrent_layers_key() -> None:
+    """b9672 `<arch>.attention.recurrent_layers` gives an exact KV-layer
+    count: full-attention layers == block_count - recurrent_layers."""
+    from scanner import metadata_attention_layer_count
+
+    # Qwen3.6-A3B MoE: 48 blocks, 36 recurrent → 12 full-attention.
+    md = {
+        "general.architecture": "qwen35moe",
+        "qwen35moe.block_count": 48,
+        "qwen35moe.attention.recurrent_layers": 36,
+    }
+    assert metadata_attention_layer_count(md) == 12
+
+    # Qwen3.5 dense: 36 blocks, 27 recurrent → 9.
+    md = {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 36,
+        "qwen35.attention.recurrent_layers": 27,
+    }
+    assert metadata_attention_layer_count(md) == 9
+
+
+def test_recurrent_layers_key_takes_priority_over_ratio() -> None:
+    """When the recurrent_layers key is present it must override the
+    coarse per-arch ratio (which would give a different number)."""
+    from scanner import metadata_attention_layer_count
+
+    # 40 blocks, ratio 0.25 would give 10; recurrent=10 gives 30. The key
+    # must win → 30, not 10.
+    md = {
+        "general.architecture": "qwen35moe",
+        "qwen35moe.block_count": 40,
+        "qwen35moe.attention.recurrent_layers": 10,
+    }
+    assert metadata_attention_layer_count(md) == 30
+
+
+def test_recurrent_layers_generic_key_scan() -> None:
+    """A *.attention.recurrent_layers key with a non-matching arch prefix
+    (community re-convert) is still honoured."""
+    from scanner import metadata_attention_layer_count
+
+    md = {
+        "general.architecture": "nemotron_h_moe",
+        "nemotron_h_moe.block_count": 56,
+        # Note the deliberately wrong prefix:
+        "foo.attention.recurrent_layers": 48,
+    }
+    assert metadata_attention_layer_count(md) == 8
+
+
+def test_recurrent_layers_out_of_range_falls_back_to_ratio() -> None:
+    """An impossible recurrent count (>= total) must not produce a
+    nonsensical value; it falls through to the per-arch ratio."""
+    from scanner import metadata_attention_layer_count
+
+    # recurrent == total → invalid, must fall back to ratio (0.25 → 12).
+    md = {
+        "general.architecture": "qwen35moe",
+        "qwen35moe.block_count": 48,
+        "qwen35moe.attention.recurrent_layers": 48,
+    }
+    n = metadata_attention_layer_count(md)
+    assert n > 0
+    assert 10 <= n <= 14, f"expected ratio fallback ~12, got {n}"
+
+    # recurrent == 0 is valid (all-attention) → total - 0 == total.
+    md = {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 36,
+        "qwen35.attention.recurrent_layers": 0,
+    }
+    assert metadata_attention_layer_count(md) == 36
+
+
+def test_attention_layer_count_new_hybrid_ratios() -> None:
+    """Without explicit keys, the new hybrid families use sensible ratios."""
+    from scanner import metadata_attention_layer_count
+
+    # qwen3next ~25%
+    n = metadata_attention_layer_count(
+        {"general.architecture": "qwen3next", "qwen3next.block_count": 48}
+    )
+    assert 10 <= n <= 14, f"qwen3next ~25% of 48, got {n}"
+
+    # qwen35moe ~25%
+    n = metadata_attention_layer_count(
+        {"general.architecture": "qwen35moe", "qwen35moe.block_count": 48}
+    )
+    assert 10 <= n <= 14, f"qwen35moe ~25% of 48, got {n}"
+
+    # lfm2moe ~20%
+    n = metadata_attention_layer_count(
+        {"general.architecture": "lfm2moe", "lfm2moe.block_count": 30}
+    )
+    assert 4 <= n <= 8, f"lfm2moe ~20% of 30, got {n}"
+
+
+def test_gpt_oss_arch_fallback_for_unrecognised_filename() -> None:
+    """A gpt-oss GGUF whose filename matches no pattern must still resolve
+    to the gpt-oss profile via arch_fallback (so it gets --jinja), not
+    _default."""
+    profiles = load_profiles(SETTINGS_DIR)
+
+    # Unrecognised name, gpt-oss architecture.
+    p = match_profile("Some-Weird-MXFP4-Merge.gguf", profiles, "gpt-oss")
+    assert p.display_name == "gpt-oss (OpenAI)", (
+        f"gpt-oss arch fallback failed, got {p.display_name!r}"
+    )
+    assert "--jinja" in p.extra_args
+
+
+def test_vibecoder_matches_gpt_oss_by_pattern() -> None:
+    """VibeCoder (gpt-oss arch MXFP4 merge) matches the gpt-oss profile by
+    its filename pattern alone."""
+    profiles = load_profiles(SETTINGS_DIR)
+    p = match_profile("VibeCoder-20b-RL1_0_MXFP4_MOE.gguf", profiles)
+    assert p.display_name == "gpt-oss (OpenAI)"
+    assert "--jinja" in p.extra_args
+
+
+def test_arch_fallback_does_not_swallow_unrelated_models() -> None:
+    """arch_fallback must only fire when NO pattern matched, and only for
+    the exact arch. A non-gpt-oss unknown must still go to _default."""
+    profiles = load_profiles(SETTINGS_DIR)
+
+    # llama-arch unknown → generic fallback, NOT gpt-oss.
+    p = match_profile("kafkalm-70b-german-v0.1.Q5_K_M.gguf", profiles, "llama")
+    assert p.display_name == "Generic / fallback"
+
+    # qwen35-arch unknown (no qwen arch_fallback declared) → generic.
+    p = match_profile("Qwopus3.5-9B-coder-Exp-Q8_0.gguf", profiles, "qwen35")
+    assert p.display_name == "Generic / fallback"
+
+
+def test_arch_fallback_is_backward_compatible() -> None:
+    """Calling match_profile without an arch (old 2-arg form) is unchanged:
+    pattern matching still works and unknowns still hit _default."""
+    profiles = load_profiles(SETTINGS_DIR)
+
+    # Pattern still wins with no arch supplied.
+    assert (
+        match_profile("gpt-oss-20b-UD-Q6_K_XL.gguf", profiles).display_name
+        == "gpt-oss (OpenAI)"
+    )
+    # Unknown with no arch → generic fallback (exactly as before).
+    assert (
+        match_profile("Some-Random-LLM.gguf", profiles).display_name
+        == "Generic / fallback"
+    )
+
+
+def test_filename_pattern_beats_arch_fallback() -> None:
+    """If a filename pattern matches one profile but the arch_fallback of
+    another would also match, the filename pattern must win."""
+    profiles = load_profiles(SETTINGS_DIR)
+
+    # gpt-oss filename pattern + a (hypothetical) mismatched arch arg:
+    # the pattern match must take precedence over any arch fallback.
+    p = match_profile("gpt-oss-20b-UD-Q6_K_XL.gguf", profiles, "some-other-arch")
+    assert p.display_name == "gpt-oss (OpenAI)"
+    

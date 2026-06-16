@@ -1970,7 +1970,9 @@ class MainWindow(QMainWindow):
         entry = getattr(self, "_current_entry", None)
         if entry is not None and self._system is not None:
             try:
-                profile = match_profile(entry.name, self._profiles)
+                profile = match_profile(
+                    entry.name, self._profiles, getattr(entry, "architecture", "")
+                )
                 self._update_config_text(entry, profile)
             except Exception as exc:
                 self._log(f"[Warning] Config refresh failed: {exc}")
@@ -2000,7 +2002,9 @@ class MainWindow(QMainWindow):
         entry = getattr(self, "_current_entry", None)
         if entry is not None and self._system is not None:
             try:
-                profile = match_profile(entry.name, self._profiles)
+                profile = match_profile(
+                    entry.name, self._profiles, getattr(entry, "architecture", "")
+                )
                 self._update_config_text(entry, profile)
             except Exception as exc:
                 self._log(f"[Warning] Config refresh failed: {exc}")
@@ -2090,7 +2094,9 @@ class MainWindow(QMainWindow):
         entry = getattr(self, "_current_entry", None)
         if entry is not None and self._system is not None:
             try:
-                profile = match_profile(entry.name, self._profiles)
+                profile = match_profile(
+                    entry.name, self._profiles, getattr(entry, "architecture", "")
+                )
                 self._update_config_text(entry, profile)
             except Exception as exc:
                 self._log(f"[Warning] Config refresh failed: {exc}")
@@ -2363,7 +2369,9 @@ class MainWindow(QMainWindow):
         self._current_draft = _find_draft_model(entry, self._all_entries)
         self._btn_diagnose.setEnabled(True)
         self._update_checkboxes(entry)
-        profile = match_profile(entry.name, self._profiles)
+        profile = match_profile(
+            entry.name, self._profiles, getattr(entry, "architecture", "")
+        )
         self._auto_select_fork(profile)
         self._update_config_text(entry, profile)
 
@@ -2686,7 +2694,11 @@ class MainWindow(QMainWindow):
     def _refresh_config_preview(self) -> None:
         """Checkbox changed → recompute context/memory with new options."""
         if self._current_entry is not None and self._system is not None:
-            profile = match_profile(self._current_entry.name, self._profiles)
+            profile = match_profile(
+                self._current_entry.name,
+                self._profiles,
+                getattr(self._current_entry, "architecture", ""),
+            )
             self._update_config_text(self._current_entry, profile)
 
     def _build_auto_config(
@@ -2903,7 +2915,11 @@ class MainWindow(QMainWindow):
                 "configuration to start from.",
             )
             return
-        profile = match_profile(self._current_entry.name, self._profiles)
+        profile = match_profile(
+            self._current_entry.name,
+            self._profiles,
+            getattr(self._current_entry, "architecture", ""),
+        )
         cfg = self._build_auto_config(self._current_entry, profile)
         if cfg is None:
             return
@@ -2933,7 +2949,11 @@ class MainWindow(QMainWindow):
         # different model.
         cfg = self._expert_panel.current_config()
         if cfg is not None and self._current_entry is not None:
-            profile = match_profile(self._current_entry.name, self._profiles)
+            profile = match_profile(
+                self._current_entry.name,
+                self._profiles,
+                getattr(self._current_entry, "architecture", ""),
+            )
             self._render_cfg_to_preview(self._current_entry, profile, cfg)
         self._log("[Expert] Returned to preview.")
 
@@ -2945,7 +2965,11 @@ class MainWindow(QMainWindow):
         time they exit, it reflects their state.
         """
         if self._current_entry is not None:
-            profile = match_profile(self._current_entry.name, self._profiles)
+            profile = match_profile(
+                self._current_entry.name,
+                self._profiles,
+                getattr(self._current_entry, "architecture", ""),
+            )
             self._render_cfg_to_preview(self._current_entry, profile, cfg)
 
     def _on_expert_mode_changed(self, mode: str) -> None:
@@ -3344,7 +3368,9 @@ class MainWindow(QMainWindow):
         if not use_vision:
             entry.mmproj = None
 
-        profile = match_profile(entry.name, self._profiles)
+        profile = match_profile(
+            entry.name, self._profiles, getattr(entry, "architecture", "")
+        )
 
         # When Expert mode is open we use the panel's current config
         # (Manual mode = literal widget values; Auto mode = the last

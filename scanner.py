@@ -428,10 +428,30 @@ def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
 # unless we know the real attention-layer count.
 
 # Architectures known to be hybrid (Mamba/SSM + Transformer).
+#
+# The arch strings here are matched against ``general.architecture`` from
+# the GGUF (the runtime reader decodes that to a clean lowercase string).
+# As of llama.cpp b9672 ``llm_arch_is_hybrid()`` returns true for a larger
+# family than the classic Mamba hybrids — it now also covers the
+# linear-/gated-delta-net attention models. We mirror that list so KV is
+# only budgeted for the full-attention layers:
+#   llama-arch.cpp:  JAMBA, FALCON_H1, PLAMO2, GRANITE_HYBRID, LFM2,
+#                    LFM2MOE, NEMOTRON_H, NEMOTRON_H_MOE, QWEN3NEXT,
+#                    KIMI_LINEAR, QWEN35, QWEN35MOE
+# Qwen3.5/3.6 use SSM-style metadata (ssm.conv_kernel / ssm.state_size /
+# ssm.group_count) so the generic ``.ssm.`` fallback in
+# ``metadata_is_hybrid_architecture`` already catches them — but listing
+# them explicitly is cheaper and survives GGUFs that name the recurrent
+# keys differently. The exact recurrent-layer count is read from the
+# ``<arch>.attention.recurrent_layers`` key (b9672) in
+# ``metadata_attention_layer_count`` below; the names here are only the
+# hybrid *gate*, not the count.
 _HYBRID_ARCHS = frozenset(
     {
         "nemotron_h",
         "nemotron-h",
+        "nemotron_h_moe",  # Nemotron-H MoE (b9672 hybrid)
+        "nemotron-h-moe",
         "granitemoehybrid",
         "granite-h",
         "granite_h",
@@ -440,6 +460,13 @@ _HYBRID_ARCHS = frozenset(
         "falcon_h1",
         "plamo2",  # Plamo-2 hybrid
         "zamba2",  # Zamba2 hybrid
+        "lfm2",  # LFM2 dense hybrid (short-conv + attention)
+        "lfm2moe",  # LFM2.5-MoE hybrid (b9672 hybrid)
+        "qwen3next",  # Qwen3-Next: gated-delta-net + full attention
+        "kimi-linear",  # Kimi-Linear hybrid
+        "kimi_linear",
+        "qwen35",  # Qwen3.5: linear + full attention (b9672 hybrid)
+        "qwen35moe",  # Qwen3.6-A3B MoE: linear + full attention (b9672 hybrid)
         "rwkv6",  # RWKV — pure SSM, but treated similarly for KV
         "rwkv7",
     }
@@ -487,7 +514,39 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
     if not metadata_is_hybrid_architecture(md):
         return total  # pure Transformer — every layer has KV
 
-    # Hybrid model — try explicit metadata keys.
+    # Highest priority: the authoritative recurrent-layer count.
+    #
+    # llama.cpp b9672 added ``LLM_KV_ATTENTION_RECURRENT_LAYERS`` =
+    # ``<arch>.attention.recurrent_layers``. For a hybrid model this is the
+    # number of linear-/SSM-attention layers that do NOT carry a standard
+    # KV cache, so the full-attention (KV-bearing) count is exactly
+    # ``block_count - recurrent_layers``. This is precise for the whole
+    # Qwen3.5/3.6, LFM2-MoE, Nemotron-H(-MoE) and Qwen3-Next family and
+    # replaces the coarse per-arch ratio guess below. We also scan for any
+    # ``*.attention.recurrent_layers`` key so a GGUF whose arch prefix does
+    # not match (community re-converts) still benefits.
+    recurrent = None
+    rec_key = f"{arch}.attention.recurrent_layers"
+    if rec_key in md:
+        recurrent = md.get(rec_key)
+    else:
+        for k, v in md.items():
+            if k.endswith(".attention.recurrent_layers"):
+                recurrent = v
+                break
+    if recurrent is not None:
+        try:
+            n_rec = int(recurrent)
+            # 0 <= n_rec < total: a hybrid must keep at least one full-
+            # attention layer, and cannot have more recurrent layers than
+            # total blocks. Out-of-range values fall through to the keys
+            # and ratio below rather than producing a nonsensical count.
+            if 0 <= n_rec < total:
+                return max(1, total - n_rec)
+        except (TypeError, ValueError):
+            pass
+
+    # Next: explicit attention-layer-count keys some converters emit.
     explicit_keys = (
         f"{arch}.attention.block_count",
         f"{arch}.attention.layer_count",
@@ -507,10 +566,29 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
     # No explicit count — apply a per-architecture heuristic. These
     # ratios come from each model's published architecture diagrams.
     # When in doubt we err high (more attention layers ↔ larger KV
-    # estimate ↔ safer placement).
+    # estimate ↔ safer placement). This path only runs when the
+    # authoritative ``attention.recurrent_layers`` key (b9672) is absent —
+    # i.e. older or community GGUFs predating that key.
     arch_l = arch.lower()
-    if "nemotron" in arch_l:
-        # Nemotron-H: roughly 1 attention block per 4 Mamba blocks.
+    if "qwen3next" in arch_l:
+        # Qwen3-Next: gated-delta-net on most layers, full attention on a
+        # 1-in-4 minority (~25%).
+        ratio = 0.25
+    elif arch_l.startswith("qwen35"):
+        # Qwen3.5 / Qwen3.6(-A3B MoE): linear attention interleaved with a
+        # minority of full-attention layers. Published layouts put full
+        # attention at roughly 1 in 4 (~25%); err high for KV safety.
+        ratio = 0.25
+    elif "lfm2" in arch_l:
+        # LFM2 / LFM2.5-MoE: short-conv recurrent blocks with a small
+        # number of GQA attention layers (~1 in 6, ~17%).
+        ratio = 0.20
+    elif "kimi" in arch_l and "linear" in arch_l:
+        # Kimi-Linear: linear attention with ~1-in-4 full attention.
+        ratio = 0.25
+    elif "nemotron" in arch_l:
+        # Nemotron-H / Nemotron-H-MoE: roughly 1 attention block per 4
+        # Mamba blocks.
         ratio = 0.25
     elif "jamba" in arch_l:
         # Jamba: 1 attention per 7 Mamba (~14%).
@@ -1012,9 +1090,7 @@ def _find_mmproj_candidates(model: Path, candidates: List[Path]) -> List[Path]:
             # bases), so a more-specific projector still outranks a generic
             # one and an unrelated short prefix can't hijack the pairing.
             overlap = min(len(model_canon), len(c_canon))
-            scored.append(
-                (overlap, _mmproj_precision_score(c.name), c.name.lower(), c)
-            )
+            scored.append((overlap, _mmproj_precision_score(c.name), c.name.lower(), c))
     # Sort: longest prefix first, then highest precision, then name.
     scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
     return [t[3] for t in scored]

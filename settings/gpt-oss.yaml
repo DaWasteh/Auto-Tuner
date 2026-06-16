@@ -2,6 +2,16 @@ display_name: "gpt-oss (OpenAI)"
 patterns:
   - gpt-oss
   - gpt_oss
+  - vibecoder      # EpistemeAI VibeCoder (gpt-oss arch, MXFP4-MoE merge)
+
+# Architektur-Fallback: greift NUR wenn KEIN Pattern oben gematcht hat.
+# Jede GGUF mit general.architecture == "gpt-oss" (z.B. eine umbenannte
+# Community-Variante oder ein Merge mit ungewöhnlichem Dateinamen) bekommt
+# dann trotzdem dieses Profil — entscheidend, weil gpt-oss ZWINGEND --jinja
+# braucht (harmony-Format) und sonst auf _default.yaml ohne --jinja landen
+# würde. Dateiname-Patterns haben immer Vorrang vor diesem Fallback.
+arch_fallback:
+  - gpt-oss
 
 # OpenAI gpt-oss (Aug 2025): zwei offene MoE-Modelle unter Apache 2.0.
 #   * gpt-oss-20b  — 21B total / 3.6B active, läuft in 16 GB VRAM
@@ -70,3 +80,4 @@ notes: >
   für Endnutzer gedacht. Native Tool-/Function-Calling-Fähigkeiten vorhanden.
   Quant-Stufen ändern beim MXFP4-MoE fast nichts an der Dateigröße — die
   Experten liegen immer in MXFP4; q8_0/F16 betreffen nur Embeddings/Attention.
+  

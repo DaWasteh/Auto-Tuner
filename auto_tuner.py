@@ -256,7 +256,12 @@ def _pick_model(
         query_parts = []
         flags = []
         for p in parts:
-            if p.startswith("--") or p.lower() in ("novision", "nodraft", "nothinking", "ngram"):
+            if p.startswith("--") or p.lower() in (
+                "novision",
+                "nodraft",
+                "nothinking",
+                "ngram",
+            ):
                 flags.append(p.lower().lstrip("-"))
             else:
                 query_parts.append(p)
@@ -285,7 +290,12 @@ def _pick_model(
         model_idx_str = None
         flags = []
         for p in parts:
-            if p.startswith("--") or p.lower() in ("novision", "nodraft", "nothinking", "ngram"):
+            if p.startswith("--") or p.lower() in (
+                "novision",
+                "nodraft",
+                "nothinking",
+                "ngram",
+            ):
                 flags.append(p.lower().lstrip("-"))
             elif model_idx_str is None and p.isdigit():
                 model_idx_str = p
@@ -945,7 +955,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             )
             model.mmproj = None
 
-        profile = match_profile(model.name, profiles)
+        profile = match_profile(
+            model.name, profiles, getattr(model, "architecture", "")
+        )
 
         # ── Fork / model mismatch check ─────────────────────────────────
         # Some models require a specific fork (e.g. bonsai → 1b_llama.cpp).
@@ -1185,3 +1197,4 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
 if __name__ == "__main__":
     sys.exit(main())
+    

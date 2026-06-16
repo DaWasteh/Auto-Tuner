@@ -77,14 +77,14 @@
       "vision": true
     },
     "gemma-4-12b-it-UD-Q8_K_XL": {
-      "vision": false
+      "vision": true
     },
     "gemma-4-12b-it-UD-Q6_K_XL": {
-      "vision": false
+      "vision": true
     }
   },
   "mode": "chat",
-  "window_geometry": "AdnQywADAAAAAAP6AAAAhgAACKQAAAS6AAAD+gAAAKUAAAikAAAEugAAAAAAAAAADXAAAAP6AAAApQAACKQAAAS6",
+  "window_geometry": "AdnQywADAAAAAACpAAAAeQAABVMAAAStAAAAqQAAAJgAAAVTAAAErQAAAAAAAAAADXAAAACpAAAAmAAABVMAAASt",
   "window_state": "AAAA/wAAAAD9AAAAAAAABKsAAAPhAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "H:\\LAB\\ai-local",
   "font_size": 10,

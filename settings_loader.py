@@ -19,6 +19,15 @@ except ImportError as e:
 class ModelProfile:
     display_name: str
     patterns: List[str] = field(default_factory=list)
+    # Architectures this profile also covers as a *fallback* when no
+    # filename pattern matched. These are matched against the GGUF
+    # ``general.architecture`` string (exact, case-insensitive). Filename
+    # patterns always take precedence; arch_fallback only resolves the
+    # "no pattern matched" case so that e.g. a community gpt-oss merge with
+    # an unrecognised filename still gets the gpt-oss profile (and its
+    # mandatory --jinja) instead of falling through to _default. See
+    # match_profile() for the precedence rules.
+    arch_fallback: List[str] = field(default_factory=list)
     max_context: int = 8192
     sampling: Dict[str, Any] = field(default_factory=dict)
     recommended_kv_quant: str = "q5_0"
@@ -137,6 +146,9 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
             ModelProfile(
                 display_name=str(data.get("display_name", yml.stem)),
                 patterns=[str(p).lower() for p in (data.get("patterns") or [])],
+                arch_fallback=[
+                    str(a).lower() for a in (data.get("arch_fallback") or [])
+                ],
                 max_context=int(data.get("max_context", 8192)),
                 sampling=sampling,
                 recommended_kv_quant=str(data.get("recommended_kv_quant", "q5_0")),
@@ -172,20 +184,41 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
 def match_profile(
     model_name: str,
     profiles: List[ModelProfile],
+    arch: Optional[str] = None,
 ) -> ModelProfile:
     """Pick the best-matching profile for the given model filename.
 
-    Rule: case-insensitive substring match on each pattern; the longest
-    pattern wins. Profiles with empty `patterns:` are treated as fallback.
+    Precedence:
+      1. Filename pattern — case-insensitive substring match on each
+         ``patterns:`` entry; the longest matching pattern wins. This is
+         the primary mechanism and is unchanged.
+      2. Architecture fallback — only when NO filename pattern matched and
+         an ``arch`` is supplied: a profile whose ``arch_fallback:`` list
+         contains that exact architecture string is used. This catches
+         community merges / re-quants with unrecognised filenames whose
+         ``general.architecture`` is nonetheless a known family (e.g. a
+         gpt-oss MXFP4 merge that must still get --jinja). If several
+         profiles claim the same arch the first one loaded wins
+         (load order is alphabetical by filename).
+      3. The generic ``_default.yaml`` (empty ``patterns:``), else a
+         built-in default.
+
+    ``arch`` is optional so existing callers that pass only
+    ``(model_name, profiles)`` keep their exact previous behaviour.
     """
     name_lower = model_name.lower()
+    arch_lower = (arch or "").lower().strip()
     best: Optional[ModelProfile] = None
     best_len = -1
     fallback: Optional[ModelProfile] = None
 
     for p in profiles:
         if not p.patterns:
-            if fallback is None:
+            # A profile with no filename patterns is only the generic
+            # fallback when it also declares no arch_fallback. A pattern-less
+            # profile that exists purely to claim an arch (unusual, but
+            # allowed) must not hijack the _default slot.
+            if fallback is None and not p.arch_fallback:
                 fallback = p
             continue
         for pat in p.patterns:
@@ -194,18 +227,23 @@ def match_profile(
                 best_len = len(pat)
                 # Don't break — a later pattern in the same file might be longer
 
-    return (
-        best
-        or fallback
-        or ModelProfile(
-            display_name="builtin-default",
-            max_context=8192,
-            sampling={
-                "temperature": 0.7,
-                "top_k": 40,
-                "top_p": 0.9,
-                "min_p": 0.05,
-                "repeat_penalty": 1.05,
-            },
-        )
+    if best is not None:
+        return best
+
+    # No filename pattern matched — try the architecture fallback.
+    if arch_lower:
+        for p in profiles:
+            if arch_lower in p.arch_fallback:
+                return p
+
+    return fallback or ModelProfile(
+        display_name="builtin-default",
+        max_context=8192,
+        sampling={
+            "temperature": 0.7,
+            "top_k": 40,
+            "top_p": 0.9,
+            "min_p": 0.05,
+            "repeat_penalty": 1.05,
+        },
     )
