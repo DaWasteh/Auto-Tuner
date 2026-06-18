@@ -2003,7 +2003,7 @@ def _fake_diffusion_model():
 
 
 def test_build_diffusion_command_mainline_flags() -> None:
-    """The diffusion command uses llama-diffusion-cli with mainline b9672
+    """The diffusion command uses llama-diffusion-cli with mainline b9700
     flags and NO server flags (host/port/fit)."""
     from tuner import build_diffusion_command
 

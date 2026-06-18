@@ -89,7 +89,7 @@ class ModelProfile:
     # force it (e.g. for an arch mainline doesn't recognise yet).
     runner: str = ""
     # Diffusion generation parameters (only consulted on the diffusion
-    # path). Mainline b9672 flags map as:
+    # path). Mainline b9700 flags map as:
     #   steps         -> --diffusion-steps        (default 256)
     #   algorithm     -> --diffusion-algorithm    (0..4; 4=confidence)
     #   eps           -> --diffusion-eps          (timestep schedule)
@@ -97,7 +97,7 @@ class ModelProfile:
     #                    of eps / block_length, not both)
     #   visual        -> --diffusion-visual       (live token visualisation)
     #   n_predict     -> -n / --predict           (max tokens to generate)
-    # Fork-only extras (NOT in mainline b9672 — DiffusionGemma build) are
+    # Fork-only extras (NOT in mainline b9700 — DiffusionGemma build) are
     # passed through verbatim from the ``fork_args`` list, e.g.
     #   fork_args: ["--diffusion-eb", "--diffusion-kv-cache"]
     # so the same profile schema works for both mainline and your fork.

@@ -499,7 +499,7 @@ def metadata_is_hybrid_architecture(md: Dict[str, Any]) -> bool:
 #
 # Diffusion text models (Dream, LLaDA, LLaDA-MoE, RND1 in llama.cpp
 # mainline; DiffusionGemma in a dedicated fork) are NOT served by
-# ``llama-server``. As of b9672 the server has no diffusion code path at
+# ``llama-server``. As of b9700 the server has no diffusion code path at
 # all — these run only through the single-shot ``llama-diffusion-cli``
 # example binary (prompt in → text out → exit), with their own
 # ``--diffusion-*`` flags and no OpenAI API / /health endpoint.

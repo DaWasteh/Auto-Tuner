@@ -633,7 +633,7 @@ Recommended build settings for this system:
 # - AMD Radeon R9700 AI Pro 32GB
 # - G.Skill Trident Z 48GB DDR5-8400MHz (2x24GB)
 
-# Main-Fork b9654 (SPIRV-Headers required since b9194) - Windows
+# Main-Fork b9700 (SPIRV-Headers required since b9194) - Windows
 cd H:\LAB\ai-local
 git clone https://github.com/KhronosGroup/SPIRV-Headers.git
 cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
@@ -668,7 +668,7 @@ cmake -S .\llama.cpp -B .\llama.cpp\build `
   -DCMAKE_PREFIX_PATH="H:/LAB/ai-local/SPIRV-Headers/install"
 cmake --build .\llama.cpp\build --config Release --parallel 24
 
-# Diffusion-Gemma-Fork b9654 - Windows
+# Diffusion-Gemma-Fork b9700 - Windows
 cd H:\LAB\ai-local
 git clone https://github.com/KhronosGroup/SPIRV-Headers.git
 cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `

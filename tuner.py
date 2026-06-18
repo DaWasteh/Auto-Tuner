@@ -1817,7 +1817,7 @@ def build_diffusion_command(
     fixed number of denoising steps, prints the result and exits. There is
     no /health endpoint, no OpenAI API, no port.
 
-    Flags emitted are mainline b9672 (examples/diffusion/README.md):
+    Flags emitted are mainline b9700 (examples/diffusion/README.md):
       -m / -p / -c / -ngl / -b / -ub  — standard load + batch knobs
       --diffusion-steps N             — denoising steps (profile, def 256)
       --diffusion-algorithm 0..4      — token-selection algorithm
@@ -1921,7 +1921,7 @@ def build_diffusion_command(
         cmd += ["-p", prompt]
 
     # ---- fork-only flags (verbatim passthrough) -----------------------
-    # Mainline b9672 has no --diffusion-eb / --diffusion-kv-cache; the
+    # Mainline b9700 has no --diffusion-eb / --diffusion-kv-cache; the
     # DiffusionGemma fork does. Keeping them in a profile list means the
     # same schema serves both — mainline profiles just leave fork_args out.
     fork_args = diff.get("fork_args") or []

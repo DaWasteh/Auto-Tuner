@@ -5,7 +5,7 @@ patterns:
 
 # Architektur-Fallback: greift wenn KEIN Pattern oben matcht. Die
 # general.architecture dieser GGUFs ist "diffusion-gemma" (fork-only,
-# NICHT in llama.cpp-Mainline b9672). Der Scanner erkennt sie ohnehin als
+# NICHT in llama.cpp-Mainline b9700). Der Scanner erkennt sie ohnehin als
 # Diffusionsmodell (is_diffusion -> True) und der Launcher schaltet
 # automatisch auf llama-diffusion-cli um; der Fallback ist hier zur
 # Sicherheit, falls eine Variante einen unüblichen Dateinamen trägt.
@@ -54,7 +54,7 @@ diffusion:
   visual: false
   n_predict: 2048
 
-  # Fork-only Extras: NICHT in mainline b9672. Der DiffusionGemma-Fork kennt
+  # Fork-only Extras: NICHT in mainline b9700. Der DiffusionGemma-Fork kennt
   # zusätzliche Flags (entropy-bounding, KV-Cache für Diffusion). Werden
   # verbatim ans CLI angehängt. Auskommentiert lassen, wenn dein Fork sie
   # nicht unterstützt — sonst bricht der Start mit "unknown argument" ab.
@@ -78,7 +78,7 @@ notes: >
   diffusionsfähigen llama.cpp-Build. Wähle deinen Diffusions-Build im
   Fork-Dropdown der GUI (z.B. "d_b9654_llama.cpp") — der AutoTuner findet
   llama-diffusion-cli automatisch darin, kein Pfad muss hartcodiert werden.
-  Mainline b9672 kennt die Architektur "diffusion-gemma" nicht; der
+  Mainline b9700 kennt die Architektur "diffusion-gemma" nicht; der
   AutoTuner erkennt sie trotzdem (is_diffusion) und baut automatisch einen
   llama-diffusion-cli-Befehl statt eines Server-Starts. Generierung ist
   single-shot: Prompt rein, Text raus, Prozess endet — kein /health, keine
