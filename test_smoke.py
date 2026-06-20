@@ -1863,13 +1863,82 @@ def test_arch_fallback_does_not_swallow_unrelated_models() -> None:
     the exact arch. A non-gpt-oss unknown must still go to _default."""
     profiles = load_profiles(SETTINGS_DIR)
 
-    # llama-arch unknown → generic fallback, NOT gpt-oss.
+    # llama-arch unknown → generic fallback, NOT gpt-oss (and NOT minicpm5,
+    # which is also a llama-arch profile but declares no arch_fallback).
     p = match_profile("kafkalm-70b-german-v0.1.Q5_K_M.gguf", profiles, "llama")
     assert p.display_name == "Generic / fallback"
 
-    # qwen35-arch unknown (no qwen arch_fallback declared) → generic.
-    p = match_profile("Qwopus3.5-9B-coder-Exp-Q8_0.gguf", profiles, "qwen35")
+    # An unknown filename whose arch nobody claims as a fallback → generic.
+    # gemma2 is a real arch but no profile declares arch_fallback: gemma2.
+    p = match_profile("Some-Random-Gemma2-Merge.Q6_K.gguf", profiles, "gemma2")
     assert p.display_name == "Generic / fallback"
+
+
+def test_qwen35_arch_fallback_and_qwable_qwopus_patterns() -> None:
+    """Qwen3.5/3.6 community finetunes must route to the Qwen profile:
+    via the qwable/qwopus filename patterns, or via the qwen35 / qwen35moe
+    arch_fallback for otherwise-unrecognised filenames. Their model cards
+    explicitly use Qwen3.5's recommended sampling, so this profile is the
+    correct target rather than _default."""
+    profiles = load_profiles(SETTINGS_DIR)
+    qwen = "Qwen3.5 / Qwen3.6 (Alibaba)"
+
+    # Filename patterns (work even without an arch hint).
+    assert match_profile("Qwable-27b_Q4_K_M.gguf", profiles).display_name == qwen
+    assert (
+        match_profile("Qwopus3.5-9B-coder-Exp-Q8_0.gguf", profiles).display_name == qwen
+    )
+
+    # arch_fallback: an unrecognised filename whose arch is qwen35 / qwen35moe.
+    assert (
+        match_profile("Merged-Hf-Final.gguf", profiles, "qwen35").display_name == qwen
+    )
+    assert (
+        match_profile("some-a3b-moe-requant.gguf", profiles, "qwen35moe").display_name
+        == qwen
+    )
+
+    # A real qwen3.5 filename still matches by pattern (unchanged).
+    assert match_profile("Qwen3.5-9B-Q8_0.gguf", profiles).display_name == qwen
+
+
+def test_cohere2moe_and_vibethinker_and_minicpm5_profiles_load() -> None:
+    """The three new profiles load with the expected match behaviour and
+    each carries the mandatory --jinja extra arg."""
+    profiles = load_profiles(SETTINGS_DIR)
+
+    # cohere2moe: pattern + arch_fallback (North-Mini-Code, fork-only arch).
+    north = match_profile("North-Mini-Code-1.0-UD-Q6_K_XL.gguf", profiles, "cohere2moe")
+    assert north.display_name == "North-Mini-Code (Cohere, cohere2moe)"
+    assert "cohere2moe" in north.arch_fallback
+    assert "--jinja" in north.extra_args
+    # Re-quant with an unrecognised filename still caught by arch_fallback.
+    assert (
+        match_profile("weird-name.gguf", profiles, "cohere2moe").display_name
+        == "North-Mini-Code (Cohere, cohere2moe)"
+    )
+
+    # VibeThinker: pattern only, NO arch_fallback (arch is generic "qwen2").
+    vt = match_profile("VibeThinker-3B.F32.gguf", profiles, "qwen2")
+    assert vt.display_name == "VibeThinker (WeiboAI, reasoning)"
+    assert vt.arch_fallback == []
+    assert "--jinja" in vt.extra_args
+    # A plain qwen2 model must NOT be swallowed by the VibeThinker profile.
+    assert (
+        match_profile("Qwen2.5-7B-Instruct-Q8_0.gguf", profiles, "qwen2").display_name
+        != "VibeThinker (WeiboAI, reasoning)"
+    )
+
+    # MiniCPM5: pattern only, NO arch_fallback (arch is generic "llama").
+    mc = match_profile("MiniCPM5-1B-F16.gguf", profiles, "llama")
+    assert mc.display_name == "MiniCPM5 (OpenBMB, on-device)"
+    assert mc.arch_fallback == []
+    assert "--jinja" in mc.extra_args
+    # A plain llama model must NOT be swallowed by the MiniCPM5 profile.
+    assert (
+        match_profile("Llama-3.1-8B-Instruct-Q8_0.gguf", profiles, "llama").display_name
+        != "MiniCPM5 (OpenBMB, on-device)"
+    )
 
 
 def test_arch_fallback_is_backward_compatible() -> None:

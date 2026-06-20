@@ -1,0 +1,69 @@
+display_name: "VibeThinker (WeiboAI, reasoning)"
+patterns:
+  - vibethinker
+  - vibe-thinker
+
+# KEIN arch_fallback: VibeThinker trägt general.architecture "qwen2"
+# (Basis: Qwen2.5-Coder-3B / 1.5B). "qwen2" als Fallback zu beanspruchen
+# würde JEDES generische Qwen2-Modell auf dieses Spezial-Reasoning-Profil
+# umbiegen — falsch. Match also bewusst nur über den Dateinamen.
+
+# VibeThinker-3B (Juni 2026) bzw. -1.5B (Nov 2025), WeiboAI, MIT-Lizenz.
+# Dichtes Reasoning-Modell, hart auf Mathe/Code/STEM getunt
+# ("Spectrum-to-Signal Principle"). Reasoning-Modell mit <think>-Block —
+# downstream den <think>...</think>-Span parsen/strippen.
+#
+# Kontext: GGUF-Metadata meldet qwen2.context_length = 131072 (vom
+# Qwen2.5-Coder-Basismodell); trainiert/evaluiert wurde mit 64k Fenster,
+# Generierung bis ~40k–102k Tokens. Wird via GGUF-Metadata automatisch
+# gecappt; hier der native Metadaten-Wert.
+max_context: 131072
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+sampling:
+  chat:
+    # Offizielle Empfehlung (WeiboAI HF-Card / Tech-Report 2606.16140):
+    # temperature=1.0, top_p=0.95, top_k=-1. WICHTIG: niedrigere
+    # Temperaturen VERSCHLECHTERN die Reasoning-Qualität reproduzierbar
+    # ("Lower temperatures degrade reasoning quality — counterintuitive,
+    # but documented") — das Modell wurde nicht über diverse
+    # Temperatur-Regime trainiert. top_k=-1 (aus) → hier 0.
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    # Auch für Code KEINE Temperatur-Absenkung — gleiche Begründung wie
+    # oben (Code/Math ist genau die Stärke des Modells und die Bench-Werte
+    # entstehen bei temp=1.0). Der 1.5B-Report nennt für reinen Code
+    # alternativ temp=0.6; 1.0 bleibt der sichere Default, der die
+    # trainierte Diversität erhält. Bewusst IDENTISCH zu chat.
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  # Sauberes Trennen der <think>-Blöcke ins reasoning_content-API-Feld.
+  - --jinja
+
+# Speculative decoding: kein integrierter MTP-Head, kein Draft-Sibling.
+# Draftless ngram-mod (Default). draft_max als Vulkan-Grenze.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  WeiboAI VibeThinker — dichtes Reasoning-Modell (3B auf Qwen2.5-Coder-3B,
+  bzw. 1.5B), MIT-Lizenz, spezialisiert auf verifizierbares Reasoning
+  (Mathe/Code/STEM). Architektur "qwen2" — daher KEIN arch_fallback
+  (würde sonst generische Qwen2-Modelle fangen), Match nur über
+  Dateiname. Sampling = offizielle WeiboAI-Empfehlung temp=1.0 /
+  top_p=0.95 / top_k=-1 in BEIDEN Modi: niedrigere Temperatur
+  verschlechtert hier dokumentiert die Reasoning-Qualität, das Modell ist
+  nicht für andere Temperatur-Regime trainiert. <think>-Block: downstream
+  parsen. Kein General-Purpose-Modell — für breites Weltwissen ein
+  größeres Modell nehmen.

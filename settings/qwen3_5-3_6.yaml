@@ -2,6 +2,29 @@ display_name: "Qwen3.5 / Qwen3.6 (Alibaba)"
 patterns:
   - qwen3.5
   - qwen3.6
+  # Community-Finetunes auf Qwen3.5/3.6-Basis, deren Dateiname NICHT
+  # "qwen3.5"/"qwen3.6" enthält. Beide nutzen laut Modell-Card explizit
+  # die offiziellen Qwen3.5-Sampling-Settings (temp 1.0 / top_p 0.95 /
+  # top_k 20, <think>-Reasoning), also exakt dieses Profil — daher hier
+  # als Pattern statt als separate (identische) YAML:
+  #   - Qwable  (empero-ai / Mia-AiLab): Qwen3.5-9B / Qwen3.6-35B SFT-Distill,
+  #     "run against the final checkpoint using Qwen3.5's recommended
+  #     sampling settings". 35B-Variante arch=qwen35moe, 9B/27B arch=qwen35.
+  #   - Qwopus  (Jackrong): Qwen3.5-9B Claude-Opus/GLM-Reasoning-Distill,
+  #     Bench-Setup temp=1.0 top_p=0.95, MTP n=2. arch=qwen35.
+  - qwable
+  - qwopus
+
+# Architektur-Fallback: fängt Qwen3.5/3.6-Re-Quants/Merges mit
+# unüblichen Dateinamen, die oben KEIN Pattern treffen. Gematcht wird
+# exakt gegen general.architecture. qwen35 = dense (9B/27B), qwen35moe =
+# A3B/A10B-MoE — beide sind dieselbe Qwen3.5/3.6-Familie und sollen dieses
+# Profil (inkl. der korrekten Sampling-Defaults) statt _default bekommen.
+# Filename-Pattern haben weiterhin Vorrang; das hier greift nur im
+# "kein Pattern hat gematcht"-Fall.
+arch_fallback:
+  - qwen35
+  - qwen35moe
 
 # Qwen3.5 (Feb 2026): 0.8B/2B/4B/9B/27B/35B-A3B/122B-A10B/397B-A17B.
 # Qwen3.6 (April 2026): erste Open-Weights 27B + 35B-A3B.

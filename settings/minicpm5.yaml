@@ -1,0 +1,68 @@
+display_name: "MiniCPM5 (OpenBMB, on-device)"
+patterns:
+  - minicpm5
+  - minicpm-5
+
+# KEIN arch_fallback: MiniCPM5-1B nutzt die Standard-LlamaForCausalLM-
+# Architektur, general.architecture ist schlicht "llama". "llama" als
+# Fallback zu beanspruchen würde jedes Llama-Modell auf dieses Profil
+# umbiegen — falsch. Match also bewusst nur über den Dateinamen.
+
+# MiniCPM5-1B (Mai 2026), OpenBMB, Apache-2.0. Dichtes 1B-On-Device-Modell
+# (24 Layer, GQA 16 Q / 2 KV-Heads), 1B-Klasse-SOTA bei Tool-Use, Code und
+# Reasoning. Hybrid-Reasoning aus EINEM Checkpoint: Think- und No-Think-
+# Modus werden über das Chat-Template (enable_thinking) umgeschaltet.
+#
+# Native Kontext: llama.context_length = 131072 (128k). Wird via
+# GGUF-Metadata automatisch gecappt; hier der native Wert.
+max_context: 131072
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+# OpenBMB gibt getrennte Werte für No-Think und Think an (Ollama-Modelfile /
+# vLLM-Recipe / SGLang-Skill): No-Think temp=0.7, Think temp=0.9, top_p=0.95.
+# Mapping auf unsere zwei Modi: "chat" = No-Think-Default (schnelle
+# Assistenz), "coding" = Think (deliberates Reasoning, das laut OpenBMB
+# gerade bei Code/Tool-Use die Stärke ist) mit temp=0.9.
+sampling:
+  chat:
+    # No-Think-Default (OpenBMB): temp=0.7, top_p=0.95. Kein top_k vorgegeben.
+    temperature: 0.7
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    # Think-Modus (OpenBMB): temp=0.9, top_p=0.95. Höher als chat, weil das
+    # Modell im Think-Modus mehr Exploration im <think>-Block braucht — das
+    # ist genau der Modus, den OpenBMB für Code/Tool-Use/Reasoning empfiehlt.
+    # Den Think-Modus zusätzlich im Chat-Template aktivieren (enable_thinking).
+    temperature: 0.9
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  # Pflicht: MiniCPM5 emittiert XML-Style Tool-Calls und nutzt ein
+  # eigenes Chat-Template (Think/No-Think-Umschaltung, <|im_start|>-Format).
+  # Ohne --jinja greift das Template nicht und Tool-Calls werden nicht
+  # sauber als reasoning_content/tool_calls getrennt.
+  - --jinja
+
+# Speculative decoding: kein integrierter MTP-Head, kein Draft-Sibling.
+# Draftless ngram-mod (Default). draft_max als Vulkan-Grenze.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  OpenBMB MiniCPM5-1B — dichtes 1B-On-Device-Modell (Standard-llama-Arch,
+  kein Hybrid, kein mmproj), Apache-2.0, 1B-Klasse-SOTA bei Tool-Use/Code/
+  Reasoning, nativer 128k-Kontext. Architektur "llama" — daher KEIN
+  arch_fallback (würde sonst alle Llama-Modelle fangen), Match nur über
+  Dateiname. Hybrid-Reasoning aus einem Checkpoint: Think/No-Think über
+  das Chat-Template (enable_thinking). Sampling = OpenBMB-Empfehlung:
+  chat = No-Think (temp 0.7), coding = Think (temp 0.9), top_p 0.95 in
+  beiden. --jinja ist Pflicht (Chat-Template + XML-Tool-Call-Parsing).
+  Für Tool-Calling ist SGLang/llama.cpp mit korrektem Parser empfohlen.

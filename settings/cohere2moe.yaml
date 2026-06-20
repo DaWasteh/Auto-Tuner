@@ -1,0 +1,103 @@
+display_name: "North-Mini-Code (Cohere, cohere2moe)"
+patterns:
+  - north-mini-code
+  - north_mini_code
+
+# Architektur-Fallback: greift wenn KEIN Pattern oben matcht. Die
+# general.architecture dieser GGUFs ist "cohere2moe". Fängt Re-Quants /
+# Community-Merges mit abweichendem Dateinamen, damit sie dieses Profil
+# (inkl. --jinja) statt _default bekommen.
+arch_fallback:
+  - cohere2moe
+
+# WICHTIG — Build: "cohere2moe" ist Stand llama.cpp b9739 NOCH NICHT in
+# Mainline (PR #24260 "Add arch support for cohere2-MoE" ist offen). Ein
+# Mainline-llama-server lädt die Datei NICHT ("unknown architecture
+# 'cohere2moe'"). Du brauchst einen Build vom PR-Branch:
+#     git fetch origin pull/24260/head:cohere2-moe
+#     git checkout cohere2-moe
+#     cmake -B build -DGGML_VULKAN=ON && cmake --build build --config Release
+# Wähle diesen Build im Fork-Dropdown der GUI (z.B. "c2_b9739_llama.cpp") —
+# der AutoTuner findet llama-server darin über LLAMA_CPP_DIR. KEIN
+# server_binary hier hartcodieren (gleiche Logik wie bei den anderen
+# Forks: ~5 neue Builds/Tag). Die GGUF deklariert bereits
+# general.architecture=cohere2moe, läuft also OHNE Re-Download auf
+# Mainline, sobald der PR gemerged ist.
+#
+# Im Gegensatz zu diffusion-gemma ist das ein NORMALES autoregressives
+# Modell: llama-server, OpenAI-API, /health, Chat-UI — kein
+# Diffusionspfad, kein runner-Override nötig.
+
+# North-Mini-Code-1.0: 30B total / 3B aktiv MoE, agentisches Coding,
+# Apache-2.0. cohere2moe-Metadaten: 49 Layer (1 leading-dense + 48 MoE),
+# expert_count=128 / expert_used_count=8, GQA 32 Q / 4 KV-Heads,
+# sliding_window=4096 (cohere2-Style iSWA: RoPE nur auf SWA-Layern),
+# rope.freq_base=50000.
+#
+# Native Kontext: cohere2moe.context_length = 500000. Wird via
+# GGUF-Metadata automatisch gecappt (min(max_context, native_ctx)); hier
+# der native Wert. Auf der 32-GB-R9700 ist das real durch den KV-Cache
+# begrenzt — die Cascade regelt den ctx automatisch herunter.
+max_context: 500000
+recommended_kv_quant: q8_0
+
+# MoE: das ist ein 30B-A3B-MoE. is_moe wird über expert_count>1 aus der
+# GGUF-Metadata erkannt; der Tuner hält möglichst viele Expert-Layer im
+# VRAM und lagert den Rest via --n-cpu-moe in den RAM aus. "throughput"
+# reserviert ein kleineres KV-Budget zugunsten von mehr Layern im VRAM
+# (analog Qwen3.6-A3B). Wer regelmäßig sehr langen Kontext braucht, in
+# der GUI auf "balanced"/"safe" wechseln — die GUI-Wahl gewinnt.
+performance_target: throughput
+
+# Sampling-Profile pro Modus.
+sampling:
+  chat:
+    # Offizielle Empfehlung (CohereLabs/North-Mini-Code-1.0 Modell-Card +
+    # Unsloth-GGUF-Doc): "We recommend using the following set of sampling
+    # parameters for generation: temperature=1.0, top_p=0.95." Cohere gibt
+    # kein top_k vor → deaktiviert. Repeat-Penalty aus (1.0).
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    # Cohere selbst nennt für das Modell nur temp=1.0; für
+    # deterministischere Code-Completion / stabile Tool-Calls hier etwas
+    # abgesenkt (gleiche Logik wie bei den anderen Cohere-Profilen, die
+    # für strukturierte Ausgaben niedrigere Temperaturen fahren). Wer die
+    # offiziellen Bench-Settings 1:1 will, im Chat-Modus bleiben oder beim
+    # Start überschreiben.
+    temperature: 0.6
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  # Pflicht: Ohne --jinja greift das eingebettete Chat-Template nicht und
+  # die Tool-Calls / das Reasoning werden nicht sauber getrennt. Die
+  # Unsloth-Doc startet llama-server explizit mit --jinja.
+  - --jinja
+
+# Speculative decoding: North-Mini-Code hat KEINEN integrierten MTP-Head
+# (kein nextn_predict_layers in den Metadaten) und keinen offiziellen
+# Draft-Sibling. Daher klassisches draftless ngram-mod (Default). draft_max
+# als Vulkan-Grenze (greift nur, falls extern ein -md-Drafter gepaart wird).
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Cohere North-Mini-Code-1.0 — 30B total / 3B aktiv MoE, agentisches
+  Coding (Tool-Use, Repo-Tasks, Browser-Automation), Apache-2.0,
+  Architektur "cohere2moe" (cohere2-iSWA-Attention + glm4moe-Style
+  Sigmoid-Gating, 1 leading-dense + 48 MoE-Layer, 128 Experten / 8 aktiv).
+  ACHTUNG: cohere2moe ist Stand b9739 NICHT in llama.cpp-Mainline —
+  PR #24260 ist offen. Build vom PR-Branch nötig (siehe Kommentar oben)
+  und im Fork-Dropdown auswählen; die GGUF deklariert bereits
+  general.architecture=cohere2moe und läuft ohne Re-Download auf Mainline,
+  sobald der PR landet. Normales autoregressives Server-Modell (kein
+  Diffusionspfad). Sampling = Cohere/Unsloth-Empfehlung (temp 1.0 /
+  top_p 0.95) im Chat; Coding-Profil deterministischer (0.6) für stabile
+  Tool-Calls. --jinja ist Pflicht (Chat-Template + Tool-Parsing).

@@ -1,0 +1,55 @@
+cd H:\LAB\ai-local
+git clone https://github.com/KhronosGroup/SPIRV-Headers.git
+cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
+  -G "Visual Studio 18 2026" `
+  -A x64 `
+  -DCMAKE_INSTALL_PREFIX="H:/LAB/ai-local/SPIRV-Headers/install"
+cmake --build .\SPIRV-Headers\build --config Release
+cmake --install .\SPIRV-Headers\build --config Release
+
+# --- Bonsai Ternary Fork (PrismML-Eng, branch prism; Vulkan-Q2_0 ist drin) ---
+git clone https://github.com/PrismML-Eng/llama.cpp.git _tmp_2b_llama
+Push-Location .\_tmp_2b_llama
+git checkout prism
+# Upstream-Tags holen und die b-Nummer der MAINLINE-Basis ermitteln
+# (PrismML taggt selbst als prism-bXXXX; wir wollen die echte Basis).
+git remote add upstream https://github.com/ggml-org/llama.cpp.git 2>$null
+git fetch upstream --tags 2>$null
+$base = git merge-base HEAD upstream/master 2>$null
+if (-not $base) { $base = "HEAD" }
+$desc = git describe --tags --abbrev=0 --match "b[0-9]*" $base 2>$null
+$ver  = [regex]::Match($desc, 'b\d+').Value
+if (-not $ver) { $ver = "bUNKNOWN" }
+Pop-Location
+$dir = "2b_${ver}_llama.cpp"
+if (Test-Path .\$dir) { Remove-Item .\$dir -Recurse -Force }
+Rename-Item .\_tmp_2b_llama $dir
+Write-Host "==> Build-Verzeichnis: $dir  (Fork-Basis auf mainline $ver)"
+
+Push-Location .\$dir\tools\ui
+npm ci
+npm run build
+Pop-Location
+
+# CMAKE_POLICY_DEFAULT_CMP0194=OLD + CMAKE_ASM_COMPILER=cl umgehen den
+# ASM-Compiler-Fehler (llama.cpp Issue #22100) bei neueren CMake-Versionen.
+cmake -S .\$dir -B .\$dir\build `
+  -G "Visual Studio 18 2026" `
+  -A x64 `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
+  -DCMAKE_ASM_COMPILER=cl `
+  -DGGML_VULKAN=ON `
+  -DGGML_NATIVE=OFF `
+  -DGGML_AVX2=ON `
+  -DGGML_FMA=ON `
+  -DGGML_F16C=ON `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DLLAMA_BUILD_SERVER=ON `
+  -DLLAMA_BUILD_UI=ON `
+  -DLLAMA_USE_PREBUILT_UI=OFF `
+  -DLLAMA_CURL=OFF `
+  -DGGML_CCACHE=OFF `
+  -DGGML_VULKAN_CHECK_RESULTS=OFF `
+  -DCMAKE_PREFIX_PATH="H:/LAB/ai-local/SPIRV-Headers/install"
+cmake --build .\$dir\build --config Release --parallel 24

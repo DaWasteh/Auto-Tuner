@@ -633,7 +633,7 @@ Recommended build settings for this system:
 # - AMD Radeon R9700 AI Pro 32GB
 # - G.Skill Trident Z 48GB DDR5-8400MHz (2x24GB)
 
-# Main-Fork b9700 (SPIRV-Headers required since b9194) - Windows
+# Main-Fork b9739 (SPIRV-Headers required since b9194) - Windows
 cd H:\LAB\ai-local
 git clone https://github.com/KhronosGroup/SPIRV-Headers.git
 cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
@@ -668,44 +668,7 @@ cmake -S .\llama.cpp -B .\llama.cpp\build `
   -DCMAKE_PREFIX_PATH="H:/LAB/ai-local/SPIRV-Headers/install"
 cmake --build .\llama.cpp\build --config Release --parallel 24
 
-# Diffusion-Gemma-Fork b9700 - Windows
-cd H:\LAB\ai-local
-git clone https://github.com/KhronosGroup/SPIRV-Headers.git
-cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
-  -G "Visual Studio 18 2026" `
-  -A x64 `
-  -DCMAKE_INSTALL_PREFIX="H:/LAB/ai-local/SPIRV-Headers/install"
-cmake --build .\SPIRV-Headers\build --config Release
-cmake --install .\SPIRV-Headers\build --config Release
-
-git clone https://github.com/ggml-org/llama.cpp.git
-Push-Location .\llama.cpp
-git fetch origin pull/24427/head:pr-diffusiongemma
-git checkout pr-diffusiongemma
-Pop-Location
-Push-Location .\llama.cpp\tools\ui
-npm ci
-npm run build
-Pop-Location
-
-cmake -S .\llama.cpp -B .\llama.cpp\build `
-  -G "Visual Studio 18 2026" `
-  -A x64 `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DGGML_VULKAN=ON `
-  -DGGML_NATIVE=OFF `
-  -DGGML_AVX2=ON `
-  -DGGML_FMA=ON `
-  -DGGML_F16C=ON `
-  -DBUILD_SHARED_LIBS=OFF `
-  -DLLAMA_BUILD_SERVER=ON `
-  -DLLAMA_BUILD_UI=ON `
-  -DLLAMA_USE_PREBUILT_UI=OFF `
-  -DLLAMA_CURL=OFF `
-  -DGGML_CCACHE=OFF `
-  -DGGML_VULKAN_CHECK_RESULTS=OFF `
-  -DCMAKE_PREFIX_PATH="H:/LAB/ai-local/SPIRV-Headers/install"
-cmake --build .\llama.cpp\build --config Release --parallel 24
+For all the Forks i use i keep the txt-files in this repo with the spezific commands up-to-date.
 ```
 
 ## Server features (as of b9625)
