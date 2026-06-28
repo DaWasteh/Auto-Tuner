@@ -262,6 +262,62 @@ pip install -r requirements.txt
 
 You also need a working `llama-server` binary. The tuner automatically discovers binaries in common local setups (like `C:\LAB\ai-local\`), or you can specify one via `--server`.
 
+## Update (über das Terminal)
+
+Wenn du AutoTuner per `git clone` installiert hast, holst du neue
+Versionen ganz einfach über das Terminal. Deine persönlichen
+Einstellungen bleiben dabei erhalten — `autotuner_settings.json` steht
+in der `.gitignore` und wird von `git pull` niemals angefasst.
+
+**1. In den App-Ordner wechseln** (dorthin, wo du geklont hast):
+
+```bash
+cd "H:/GitHub/Auto Tuner"
+```
+
+**2. Aktuelle Änderungen herunterladen:**
+
+```bash
+git pull
+```
+Falls du lokal an den Python-Dateien herumgepfuscht hast und `git pull`
+mit einem Konflikt abbricht, kannst du deine lokalen Änderungen
+verwerfen und den Upstream-Stand übernehmen:
+
+```bash
+git stash            # lokale Änderungen kurz beiseite legen
+git pull
+git stash drop       # beiseite gelegte Änderungen verwerfen
+# oder: git stash pop  → Änderungen wiederherstellen (evtl. Konflikte lösen)
+```
+
+> ⚠️ `git stash` berührt **nicht** `autotuner_settings.json` (gitignored) —
+> deine Pfade, Port-Einstellungen, Overrides usw. sind in jedem Fall sicher.
+
+**3. Abhängigkeiten aktualisieren** (nur nötig, wenn sich `requirements.txt`
+geändert hat — schadet aber nie):
+
+```bash
+pip install -r requirements.txt
+```
+Falls du eine virtuelle Umgebung nutzt, aktiviere sie vorher
+(`.venv\Scripts\activate` unter Windows bzw. `source .venv/bin/activate`
+unter Linux/macOS).
+
+**4. App starten** — danach einfach wie gewohnt:
+
+```bash
+python qt_launcher.py        # GUI
+# oder
+python auto_tuner.py         # Terminal
+```
+
+**Kurzform** (wenn sich nichts an den Abhängigkeiten geändert hat):
+
+```bash
+git pull && python qt_launcher.py
+```
+
 ## Usage
 
 Point it at a folder of `*.gguf` models — it will recurse:

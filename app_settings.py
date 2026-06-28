@@ -21,6 +21,10 @@ Public API:
     set_mmproj_selection(model_name, filename)
     get_font_size()        -> Optional[int]
     set_font_size(int)
+    get_base_port()        -> int
+    set_base_port(int)
+    get_port_offset()      -> int
+    set_port_offset(int)
     get_reasoning_effort(model_name) -> Optional[str]
     set_reasoning_effort(model_name, value)
 """
@@ -492,6 +496,64 @@ def set_draft_selection(model_name: str, filename: Optional[str]) -> None:
 _FONT_SIZE_MIN = 7
 _FONT_SIZE_MAX = 22
 _FONT_SIZE_DEFAULT = 10
+
+
+# ---------------------------------------------------------------------------
+# Server base port + offset
+#
+# The "Base port" field in the launcher toolbar selects the port the FIRST
+# llama-server binds to (subsequent concurrent servers get base+1, base+2…).
+# Persisting it means a user who switched away from the 1234 default — e.g.
+# to avoid clashing with another local service — does not have to re-enter it
+# on every restart. The manual port offset (0..10) is persisted alongside so
+# the whole port-selection state round-trips. Both fall back to the hardcoded
+# defaults when nothing is stored yet.
+
+_BASE_PORT_MIN = 1
+_BASE_PORT_MAX = 65535
+_BASE_PORT_DEFAULT = 1234
+
+_PORT_OFFSET_MIN = 0
+_PORT_OFFSET_MAX = 10
+_PORT_OFFSET_DEFAULT = 0
+
+
+def get_base_port() -> int:
+    """Return the persisted server base port (default 1234, clamped to 1..65535)."""
+    val = load_settings().get("base_port")
+    try:
+        n = int(val) if val is not None else _BASE_PORT_DEFAULT
+    except (TypeError, ValueError):
+        return _BASE_PORT_DEFAULT
+    return max(_BASE_PORT_MIN, min(_BASE_PORT_MAX, n))
+
+
+def set_base_port(port: int) -> None:
+    """Persist the server base port (clamped to the valid range)."""
+    try:
+        n = int(port)
+    except (TypeError, ValueError):
+        return
+    _update("base_port", max(_BASE_PORT_MIN, min(_BASE_PORT_MAX, n)))
+
+
+def get_port_offset() -> int:
+    """Return the persisted manual port offset (default 0, clamped to 0..10)."""
+    val = load_settings().get("port_offset")
+    try:
+        n = int(val) if val is not None else _PORT_OFFSET_DEFAULT
+    except (TypeError, ValueError):
+        return _PORT_OFFSET_DEFAULT
+    return max(_PORT_OFFSET_MIN, min(_PORT_OFFSET_MAX, n))
+
+
+def set_port_offset(offset: int) -> None:
+    """Persist the manual port offset (clamped to the valid range)."""
+    try:
+        n = int(offset)
+    except (TypeError, ValueError):
+        return
+    _update("port_offset", max(_PORT_OFFSET_MIN, min(_PORT_OFFSET_MAX, n)))
 
 
 def get_font_size() -> int:

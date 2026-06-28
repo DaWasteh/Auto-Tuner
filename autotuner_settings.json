@@ -1,6 +1,6 @@
 {
   "models_path": "I:\\models",
-  "fork_path": "H:\\LAB\\ai-local\\d_b9781_llama.cpp",
+  "fork_path": "H:\\LAB\\ai-local\\b9833_llama.cpp",
   "performance_target": "throughput",
   "model_overrides": {
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": {
@@ -26,7 +26,8 @@
     },
     "Qwen3.6-35B-A3B-UD-Q6_K": {
       "vision": false,
-      "thinking": true
+      "thinking": true,
+      "draft": false
     },
     "Qwen3.6-27B-MTP-UD-Q3_K_XL": {
       "vision": false,
@@ -45,7 +46,8 @@
       "draft": true
     },
     "Qwen3.5-122B-A10B-UD-Q3_K_XL": {
-      "vision": false
+      "vision": false,
+      "draft": true
     },
     "gemma-4-31B-it-UD-Q8_K_XL": {
       "draft": false,
@@ -74,7 +76,8 @@
     },
     "gemma-4-12b-it-BF16": {
       "ngram": false,
-      "vision": false
+      "vision": false,
+      "draft": false
     },
     "Ministral-3-14B-Reasoning-2512-Q6_K": {
       "vision": true
@@ -146,15 +149,16 @@
       "vision": false
     },
     "gemma-4-12B-it-qat-UD-Q4_K_XL": {
-      "vision": false
+      "vision": false,
+      "draft": false
     },
     "Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL": {
       "vision": false
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAADOAAAAqAAABXgAAATcAAAAzgAAAMcAAAV4AAAE3AAAAAAAAAAADXAAAADOAAAAxwAABXgAAATc",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABKsAAAPhAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAAAAAB0AAAAMQAABR4AAAScAAAAdAAAAFAAAAUeAAAEnAAAAAAAAAAADXAAAAB0AAAAUAAABR4AAASc",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABKsAAAQYAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "H:\\LAB\\ai-local",
   "font_size": 10,
   "gpu_overrides": {
@@ -168,12 +172,27 @@
     }
   },
   "splitter_states": {
-    "top_split": "AAAA/wAAAAEAAAACAAACVgAAAkgA/////wEAAAABAA==",
+    "top_split": "AAAA/wAAAAEAAAACAAACWQAAAkUA/////wEAAAABAA==",
     "main_split": "AAAA/wAAAAEAAAACAAADMAAAAAAA/////wEAAAACAA=="
   },
   "mmproj_selection": {
     "Qwen3.6-35B-A3B-UD-Q8_K_XL": "mmproj-Qwen3.6-35B-A3B-UD-F32.gguf",
     "Qwen3.6-27B-UD-Q6_K_XL": "mmproj-Qwen3.6-27B-MTP-UD-F32.gguf",
-    "Qwen3.6-27B-MTP-UD-Q8_K_XL": "mmproj-Qwen3.6-27B-MTP-BF16.gguf"
-  }
+    "Qwen3.6-27B-MTP-UD-Q8_K_XL": "mmproj-Qwen3.6-27B-MTP-BF16.gguf",
+    "gemma-4-12B-it-qat-UD-Q4_K_XL": "<none>",
+    "Qwen3.5-122B-A10B-UD-Q3_K_XL": "<none>",
+    "Step-3.7-Flash-UD-IQ3_S": "<none>",
+    "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-HIGH-Q8_0": "<none>",
+    "Qwopus3.5-9B-coder-Exp-Q8_0": "<none>",
+    "gemma-4-12b-it-BF16": "<none>",
+    "Qwen3.6-35B-A3B-UD-Q6_K": "<none>"
+  },
+  "draft_selection": {
+    "gemma-4-12B-it-qat-UD-Q4_K_XL": "<none>",
+    "Qwen3.5-122B-A10B-UD-Q3_K_XL": "<none>",
+    "gemma-4-12b-it-BF16": "<none>",
+    "Qwen3.6-35B-A3B-UD-Q6_K": "<none>"
+  },
+  "base_port": 1234,
+  "port_offset": 0
 }

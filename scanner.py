@@ -1027,7 +1027,10 @@ class ModelEntry:
         # the "mtp" token so it does NOT fire on a standalone drafter named
         # with an "mtp-" prefix / "-MTP-" infix (e.g. mtp-gemma-4-12B-it-qat-UD,
         # gemma-4-12B-…-MTP-BF16) — those are draft files, matched separately.
-        if _is_draft_filename(self.name):
+        # The size argument keeps a large MTP-named TARGET (integrated draft)
+        # from being mistaken for a draft file, so this fallback correctly
+        # reports it as embedded-MTP instead.
+        if _is_draft_filename(self.name, self.size_bytes):
             return False
         return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", self.name, re.IGNORECASE))
 
@@ -1239,6 +1242,19 @@ def _find_mmproj_candidates(model: Path, candidates: List[Path]) -> List[Path]:
 # :func:`metadata_is_standalone_drafter`), applied after the metadata read.
 _DRAFT_FILENAME_TOKENS = ("assistant", "draft", "mtp")
 
+# Maximum size for a GGUF to be treated as a standalone draft head based on
+# its filename alone. Real draft/assistant/MTP heads are tiny — a Gemma 4
+# MTP head is ~423M params, well under 1 GB even in BF16, and full sibling
+# assistants are likewise small. A GGUF whose name carries a draft token but
+# EXCEEDS this threshold is almost always a TARGET model that merely mentions
+# "mtp"/"draft" in its name because it ships an INTEGRATED draft head
+# (e.g. Qwen3.6-27B-MTP-UD-Q3_K_XL.gguf at several GB). Such a target must
+# stay in the normal model list and be detected via
+# :func:`metadata_has_embedded_mtp`, not be hidden away as a draft file.
+# Without this size guard every large MTP-suffixed target was misclassified
+# as a drafter and disappeared from the chooser.
+_DRAFT_MAX_SIZE_BYTES = int(1.5 * 1024**3)  # 1.5 GiB
+
 
 # Drafter-base matching: strip the speculative-draft marker AND the quant
 # tail, then compare the canonical (separator-normalised) stems. Unlike the
@@ -1287,21 +1303,42 @@ def _common_prefix_len(a: str, b: str) -> int:
     return n
 
 
-def _is_draft_filename(name: str) -> bool:
-    """Cheap pre-filter: does this filename look like a draft/assistant file?"""
+def _is_draft_filename(name: str, size_bytes: Optional[int] = None) -> bool:
+    """Cheap pre-filter: does this filename look like a draft/assistant file?
+
+    A file counts as a draft only when BOTH hold:
+      1. Its stem carries a draft token (``assistant`` / ``draft`` / ``mtp``)
+         bounded by separators or at the start of the stem.
+      2. It is small enough to plausibly BE a draft head (≤
+         :data:`_DRAFT_MAX_SIZE_BYTES`, ~1.5 GiB). Real draft heads are well
+         under 1 GB; a multi-GB GGUF whose name contains ``mtp`` is almost
+         always a TARGET model with an integrated MTP head (detected via
+         :func:`metadata_has_embedded_mtp`), not a standalone drafter, and
+         must stay in the model list. Pass ``size_bytes`` whenever the file
+         size is known so the guard can fire; when it is ``None`` the guard
+         is skipped (keeps the old behaviour for callers without a stat).
+    """
     n = name.lower()
     # Match token surrounded by separators OR at the end of stem
     # (e.g. "qwen3.5-30b-a3b-assistant-q4_k_m.gguf" is a draft;
     #  "rooks_assistant_v2.gguf" — a fictional case — would also match,
     #  which is acceptable, false-positives just cost a draft pairing).
+    matched = False
     for tok in _DRAFT_FILENAME_TOKENS:
         if (
             re.search(rf"[-_.]{tok}[-_.]", n)
             or n.startswith(tok + "-")
             or n.startswith(tok + "_")
         ):
-            return True
-    return False
+            matched = True
+            break
+    if not matched:
+        return False
+    # Size guard: a large file with a draft token in its name is a target
+    # model with an integrated draft head, not a standalone draft file.
+    if size_bytes is not None and size_bytes > _DRAFT_MAX_SIZE_BYTES:
+        return False
+    return True
 
 
 def _find_draft(model: Path, candidates: List[Path]) -> Optional[Path]:
@@ -1452,10 +1489,19 @@ def scan_models(
     for f in all_gguf:
         if _is_mmproj_filename(f.name):
             mmprojs.append(f)
-        elif _is_draft_filename(f.name):
-            drafts.append(f)
         else:
-            models.append(f)
+            # Stat once so the size guard in _is_draft_filename can tell a
+            # real (small) draft head apart from a large MTP-named target
+            # model that carries an integrated draft. A failed stat falls
+            # back to the size-agnostic check so the file is not lost.
+            try:
+                f_size = f.stat().st_size
+            except OSError:
+                f_size = None
+            if _is_draft_filename(f.name, f_size):
+                drafts.append(f)
+            else:
+                models.append(f)
 
     # ------------------------------------------------------------------
     # Separate single-file models from multi-part (sharded) GGUFs.

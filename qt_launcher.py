@@ -1110,7 +1110,8 @@ class MainWindow(QMainWindow):
         # GPU name the most recent launch was pinned to (for the registry).
         self._last_pinned_gpu: Optional[str] = None
         # Base port for the first server; subsequent ones get base+1, base+2…
-        self._base_port: int = 1234
+        # Restored from settings so a non-default port survives restarts.
+        self._base_port: int = app_settings.get_base_port()
         # /health handshake state: base URL of the running server and a
         # latch that flips once GET /health returns 200 (model loaded).
         self._server_base_url: Optional[str] = None
@@ -1540,13 +1541,17 @@ class MainWindow(QMainWindow):
         bl.addWidget(self._host_edit)
 
         bl.addWidget(QLabel(" Base port:"))
-        self._port_edit = QLineEdit("1234")
+        self._port_edit = QLineEdit(str(self._base_port))
         self._port_edit.setFixedWidth(60)
         self._port_edit.setToolTip(
             "Base port for the FIRST server. Each additional concurrent\n"
             "server gets the next free port (1234, 1235, 1236…). Stopping\n"
-            "a server frees its port for reuse."
+            "a server frees its port for reuse.\n"
+            "Remembered across restarts."
         )
+        # Persist on focus loss / Enter so the chosen port is remembered even
+        # without launching (matches fork_path / font_size behaviour).
+        self._port_edit.editingFinished.connect(self._persist_base_port)
         bl.addWidget(self._port_edit)
 
         bl.addWidget(QLabel(" Offset:"))
@@ -1557,6 +1562,15 @@ class MainWindow(QMainWindow):
         )
         for i in range(11):  # 0 to 10
             self._port_offset_combo.addItem(str(i))
+        # Restore the persisted offset selection (clamped to the combo range).
+        self._port_offset_combo.setCurrentIndex(
+            max(0, min(self._port_offset_combo.count() - 1, app_settings.get_port_offset()))
+        )
+        self._port_offset_combo.currentIndexChanged.connect(
+            lambda _i: app_settings.set_port_offset(
+                int(self._port_offset_combo.currentText())
+            )
+        )
         bl.addWidget(self._port_offset_combo)
 
         bl.addStretch()
@@ -1714,6 +1728,21 @@ class MainWindow(QMainWindow):
                 continue
 
     # ------------------------------------------------------------------
+    def _persist_base_port(self) -> None:
+        """Save the current Base port field to settings (on edit / launch).
+
+        Invalid input is ignored — the field keeps its text but nothing is
+        stored, so the previous valid value is restored on the next restart.
+        Also updates ``self._base_port`` so an immediate launch uses the
+        just-typed value even before a relaunch.
+        """
+        try:
+            port = int(self._port_edit.text().strip())
+        except ValueError:
+            return
+        self._base_port = port
+        app_settings.set_base_port(port)
+
     def _apply_mono_font(self, w: QTextEdit) -> None:
         f = QFont("Consolas")
         f.setStyleHint(QFont.StyleHint.Monospace)
@@ -3641,11 +3670,16 @@ class MainWindow(QMainWindow):
         except ValueError:
             base_port = self._base_port
         self._base_port = base_port
+        # Persist the chosen base port + offset so they survive a restart
+        # (same convention as fork_path / font_size). Only committed here, at
+        # launch time, so a typo that is immediately corrected is not stored.
+        app_settings.set_base_port(base_port)
 
         try:
             offset = int(self._port_offset_combo.currentText())
         except (ValueError, AttributeError):
             offset = 0
+        app_settings.set_port_offset(offset)
 
         start_port = self._requested_start_port(base_port, offset)
         port = self._next_free_port(host, start_port)
