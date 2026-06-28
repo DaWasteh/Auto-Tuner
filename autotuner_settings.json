@@ -147,10 +147,13 @@
     },
     "gemma-4-12B-it-qat-UD-Q4_K_XL": {
       "vision": false
+    },
+    "Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL": {
+      "vision": false
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAGZAAAAtwAABkMAAATrAAABmQAAANYAAAZDAAAE6wAAAAAAAAAADXAAAAGZAAAA1gAABkMAAATr",
+  "window_geometry": "AdnQywADAAAAAADOAAAAqAAABXgAAATcAAAAzgAAAMcAAAV4AAAE3AAAAAAAAAAADXAAAADOAAAAxwAABXgAAATc",
   "window_state": "AAAA/wAAAAD9AAAAAAAABKsAAAPhAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "fork_container_path": "H:\\LAB\\ai-local",
   "font_size": 10,

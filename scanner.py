@@ -211,6 +211,45 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def metadata_is_standalone_drafter(md: Dict[str, Any]) -> bool:
+    """Return True iff the GGUF is a *standalone* speculative-draft head.
+
+    These are the small "assistant" / MTP-head files that ship as a
+    SEPARATE GGUF next to a normal target model (Gemma 4 MTP, e.g.
+    ``google/gemma-4-12B-it-assistant`` and the Frankenmerger
+    ``…-MTP-BF16`` / ``mtp-…`` builds). They are NOT runnable on their own
+    — stock llama.cpp aborts with ``unknown model architecture:
+    'gemma4-assistant'`` / ``Gemma4Assistant requires ctx_other to be
+    set`` — so they must be attached to their big-brother target and
+    passed via ``-md`` + ``--spec-type draft-mtp``, never offered as a
+    choosable model. This mirrors the mmproj rule.
+
+    The authoritative signal is the architecture name: the Gemma 4 MTP
+    drafter declares ``general.architecture = gemma4-assistant`` (llama.cpp
+    PR #23398 — ``LLM_ARCH_GEMMA4_ASSISTANT``, renamed from
+    ``GEMMA4_MTP``). We generalise to any architecture whose name ends in
+    ``-assistant`` / ``_assistant`` so future vendors' draft-head archs are
+    caught without a code change. A standalone drafter is additionally
+    tiny (here: 4 blocks, ``general.size_label`` like ``423M``) and always
+    carries ``<arch>.nextn_predict_layers > 0`` — but the arch suffix
+    alone is the reliable discriminator and is what we key on.
+
+    NOTE — this is deliberately distinct from
+    :func:`metadata_has_embedded_mtp`, which detects a *target* model that
+    has an MTP head fused INSIDE its own GGUF (Qwen3.6-27B-MTP, run via
+    ``--spec-type draft-mtp`` with no second file). A standalone drafter is
+    the opposite case: the head lives in its own file. ``has_embedded_mtp``
+    must NOT fire on a standalone drafter (it would mislabel the bare
+    drafter as a self-speculating target), so callers check
+    :func:`metadata_is_standalone_drafter` first and treat the file as a
+    draft, not a model.
+    """
+    if not md:
+        return False
+    arch = str(md.get("general.architecture", "") or "").lower().strip()
+    return arch.endswith("-assistant") or arch.endswith("_assistant")
+
+
 def metadata_has_embedded_mtp(md: Dict[str, Any]) -> bool:
     """Return True iff the GGUF contains an integrated MTP/draft-head.
 
@@ -852,6 +891,14 @@ class ModelEntry:
     # `mmproj_candidates[0]` when any matched.
     mmproj_candidates: List[Path] = field(default_factory=list)
     draft: Optional[Path] = None  # paired assistant/draft model (if any)
+    # Every mmproj / draft file found in this model's own directory,
+    # REGARDLESS of whether it matches this model. The GUI shows these as
+    # always-available manual dropdowns so the user can override the auto
+    # pick or experiment across models; entries the auto-logic considers
+    # incompatible are flagged (not hidden). `mmproj_candidates` / `draft`
+    # above remain the auto-resolved subset used for headless launches.
+    folder_mmprojs: List[Path] = field(default_factory=list)
+    folder_drafts: List[Path] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     part_paths: List[Path] = field(default_factory=list)
     """All shard paths in order; length > 1 for split GGUFs, otherwise [path]."""
@@ -965,11 +1012,32 @@ class ModelEntry:
         Examples that never match (correct negative):
             ``prometheus-13b.gguf``  (contains 'mtp' but not bounded)
         """
+        # A standalone drafter (its own gemma4-assistant GGUF) is NOT a
+        # self-speculating target — its MTP head is the whole file, not an
+        # extra block fused into a full model. Never report embedded MTP for
+        # it, or the launcher would try to run the bare drafter as a model
+        # with --spec-type draft-mtp (it can't run alone). It is handled as a
+        # draft attached to its target instead.
+        if self.metadata and metadata_is_standalone_drafter(self.metadata):
+            return False
         # Primary: authoritative GGUF metadata
         if self.metadata and metadata_has_embedded_mtp(self.metadata):
             return True
-        # Fallback: filename-based for GGUFs missing the standard key
+        # Fallback: filename-based for GGUFs missing the standard key. Guard
+        # the "mtp" token so it does NOT fire on a standalone drafter named
+        # with an "mtp-" prefix / "-MTP-" infix (e.g. mtp-gemma-4-12B-it-qat-UD,
+        # gemma-4-12B-…-MTP-BF16) — those are draft files, matched separately.
+        if _is_draft_filename(self.name):
+            return False
         return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", self.name, re.IGNORECASE))
+
+    @property
+    def is_standalone_drafter(self) -> bool:
+        """True if this GGUF is a separate speculative-draft head (Gemma 4
+        ``gemma4-assistant`` MTP drafter and similar). Such files attach to a
+        target via :attr:`draft` and are launched with ``-md`` +
+        ``--spec-type draft-mtp``; they are never choosable on their own."""
+        return metadata_is_standalone_drafter(self.metadata)
 
     @property
     def has_speculative_draft(self) -> bool:
@@ -1158,7 +1226,65 @@ def _find_mmproj_candidates(model: Path, candidates: List[Path]) -> List[Path]:
 # never offer them as standalone choices, mirroring the mmproj rule.
 
 # Filename markers that identify a draft/assistant model.
-_DRAFT_FILENAME_TOKENS = ("assistant", "draft")
+#   - "assistant" / "draft": the conventional distributor naming
+#     (Qwen3.6-32B-Assistant-…, …-draft-…).
+#   - "mtp": Gemma 4 MTP drafters ship as a SEPARATE small head named with
+#     an "mtp-" prefix (mtp-gemma-4-12B-it-qat-UD) or a "-MTP-" infix
+#     (gemma-4-…-MTP-BF16). The bounded match below keeps this from firing
+#     on an unrelated word, and the embedded-MTP filename fallback skips any
+#     name caught here so a real self-speculating target (Qwen3.6-27B-MTP,
+#     detected from metadata) is never misread as a draft file.
+# This is only the cheap filename pre-filter; the authoritative signal for
+# Gemma-4-style drafters is the architecture (see
+# :func:`metadata_is_standalone_drafter`), applied after the metadata read.
+_DRAFT_FILENAME_TOKENS = ("assistant", "draft", "mtp")
+
+
+# Drafter-base matching: strip the speculative-draft marker AND the quant
+# tail, then compare the canonical (separator-normalised) stems. Unlike the
+# generic _strip_quant, this PRESERVES a standalone "UD" variant token: in
+# the QAT family both gemma-4-12b-it-qat-q4_0 and gemma-4-12B-it-qat-UD-Q4_K_XL
+# collapse to "…-it-qat" once UD is treated as part of the quant tail, which
+# makes the drafter mtp-gemma-4-12B-it-qat-UD ambiguous between them. Keeping
+# UD as an identity token lets the drafter bind to the UD target it names.
+_QUANT_CORE_PATTERN = re.compile(
+    r"[-._]"
+    r"(?:i\d+-)?"
+    r"(?:Q\d+(?:_[A-Z0-9]+)*"
+    r"|IQ\d+(?:_[A-Z0-9]+)*"
+    r"|MXFP4(?:_MOE)?"
+    r"|BF16|F16|F32"
+    r")"
+    r"(?:[-._][0-9.]+bpw)?"
+    r"(?:[-._](?:bf16|f16|f32))?"
+    r"\.gguf$",
+    re.IGNORECASE,
+)
+_DRAFT_MARKER_RE = re.compile(
+    r"(?:^|[-_.])(?:assistant|draft|mtp)(?=[-_.]|$)", re.IGNORECASE
+)
+
+
+def _strip_quant_keep_variant(filename: str) -> str:
+    """Strip the quant token but keep a standalone UD identity marker."""
+    s = _QUANT_CORE_PATTERN.sub("", filename)
+    if s == filename and filename.lower().endswith(".gguf"):
+        s = filename[: -len(".gguf")]
+    return s.rstrip(".-_")
+
+
+def _draft_match_base(filename: str) -> str:
+    """Canonical base of a drafter: quant stripped (UD kept), marker removed."""
+    return _canonical_sep(_DRAFT_MARKER_RE.sub("", _strip_quant_keep_variant(filename)))
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 def _is_draft_filename(name: str) -> bool:
@@ -1178,46 +1304,116 @@ def _is_draft_filename(name: str) -> bool:
     return False
 
 
-def _strip_draft_token(stem: str) -> str:
-    """Remove ``-assistant-…`` / ``_draft_…`` segments from a filename stem
-    so the remaining base can be matched against the main model's stem.
-    """
-    s = stem.lower()
-    for tok in _DRAFT_FILENAME_TOKENS:
-        # remove ``-assistant`` segment (and any quant tail attached to it)
-        s = re.sub(rf"[-_.]{tok}(?=[-_.]|$)", "", s)
-    return s.strip("-_.")
-
-
 def _find_draft(model: Path, candidates: List[Path]) -> Optional[Path]:
-    """Pick the smallest draft whose base prefix matches the main model.
+    """Pick the draft whose stem best matches the main model.
 
     Same directory only — drafts only count if they sit beside the main
-    model. Among multiple matches, pick the smallest on disk (drafts are
-    speculative; smaller is faster to evaluate).
+    model. Matching is by longest common canonical-stem prefix after both
+    sides have their quant tail stripped (UD preserved as an identity token)
+    and the drafter's speculative marker removed. This is robust to the
+    fragile cases that a strict ``startswith`` missed:
+
+      * Frankenmerger ``…-MTP-BF16`` drafters whose base equals the target's
+        full stem (``gemma-4-12B-agentic-…-tau2``), where two unrelated
+        targets (agentic vs coder) share only a short prefix.
+      * QAT ``mtp-…-it-qat-UD`` drafters where ``_strip_quant`` erases the UD
+        token from both candidate targets, making them tie; keeping UD as an
+        identity token binds the drafter to the UD target it names.
+
+    A candidate must share at least the model-family prefix to qualify; the
+    longest common prefix wins, and among equal-length matches the smallest
+    file on disk is preferred (drafts are speculative — smaller evaluates
+    faster). The threshold (half the shorter base) guards against an
+    unrelated drafter in the same folder binding to the wrong target.
     """
-    main_norm = _normalize_model(model.name)
+    main_base = _canonical_sep(_strip_quant_keep_variant(model.name))
     best: Optional[Path] = None
+    best_score = -1
     best_size = -1
     for c in candidates:
         if c.parent != model.parent:
             continue
-        # Normalize the draft: strip its quant tail AND the assistant/draft token,
-        # then check whether the result is a prefix of the main model's base.
-        c_base = _strip_quant(c.name).lower()
-        c_norm = _strip_draft_token(c_base.removesuffix(".gguf"))
-        if not c_norm:
+        c_base = _draft_match_base(c.name)
+        if not c_base:
             continue
-        if not main_norm.startswith(c_norm + "-") and main_norm != c_norm:
+        cp = _common_prefix_len(main_base, c_base)
+        # Require a meaningful shared prefix: at least half of the shorter
+        # base (so "gemma-4-12b" alone can't bind a coder drafter to an
+        # agentic target, but a full-stem match always wins).
+        if cp < max(8, min(len(main_base), len(c_base)) // 2):
             continue
         try:
             sz = c.stat().st_size
         except OSError:
             continue
-        if best is None or sz < best_size:
+        if cp > best_score or (cp == best_score and sz < best_size):
             best = c
+            best_score = cp
             best_size = sz
     return best
+
+
+def is_mmproj_compatible(model: Path, mmproj: Path) -> bool:
+    """True if ``mmproj`` is a plausible projector for ``model``.
+
+    Used by the GUI to flag (not hide) incompatible picks in the always-on
+    mmproj dropdown. Reuses the same separator-tolerant bidirectional prefix
+    match as :func:`_find_mmproj_candidates`: the projector's normalized base
+    and the model's normalized name must share a prefix. Cross-model files in
+    the same folder (e.g. another model's projector) correctly fail this.
+    """
+    model_canon = _canonical_sep(_normalize_model(model.name))
+    c_canon = _canonical_sep(_normalize_mmproj(mmproj.name))
+    if not c_canon or not model_canon:
+        return False
+    return model_canon.startswith(c_canon) or c_canon.startswith(model_canon)
+
+
+def is_draft_compatible(
+    model: Path, draft: Path, draft_md: Optional[Dict[str, Any]] = None
+) -> bool:
+    """True if ``draft`` can plausibly drive speculative decoding for ``model``.
+
+    Two independent acceptance paths (either suffices), mirroring how
+    llama.cpp actually pairs drafts:
+
+      1. **Name affinity** — the draft's canonical base (quant stripped, UD
+         kept, speculative marker removed) shares a meaningful prefix with the
+         model's base. This is the standard sibling-drafter case
+         (``…-Assistant-Q4`` next to the full model) and the Frankenmerger /
+         QAT MTP heads.
+      2. **Architecture family** — a standalone MTP head declares
+         ``<family>-assistant`` (Gemma 4 ``gemma4-assistant``). When the
+         drafter's metadata is available and its architecture family matches
+         the model's (``gemma4-assistant`` ↔ ``gemma4``), accept it even if
+         the filenames diverge, since the head binds by tokenizer/backbone,
+         not by name.
+
+    The GUI uses this only to decide whether to prefix an entry with "!" — an
+    incompatible pick still launches (with a logged warning), so this stays
+    deliberately permissive: it answers "does this look like a real pair?",
+    not "is this guaranteed to load".
+    """
+    main_base = _canonical_sep(_strip_quant_keep_variant(model.name))
+    d_base = _draft_match_base(draft.name)
+    if d_base and main_base:
+        cp = _common_prefix_len(main_base, d_base)
+        if cp >= max(8, min(len(main_base), len(d_base)) // 2):
+            return True
+    # Architecture-family fallback for standalone MTP heads.
+    if draft_md and metadata_is_standalone_drafter(draft_md):
+        d_arch = str(draft_md.get("general.architecture", "") or "").lower()
+        # "gemma4-assistant" → backbone family "gemma4".
+        family = d_arch.rsplit("-assistant", 1)[0].rsplit("_assistant", 1)[0]
+        # We don't always have the target's metadata here, so match on the
+        # family token appearing in the model's filename base (gemma4 ↔
+        # "gemma-4"/"gemma4"). Canonicalise both to compare separator-free.
+        if family:
+            fam_canon = re.sub(r"[-_.]", "", family)
+            model_canon = re.sub(r"[-_.]", "", _normalize_model(model.name))
+            if fam_canon and fam_canon in model_canon:
+                return True
+    return False
 
 
 def scan_models(
@@ -1286,15 +1482,50 @@ def scan_models(
         except ValueError:
             return str(path.parent)
 
+    # Per-directory index of EVERY projector / drafter, used to populate the
+    # always-on manual dropdowns (folder_mmprojs / folder_drafts). These hold
+    # all same-folder files regardless of whether they match the model; the
+    # GUI flags non-matching ones rather than hiding them. Note: `drafts` is
+    # finalised below in phase 1 (after standalone-drafter reclassification),
+    # so the draft index is built afterwards.
+    def _by_parent(paths: List[Path]) -> Dict[str, List[Path]]:
+        idx: Dict[str, List[Path]] = {}
+        for p in sorted(paths, key=lambda x: x.name.lower()):
+            idx.setdefault(str(p.parent), []).append(p)
+        return idx
+
+    mmproj_by_parent = _by_parent(mmprojs)
+
     entries: List[ModelEntry] = []
 
     # --- Single-file models -------------------------------------------
+    # Phase 1: read metadata and split off any file whose architecture marks
+    # it as a standalone speculative drafter (Gemma 4 gemma4-assistant and
+    # friends). The filename pre-filter already catches the common "mtp-" /
+    # "-MTP-" / "-assistant-" names, but the architecture check is the
+    # authoritative backstop — it reclassifies a drafter that slipped through
+    # with an unconventional name so it is paired via -md, never listed as a
+    # choosable model. Reclassified drafters join the `drafts` pool so the
+    # real targets in the same folder can bind them in phase 2.
+    single_meta: List[Tuple[Path, int, Dict[str, Any]]] = []
     for m in sorted(single_models):
         try:
             size = m.stat().st_size
         except OSError:
             continue
         md = read_gguf_metadata(m) if read_metadata else {}
+        if md and metadata_is_standalone_drafter(md):
+            if m not in drafts:
+                drafts.append(m)
+            continue
+        single_meta.append((m, size, md))
+
+    # Phase 2: build entries for the genuine models, pairing against the
+    # (now complete) draft pool. The draft index is built here because phase
+    # 1 may have moved standalone drafters into `drafts`.
+    draft_by_parent = _by_parent(drafts)
+    for m, size, md in single_meta:
+        parent = str(m.parent)
         entries.append(
             ModelEntry(
                 path=m,
@@ -1304,6 +1535,8 @@ def scan_models(
                 mmproj=_find_mmproj(m, mmprojs),
                 mmproj_candidates=_find_mmproj_candidates(m, mmprojs),
                 draft=_find_draft(m, drafts),
+                folder_mmprojs=list(mmproj_by_parent.get(parent, [])),
+                folder_drafts=list(draft_by_parent.get(parent, [])),
                 metadata=md,
                 part_paths=[m],
             )
@@ -1328,6 +1561,7 @@ def scan_models(
         # Build a synthetic Path whose .name == "<base>.gguf" so the
         # mmproj / draft pairing functions get the correct base stem.
         pairing_path = part1.parent / (base + ".gguf")
+        parent = str(part1.parent)
         md = read_gguf_metadata(part1) if read_metadata else {}
         entries.append(
             ModelEntry(
@@ -1338,6 +1572,8 @@ def scan_models(
                 mmproj=_find_mmproj(pairing_path, mmprojs),
                 mmproj_candidates=_find_mmproj_candidates(pairing_path, mmprojs),
                 draft=_find_draft(pairing_path, drafts),
+                folder_mmprojs=list(mmproj_by_parent.get(parent, [])),
+                folder_drafts=list(draft_by_parent.get(parent, [])),
                 metadata=md,
                 part_paths=ordered_parts,
             )

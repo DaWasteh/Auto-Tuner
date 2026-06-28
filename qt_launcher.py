@@ -56,7 +56,14 @@ from PyQt6.QtWidgets import (
 )
 
 from hardware import detect_system, SystemInfo
-from scanner import scan_models, group_entries, ModelEntry
+from scanner import (
+    scan_models,
+    group_entries,
+    ModelEntry,
+    read_gguf_metadata,
+    is_mmproj_compatible,
+    is_draft_compatible,
+)
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import build_command, compute_config, TunedConfig
 from performance_target import (
@@ -236,13 +243,15 @@ class _ScanWorker(QObject):
 # expects a ModelEntry with `.path` and `.size_gb`) keeps working.
 
 
-def _find_draft_model(
-    entry: ModelEntry, all_entries: List[ModelEntry]
-) -> Optional[ModelEntry]:
-    """Return a synthetic ModelEntry for `entry`'s paired draft, or None."""
-    if entry.draft is None:
-        return None
-    p = entry.draft
+def _make_draft_entry(p: Path, group: str) -> Optional[ModelEntry]:
+    """Build a ModelEntry for a draft GGUF at ``p``.
+
+    Metadata is read so the drafter's :attr:`is_standalone_drafter` resolves
+    correctly — that flag drives whether the launcher emits
+    ``--spec-type draft-mtp`` (required for Gemma 4 gemma4-assistant heads,
+    which do not auto-detect from ``-md`` alone). Returns None if the file
+    has vanished.
+    """
     try:
         size = p.stat().st_size
     except OSError:
@@ -250,12 +259,21 @@ def _find_draft_model(
     return ModelEntry(
         path=p,
         name=p.stem,
-        group=entry.group,  # same parent folder
+        group=group,
         size_bytes=size,
         mmproj=None,
         draft=None,
-        metadata={},
+        metadata=read_gguf_metadata(p),
     )
+
+
+def _find_draft_model(
+    entry: ModelEntry, all_entries: List[ModelEntry]
+) -> Optional[ModelEntry]:
+    """Return a ModelEntry for `entry`'s auto-paired draft, or None."""
+    if entry.draft is None:
+        return None
+    return _make_draft_entry(entry.draft, entry.group)
 
 
 # Capability markers shown next to the model name in the list. Keep
@@ -1358,12 +1376,12 @@ class MainWindow(QMainWindow):
         ol.setSpacing(4)
 
         # ── mmproj (vision projector) selector ──────────────────────────
-        # Some models ship several projector precisions side by side
-        # (bf16 / f16 / f32). The scanner auto-picks the best match, but
-        # the user may prefer another precision. This dropdown lists every
-        # candidate found beside the model and lets the user switch; the
-        # choice is remembered per model. Hidden entirely when a model has
-        # 0 or 1 projector (nothing to choose).
+        # Always-on manual override. Lists EVERY projector in the model's
+        # folder so the user can switch precision (bf16 / f16 / f32), force a
+        # projector the auto-logic didn't pair, or pick "none". Files the
+        # scanner considers incompatible with this model are prefixed with a
+        # warning marker (not hidden) so experimenting is possible; launching
+        # with one just logs a warning. The choice is remembered per model.
         self._mmproj_row = QWidget()
         _mmproj_l = QHBoxLayout(self._mmproj_row)
         _mmproj_l.setContentsMargins(0, 0, 0, 0)
@@ -1371,13 +1389,36 @@ class MainWindow(QMainWindow):
         _mmproj_l.addWidget(QLabel("mmproj:"))
         self._cb_mmproj = QComboBox()
         self._cb_mmproj.setToolTip(
-            "Pick which vision projector to load when several precisions\n"
-            "(bf16 / f16 / f32) are present. Remembered per model."
+            "Vision projector to load. Lists every projector in the model's\n"
+            "folder; '⚠' marks ones that don't match this model (you can still\n"
+            "select them to experiment). Remembered per model."
         )
         self._cb_mmproj.currentIndexChanged.connect(self._on_mmproj_changed)
         _mmproj_l.addWidget(self._cb_mmproj, 1)
-        self._mmproj_row.setVisible(False)
+        self._mmproj_row.setVisible(True)
         ol.addWidget(self._mmproj_row)
+
+        # ── draft (speculative-decoding head) selector ──────────────────
+        # Parallel to the mmproj dropdown. Always shown; lists every draft /
+        # assistant GGUF in the model's folder, plus a "none" entry and (when
+        # the GGUF carries an embedded MTP head) an "embedded MTP" entry.
+        # Incompatible drafts are flagged with '⚠'. Selecting here overrides
+        # the scanner's auto pick and is remembered per model.
+        self._draft_row = QWidget()
+        _draft_l = QHBoxLayout(self._draft_row)
+        _draft_l.setContentsMargins(0, 0, 0, 0)
+        _draft_l.setSpacing(4)
+        _draft_l.addWidget(QLabel("draft:"))
+        self._cb_draft = QComboBox()
+        self._cb_draft.setToolTip(
+            "Draft model for speculative decoding. Lists every draft/assistant\n"
+            "GGUF in the model's folder; '⚠' marks ones that don't match this\n"
+            "model (selectable anyway for experimenting). Remembered per model."
+        )
+        self._cb_draft.currentIndexChanged.connect(self._on_draft_combo_changed)
+        _draft_l.addWidget(self._cb_draft, 1)
+        self._draft_row.setVisible(True)
+        ol.addWidget(self._draft_row)
 
         self._chk_vision = QCheckBox("Vision (mmproj)")
         self._chk_draft = QCheckBox("Draft model (speculative decoding)")
@@ -2398,6 +2439,12 @@ class MainWindow(QMainWindow):
         cached = self._option_overrides.get(entry.name, {})
         ov = {**persisted, **cached}
 
+        # Resolve the draft dropdown FIRST. It sets self._current_draft from
+        # the remembered/auto selection, which the Vision + Draft sections
+        # below read (an active external draft blocks vision). Populating it
+        # here keeps a single source of truth for the chosen drafter.
+        self._populate_draft_combo(entry, ov)
+
         # ── Vision ──────────────────────────────────────────────────
         mmproj = entry.mmproj
         has_external_draft = self._current_draft is not None
@@ -2507,47 +2554,130 @@ class MainWindow(QMainWindow):
         self._chk_prompt_cache.blockSignals(False)
 
     def _populate_mmproj_combo(self, entry: ModelEntry, ov: dict) -> None:
-        """Fill the mmproj dropdown from ``entry.mmproj_candidates``.
+        """Fill the always-on mmproj dropdown from ``entry.folder_mmprojs``.
 
-        Shows the row only when 2+ projectors exist. Restores the
-        remembered per-model selection if its file is still present,
-        otherwise keeps the scanner's auto pick. Writes the resolved
-        choice back onto ``entry.mmproj`` so launch + preview agree.
+        Lists every projector in the model's folder plus a leading
+        "— no mmproj —" entry. Projectors the scanner considers incompatible
+        with this model are prefixed with a warning marker but remain
+        selectable. The remembered per-model selection wins; otherwise the
+        scanner's auto pick (``entry.mmproj``) is preselected. The resolved
+        choice is written back onto ``entry.mmproj`` so launch + preview agree
+        (None when "no mmproj" is selected).
         """
-        candidates = list(getattr(entry, "mmproj_candidates", []) or [])
+        WARN = "⚠ "
+        NONE_LABEL = "— no mmproj —"
+        folder = list(getattr(entry, "folder_mmprojs", []) or [])
+        auto = entry.mmproj  # scanner's best pick (may be None)
+
         self._cb_mmproj.blockSignals(True)
         self._cb_mmproj.clear()
+        # Index 0 is always the explicit "none" choice (userData empty string).
+        self._cb_mmproj.addItem(NONE_LABEL, userData="")
 
-        if len(candidates) < 2:
-            # 0 or 1 projector → nothing to choose; hide the row entirely.
-            self._mmproj_row.setVisible(False)
-            self._cb_mmproj.blockSignals(False)
-            return
-
-        # Resolve the desired selection: remembered filename → else current
-        # entry.mmproj → else first candidate (scanner's best pick).
         remembered = app_settings.get_mmproj_selection(entry.name)
-        chosen_idx = 0
-        for i, c in enumerate(candidates):
+        chosen_idx = 0  # default to "none"
+        # Explicit "none" choice → keep index 0, skip auto-pick preselection.
+        deliberate_none = remembered == app_settings.MMPROJ_NONE_SENTINEL
+        for c in folder:
+            compatible = is_mmproj_compatible(entry.path, c)
             label = c.name
-            # Annotate the auto pick so the user knows the default.
-            if i == 0:
+            if c == auto:
                 label += "   (auto)"
+            if not compatible:
+                label = WARN + label
             self._cb_mmproj.addItem(label, userData=str(c))
-            if remembered and c.name == remembered:
-                chosen_idx = i
-        # If nothing remembered, preselect whatever entry.mmproj points at.
-        if not remembered and entry.mmproj is not None:
-            for i, c in enumerate(candidates):
-                if c == entry.mmproj:
+            idx = self._cb_mmproj.count() - 1
+            if remembered and not deliberate_none and c.name == remembered:
+                chosen_idx = idx
+        # No remembered choice → preselect the scanner's auto pick if present.
+        if not remembered and auto is not None:
+            for i in range(1, self._cb_mmproj.count()):
+                if self._cb_mmproj.itemData(i) == str(auto):
                     chosen_idx = i
                     break
 
         self._cb_mmproj.setCurrentIndex(chosen_idx)
         # Apply the resolved choice to the entry so launch uses it.
-        entry.mmproj = candidates[chosen_idx]
+        sel = self._cb_mmproj.itemData(chosen_idx)
+        entry.mmproj = Path(sel) if sel else None
         self._mmproj_row.setVisible(True)
         self._cb_mmproj.blockSignals(False)
+
+    def _populate_draft_combo(self, entry: ModelEntry, ov: dict) -> None:
+        """Fill the always-on draft dropdown from ``entry.folder_drafts``.
+
+        Mirrors :meth:`_populate_mmproj_combo`. Lists a leading
+        "— no draft —" entry, an "MTP (embedded in GGUF)" entry when the model
+        carries an embedded MTP head, then every draft GGUF in the folder
+        (incompatible ones flagged with '⚠'). Resolves and applies the
+        per-model selection onto ``self._current_draft`` (a draft ModelEntry
+        with metadata, or None). The remembered choice wins; otherwise the
+        scanner's auto pick (``entry.draft``) is preselected, falling back to
+        embedded-MTP when present.
+        """
+        WARN = "⚠ "
+        NONE_LABEL = "— no draft —"
+        MTP_LABEL = "MTP (embedded in GGUF)"
+        MTP_DATA = "<embedded-mtp>"
+        folder = list(getattr(entry, "folder_drafts", []) or [])
+        auto = entry.draft  # scanner's best external pick (Path or None)
+        has_embedded = entry.has_embedded_mtp
+
+        self._cb_draft.blockSignals(True)
+        self._cb_draft.clear()
+        self._cb_draft.addItem(NONE_LABEL, userData="")
+        if has_embedded:
+            self._cb_draft.addItem(MTP_LABEL, userData=MTP_DATA)
+
+        remembered = app_settings.get_draft_selection(entry.name)
+        # Default selection priority: remembered → external auto → embedded.
+        chosen_idx = 0
+        if remembered == app_settings.DRAFT_NONE_SENTINEL:
+            chosen_idx = 0
+        for c in folder:
+            md = read_gguf_metadata(c)
+            compatible = is_draft_compatible(entry.path, c, md)
+            label = f"{c.name}   ({c.stat().st_size / (1024**3):.1f} GB)"
+            if auto is not None and c == auto:
+                label += "  (auto)"
+            if not compatible:
+                label = WARN + label
+            self._cb_draft.addItem(label, userData=str(c))
+            idx = self._cb_draft.count() - 1
+            if remembered and remembered not in ("", app_settings.DRAFT_NONE_SENTINEL):
+                if c.name == remembered:
+                    chosen_idx = idx
+        # No remembered choice → prefer external auto pick, else embedded MTP.
+        if not remembered:
+            if auto is not None:
+                for i in range(self._cb_draft.count()):
+                    if self._cb_draft.itemData(i) == str(auto):
+                        chosen_idx = i
+                        break
+            elif has_embedded:
+                chosen_idx = 1  # the MTP entry
+
+        self._cb_draft.setCurrentIndex(chosen_idx)
+        self._draft_row.setVisible(True)
+        self._cb_draft.blockSignals(False)
+        # Resolve the selection into _current_draft (and update the checkbox
+        # text / state) via the shared applier.
+        self._apply_draft_selection(entry, self._cb_draft.itemData(chosen_idx))
+
+    def _apply_draft_selection(self, entry: ModelEntry, data: object) -> None:
+        """Resolve a draft-combo userData value onto ``self._current_draft``.
+
+        ``data`` is "" (none), the embedded-MTP sentinel, or a draft file
+        path string. For an external path we build a draft ModelEntry WITH
+        metadata so ``is_standalone_drafter`` resolves (drives draft-mtp).
+        Embedded MTP carries no separate file, so ``_current_draft`` is None
+        and the embedded path inside the GGUF is used at launch.
+        """
+        s = "" if data is None else str(data)
+        if s and s != "<embedded-mtp>":
+            self._current_draft = _make_draft_entry(Path(s), entry.group)
+        else:
+            self._current_draft = None
 
     def _auto_select_fork(self, profile: ModelProfile) -> None:
         """Auto-select fork from combo based on profile requirement.
@@ -2675,26 +2805,78 @@ class MainWindow(QMainWindow):
     def _on_mmproj_changed(self, index: int) -> None:
         """User picked a different vision projector from the dropdown.
 
-        Updates the current model's `mmproj` to the chosen file, remembers
-        the choice per model, and refreshes the preview (the projector size
-        feeds the VRAM estimate).
+        Updates the current model's ``mmproj`` to the chosen file (or None for
+        the "— no mmproj —" entry), remembers the choice per model, re-runs the
+        checkbox interlock (vision availability depends on mmproj), and
+        refreshes the preview (the projector size feeds the VRAM estimate).
         """
         if self._current_entry is None or index < 0:
             return
         path_str = self._cb_mmproj.itemData(index)
-        if not path_str:
-            return
-        chosen = Path(path_str)
+        chosen = Path(path_str) if path_str else None
         self._current_entry.mmproj = chosen
         try:
-            app_settings.set_mmproj_selection(self._current_entry.name, chosen.name)
+            # A real filename is remembered; selecting "— no mmproj —" records
+            # the explicit none-sentinel so re-population doesn't re-apply the
+            # scanner's auto pick over the user's deliberate choice.
+            app_settings.set_mmproj_selection(
+                self._current_entry.name,
+                chosen.name if chosen else app_settings.MMPROJ_NONE_SENTINEL,
+            )
         except Exception as exc:
             self._log(f"[Warning] Could not save mmproj selection: {exc}")
-        # Reflect the chosen file in the Vision checkbox label too.
-        if self._chk_vision.isEnabled():
-            self._chk_vision.blockSignals(True)
-            self._chk_vision.setText(f"Vision  ({chosen.name})")
-            self._chk_vision.blockSignals(False)
+        # mmproj presence changes whether Vision can be enabled → re-run the
+        # interlock so the checkbox label/state matches the new selection.
+        self._update_checkboxes(self._current_entry)
+        self._refresh_config_preview()
+
+    def _on_draft_combo_changed(self, index: int) -> None:
+        """User picked a different draft head from the dropdown.
+
+        Resolves the selection onto ``self._current_draft`` (None for
+        "— no draft —", a metadata-bearing draft ModelEntry for a file, None
+        for embedded MTP since it lives inside the main GGUF), remembers the
+        choice per model, re-runs the checkbox interlock (an active external
+        draft blocks vision), and refreshes the preview.
+        """
+        if self._current_entry is None or index < 0:
+            return
+        data = self._cb_draft.itemData(index)
+        s = "" if data is None else str(data)
+        # Persist: "" → deliberate "no draft" sentinel; embedded-MTP →
+        # sentinel too (no file to remember, embedded is implied by the GGUF);
+        # otherwise the chosen draft filename.
+        try:
+            if not s or s == "<embedded-mtp>":
+                app_settings.set_draft_selection(
+                    self._current_entry.name, app_settings.DRAFT_NONE_SENTINEL
+                )
+            else:
+                app_settings.set_draft_selection(self._current_entry.name, Path(s).name)
+        except Exception as exc:
+            self._log(f"[Warning] Could not save draft selection: {exc}")
+        # Warn (don't block) when an incompatible draft was chosen.
+        if s and s != "<embedded-mtp>":
+            chosen = Path(s)
+            if not is_draft_compatible(
+                self._current_entry.path, chosen, read_gguf_metadata(chosen)
+            ):
+                self._log(
+                    f"[Warning] Draft '{chosen.name}' looks incompatible with "
+                    f"'{self._current_entry.name}' (different model/architecture). "
+                    "Launching anyway — speculative decoding may fail or be slow."
+                )
+        self._apply_draft_selection(self._current_entry, data)
+        # Keep the Draft checkbox in sync with the dropdown: choosing a real
+        # draft (or embedded MTP) implies draft ON; choosing "none" implies
+        # OFF. We record this as the per-model "draft" override so the
+        # interlock + launch path agree with the dropdown.
+        draft_on = bool(s) and s != ""  # "" is the none entry
+        if s == "":
+            draft_on = False
+        self._record_override("draft", draft_on)
+        # An active external draft conflicts with --mmproj → re-run interlock.
+        self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
     def _refresh_config_preview(self) -> None:

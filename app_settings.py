@@ -390,9 +390,16 @@ def set_splitter_state(name: str, b64_value: str) -> None:
 # Schema:
 #   "mmproj_selection": { "<model_name>": "mmproj-…-f32.gguf", ... }
 
+MMPROJ_NONE_SENTINEL = "<none>"
+
 
 def get_mmproj_selection(model_name: str) -> Optional[str]:
-    """Return the remembered mmproj filename for *model_name*, or None."""
+    """Return the remembered mmproj filename for *model_name*.
+
+    Returns the literal ``"<none>"`` sentinel when the user explicitly chose
+    no projector, the chosen filename when one was picked, or ``None`` when
+    there is no stored preference (caller uses the scanner's auto pick).
+    """
     if not model_name:
         return None
     bucket = load_settings().get("mmproj_selection")
@@ -419,6 +426,59 @@ def set_mmproj_selection(model_name: str, filename: Optional[str]) -> None:
     else:
         bucket[model_name] = str(filename)
     s["mmproj_selection"] = bucket
+    save_settings(s)
+
+
+# ---------------------------------------------------------------------------
+# Per-model draft (speculative-decoding head) selection.
+#
+# Mirrors mmproj_selection. The GUI exposes an always-on dropdown listing
+# every draft/assistant GGUF in the model's folder; the chosen filename is
+# remembered here. A sentinel empty string is NOT used — absence of a key
+# means "use the scanner's auto pick", and the explicit literal "<none>"
+# means "the user deliberately chose no draft" (so we don't silently
+# re-enable the auto draft on the next launch).
+#
+# Schema:
+#   "draft_selection": { "<model_name>": "…-assistant-Q4_K_M.gguf" | "<none>" }
+
+DRAFT_NONE_SENTINEL = "<none>"
+
+
+def get_draft_selection(model_name: str) -> Optional[str]:
+    """Return the remembered draft filename for *model_name*.
+
+    Returns the literal ``"<none>"`` sentinel when the user explicitly chose
+    no draft, the chosen filename when one was picked, or ``None`` when there
+    is no stored preference (caller should use the scanner's auto pick).
+    """
+    if not model_name:
+        return None
+    bucket = load_settings().get("draft_selection")
+    if not isinstance(bucket, dict):
+        return None
+    val = bucket.get(model_name)
+    return val if isinstance(val, str) and val else None
+
+
+def set_draft_selection(model_name: str, filename: Optional[str]) -> None:
+    """Persist (or clear) the chosen draft filename for *model_name*.
+
+    Pass the filename to remember a specific draft, ``"<none>"`` to record a
+    deliberate "no draft" choice, or ``None`` / empty to drop the override
+    entirely (model reverts to the scanner's automatic pick).
+    """
+    if not model_name:
+        return
+    s = load_settings()
+    bucket = s.get("draft_selection")
+    if not isinstance(bucket, dict):
+        bucket = {}
+    if not filename:
+        bucket.pop(model_name, None)
+    else:
+        bucket[model_name] = str(filename)
+    s["draft_selection"] = bucket
     save_settings(s)
 
 

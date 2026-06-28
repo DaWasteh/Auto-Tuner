@@ -2099,6 +2099,17 @@ def build_command(
     # because the draft head is already inside the main GGUF — there is no
     # second model file to load.
     use_external = enable_speculative and draft_model is not None and not vision_loaded
+    # An external drafter that is a standalone MTP head (Gemma 4
+    # gemma4-assistant: gemma-4-…-MTP-BF16, mtp-gemma-4-…) is NOT auto-detected
+    # by mainline from -md alone — it loads with the dedicated draft-mtp path
+    # and aborts otherwise ("Model type gemma4_assistant not supported" /
+    # "Gemma4Assistant requires ctx_other to be set"; llama.cpp issue #23161,
+    # PR #23398). For these we MUST add "draft-mtp" to --spec-type. A plain
+    # sibling drafter (a small full model sharing the tokenizer) keeps the
+    # auto-detected path with no type token.
+    external_is_mtp_head = use_external and bool(
+        getattr(draft_model, "is_standalone_drafter", False)
+    )
     # Path B: integrated MTP (draft-mtp) — compatible with vision (--mmproj)
     # since mainline b9180 (PR #22673, merged 2026-05-16). The MTP draft head
     # lives inside the same GGUF as the main model; llama.cpp loads it as part
@@ -2146,6 +2157,10 @@ def build_command(
     spec_types: List[str] = []
     if use_integrated:
         spec_types.append("draft-mtp")
+    elif external_is_mtp_head:
+        # External standalone MTP head (Gemma 4 assistant) — needs the
+        # explicit draft-mtp path; it is not auto-detected from -md.
+        spec_types.append("draft-mtp")
     if use_ngram:
         spec_types.append(ngram_method)
     if spec_types:
@@ -2154,9 +2169,13 @@ def build_command(
     if use_external:
         # Path A — sibling drafter file.
         # -md MUST come before --spec-draft-n-max (llama-server parses
-        # left-to-right). No --spec-type token: mainline auto-detects the
-        # draft path from -md. If ngram is also enabled it was added to
-        # --spec-type above and runs as the draftless path alongside -md.
+        # left-to-right). For a plain sibling drafter mainline auto-detects
+        # the draft path from -md, so no --spec-type token is needed. A
+        # standalone MTP head (gemma4-assistant) is the exception: its
+        # "draft-mtp" type was already added to --spec-type above
+        # (external_is_mtp_head), because -md alone does not select that path.
+        # If ngram is also enabled it was added to --spec-type too and runs as
+        # the draftless path alongside -md.
         assert draft_model is not None  # guaranteed by use_external condition
         cmd += ["-md", str(draft_model.path)]
         cmd += ["--spec-draft-ngl", "99"]
