@@ -634,10 +634,15 @@ def _discover_llama_forks() -> List[Tuple[str, Path]]:
         except (OSError, RuntimeError):
             continue
         # Walk up to the drive root (Windows) or '/' (POSIX).
+        # NB: anchor.drive / anchor.root are plain strings on POSIX, so
+        # wrap them in Path() — drive_roots must hold Path objects only
+        # (consumed below via `root / rel`).
         if anchor.drive:
             drive_roots.add(Path(anchor.drive + os.sep))
+        elif anchor.root:
+            drive_roots.add(Path(anchor.root))
         else:
-            drive_roots.add(anchor.root if anchor.root else anchor)
+            drive_roots.add(anchor)
     for root in drive_roots:
         for rel in _WORKSPACE_RELS:
             cand = root / rel
