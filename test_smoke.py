@@ -2233,6 +2233,139 @@ def test_diffusion_algorithm_normalization() -> None:
     assert _diffusion_algorithm_value(True) is None
 
 
+def test_diffusiongemma_kv_broadcast_not_undersized() -> None:
+    """DiffusionGemma stores head_count_kv=[2] as a broadcast scalar (a
+    single-element list applying to all 30 layers), unlike Gemma-4's
+    30-element per-layer array. The KV estimate must expand the broadcast
+    to the full layer count, otherwise it is ~30x too small and
+    compute_config picks a context that OOMs on KV allocation.
+
+    Regression for the Vulkan ``alloc_tensor_range: failed to allocate
+    Vulkan0 buffer of size 1073741824`` crash on DiffusionGemma.
+    """
+    from tuner import kv_per_token_mb_from_metadata
+
+    # Real DiffusionGemma GGUF metadata: broadcast scalars in 1-element lists.
+    md = {
+        "general.architecture": "diffusion-gemma",
+        "diffusion-gemma.block_count": 30,
+        "diffusion-gemma.attention.head_count": 16,
+        "diffusion-gemma.attention.head_count_kv": [2],          # broadcast
+        "diffusion-gemma.attention.key_length": 512,
+        "diffusion-gemma.attention.value_length": 512,
+        "diffusion-gemma.attention.sliding_window": 1024,
+        "diffusion-gemma.attention.sliding_window_pattern": [False],  # broadcast
+        "diffusion-gemma.attention.key_length_swa": 256,
+        "diffusion-gemma.attention.value_length_swa": 256,
+        "diffusion-gemma.embedding_length": 2816,
+    }
+    kvt = kv_per_token_mb_from_metadata(md)
+    # 30 layers * 2 kv_heads * (512+512) * 2 bytes = 122880 B = 0.1172 MB
+    assert kvt > 0.10, f"KV/token far too small ({kvt:.4f} MB) — broadcast not expanded"
+    assert kvt < 0.15, f"KV/token unexpectedly large ({kvt:.4f} MB)"
+    # Sanity: at max_context 262144 the cache is huge (this is why it OOMs).
+    assert kvt * 262144 >= 29 * 1024, "expected ~30 GiB KV at full context"
+
+
+def test_gemma4_per_layer_kv_array_not_broken_by_broadcast_fix() -> None:
+    """Gemma-4's 30-element per-layer KV-head array must still be summed
+    correctly (only full-attention layers) after the DiffusionGemma
+    broadcast expansion was added — it is a regression guard for that fix.
+    """
+    from tuner import kv_per_token_mb_from_metadata
+
+    md = {
+        "general.architecture": "gemma4",
+        "gemma4.block_count": 30,
+        "gemma4.attention.head_count": 16,
+        # 5 full-attention (8 heads) + 1 SWA (2 heads), repeated 5x = 30 entries
+        "gemma4.attention.head_count_kv": [8, 8, 8, 8, 8, 2] * 5,
+        # 5 SWA layers (True) + 1 full-attention layer (False) per 6-group;
+        # only the False (full-attention) layers carry scaling KV.
+        "gemma4.attention.sliding_window_pattern": [True, True, True, True, True, False] * 5,
+        "gemma4.attention.key_length": 512,
+        "gemma4.attention.value_length": 512,
+        "gemma4.embedding_length": 2816,
+    }
+    kvt = kv_per_token_mb_from_metadata(md)
+    # Only the False (full-attention) layers count: 1 per group * 5 = 5, each 2 kv_heads
+    # 5 * 2 * (512+512) * 2 = 20480 B = 0.0195 MB
+    assert 0.015 < kvt < 0.025, f"Gemma-4 KV/token changed unexpectedly ({kvt:.4f} MB)"
+
+
+def test_diffusion_resolver_picks_gemma_binary_for_diffusiongemma() -> None:
+    """The diffusion binary resolver must prefer llama-diffusion-gemma-cli
+    for the diffusion-gemma architecture (PR #24427 fork binary), while
+    mainline diffusion archs (dream/llada/rnd1) keep the generic
+    llama-diffusion-cli. Without this, DiffusionGemma would launch with
+    the wrong (mainline) binary.
+    """
+    import auto_tuner as at
+
+    assert (
+        at._diffusion_binary_for_arch("diffusion-gemma")
+        == "llama-diffusion-gemma-cli"
+    )
+    assert (
+        at._diffusion_binary_for_arch("diffusion_gemma")
+        == "llama-diffusion-gemma-cli"
+    )
+    # Mainline diffusion archs keep the generic CLI.
+    for arch in ("dream", "llada", "rnd1", None):
+        assert at._diffusion_binary_for_arch(arch) == "llama-diffusion-cli"
+
+    # Subpath builder produces the gemma binary name when asked.
+    subs = at._diffusion_subpaths_for("llama-diffusion-gemma-cli")
+    assert any("llama-diffusion-gemma-cli.exe" in s for s in subs)
+
+
+def test_build_diffusion_server_command_gemma_server() -> None:
+    """DiffusionGemma runs via llama-diffusion-gemma-server (PR #24427 HTTP
+    server). The dedicated builder emits ONLY flags the fork's manual arg
+    parser understands — it must NOT contain llama-server-only flags
+    (--fit/--jinja/--spec-type/--cache-ram) or the binary aborts with
+    'unknown argument'. It must bind --host/--port and forward the GPU
+    placement so the model boots on the 32 GB card.
+    """
+    from tuner import build_diffusion_server_command
+
+    profiles = load_profiles(SETTINGS_DIR)
+    profile = match_profile("diffusiongemma-26B-A4B-it-Q8_0.gguf", profiles)
+    assert profile.runner == "llama-diffusion-gemma-server"
+
+    cfg = _fake_diffusion_config()
+    cfg.main_gpu = 1
+    cfg.tensor_split = "0.000,1.000"
+    cmd = build_diffusion_server_command(
+        _fake_diffusion_model(),
+        cfg,
+        profile,
+        server_binary="d_b9781/llama-diffusion-gemma-server",
+        host="127.0.0.1",
+        port=8080,
+        alias="diffusiongemma",
+    )
+
+    assert cmd[0] == "d_b9781/llama-diffusion-gemma-server"
+    # Core load flags
+    assert "-m" in cmd and "-c" in cmd and "-ngl" in cmd
+    # Diffusion + HTTP binding
+    assert "--diffusion-steps" in cmd
+    assert "--host" in cmd
+    assert cmd[cmd.index("--host") + 1] == "127.0.0.1"
+    assert "--port" in cmd
+    assert cmd[cmd.index("--port") + 1] == "8080"
+    # GPU placement forwarded
+    assert "--main-gpu" in cmd
+    assert cmd[cmd.index("--main-gpu") + 1] == "1"
+    assert "--tensor-split" in cmd
+    # Prompt (-p) must NOT be present — the server takes requests via HTTP
+    assert "-p" not in cmd
+    # Forbidden llama-server-only flags
+    for forbidden in ("--fit", "--jinja", "--spec-type", "--cache-ram"):
+        assert forbidden not in cmd, f"{forbidden} must not reach the gemma-server"
+
+
 def _fake_diffusion_config():
     from tuner import TunedConfig
 
@@ -2293,6 +2426,38 @@ def test_build_diffusion_command_mainline_flags() -> None:
         assert forbidden not in cmd, f"{forbidden} must not be in a diffusion cmd"
 
 
+def test_build_diffusion_command_gpu_placement_passthrough() -> None:
+    """compute_config's multi-GPU placement must reach the diffusion CLI.
+
+    Without --main-gpu/--tensor-split the binary defaults to Vulkan device
+    0 (often the smaller card) and OOMs on KV allocation. The fix for the
+    DiffusionGemma ``alloc_tensor_range: failed to allocate Vulkan0 buffer
+    of size 1073741824`` crash forwards these from the TunedConfig.
+    """
+    from tuner import build_diffusion_command
+    from settings_loader import ModelProfile
+    from scanner import ModelEntry
+
+    cfg = _fake_diffusion_config()
+    cfg.main_gpu = 1          # pin to the 32 GB card
+    cfg.tensor_split = "0.000,1.000"
+    p = ModelProfile(display_name="x", diffusion={"steps": 48})
+    cmd = build_diffusion_command(_fake_diffusion_model(), cfg, p)
+
+    assert "--main-gpu" in cmd, "--main-gpu must be forwarded to pin the large card"
+    assert cmd[cmd.index("--main-gpu") + 1] == "1"
+    assert "--tensor-split" in cmd
+    assert cmd[cmd.index("--tensor-split") + 1] == "0.000,1.000"
+
+    # When unset (single-GPU system), neither flag is emitted.
+    cfg2 = _fake_diffusion_config()
+    cfg2.main_gpu = None
+    cfg2.tensor_split = None
+    cmd2 = build_diffusion_command(_fake_diffusion_model(), cfg2, p)
+    assert "--main-gpu" not in cmd2
+    assert "--tensor-split" not in cmd2
+
+
 def test_build_diffusion_command_eps_xor_block_length() -> None:
     """eps and block_length are mutually exclusive; block_length wins if
     both are set, and a profile with only eps emits --diffusion-eps."""
@@ -2335,13 +2500,15 @@ def test_build_diffusion_command_fork_args_passthrough() -> None:
 
 
 def test_diffusion_gemma_profile_loads_with_runner() -> None:
-    """The shipped diffusion-gemma profile sets the diffusion runner."""
+    """The shipped diffusion-gemma profile uses the DiffusionGemma HTTP server
+    runner (PR #24427), not the single-shot CLI."""
     profiles = load_profiles(SETTINGS_DIR)
     p = match_profile("diffusiongemma-26B-A4B-it-Q8_0.gguf", profiles)
-    assert p.runner == "llama-diffusion-cli"
+    assert p.runner == "llama-diffusion-gemma-server"
     assert p.display_name.startswith("DiffusionGemma")
     # Diffusion block carries the expected keys.
-    assert p.diffusion.get("steps") == 256
+    # steps: Doku-Empfehlung max 48 (adaptives Early-Stop meist 12-16).
+    assert p.diffusion.get("steps") == 48
     assert "block_length" in p.diffusion
 
 

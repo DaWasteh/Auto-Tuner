@@ -116,6 +116,17 @@ def _kv_per_token_for_interleaved_attention(
     the head array, sum every entry (treat all as full-attention).
     That overshoots, but on the safe side — better the AutoTuner
     reserves too much KV than too little.
+
+    **Broadcast arrays (DiffusionGemma).** Some forks store scalar
+    values inside a single-element list (e.g. ``head_count_kv=[2]``
+    and ``sliding_window_pattern=[False]``) that apply to EVERY layer
+    rather than per-layer 30-element arrays like Gemma-4. Without
+    expansion the loop below sums only 1 layer's worth of KV and
+    under-estimates the cache by the layer count (factor 30 on a
+    30-block model), so compute_config picks huge contexts and the
+    backend OOMs on KV allocation. When the head array is shorter
+    than ``block_count`` we expand both it and the pattern to the full
+    layer count before iterating.
     """
 
     def _int_md(key: str) -> int:
@@ -130,6 +141,23 @@ def _kv_per_token_for_interleaved_attention(
     vl = _int_md("attention.value_length")
     n_heads = _int_md("attention.head_count")
     embd = _int_md("embedding_length")
+    n_layers = _int_md("block_count")
+
+    # Expand broadcast (single-element / short) per-layer arrays to the
+    # full layer count. This is the DiffusionGemma case: head_count_kv=[2]
+    # and sliding_window_pattern=[False] are scalars wrapped in a list,
+    # broadcast across all 30 layers. Without this the KV estimate is off
+    # by the layer-count factor and compute_config over-selects context.
+    if n_layers > 1 and 0 < len(n_kv_heads_per_layer) < n_layers:
+        scalar_kv = n_kv_heads_per_layer[0]
+        n_kv_heads_per_layer = [scalar_kv] * n_layers
+    if (
+        n_layers > 1
+        and isinstance(sliding_pattern, list)
+        and 0 < len(sliding_pattern) < n_layers
+    ):
+        scalar_pat = sliding_pattern[0]
+        sliding_pattern = [scalar_pat] * n_layers
 
     # Fall back to embd/n_heads if explicit head dims absent.
     if kl <= 0 or vl <= 0:
@@ -1860,9 +1888,11 @@ def build_diffusion_command(
     --diffusion-kv-cache). User ``extra_args`` (CLI passthrough) come last.
 
     ``prompt`` is optional: when omitted the caller is expected to add a
-    ``-p`` itself or run interactively. We keep KV-quant / tensor-split out
-    of the command on purpose — the diffusion example binary does not parse
-    those server-side flags.
+    ``-p`` itself or run interactively. The diffusion CLI parses the
+    same backend-placement flags as llama-server (``--main-gpu``,
+    ``--tensor-split``, ``-ngl``), so we forward the multi-GPU placement
+    computed by ``compute_config`` — critical for big models that must
+    boot on the large card and would OOM if left on Vulkan device 0.
     """
     diff = profile.diffusion or {}
 
@@ -1879,6 +1909,19 @@ def build_diffusion_command(
         "-ub",
         str(config.ubatch),
     ]
+
+    # ---- multi-GPU placement (mirror build_command) ------------------
+    # DiffusionGemma (25 GB) must boot on the 32 GB card. Without these
+    # flags the binary defaults to Vulkan device 0 — often the smaller
+    # gaming GPU — and the KV-cache allocation fails with
+    # ``alloc_tensor_range: failed to allocate Vulkan0 buffer of size
+    # 1073741824``. The env_overrides (HIP/VK_VISIBLE_DEVICES) are applied
+    # by the launcher separately; tensor-split/main-gpu cover the
+    # hip-index-unknown (pure Vulkan) case where env hiding is not emitted.
+    if config.tensor_split:
+        cmd += ["--tensor-split", config.tensor_split]
+    if config.main_gpu is not None:
+        cmd += ["--main-gpu", str(config.main_gpu)]
 
     # ---- max tokens to generate (-n / --predict) ----------------------
     n_predict = diff.get("n_predict")
@@ -1960,6 +2003,95 @@ def build_diffusion_command(
         cmd += [str(a) for a in fork_args]
 
     # ---- user CLI passthrough (highest precedence) --------------------
+    if extra_args:
+        cmd += [str(a) for a in extra_args]
+
+    return cmd
+
+
+def build_diffusion_server_command(
+    model: ModelEntry,
+    config: TunedConfig,
+    profile: ModelProfile,
+    server_binary: str = "llama-diffusion-gemma-server",
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    alias: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
+) -> List[str]:
+    """Build a ``llama-diffusion-gemma-server`` command line.
+
+    PR #24427 ships a dedicated OpenAI-compatible HTTP server for
+    DiffusionGemma: it exposes ``/health``, ``/v1/chat/completions``,
+    ``/props``, ``/metrics`` and binds ``--host``/``--port`` (defaults
+    127.0.0.1:8080). Unlike the single-shot ``llama-diffusion-cli`` this is
+    a PERSISTENT, queryable server — the right choice for DiffusionGemma.
+
+    The fork's server uses a manual arg parser (the common llama.cpp flags
+    PLUS --host/--port/--api-key/--metrics/--slots) and does NOT understand
+    the llama-server-only flags (``--fit``, ``--jinja``, ``--spec-type``,
+    ``--cache-ram`` …). Emitting any of those aborts with "unknown
+    argument", so this builder keeps the flag set minimal and verified
+    against the binary's own ``--help``.
+    """
+    diff = profile.diffusion or {}
+
+    cmd: List[str] = [
+        server_binary,
+        "-m",
+        str(model.path),
+        "-c",
+        str(config.ctx),
+        "-ngl",
+        str(config.ngl),
+        "-b",
+        str(config.batch),
+        "-ub",
+        str(config.ubatch),
+    ]
+
+    # ---- multi-GPU placement (mirror build_command) ------------------
+    # DiffusionGemma (25 GB) must boot on the 32 GB card; without these
+    # flags the binary defaults to Vulkan device 0 (often the smaller card)
+    # and OOMs on KV allocation.
+    if config.tensor_split:
+        cmd += ["--tensor-split", config.tensor_split]
+    if config.main_gpu is not None:
+        cmd += ["--main-gpu", str(config.main_gpu)]
+
+    # ---- multimodal projector (if present) ---------------------------
+    if getattr(model, "mmproj", None):
+        cmd += ["--mmproj", str(model.mmproj)]
+
+    # ---- denoising steps (profile; Doku default 48) ------------------
+    steps = diff.get("steps")
+    if steps is not None:
+        try:
+            s = int(steps)
+            if s > 0:
+                cmd += ["--diffusion-steps", str(s)]
+        except (TypeError, ValueError):
+            pass
+
+    # ---- sampling (temperature from chat block) ----------------------
+    chat_sampling = profile.sampling.get("chat") or profile.sampling or {}
+    if isinstance(chat_sampling, dict):
+        temp = chat_sampling.get("temperature")
+        if temp is not None:
+            try:
+                cmd += ["--temp", str(float(temp))]
+            except (TypeError, ValueError):
+                pass
+
+    # ---- HTTP binding -------------------------------------------------
+    cmd += ["--host", host, "--port", str(port)]
+
+    # ---- readable alias / Prometheus metrics -------------------------
+    if alias:
+        cmd += ["-a", alias]
+    cmd += ["--metrics"]
+
+    # ---- user CLI passthrough (highest precedence) -------------------
     if extra_args:
         cmd += [str(a) for a in extra_args]
 

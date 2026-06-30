@@ -1,0 +1,110 @@
+# =============================================================================
+# Diffusion-Gemma (PR #24427) — HIP/ROCm-Build fuer AMD-GPUs
+# =============================================================================
+# Warum ein eigener HIP-Build neben diffusion_llama_build.txt (Vulkan)?
+#   Der Vulkan-Backend hat eine harte Grenze fuer zusammenhaengende
+#   Einzel-Allokationen (~1 GiB). DiffusionGemma braucht grosse KV-Cache-
+#   Bloecke (key/value_length=512) und schlaegt bei Vulkan mit
+#     alloc_tensor_range: failed to allocate Vulkan0 buffer of size 1073741824
+#   fehl -> Kontext-Init bricht ab. HIP/ROCm hat diese 1-GiB-Decke nicht.
+#
+# Dieser Build landet in einem EIGENEN Verzeichnis d_${ver}_hip_llama.cpp,
+# weil Vulkan und HIP nicht im selben CMake-Tree gemischt werden duerfen
+# (der Cache wuerde die Backend-Flags ueberschreiben).
+#
+# -----------------------------------------------------------------------------
+# VORAUSSETZUNG (einmalig, falls noch nicht geschehen):
+# -----------------------------------------------------------------------------
+#   1. AMD ROCm HIP SDK fuer Windows installieren (ab RDNA4 supported):
+#        https://www.amd.com/en/developer/resources/rocm-hub/eula/windows.html
+#      Default-Install: C:\Program Files\AMD\ROCm\<version>
+#   2. In der Shell vor dem Build setzen (oder hier einkommentieren):
+#        $env:ROCM_PATH = "C:\Program Files\AMD\ROCm\6.4"
+#        $env:PATH      = "$env:ROCM_PATH\bin;" + $env:PATH
+#      hipcc muss aufrufbar sein:  hipcc --version
+#   3. gfx-Target: R9700 + RX 9070 XT sind BEIDE RDNA4 = gfx1201.
+#      Ein einziges Target reicht daher (kein Misch-Build noetig).
+# =============================================================================
+
+cd H:\LAB\ai-local
+
+# --- ROCm-Pfad bestimmen (falls vom User nicht in der Shell gesetzt) ---
+if (-not $env:ROCM_PATH) {
+    $cand = Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($cand) {
+        $env:ROCM_PATH = $cand.FullName
+        Write-Host "==> ROCm-Pfad erkannt: $env:ROCM_PATH"
+    }
+}
+if (-not (Get-Command hipcc -ErrorAction SilentlyContinue)) {
+    if ($env:ROCM_PATH) { $env:PATH = "$env:ROCM_PATH\bin;" + $env:PATH }
+}
+if (-not (Get-Command hipcc -ErrorAction SilentlyContinue)) {
+    Write-Error "hipcc nicht gefunden. ROCm HIP SDK installieren und ROCM_PATH setzen (siehe Kopf dieses Scripts)."
+    exit 1
+}
+$hipcc = (Get-Command hipcc).Source
+Write-Host "==> HIP-Compiler: $hipcc"
+
+# --- Diffusion-Gemma: PR #24427 (noch nicht in mainline gemerged) ---
+git clone https://github.com/ggml-org/llama.cpp.git _tmp_d_hip_llama
+Push-Location .\_tmp_d_hip_llama
+git fetch origin pull/24427/head:pr-diffusiongemma
+git checkout pr-diffusiongemma
+# b-Nummer der mainline-Basis ermitteln, auf der der PR aufsetzt
+git remote add upstream https://github.com/ggml-org/llama.cpp.git 2>$null
+git fetch upstream --tags 2>$null
+$base = git merge-base HEAD upstream/master 2>$null
+if (-not $base) { $base = "HEAD" }
+$desc = git describe --tags --abbrev=0 --match "b[0-9]*" $base 2>$null
+$ver  = [regex]::Match($desc, 'b\d+').Value
+if (-not $ver) { $ver = "bUNKNOWN" }
+Pop-Location
+# EIGENER Ordner (_hip), damit Vulkan- und HIP-Build nebeneinander existieren
+$dir = "d_${ver}_hip_llama.cpp"
+if (Test-Path .\$dir) { Remove-Item .\$dir -Recurse -Force }
+Rename-Item .\_tmp_d_hip_llama $dir
+Write-Host "==> HIP-Build-Verzeichnis: $dir"
+
+# UI vorab bauen (layout-tolerant: tools/ui ab b9174, sonst tools/server/webui)
+$uiDir = ".\$dir\tools\ui"
+if (-not (Test-Path $uiDir)) { $uiDir = ".\$dir\tools\server\webui" }
+if ((Test-Path $uiDir) -and (Test-Path "$uiDir\package.json")) {
+    Push-Location $uiDir
+    npm ci
+    if ($LASTEXITCODE -ne 0) { npm install }
+    npm run build
+    Pop-Location
+} else {
+    Write-Host "==> Kein lokales UI gefunden -> LLAMA_USE_PREBUILT_UI=ON (CMake laedt es von HF)."
+}
+
+cmake -S .\$dir -B .\$dir\build `
+  -G "Visual Studio 18 2026" `
+  -A x64 `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
+  -DCMAKE_ASM_COMPILER=cl `
+  -DGGML_HIP=ON `
+  -DCMAKE_HIP_COMPILER="$hipcc" `
+  -DAMDGPU_TARGETS="gfx1201" `
+  -DGGML_VULKAN=OFF `
+  -DGGML_NATIVE=OFF `
+  -DGGML_AVX2=ON `
+  -DGGML_FMA=ON `
+  -DGGML_F16C=ON `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DLLAMA_BUILD_SERVER=ON `
+  -DLLAMA_BUILD_UI=ON `
+  -DLLAMA_USE_PREBUILT_UI=OFF `
+  -DLLAMA_CURL=OFF `
+  -DGGML_CCACHE=OFF `
+  -DGGML_OPENSSL=OFF
+cmake --build .\$dir\build --config Release --parallel 24
+
+Write-Host ""
+Write-Host "==> Fertig. llama-diffusion-gemma-cli/server liegen in:"
+Write-Host "    H:\LAB\ai-local\$dir\build\bin\Release\"
+Write-Host "==> Im Auto Tuner Fork-Dropdown '$dir' auswaehlen."
+Write-Host "==> HIP loest die Vulkan-1-GiB-Allokationsgrenze auf."

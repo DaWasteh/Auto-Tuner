@@ -168,10 +168,18 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
             )
             perf_target_raw = ""
 
-        # Runner override (optional). Soft-validate: only the two known
+        # Runner override (optional). Soft-validate: only the known
         # values are honoured; anything else falls back to the server path.
+        #   ""/"llama-server"               → normal OpenAI HTTP server
+        #   "llama-diffusion-cli"           → single-shot CLI (dream/llada/rnd1)
+        #   "llama-diffusion-gemma-server"  → PR #24427 DiffusionGemma HTTP server
         runner_raw = str(data.get("runner", "") or "").lower().strip()
-        if runner_raw not in ("", "llama-server", "llama-diffusion-cli"):
+        if runner_raw not in (
+            "",
+            "llama-server",
+            "llama-diffusion-cli",
+            "llama-diffusion-gemma-server",
+        ):
             print(
                 f"[AutoTuner] {yml.name}: unknown runner '{runner_raw}', "
                 f"ignoring (using llama-server)."

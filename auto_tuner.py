@@ -34,7 +34,7 @@ from hardware import detect_system, format_system, SystemInfo
 from launcher import launch
 from scanner import scan_models, group_entries, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
-from tuner import build_command, build_diffusion_command, compute_config, TunedConfig
+from tuner import build_command, build_diffusion_command, build_diffusion_server_command, compute_config, TunedConfig
 from performance_target import (
     resolve_performance_target,
     list_target_names,
@@ -329,15 +329,45 @@ _SERVER_SUBPATHS = [
 
 # Diffusion models run through the single-shot llama-diffusion-cli example
 # binary, not llama-server. Same build tree, different target name.
-_DIFFUSION_SUBPATHS = [
-    "build/bin/Release/llama-diffusion-cli.exe",
-    "build/bin/Debug/llama-diffusion-cli.exe",
-    "build/bin/llama-diffusion-cli.exe",
-    "build/bin/llama-diffusion-cli",
-    "build/llama-diffusion-cli",
-    "llama-diffusion-cli.exe",
-    "llama-diffusion-cli",
+# DiffusionGemma (PR #24427) ships its OWN fork binaries
+# llama-diffusion-gemma-cli / -gemma-server; mainline Dream/LLaDA/RND1 use
+# the generic llama-diffusion-cli. _DIFFUSION_BINARIES lists the candidate
+# binary names in PREFERENCE order — the resolver tries each until one is
+# found in the fork tree.
+_DIFFUSION_BINARIES = [
+    "llama-diffusion-gemma-cli",  # DiffusionGemma fork (PR #24427)
+    "llama-diffusion-cli",       # mainline Dream/LLaDA/RND1
 ]
+
+
+def _diffusion_binary_for_arch(arch: Optional[str]) -> str:
+    """Return the preferred diffusion binary name for a model architecture.
+
+    DiffusionGemma (arch 'diffusion-gemma', fork-only PR #24427) ships its
+    own llama-diffusion-gemma-cli, which is NOT interchangeable with the
+    generic llama-diffusion-cli (different model loader + diffusion flags).
+    All other diffusion archs (dream / llada / rnd1) use the generic CLI.
+    """
+    if arch and "gemma" in arch.lower():
+        return "llama-diffusion-gemma-cli"
+    return "llama-diffusion-cli"
+
+
+def _diffusion_subpaths_for(binary_name: str) -> List[str]:
+    """Build the candidate subpaths for a given diffusion binary name."""
+    bases = [
+        "build/bin/Release/",
+        "build/bin/Debug/",
+        "build/bin/",
+        "build/",
+        "",
+    ]
+    out: List[str] = []
+    for b in bases:
+        for ext in (".exe", ""):
+            out.append(f"{b}{binary_name}{ext}")
+    return out
+
 
 
 def _candidate_search_roots() -> List[Path]:
@@ -542,37 +572,61 @@ def _resolve_server_binary(user_value: str) -> str:
     return user_value
 
 
-def _resolve_diffusion_binary(user_value: str) -> str:
-    """Resolve the llama-diffusion-cli binary (fork or mainline build).
+def _resolve_diffusion_binary(user_value: str, arch: Optional[str] = None) -> str:
+    """Resolve the diffusion binary (fork or mainline build).
 
-    A diffusion model needs llama-diffusion-cli, which lives in the same
-    build tree as llama-server. We reuse _resolve_server_binary's search
-    logic (it already builds ``build/bin/...{name}`` candidates for any
-    non-server binary name and resolves ``fork/inner`` paths), then fall
-    back to a direct scan over _DIFFUSION_SUBPATHS in every candidate root.
+    A diffusion model needs a diffusion CLI (llama-diffusion-cli for
+    mainline Dream/LLaDA/RND1, or llama-diffusion-gemma-cli for the
+    DiffusionGemma fork PR #24427), which lives in the same build tree
+    as llama-server.
 
     ``user_value`` may be:
       * a bare name ("llama-diffusion-cli") — searched in all known roots,
       * a fork-relative path ("d_b96.../llama-diffusion-cli") — the fork is
         matched by name like any other server_binary,
       * an absolute path — used as-is if it exists.
+
+    ``arch`` (the GGUF general.architecture) selects the PREFERRED binary
+    name: DiffusionGemma wants llama-diffusion-gemma-cli, everything else
+    the generic llama-diffusion-cli. When ``user_value`` is a bare default
+    ("llama-diffusion-cli") we still try the arch-preferred name first so
+    the DiffusionGemma fork's dedicated binary is found automatically.
     """
+    # If the user passed an explicit binary name/path, honour it directly.
     resolved = _resolve_server_binary(user_value)
     # If the generic resolver already found a real file, use it.
     if Path(resolved).is_file():
         return resolved
-    # Otherwise scan the diffusion-specific subpaths across all roots.
-    for root in _candidate_search_roots():
-        for sub in _DIFFUSION_SUBPATHS:
-            candidate = root / sub
-            if candidate.is_file():
-                _debug_print(f"Found diffusion binary: {candidate}")
-                return str(candidate)
+
+    # Build the ordered list of binary names to search for. An EXPLICIT
+    # request (e.g. "llama-diffusion-gemma-server") wins over the
+    # arch-derived default, then the arch-preferred name, then the generic
+    # llama-diffusion-cli as the portable fallback.
+    requested_name = Path(user_value).name if user_value else ""
+    preferred = _diffusion_binary_for_arch(arch)
+    search_names: List[str] = []
+    for name in (requested_name, preferred, "llama-diffusion-cli"):
+        if name and name not in search_names:
+            search_names.append(name)
+
+    # Scan the diffusion-specific subpaths across all roots, trying each
+    # candidate binary name in preference order. The outer loop is the
+    # binary name so the PREFERRED name (e.g. llama-diffusion-gemma-cli for
+    # DiffusionGemma) is searched across ALL roots before falling back to
+    # the generic llama-diffusion-cli — otherwise a different fork's
+    # generic CLI would win over the correct fork's dedicated binary.
+    for binary_name in search_names:
+        for root in _candidate_search_roots():
+            for sub in _diffusion_subpaths_for(binary_name):
+                candidate = root / sub
+                if candidate.is_file():
+                    _debug_print(f"Found diffusion binary: {candidate}")
+                    return str(candidate)
     # Last resort: a bare name might be on PATH.
-    name = Path(user_value).name or "llama-diffusion-cli"
-    which = shutil.which(name)
-    if which:
-        return which
+    for name in search_names:
+        which = shutil.which(name)
+        if which:
+            return which
     return resolved
 
 
@@ -1265,18 +1319,22 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         # llama-diffusion-cli with --diffusion-* flags and no /health/API.
         # The scanner detects this from general.architecture; a profile may
         # also force it with `runner: llama-diffusion-cli`.
-        is_diffusion_run = model.is_diffusion or (
-            profile.runner == "llama-diffusion-cli"
-        )
+        is_diffusion_run = (
+            model.is_diffusion or profile.runner == "llama-diffusion-cli"
+        ) and profile.runner != "llama-diffusion-gemma-server"
 
         extra = args.passthrough or []
 
         if is_diffusion_run:
             # Resolve the diffusion binary. A profile's server_binary field
             # can point at the fork (e.g. "d_b96.../llama-diffusion-cli");
-            # otherwise we search for llama-diffusion-cli in the build tree.
+            # otherwise we search for the diffusion binary in the build
+            # tree. The architecture selects the preferred binary name:
+            # DiffusionGemma (PR #24427) ships llama-diffusion-gemma-cli,
+            # mainline Dream/LLaDA/RND1 use the generic llama-diffusion-cli.
             diff_request = profile.server_binary or "llama-diffusion-cli"
-            diffusion_bin = _resolve_diffusion_binary(diff_request)
+            diff_arch = (model.metadata or {}).get("general.architecture")
+            diffusion_bin = _resolve_diffusion_binary(diff_request, arch=diff_arch)
 
             if Path(diffusion_bin).is_file():
                 print(f"[AutoTuner] Found diffusion binary: {diffusion_bin}")
@@ -1301,6 +1359,35 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 profile=profile,
                 diffusion_binary=diffusion_bin,
                 prompt=diff_prompt,
+                extra_args=extra,
+            )
+        elif profile.runner == "llama-diffusion-gemma-server":
+            # ── DiffusionGemma HTTP server (PR #24427) ───────────────────
+            # Persistent OpenAI-compatible server with its own binary +
+            # flag set. Uses the dedicated builder (the gemma-server's
+            # manual arg parser rejects llama-server-only flags).
+            diff_arch = (model.metadata or {}).get("general.architecture")
+            gemma_server = _resolve_diffusion_binary(
+                "llama-diffusion-gemma-server", arch=diff_arch
+            )
+            if Path(gemma_server).is_file():
+                print(f"[AutoTuner] Found diffusion-gemma-server: {gemma_server}")
+            elif not shutil.which(gemma_server):
+                print(
+                    f"[AutoTuner] Warning: llama-diffusion-gemma-server "
+                    f"'{gemma_server}' not found."
+                )
+                print(
+                    "  Build a DiffusionGemma-capable fork (PR #24427) and "
+                    "select it via LLAMA_CPP_DIR."
+                )
+            cmd = build_diffusion_server_command(
+                model=model,
+                config=cfg,
+                profile=profile,
+                server_binary=gemma_server,
+                host=args.host,
+                port=args.port,
                 extra_args=extra,
             )
         else:

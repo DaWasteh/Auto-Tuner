@@ -4062,15 +4062,21 @@ class MainWindow(QMainWindow):
         # for static checkers (Pylance / mypy) that cannot prove this.
         assert cfg is not None
 
-        # ── Diffusion models: different runner entirely ──────────────────
-        # Dream/LLaDA/RND1 (mainline) and DiffusionGemma (fork) are NOT
-        # served by llama-server — they run single-shot via
-        # llama-diffusion-cli. No port, no /health, no server registry. The
-        # binary is found in the SELECTED fork (the fork dropdown already
-        # points LLAMA_CPP_DIR at it), so nothing is hard-coded.
-        if entry.is_diffusion or profile.runner == "llama-diffusion-cli":
+        # ── Diffusion routing ────────────────────────────────────────
+        # llama-diffusion-gemma-server (PR #24427) is a REAL persistent
+        # OpenAI HTTP server (/health, /v1/chat/completions, port) → run it
+        # through the normal launch path below (port / health / registry),
+        # just with the dedicated binary + command builder. Everything else
+        # diffusion (mainline Dream/LLaDA/RND1) is single-shot CLI: no port,
+        # no /health, no registry. The binary is found in the SELECTED fork
+        # (the fork dropdown points LLAMA_CPP_DIR at it).
+        if profile.runner == "llama-diffusion-cli" or (
+            entry.is_diffusion
+            and profile.runner != "llama-diffusion-gemma-server"
+        ):
             self._launch_diffusion(entry, cfg, profile)
             return
+
 
         # ── Load-balancing across GPUs for a 2nd/3rd concurrent model ──
         # When at least one server is already running, re-check live VRAM
@@ -4128,26 +4134,83 @@ class MainWindow(QMainWindow):
         start_port = self._requested_start_port(base_port, offset)
         port = self._next_free_port(host, start_port)
 
-        server_binary = self._resolve_binary(profile, use_draft, entry.name)
         # Clean alias so RooCode/clients show a readable name, not the file path
         alias = _clean_model_name(entry.name)
-        cmd = build_command(
-            model=entry,
-            config=cfg,
-            profile=profile,
-            draft_model=self._current_draft if use_draft else None,
-            server_binary=server_binary,
-            host=host,
-            port=port,
-            extra_args=["-a", alias],
-            use_thinking=use_thinking,
-            # The Draft checkbox governs BOTH external draft (-md) and embedded
-            # MTP. For an MTP model draft_model is None, so unchecking Draft must
-            # also flip enable_speculative off to actually suppress the MTP path.
-            enable_speculative=use_draft,
-            enable_ngram=use_ngram,
-            enable_prompt_cache=use_prompt_cache,
-        )
+
+        if profile.runner == "llama-diffusion-gemma-server":
+            # DiffusionGemma HTTP server (PR #24427): persistent OpenAI-
+            # compatible server with its own binary + flag set. Build the
+            # command with the dedicated builder (the gemma-server's manual
+            # arg parser does NOT understand llama-server-only flags like
+            # --fit/--jinja/--spec-type). The binary is resolved in the
+            # selected fork (the dropdown already pointed LLAMA_CPP_DIR
+            # at it); the rest — port, /health, registry — is identical to
+            # a normal server, so a queryable chat endpoint is exposed.
+            from tuner import build_diffusion_server_command
+
+            try:
+                _, _, resolve_diff = _get_fork_tools()
+            except Exception as exc:
+                self._log(f"[Diffusion-Server] Resolver nicht ladbar: {exc}")
+                QMessageBox.warning(
+                    self,
+                    "DiffusionGemma-Server nicht verfügbar",
+                    f"Der llama-diffusion-gemma-server-Resolver konnte nicht "
+                    f"geladen werden:\n{exc}",
+                )
+                return
+            arch = (entry.metadata or {}).get("general.architecture")
+            gemma_server_bin = resolve_diff(
+                "llama-diffusion-gemma-server", arch=arch
+            )
+            self._log(
+                f"[Diffusion-Server] binary: 'llama-diffusion-gemma-server' "
+                f"→ {gemma_server_bin} (arch={arch!r})"
+            )
+            if not Path(gemma_server_bin).is_file() and not shutil.which(
+                gemma_server_bin
+            ):
+                self._log(
+                    f"[Diffusion-Server] Binary nicht gefunden: {gemma_server_bin}"
+                )
+                QMessageBox.warning(
+                    self,
+                    "llama-diffusion-gemma-server nicht gefunden",
+                    "DiffusionGemma benötigt llama-diffusion-gemma-server aus "
+                    "einem DiffusionGemma-Fähigen Build (PR #24427).\n\n"
+                    "Wähle im Fork-Dropdown den Build, der "
+                    "llama-diffusion-gemma-server enthält (z.B. "
+                    "d_b9781_llama.cpp / d_bXXXX_hip_llama.cpp).",
+                )
+                return
+            cmd = build_diffusion_server_command(
+                model=entry,
+                config=cfg,
+                profile=profile,
+                server_binary=gemma_server_bin,
+                host=host,
+                port=port,
+                alias=alias,
+            )
+        else:
+            server_binary = self._resolve_binary(profile, use_draft, entry.name)
+            cmd = build_command(
+                model=entry,
+                config=cfg,
+                profile=profile,
+                draft_model=self._current_draft if use_draft else None,
+                server_binary=server_binary,
+                host=host,
+                port=port,
+                extra_args=["-a", alias],
+                use_thinking=use_thinking,
+                # The Draft checkbox governs BOTH external draft (-md) and embedded
+                # MTP. For an MTP model draft_model is None, so unchecking Draft must
+                # also flip enable_speculative off to actually suppress the MTP path.
+                enable_speculative=use_draft,
+                enable_ngram=use_ngram,
+                enable_prompt_cache=use_prompt_cache,
+            )
 
         self._log("\n" + "─" * 60)
         self._log(f"Starting: {' '.join(cmd)}")
@@ -4240,8 +4303,12 @@ class MainWindow(QMainWindow):
             return
 
         request = profile.server_binary or "llama-diffusion-cli"
-        diffusion_bin = resolve_diffusion(request)
-        self._log(f"[Diffusion] binary: {request!r} → {diffusion_bin}")
+        # DiffusionGemma (PR #24427) ships its own llama-diffusion-gemma-cli;
+        # pass the architecture so the resolver prefers it over the generic
+        # llama-diffusion-cli (which is for mainline Dream/LLaDA/RND1).
+        arch = (entry.metadata or {}).get("general.architecture")
+        diffusion_bin = resolve_diffusion(request, arch=arch)
+        self._log(f"[Diffusion] binary: {request!r} → {diffusion_bin} (arch={arch!r})")
 
         if not Path(diffusion_bin).is_file() and not shutil.which(diffusion_bin):
             self._log(f"[Diffusion] Binary not found: {diffusion_bin}")

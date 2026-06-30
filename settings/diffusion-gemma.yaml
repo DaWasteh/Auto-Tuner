@@ -14,14 +14,15 @@ arch_fallback:
   - diffusion_gemma
   - diffusiongemma
 
-# WICHTIG — Runner: Diffusionsmodelle laufen NICHT über llama-server.
-# Stand b9672 hat der Server keinerlei Diffusions-Codepfad. Generierung
-# erfolgt single-shot über llama-diffusion-cli (Prompt rein -> Text raus ->
-# Prozess endet). Kein /health, keine OpenAI-API, kein Port, kein Chat-UI.
-# Der Scanner erkennt die Architektur automatisch; dieses Feld macht es
-# explizit (und erlaubt das Erzwingen, falls die Auto-Erkennung mal nicht
-# greift).
-runner: llama-diffusion-cli
+# WICHTIG — Runner: DiffusionGemma läuft ab PR #24427 über einen
+# EIGENEN OpenAI-kompatiblen HTTP-Server (llama-diffusion-gemma-server):
+# /health, /v1/chat/completions, /props, Port, API-Key — wie llama-server,
+# aber mit Diffusions-Sampling-Pfad. Damit ist der Server persistent
+# abfragbar (Chat-UI, RooCode, etc.), nicht mehr single-shot.
+# Mainline-Diffusionsmodelle (Dream/LLaDA/RND1) ohne eigenen Server nutzen
+# stattdessen runner: llama-diffusion-cli (single-shot). Der Scanner
+# erkennt die Architektur automatisch; dieses Feld macht es explizit.
+runner: llama-diffusion-gemma-server
 
 # Binary: KEIN server_binary/Pfad hier eintragen. llama-diffusion-cli wird
 # automatisch in dem llama.cpp-Build gesucht, den du im Fork-Dropdown der
@@ -35,8 +36,15 @@ runner: llama-diffusion-cli
 # "<fork-ordnername>/llama-diffusion-cli" setzen — normalerweise NICHT nötig.
 
 # Native Kontextlänge: wird via GGUF-Metadata automatisch gecappt; hier der
-# Familien-Maximalwert (diffusiongemma-26B-A4B-it).
-max_context: 262144
+# Familien-Maximalwert (diffusiongemma-26B-A4B-it). HINWEIS: DiffusionGemma
+# generiert in 256-Token-Blöcken (canvas_length=256) — selbst mit
+# Prompt+Ausgabe reicht ein moderater Kontext. 262144 ist das
+# Modell-Maximum; der KV-Cache (k/v_length=512, 30 Layer) wächst dabei auf
+# ~30 GiB, was auf 16-GB-Vulkan-Karten crash ("failed to allocate Vulkan0
+# buffer of size 1073741824"). compute_config deckelt den Kontext anhand der
+# echten KV-Schätzung automatisch nach unten; 8192 ist ein sicherer
+# Praxis-Wert (KV ~0,9 GiB) für lokale Diffusions-Workloads.
+max_context: 8192
 
 # Diffusions-Parameter (nur auf dem Diffusionspfad ausgewertet). Mapping auf
 # die b9672-Mainline-Flags:
@@ -48,7 +56,9 @@ max_context: 262144
 #   visual       -> --diffusion-visual       (Live-Visualisierung der Tokens)
 #   n_predict    -> -n                       (max. zu generierende Tokens)
 diffusion:
-  steps: 256
+  # steps: Doku-Empfehlung max 48 (adaptives Early-Stop meist bei 12-16).
+  # 256 war zu hoch und nur Langsamkeit ohne Qualitäts-Gewinn.
+  steps: 48
   algorithm: confidence   # 0=origin 1=entropy 2=margin 3=random 4=confidence
   block_length: 32        # Block-Scheduling (Gemma-Diffusion nutzt Blöcke)
   visual: false
@@ -74,19 +84,22 @@ sampling:
 
 notes: >
   DiffusionGemma ist ein Diffusions-Textmodell (kein autoregressives GGUF
-  für llama-server). Es läuft NUR über llama-diffusion-cli aus einem
-  diffusionsfähigen llama.cpp-Build. Wähle deinen Diffusions-Build im
-  Fork-Dropdown der GUI (z.B. "d_b9654_llama.cpp") — der AutoTuner findet
-  llama-diffusion-cli automatisch darin, kein Pfad muss hartcodiert werden.
-  Mainline b9700 kennt die Architektur "diffusion-gemma" nicht; der
-  AutoTuner erkennt sie trotzdem (is_diffusion) und baut automatisch einen
-  llama-diffusion-cli-Befehl statt eines Server-Starts. Generierung ist
-  single-shot: Prompt rein, Text raus, Prozess endet — kein /health, keine
-  OpenAI-API, kein Chat-UI. In der GUI fragt ein Dialog nach dem Prompt; im
-  Terminal via `--prompt "..."`. Scheduling: ENTWEDER --diffusion-eps ODER
-  --diffusion-block-length, nicht beides (DiffusionGemma nutzt
-  Block-Scheduling). Fork-spezifische Flags (--diffusion-eb,
-  --diffusion-kv-cache) sind NICHT in mainline und müssen über
-  diffusion.fork_args zugeschaltet werden, falls dein Build sie kennt.
-  Mainline-Diffusionsmodelle (Dream/LLaDA/RND1) werden ebenso automatisch
-  erkannt und brauchen kein eigenes Profil.
+  für den normalen llama-server). Es läuft über llama-diffusion-gemma-server
+  (PR #24427) — einen EIGENEN OpenAI-kompatiblen HTTP-Server mit /health,
+  /v1/chat/completions, /props und Port-Binding. Wähle deinen Diffusion-
+  Build im Fork-Dropdown der GUI (z.B. "d_b9781_llama.cpp" oder den
+  HIP-Build "d_bXXXX_hip_llama.cpp"); der AutoTuner findet
+  llama-diffusion-gemma-server automatisch darin, kein Pfad muss hartcodiert
+  werden. Der Server ist persistent abfragbar (Chat-UI, RooCode, OpenAI-
+  Clients) — Port/Zustand wie bei jedem anderen Server. Mainline b9700
+  ertechnet die Architektur "diffusion-gemma" nicht; der AutoTuner erkennt
+  sie trotzdem (is_diffusion) und wählt automatisch den gemma-server-Runner.
+  Mainline-Diffusionsmodelle (Dream/LLaDA/RND1) haben KEINEN eigenen Server
+  und laufen stattdessen single-shot über llama-diffusion-cli. Scheduling:
+  ENTWEDER --diffusion-eps ODER --diffusion-block-length, nicht beides
+  (DiffusionGemma nutzt Block-Scheduling). Fork-spezifische Flags müssen
+  über diffusion.fork_args zugeschaltet werden, falls dein Build sie kennt.
+  WICHTIG VRAM: DiffusionGemma hat extrem großen KV-Cache (k/v_length=512,
+  5x normal); max_context ist daher auf 8192 gedeckelt (KV ~0,9 GiB), damit
+  der Start auf Vulkan/16-GB-Karten nicht an der 1-GiB-Allocationsgrenze
+  crasht. Pinnen auf die 32-GB-R9700 geschieht automatisch (env_overrides).
