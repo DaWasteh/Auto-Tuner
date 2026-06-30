@@ -2436,7 +2436,6 @@ def test_build_diffusion_command_gpu_placement_passthrough() -> None:
     """
     from tuner import build_diffusion_command
     from settings_loader import ModelProfile
-    from scanner import ModelEntry
 
     cfg = _fake_diffusion_config()
     cfg.main_gpu = 1          # pin to the 32 GB card
