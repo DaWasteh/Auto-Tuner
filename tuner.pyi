@@ -92,6 +92,8 @@ class TunedConfig:
     # Sourced from PerformanceTarget.n_parallel; always emitted explicitly
     # so llama-server cannot over-provision KV cache via its "auto" mode.
     n_parallel: int = ...
+    # True when n_parallel was pinned by the Expert panel override.
+    n_parallel_forced: bool = ...
     warning: Optional[str] = ...
 
 # ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ def compute_config(
     force_cache_v: Optional[str] = ...,
     force_ngl: Optional[int] = ...,
     force_n_cpu_moe: Optional[int] = ...,
+    force_n_parallel: Optional[int] = ...,
     force_rope_scale: Optional[bool] = ...,
     gpu_priorities: Optional[Dict[str, int]] = ...,
     force_gpu: Optional[str] = ...,

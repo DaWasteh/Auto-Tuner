@@ -334,7 +334,7 @@ def _clean_model_name(name: str) -> str:
 # batch_threads, batch, ubatch, flash_attn, mlock, no_mmap, jinja,
 # verbose, numa, rope_scaling, rope_factor, temperature, top_k,
 # top_p, min_p, repeat_penalty, presence_penalty, reasoning,
-# think_budget, extras.
+# think_budget, parallel_enabled, parallel_count, extras.
 
 
 def _expert_sampling_from_values(vals: dict) -> dict:
@@ -417,6 +417,18 @@ def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
         cfg.numa = None if numa_choice == "off" else numa_choice
         cfg.sampling = _expert_sampling_from_values(vals)
         cfg.extra_cli_flags = _expert_extras_from_values(vals)
+        # Parallel-slots override (--parallel / -np). When enabled, pin
+        # the count and mark it forced so the panel can render the
+        # checkbox state; when disabled, leave whatever compute_config
+        # derived from the performance target and clear the flag.
+        if vals.get("parallel_enabled"):
+            try:
+                cfg.n_parallel = max(1, int(vals.get("parallel_count", cfg.n_parallel) or cfg.n_parallel))
+            except (TypeError, ValueError):
+                pass
+            cfg.n_parallel_forced = True
+        else:
+            cfg.n_parallel_forced = False
     except Exception:
         pass
     return cfg
@@ -744,6 +756,43 @@ class ExpertPanel(QWidget):
         self._sp_ubatch.setSingleStep(64)
         _add("ubatch", self._sp_ubatch, "-ub (physical batch size)")
 
+        # Parallelism (llama-server --parallel N, short: -np N)
+        # Each slot gets its own KV-cache window, so Auto mode re-fits
+        # the context length around the chosen slot count (same math the
+        # performance target uses internally). Off = keep the
+        # performance-target default (1/2/4 for safe/balanced/throughput).
+        _section("Parallelism")
+        # Create the spinbox first so the checkbox's toggled signal can
+        # safely reference it (it enables/disables the spinbox directly,
+        # which must also work in Manual mode where _on_edit is a no-op).
+        self._sp_parallel = QSpinBox()
+        self._sp_parallel.setRange(1, 32)
+        self._sp_parallel.setEnabled(False)
+        self._sp_parallel.valueChanged.connect(
+            lambda _: self._on_edit("force_n_parallel")
+        )
+
+        self._chk_parallel = QCheckBox("Parallel slots (--parallel / -np)")
+        self._chk_parallel.toggled.connect(self._sp_parallel.setEnabled)
+        self._chk_parallel.toggled.connect(
+            lambda _: self._on_edit("force_n_parallel")
+        )
+        _add(
+            "",
+            self._chk_parallel,
+            "Run multiple concurrent inference slots (continuous batching). "
+            "Useful for local subagent testing / parallel requests. Each "
+            "slot gets its own KV window, so context shrinks to fit. "
+            "Off = use the performance-target default.",
+        )
+        _add(
+            "parallel slots",
+            self._sp_parallel,
+            "Number of concurrent inference slots (llama-server --parallel N). "
+            "Default scales with your GPU: 3 when the largest GPU has "
+            "≥24 GB free VRAM, otherwise 2.",
+        )
+
         # Flags
         _section("Flags")
         self._chk_fa = QCheckBox("flash attention (-fa)")
@@ -886,6 +935,7 @@ class ExpertPanel(QWidget):
             self._sp_batch_threads, self._sp_batch, self._sp_ubatch,
             self._sp_rope_factor, self._sp_temp, self._sp_top_k, self._sp_top_p,
             self._sp_min_p, self._sp_rep, self._sp_presence, self._sp_think_budget,
+            self._sp_parallel,
         ):
             sp.valueChanged.connect(self._schedule_save)
         for cb in (
@@ -894,7 +944,7 @@ class ExpertPanel(QWidget):
             cb.currentTextChanged.connect(self._schedule_save)
         for chk in (
             self._chk_fa, self._chk_mlock, self._chk_no_mmap, self._chk_jinja,
-            self._chk_verbose, self._chk_rope,
+            self._chk_verbose, self._chk_rope, self._chk_parallel,
         ):
             chk.toggled.connect(self._schedule_save)
         self._le_extra.textChanged.connect(self._schedule_save)
@@ -982,6 +1032,19 @@ class ExpertPanel(QWidget):
             self._sp_batch_threads.setValue(cfg.batch_threads)
             self._sp_batch.setValue(cfg.batch)
             self._sp_ubatch.setValue(cfg.ubatch)
+
+            # Parallel slots — checkbox reflects an active override
+            # (n_parallel_forced, set in both Auto and Manual mode); the
+            # spinbox shows the live count when forced, otherwise the
+            # hardware-suggested default so enabling yields a sane value.
+            parallel_on = bool(getattr(cfg, "n_parallel_forced", False))
+            self._chk_parallel.setChecked(parallel_on)
+            self._sp_parallel.setEnabled(parallel_on)
+            self._sp_parallel.setValue(
+                int(cfg.n_parallel)
+                if parallel_on
+                else self._suggested_parallel_count()
+            )
 
             # Flags
             self._chk_fa.setChecked(cfg.flash_attn)
@@ -1132,6 +1195,16 @@ class ExpertPanel(QWidget):
         elif kind == "force_n_cpu_moe":
             v = self._sp_ncpumoe.value()
             self._user_pins["force_n_cpu_moe"] = v if v > 0 else None
+        elif kind == "force_n_parallel":
+            # Pinning the parallel-slot count makes Auto mode re-fit ctx
+            # around N slots; unchecking releases the pin so the
+            # performance-target default (1/2/4) takes over again.
+            if self._chk_parallel.isChecked():
+                self._user_pins["force_n_parallel"] = max(
+                    1, self._sp_parallel.value()
+                )
+            else:
+                self._user_pins["force_n_parallel"] = None
         elif kind == "force_rope_scale":
             self._user_pins["force_rope_scale"] = self._chk_rope.isChecked()
 
@@ -1161,6 +1234,22 @@ class ExpertPanel(QWidget):
         if base is None:
             return None
         return expert_cfg_from_values(base, self._widgets_to_values())
+
+    def _suggested_parallel_count(self) -> int:
+        """Hardware-aware default for the parallel-slots override.
+
+        3 when the largest GPU has plenty of free VRAM (≥24 GB), else 2.
+        Falls back to 2 on CPU-only systems. This is only the *initial*
+        spinbox suggestion shown while the override is off — once the
+        user picks a value it is persisted in the Expert snapshot.
+        """
+        sysinfo = self._system
+        if sysinfo and getattr(sysinfo, "gpus", None):
+            biggest_free = max(
+                (g.free_vram_gb for g in sysinfo.gpus), default=0.0
+            )
+            return 3 if biggest_free >= 24.0 else 2
+        return 2
 
     # ------------------------------------------------------------------
     # Reasoning helper
@@ -1220,6 +1309,8 @@ class ExpertPanel(QWidget):
             "presence_penalty": self._sp_presence.value(),
             "reasoning": self._cb_reasoning.currentText(),
             "think_budget": self._sp_think_budget.value(),
+            "parallel_enabled": self._chk_parallel.isChecked(),
+            "parallel_count": self._sp_parallel.value(),
             "extras": self._le_extra.text().strip(),
         }
 
@@ -3419,6 +3510,9 @@ class MainWindow(QMainWindow):
             kv_line,
             f"Threads         : {cfg.threads}  (batch: {cfg.batch_threads})",
             f"Batch / ubatch  : {cfg.batch} / {cfg.ubatch}",
+            f"Parallel slots   : {cfg.n_parallel}"
+            + (" (manual)" if getattr(cfg, "n_parallel_forced", False) else "")
+            + "  (--parallel / -np)",
             f"Flash attention : {'on' if cfg.flash_attn else 'off'}",
         ]
         if cfg.mlock:

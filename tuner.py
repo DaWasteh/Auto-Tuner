@@ -495,6 +495,12 @@ class TunedConfig:
     # window instead of the server silently multiplying KV by N slots.
     n_parallel: int = 1
 
+    # True when n_parallel was explicitly pinned by the GUI's Expert
+    # panel (the Parallelism override).  Lets the panel render the
+    # checkbox state in both Auto and Manual mode without re-deriving it
+    # from the performance target's default.
+    n_parallel_forced: bool = False
+
     warning: Optional[str] = None
 
 
@@ -910,6 +916,7 @@ def compute_config(
     force_cache_v: Optional[str] = None,  # Pin V-quant; ctx adjusts
     force_ngl: Optional[int] = None,  # Pin layer offload count
     force_n_cpu_moe: Optional[int] = None,  # Pin MoE CPU-layer count
+    force_n_parallel: Optional[int] = None,  # Pin --parallel slot count
     force_rope_scale: Optional[bool] = None,  # Force YaRN on/off
     # ---- GPU priority overrides ----------------------------------------
     # Optional mapping of GPU name → user-assigned priority (≥1).
@@ -971,7 +978,16 @@ def compute_config(
 
     # Number of parallel inference slots — always passed as --parallel N
     # to llama-server to prevent auto-detection from over-provisioning KV.
-    n_parallel: int = max(1, perf_target.n_parallel)
+    # An Expert-panel pin (force_n_parallel) wins over the performance
+    # target's default AND drives the per-slot KV-budget calculation
+    # below, so context shrinks to fit N slots instead of llama-server
+    # silently multiplying KV by N (the documented RAM-explosion bug).
+    n_parallel_forced = force_n_parallel is not None
+    n_parallel: int = (
+        max(1, int(force_n_parallel))
+        if force_n_parallel is not None
+        else max(1, perf_target.n_parallel)
+    )
 
     has_gpu = bool(system.gpus) and system.total_vram_gb > 1
     free_vram = max(0.0, system.free_vram_gb)
@@ -2011,6 +2027,7 @@ def compute_config(
         rope_scale_factor=float(profile_rope_factor) if rope_scaling_active else 1.0,
         performance_target=perf_target.name,
         n_parallel=n_parallel,
+        n_parallel_forced=n_parallel_forced,
         warning=warning,
         extra_cli_flags=seed_extras,
         env_overrides=env_overrides,
