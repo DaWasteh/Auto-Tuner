@@ -3846,14 +3846,16 @@ class MainWindow(QMainWindow):
 
         # CPU-Anzeige
         if s.cpu_name:
-            self._cpu_lbl.setText(f"CPU: {s.cpu_name}")
+            display_cpu = (s.cpu_name[:40] + '...') if len(s.cpu_name) > 40 else s.cpu_name
+            self._cpu_lbl.setText(f"CPU: {display_cpu}")
 
         # GPU-Anzeige mit Utilization
         if s.gpus:
             gpu_parts = []
             for g in s.gpus:
                 util = f"{g.gpu_util_percent:.0f}%" if g.gpu_util_percent > 0 else "—"
-                gpu_parts.append(f"{g.name} ({util})")
+                display_name = (g.name[:25] + '...') if len(g.name) > 25 else g.name
+                gpu_parts.append(f"{display_name} ({util})")
             txt = "GPU: " + ", ".join(gpu_parts)
             # Ignorierte GPUs (iGPU etc.) auch zeigen — Transparenz darüber, was
             # erkannt aber bewusst nicht für Inference verwendet wird.
@@ -3865,7 +3867,8 @@ class MainWindow(QMainWindow):
                         if g.total_vram_mb > 0
                         else "VRAM unknown"
                     )
-                    ign_parts.append(f"{g.name} ({size}, ignored)")
+                    display_ign_name = (g.name[:20] + '...') if len(g.name) > 20 else g.name
+                    ign_parts.append(f"{display_ign_name} ({size}, ignored)")
                 txt += "  ·  " + ", ".join(ign_parts)
             self._gpu_lbl.setText(txt)
         else:
