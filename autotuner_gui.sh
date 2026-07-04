@@ -76,22 +76,12 @@ else
 fi
 
 # Auto-Tuner GUI starten
-# Standard: vom ggf. geöffneten Dateimanager-Terminal entkoppeln, damit ein
-# versehentlich geschlossenes Terminal die GUI nicht beendet. Für Debugging:
-#   AUTOTUNER_FOREGROUND=1 ./autotuner_gui.sh
 if [ "${AUTOTUNER_FOREGROUND:-0}" = "1" ]; then
     "$PY" qt_launcher.py
 else
-    LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/autotuner"
-    if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
-        LOG_DIR="/tmp/autotuner-${USER:-user}"
-        mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="/tmp"
-    fi
-    LOG_FILE="$LOG_DIR/gui.log"
-
-    # Keep the normal graphical user session intact. `setsid` can break Qt's
-    # Wayland/X11 connection on some Ubuntu desktops; `nohup` is enough to
-    # survive a terminal close while preserving the GUI environment.
-    PYTHONUNBUFFERED=1 nohup "$PY" qt_launcher.py >"$LOG_FILE" 2>&1 < /dev/null &
-    exit 0
+    # Wir starten die App direkt. Die .desktop-Datei (Terminal=false)
+    # kümmert sich unter Linux darum, dass kein Terminal aufpoppt.
+    # Ein nohup/setsid hier würde die GUI-Session-Variablen (XAUTHORITY)
+    # zerstören und zum Absturz führen.
+    "$PY" qt_launcher.py
 fi
