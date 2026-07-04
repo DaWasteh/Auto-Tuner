@@ -1,6 +1,6 @@
 {
-  "models_path": "I:\\models",
-  "fork_path": "L:\\LAB\\ai-local\\b9867_llama.cpp",
+  "models_path": "/run/media/dawasteh/OneDrive/models",
+  "fork_path": "/home/dawasteh/local_ai/b9870_ubuntu_llama.cpp",
   "performance_target": "throughput",
   "model_overrides": {
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": {
@@ -163,9 +163,9 @@
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAADjAAAAYwAABYgAAATOAAAA4wAAAIIAAAWIAAAEzgAAAAAAAAAADXAAAADjAAAAggAABYgAAATO",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABKYAAAQYAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
-  "fork_container_path": "L:\\LAB\\ai-local",
+  "window_geometry": "AdnQywADAAAAAAhwAAAFAwAADZAAAAmNAAAIcAAABQMAAA2QAAAJjQAAAAAAAAAADXAAAAhwAAAFAwAADZAAAAmN",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABSEAAARVAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "fork_container_path": "/home/dawasteh/local_ai",
   "font_size": 10,
   "gpu_overrides": {
     "AMD Radeon AI PRO R9700": {
@@ -200,7 +200,8 @@
     "Devstral-Small-2-24B-Instruct-2512-UD-Q8_K_XL": "<none>",
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": "<none>",
     "Qwen3.6-27B-MTP-IQ4_XS": "<none>",
-    "qwen3.6-35b-a3b-mxfp4_moe": "<none>"
+    "qwen3.6-35b-a3b-mxfp4_moe": "<none>",
+    "Qwen3.5-4B-Q8_0": "<none>"
   },
   "draft_selection": {
     "gemma-4-12B-it-qat-UD-Q4_K_XL": "<none>",
@@ -213,43 +214,6 @@
   "base_port": 1234,
   "port_offset": 0,
   "expert_overrides": {
-    "ornith-1.0-35b-Q6_K": {
-      "mode": "auto",
-      "pins": {
-        "force_n_parallel": 3
-      },
-      "values": {
-        "ctx": 262144,
-        "cache_k": "q5_0",
-        "cache_v": "q5_0",
-        "ngl": 999,
-        "n_cpu_moe": 0,
-        "threads": 12,
-        "batch_threads": 16,
-        "batch": 1024,
-        "ubatch": 1024,
-        "flash_attn": true,
-        "mlock": false,
-        "no_mmap": false,
-        "jinja": false,
-        "verbose": false,
-        "numa": "distribute",
-        "rope_scaling": false,
-        "rope_factor": 1.0,
-        "temperature": 0.6,
-        "top_k": 20,
-        "top_p": 0.95,
-        "min_p": 0.0,
-        "repeat_penalty": 1.0,
-        "presence_penalty": 0.0,
-        "reasoning": "auto",
-        "think_budget": -1,
-        "parallel_enabled": true,
-        "parallel_count": 3,
-        "extras": ""
-      },
-      "saved_at": "2026-07-02T19:03:15"
-    },
     "ornith-1.0-9b-Q8_0": {
       "mode": "auto",
       "pins": {
@@ -365,6 +329,45 @@
         "extras": ""
       },
       "saved_at": "2026-07-03T19:14:30"
+    },
+    "Qwen3.5-4B-Q8_0": {
+      "mode": "auto",
+      "pins": {
+        "force_cache_k": "q4_0",
+        "force_cache_v": "q4_0",
+        "user_ctx": 10240
+      },
+      "values": {
+        "ctx": 10240,
+        "cache_k": "q4_0",
+        "cache_v": "q4_0",
+        "ngl": 999,
+        "n_cpu_moe": 0,
+        "threads": 12,
+        "batch_threads": 16,
+        "batch": 1024,
+        "ubatch": 1024,
+        "flash_attn": true,
+        "mlock": true,
+        "no_mmap": true,
+        "jinja": false,
+        "verbose": false,
+        "numa": "distribute",
+        "rope_scaling": false,
+        "rope_factor": 1.0,
+        "temperature": 0.6,
+        "top_k": 20,
+        "top_p": 0.95,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "reasoning": "auto",
+        "think_budget": -1,
+        "parallel_enabled": false,
+        "parallel_count": 3,
+        "extras": ""
+      },
+      "saved_at": "2026-07-03T23:13:44"
     }
   }
 }
