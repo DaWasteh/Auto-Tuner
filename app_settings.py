@@ -9,8 +9,12 @@ Public API:
     save_settings(dict)    -> bool
     get_models_path()      -> Optional[Path]
     set_models_path(Path)
+    get_model_paths()      -> list[(Path, enabled)]
+    set_model_paths(list[(Path, enabled)])
     get_fork_path()        -> Optional[Path]
     set_fork_path(Path)
+    get_llama_build_paths() -> list[(Path, enabled)]
+    set_llama_build_paths(list[(Path, enabled)])
     get_window_geometry()  -> Optional[str]   # base64 of QByteArray
     set_window_geometry(str)
     get_window_state()     -> Optional[str]   # base64 of QByteArray (toolbars/docks)
@@ -38,7 +42,7 @@ import base64
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _FILENAME = "autotuner_settings.json"
 
@@ -114,6 +118,81 @@ def set_models_path(path: Path) -> None:
     _update("models_path", str(path.resolve()))
 
 
+PathEnabled = Tuple[Path, bool]
+
+
+def _read_path_list(key: str) -> List[PathEnabled]:
+    """Read a persisted multi-folder list as ``[(Path, enabled), ...]``.
+
+    The JSON schema is intentionally small and human-editable:
+    ``[{"path": "...", "enabled": true}, ...]``. Invalid and duplicate
+    paths are skipped; missing folders are kept so the GUI can still show and
+    edit a removable stale entry.
+    """
+    raw = load_settings().get(key)
+    if not isinstance(raw, list):
+        return []
+    out: List[PathEnabled] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, dict):
+            p_raw = item.get("path")
+            enabled = bool(item.get("enabled", True))
+        else:
+            p_raw = item
+            enabled = True
+        if not p_raw:
+            continue
+        try:
+            p = Path(str(p_raw)).expanduser()
+            # ``resolve(strict=False)`` normalises duplicates without requiring
+            # the directory to still exist.
+            rp = p.resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        key_text = os.path.normcase(str(rp))
+        if key_text in seen:
+            continue
+        seen.add(key_text)
+        out.append((rp, enabled))
+    return out
+
+
+def _write_path_list(key: str, paths: List[PathEnabled]) -> None:
+    clean = []
+    seen: set[str] = set()
+    for path, enabled in paths:
+        try:
+            rp = Path(path).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        key_text = os.path.normcase(str(rp))
+        if key_text in seen:
+            continue
+        seen.add(key_text)
+        clean.append({"path": str(rp), "enabled": bool(enabled)})
+    _update(key, clean)
+
+
+def get_model_paths() -> List[PathEnabled]:
+    """Return configured model folders with their enabled state.
+
+    Empty means the multi-folder setting has never been written; callers should
+    fall back to ``models_path`` / ``AUTOTUNER_MODELS`` / defaults and then save
+    through ``set_model_paths`` once the user edits the list.
+    """
+    return _read_path_list("model_paths")
+
+
+def set_model_paths(paths: List[PathEnabled]) -> None:
+    _write_path_list("model_paths", paths)
+    first_enabled = next((p for p, enabled in paths if enabled), None)
+    if first_enabled is None and paths:
+        first_enabled = paths[0][0]
+    if first_enabled is not None:
+        set_models_path(first_enabled)
+
+
 def get_fork_path() -> Optional[Path]:
     p = load_settings().get("fork_path")
     if not p:
@@ -158,6 +237,21 @@ def clear_fork_container_path() -> None:
     if "fork_container_path" in s:
         s.pop("fork_container_path", None)
         save_settings(s)
+
+
+def get_llama_build_paths() -> List[PathEnabled]:
+    """Return configured llama.cpp build/container folders with enabled state."""
+    return _read_path_list("llama_build_paths")
+
+
+def set_llama_build_paths(paths: List[PathEnabled]) -> None:
+    """Persist llama.cpp build/container folders.
+
+    The selected active fork remains stored separately in ``fork_path`` because
+    this list represents scan roots (containers or individual builds), not the
+    combo-box selection.
+    """
+    _write_path_list("llama_build_paths", paths)
 
 
 # ---------------------------------------------------------------------------

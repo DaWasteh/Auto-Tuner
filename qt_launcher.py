@@ -158,6 +158,149 @@ class _TerminalProcess:
         except (ProcessLookupError, OSError):
             pass
 
+
+class _PathListDialog(QDialog):
+    """Small overlay dialog for enabling/disabling multiple folder roots."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        title: str,
+        paths: List[Tuple[Path, bool]],
+        pick_title: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._pick_title = pick_title
+        self._updating_master = False
+        self.resize(720, 420)
+
+        layout = QVBoxLayout(self)
+        self._master = QCheckBox("Alle aktivieren")
+        self._master.toggled.connect(self._toggle_all)
+        layout.addWidget(self._master)
+
+        self._list = QListWidget()
+        self._list.itemChanged.connect(self._sync_master)
+        layout.addWidget(self._list, 1)
+
+        buttons_row = QHBoxLayout()
+        self._btn_add = QPushButton("Hinzufügen…")
+        self._btn_edit = QPushButton("Bearbeiten…")
+        self._btn_remove = QPushButton("Entfernen")
+        self._btn_add.clicked.connect(self._add_path)
+        self._btn_edit.clicked.connect(self._edit_path)
+        self._btn_remove.clicked.connect(self._remove_path)
+        for btn in (self._btn_add, self._btn_edit, self._btn_remove):
+            buttons_row.addWidget(btn)
+        buttons_row.addStretch()
+        layout.addLayout(buttons_row)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+        for path, enabled in paths:
+            self._append_item(path, enabled)
+        self._sync_master()
+
+    def _append_item(self, path: Path, enabled: bool = True) -> None:
+        item = QListWidgetItem(str(path))
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+        )
+        item.setData(Qt.ItemDataRole.UserRole, Path(path))
+        self._list.addItem(item)
+
+    def _pick_directory(self, start: Optional[Path]) -> Optional[Path]:
+        directory = str(start) if start is not None else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, self._pick_title, directory)
+        return Path(folder).resolve() if folder else None
+
+    def _add_path(self) -> None:
+        selected = self._pick_directory(None)
+        if selected is not None:
+            self._append_item(selected, True)
+            self._dedupe_items()
+            self._sync_master()
+
+    def _edit_path(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            return
+        current = item.data(Qt.ItemDataRole.UserRole)
+        start = current if isinstance(current, Path) else Path(str(item.text()))
+        selected = self._pick_directory(start)
+        if selected is None:
+            return
+        item.setText(str(selected))
+        item.setData(Qt.ItemDataRole.UserRole, selected)
+        self._dedupe_items()
+        self._sync_master()
+
+    def _remove_path(self) -> None:
+        row = self._list.currentRow()
+        if row >= 0:
+            self._list.takeItem(row)
+            self._sync_master()
+
+    def _toggle_all(self, checked: bool) -> None:
+        if self._updating_master:
+            return
+        for i in range(self._list.count()):
+            self._list.item(i).setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+
+    def _sync_master(self) -> None:
+        total = self._list.count()
+        enabled = sum(
+            1
+            for i in range(total)
+            if self._list.item(i).checkState() == Qt.CheckState.Checked
+        )
+        self._updating_master = True
+        try:
+            self._master.setChecked(total > 0 and enabled == total)
+            if total == 0:
+                self._master.setText("Alle aktivieren")
+            elif enabled == total:
+                self._master.setText(f"Alle aktiv ({enabled}/{total})")
+            elif enabled == 0:
+                self._master.setText(f"Alle deaktiviert (0/{total})")
+            else:
+                self._master.setText(f"Teilweise aktiv ({enabled}/{total})")
+        finally:
+            self._updating_master = False
+
+    def _dedupe_items(self) -> None:
+        seen: set[str] = set()
+        for i in reversed(range(self._list.count())):
+            item = self._list.item(i)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            try:
+                key = os.path.normcase(str(Path(path).resolve(strict=False)))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                key = os.path.normcase(item.text())
+            if key in seen:
+                self._list.takeItem(i)
+            else:
+                seen.add(key)
+
+    def paths(self) -> List[Tuple[Path, bool]]:
+        out: List[Tuple[Path, bool]] = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(path, Path):
+                path = Path(str(item.text()))
+            out.append((path, item.checkState() == Qt.CheckState.Checked))
+        return out
+
         # Capture in a local variable BEFORE clearing self.proc —
         # the daemon thread runs after self.proc is already None.
         _proc = self.proc
@@ -221,13 +364,25 @@ class _ScanWorker(QObject):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, roots: List[Path]) -> None:
         super().__init__()
-        self._root = root
+        self._roots = roots
 
     def run(self) -> None:
         try:
-            self.finished.emit(scan_models(self._root))
+            entries: List[ModelEntry] = []
+            seen: set[str] = set()
+            for root in self._roots:
+                for entry in scan_models(root):
+                    try:
+                        key = os.path.normcase(str(entry.path.resolve(strict=False)))
+                    except (OSError, RuntimeError):
+                        key = os.path.normcase(str(entry.path))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    entries.append(entry)
+            self.finished.emit(entries)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -1650,6 +1805,10 @@ class MainWindow(QMainWindow):
         self._restore_window_geometry()
 
         self.models_path = models_path
+        configured_model_paths = app_settings.get_model_paths()
+        self.model_paths: List[Tuple[Path, bool]] = (
+            configured_model_paths if configured_model_paths else [(models_path, True)]
+        )
         self.settings_path = settings_path
 
         self._server: Optional[_TerminalProcess] = None
@@ -1685,6 +1844,7 @@ class MainWindow(QMainWindow):
         self._system: Optional[SystemInfo] = None
         self._profiles: List[ModelProfile] = []
         self._forks: List[Tuple[str, Path]] = []
+        self._fork_roots: List[Tuple[Path, bool]] = app_settings.get_llama_build_paths()
         self._fork_path: Optional[Path] = None  # manueller Fork-Ordner
 
         # Currently selected model + its draft (set in _show_config)
@@ -1742,11 +1902,6 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        self._path_label = QLabel()
-        self._path_label.setStyleSheet("padding:0 6px;color:#aaa;")
-        tb.addWidget(self._path_label)
-        tb.addSeparator()
-
         for label, slot in (
             ("📂 Models folder", self._browse_models),
             ("🔄 Refresh", self._start_scan),
@@ -1774,15 +1929,8 @@ class MainWindow(QMainWindow):
         self._fork_combo.currentIndexChanged.connect(self._on_fork_changed)
         tb.addWidget(self._fork_combo)
 
-        self._fork_path_lbl = QLabel()
-        self._fork_path_lbl.setStyleSheet("color:#aaa;font-size:9pt;")
-        self._fork_path_lbl.setMaximumWidth(120)
-        self._fork_path_lbl.setText("")
-        tb.addWidget(self._fork_path_lbl)
-
-        self._btn_fork_folder = QPushButton("📂")
-        self._btn_fork_folder.setFixedWidth(28)
-        self._btn_fork_folder.setToolTip("Manuellen Fork-Ordner auswählen")
+        self._btn_fork_folder = QPushButton("llama Builds")
+        self._btn_fork_folder.setToolTip("llama.cpp-Build-Pfade verwalten")
         self._btn_fork_folder.clicked.connect(self._browse_fork_folder)
         tb.addWidget(self._btn_fork_folder)
 
@@ -2371,7 +2519,36 @@ class MainWindow(QMainWindow):
     # Fork-container helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _expand_fork_container(path: Path) -> List[Tuple[str, Path]]:
+    def _llama_binary_subpaths() -> Tuple[str, ...]:
+        # Mirrors auto_tuner._SERVER_SUBPATHS — update both if paths change.
+        return (
+            "build/bin/Release/llama-server.exe",
+            "build/bin/Debug/llama-server.exe",
+            "build/bin/llama-server.exe",
+            "build/bin/llama-server",
+            "build/llama-server",
+            "llama-server.exe",  # prebuilt / release-zip drops
+            "llama-server",
+        )
+
+    @classmethod
+    def _is_llama_build_dir(cls, path: Path) -> bool:
+        return path.is_dir() and any(
+            (path / sub).is_file() for sub in cls._llama_binary_subpaths()
+        )
+
+    @staticmethod
+    def _looks_like_llama_dir_name(name: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:(?:^|[-_.])llama(?:[-_.]|$)|llama\.cpp)",
+                name,
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _expand_fork_container(cls, path: Path) -> List[Tuple[str, Path]]:
         """List all llama.cpp build directories inside `path`.
 
         Returns a list of (display_name, fork_path) pairs for every
@@ -2385,28 +2562,14 @@ class MainWindow(QMainWindow):
         binary drops (``llama-server[.exe]`` at the folder root) are
         recognised.
         """
-        # Mirrors auto_tuner._SERVER_SUBPATHS — update both if paths change.
-        _BINARY_SUBPATHS = (
-            "build/bin/Release/llama-server.exe",
-            "build/bin/Debug/llama-server.exe",
-            "build/bin/llama-server.exe",
-            "build/bin/llama-server",
-            "build/llama-server",
-            "llama-server.exe",  # prebuilt / release-zip drops
-            "llama-server",
-        )
         result: List[Tuple[str, Path]] = []
         try:
             for child in sorted(path.iterdir(), key=lambda c: c.name.lower()):
                 if not child.is_dir():
                     continue
-                if not re.search(
-                    r"(?:(?:^|[-_.])llama(?:[-_.]|$)|llama\.cpp)",
-                    child.name,
-                    re.IGNORECASE,
-                ):
+                if not cls._looks_like_llama_dir_name(child.name):
                     continue
-                has_binary = any((child / sub).is_file() for sub in _BINARY_SUBPATHS)
+                has_binary = cls._is_llama_build_dir(child)
                 if has_binary:
                     result.append((child.name, child))
                 else:
@@ -2424,6 +2587,100 @@ class MainWindow(QMainWindow):
         except (OSError, PermissionError):
             pass
         return result
+
+    def _active_llama_roots(self) -> List[Path]:
+        roots: List[Path] = []
+        seen: set[str] = set()
+        for path, enabled in self._fork_roots:
+            if not enabled:
+                continue
+            try:
+                rp = Path(path).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            key = os.path.normcase(str(rp))
+            if key in seen or not rp.is_dir():
+                continue
+            seen.add(key)
+            roots.append(rp)
+        return roots
+
+    def _scan_llama_roots(self, roots: List[Path]) -> List[Tuple[str, Path]]:
+        forks: List[Tuple[str, Path]] = []
+        seen: set[str] = set()
+
+        def add(name: str, path: Path) -> None:
+            try:
+                rp = path.resolve(strict=False)
+            except (OSError, RuntimeError):
+                return
+            key = os.path.normcase(str(rp))
+            if key in seen:
+                return
+            seen.add(key)
+            forks.append((name, rp))
+
+        for root in roots:
+            if self._looks_like_llama_dir_name(root.name) and self._is_llama_build_dir(root):
+                add(root.name, root)
+            for name, fork_path in self._expand_fork_container(root):
+                add(name, fork_path)
+
+        def _fork_sort_key(item: Tuple[str, Path]) -> tuple:
+            name_lower = item[0].lower()
+            return (name_lower != "llama.cpp", name_lower)
+
+        forks.sort(key=_fork_sort_key)
+        return forks
+
+    def _populate_fork_combo(
+        self,
+        forks: List[Tuple[str, Path]],
+        preferred: Optional[Path] = None,
+    ) -> None:
+        self._fork_combo.blockSignals(True)
+        self._fork_combo.clear()
+        if not forks:
+            self._fork_combo.addItem("not found", userData=None)
+            self._fork_path = None
+            self._fork_combo.blockSignals(False)
+            return
+
+        preferred_resolved: Optional[Path] = None
+        if preferred is not None:
+            try:
+                preferred_resolved = preferred.resolve(strict=False)
+            except (OSError, RuntimeError):
+                preferred_resolved = preferred
+
+        selected_idx = 0
+        for i, (name, path) in enumerate(forks):
+            self._fork_combo.addItem(name, userData=path)
+            if preferred_resolved is not None:
+                try:
+                    if path.resolve(strict=False) == preferred_resolved:
+                        selected_idx = i
+                except (OSError, RuntimeError):
+                    pass
+        self._fork_combo.setCurrentIndex(selected_idx)
+        self._fork_path = forks[selected_idx][1]
+        self._fork_combo.blockSignals(False)
+        self._apply_fork(selected_idx)
+
+    def _start_hardware_detection(self) -> None:
+        # Hardware detection (spawns PowerShell on Windows) → background thread
+        # so it never blocks the UI and never flashes a window.
+        # Use signal/slot pattern instead of QTimer.singleShot from bg thread
+        # to avoid potential PyQt6 deadlocks when COM is involved.
+        self._log("Detecting system hardware…")
+        self._hw_detect_worker = _HwDetectWorker(timeout=30.0)
+        self._hw_detect_thread = QThread(self)
+        self._hw_detect_worker.moveToThread(self._hw_detect_thread)
+        self._hw_detect_thread.started.connect(self._hw_detect_worker.run)
+        self._hw_detect_worker.finished.connect(self._hw_detect_done)
+        self._hw_detect_worker.finished.connect(self._hw_detect_thread.quit)
+        self._hw_detect_thread.finished.connect(self._hw_detect_thread.deleteLater)
+        self._hw_detect_thread.start()
 
     # ------------------------------------------------------------------
     # Startup
@@ -2446,6 +2703,24 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"[Warning] Fork discovery failed: {exc}")
             self._forks = []
+
+        if self._fork_roots:
+            active_roots = self._active_llama_roots()
+            forks = self._scan_llama_roots(active_roots)
+            self._forks = forks
+            preferred = app_settings.get_fork_path()
+            self._populate_fork_combo(forks, preferred)
+            if forks:
+                self._log(
+                    f"[Fork] Loaded {len(forks)} build(s) from "
+                    f"{len(active_roots)} active llama path(s)."
+                )
+            else:
+                self._log(
+                    "[Warning] No llama.cpp builds found in active llama paths."
+                )
+            self._start_hardware_detection()
+            return
 
         # ── Resolve persisted fork state ────────────────────────────
         # The container path (the parent folder the user picked via
@@ -2515,7 +2790,6 @@ class MainWindow(QMainWindow):
                 self._fork_combo.addItem(name, userData=path)
             self._fork_combo.setCurrentIndex(matched_idx)
             self._fork_path = self._forks[matched_idx][1]
-            self._fork_path_lbl.setText(manual_path.name)
             src_label = (
                 "persisted settings" if manual_source == "settings" else "LLAMA_CPP_DIR"
             )
@@ -2536,7 +2810,6 @@ class MainWindow(QMainWindow):
                 self._log(f"  - {name} → {fork_path}")
                 self._fork_combo.addItem(name, userData=fork_path)
             os.environ["LLAMA_CPP_DIR"] = str(manual_path)
-            self._fork_path_lbl.setText(manual_path.name + " (📁)")
             # Restore previously active selection inside the container,
             # if persisted_active points at one of these children.
             initial_idx = 0
@@ -2560,7 +2833,6 @@ class MainWindow(QMainWindow):
             self._fork_combo.addItem(label, userData=manual_path)
             self._fork_path = manual_path
             self._fork_combo.setCurrentIndex(0)
-            self._fork_path_lbl.setText(manual_path.name)
             src_label = (
                 "persisted settings" if manual_source == "settings" else "LLAMA_CPP_DIR"
             )
@@ -2579,19 +2851,7 @@ class MainWindow(QMainWindow):
             self._log("[Warning] No llama.cpp forks found. Set LLAMA_CPP_DIR.")
         self._fork_combo.blockSignals(False)
 
-        # Hardware detection (spawns PowerShell on Windows) → background thread
-        # so it never blocks the UI and never flashes a window.
-        # Use signal/slot pattern instead of QTimer.singleShot from bg thread
-        # to avoid potential PyQt6 deadlocks when COM is involved.
-        self._log("Detecting system hardware…")
-        self._hw_detect_worker = _HwDetectWorker(timeout=30.0)
-        self._hw_detect_thread = QThread(self)
-        self._hw_detect_worker.moveToThread(self._hw_detect_thread)
-        self._hw_detect_thread.started.connect(self._hw_detect_worker.run)
-        self._hw_detect_worker.finished.connect(self._hw_detect_done)
-        self._hw_detect_worker.finished.connect(self._hw_detect_thread.quit)
-        self._hw_detect_thread.finished.connect(self._hw_detect_thread.deleteLater)
-        self._hw_detect_thread.start()
+        self._start_hardware_detection()
 
     # ------------------------------------------------------------------
     # Fork selection
@@ -2800,22 +3060,54 @@ class MainWindow(QMainWindow):
         self._start_scan()
 
     def _browse_fork_folder(self) -> None:
-        """Manuellen Fork-Ordner auswählen (ähnlich wie Models folder)."""
-        dialog = QFileDialog(self, "LLama.cpp Fork-Ordner auswählen")
-        dialog.setFileMode(QFileDialog.FileMode.Directory)
-        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        """Open the multi-path llama.cpp builds manager."""
+        initial = self._fork_roots[:]
+        if not initial:
+            if self._fork_container is not None:
+                initial = [(self._fork_container, True)]
+            elif self._fork_path is not None:
+                initial = [(self._fork_path, True)]
+            else:
+                env_fork = os.environ.get("LLAMA_CPP_DIR", "")
+                if env_fork:
+                    initial = [(Path(env_fork).expanduser(), True)]
+        dlg = _PathListDialog(
+            self,
+            "llama.cpp-Build-Pfade verwalten",
+            initial,
+            "llama.cpp-Build- oder Container-Ordner auswählen",
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._fork_roots = dlg.paths()
+        try:
+            app_settings.set_llama_build_paths(self._fork_roots)
+            self._log(
+                f"[Fork] Saved {len(self._fork_roots)} llama path(s), "
+                f"{len(self._active_llama_roots())} active."
+            )
+        except Exception as exc:
+            self._log(f"[Warning] Could not save llama build paths: {exc}")
+        self._reload_llama_builds()
 
-        # Vorgabepfad: aktueller Fork oder Workspace
-        if self._fork_path is not None:
-            dialog.setDirectory(str(self._fork_path))
-        elif self._forks:
-            dialog.setDirectory(str(self._forks[0][1]))
-
-        if dialog.exec() == QFileDialog.DialogCode.Accepted:
-            selected = dialog.selectedFiles()
-            if selected:
-                new_path = Path(selected[0])
-                self._set_manual_fork_path(new_path)
+    def _reload_llama_builds(self) -> None:
+        active_roots = self._active_llama_roots()
+        forks = self._scan_llama_roots(active_roots)
+        self._forks = forks
+        preferred = self._fork_path or app_settings.get_fork_path()
+        self._populate_fork_combo(forks, preferred)
+        if forks:
+            self._log(
+                f"[Fork] Loaded {len(forks)} build(s) from "
+                f"{len(active_roots)} active llama path(s)."
+            )
+            if self._fork_path is not None:
+                try:
+                    app_settings.set_fork_path(self._fork_path)
+                except Exception as exc:
+                    self._log(f"[Warning] Could not save fork path: {exc}")
+        else:
+            self._log("[Warning] No llama.cpp builds found in active llama paths.")
 
     def _set_manual_fork_path(self, path: Path) -> None:
         r"""Manuellen Fork-Pfad setzen und UI aktualisieren.
@@ -2851,7 +3143,6 @@ class MainWindow(QMainWindow):
                 self._fork_combo.addItem(name, userData=fork_path)
             self._fork_combo.setCurrentIndex(0)
             os.environ["LLAMA_CPP_DIR"] = str(path)
-            self._fork_path_lbl.setText(path.name + " (📁)")
             try:
                 app_settings.set_fork_container_path(path)
                 # Active selection within the container — the first build.
@@ -2869,7 +3160,6 @@ class MainWindow(QMainWindow):
                 self._log(f"[Warning] Could not clear fork container: {exc}")
             self._fork_combo.addItem(f"📁 {path.name}", userData=path)
             self._fork_combo.setCurrentIndex(0)
-            self._fork_path_lbl.setText(path.name)
             os.environ["LLAMA_CPP_DIR"] = str(path)
             try:
                 app_settings.set_fork_path(path)
@@ -2883,6 +3173,31 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Background model scan
     # ------------------------------------------------------------------
+    def _active_model_paths(self) -> List[Path]:
+        """Return existing enabled model roots from the multi-folder list."""
+        roots: List[Path] = []
+        seen: set[str] = set()
+        for path, enabled in self.model_paths:
+            if not enabled:
+                continue
+            try:
+                rp = Path(path).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            key = os.path.normcase(str(rp))
+            if key in seen or not rp.is_dir():
+                continue
+            seen.add(key)
+            roots.append(rp)
+        return roots
+
+    def _models_label(self, paths: List[Path]) -> str:
+        if not paths:
+            return "keine aktiven Model-Pfade"
+        if len(paths) == 1:
+            return str(paths[0])
+        return f"{len(paths)} Model-Pfade"
+
     def _start_scan(self) -> None:
         try:
             if self._scan_thread is not None and self._scan_thread.isRunning():
@@ -2890,25 +3205,31 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             self._scan_thread = None
 
-        self._path_label.setText(f"Models: {self.models_path}")
         self._btn_refresh.setEnabled(False)
         self._btn_launch.setEnabled(False)
         self._model_list.clear()
-        self._status.showMessage(f"Scanning {self.models_path} …")
-        self._log(f"Scanning: {self.models_path}")
+        roots = self._active_model_paths()
+        self._last_scan_roots = roots
+        label = self._models_label(roots)
+        self._status.showMessage(f"Scanning {label} …")
+        self._log(f"Scanning model folders: {label}")
+        for root in roots:
+            self._log(f"  - {root}")
 
-        if not self.models_path.exists():
+        if not roots:
+            configured = "\n".join(f"  - {p} {'(deaktiviert)' if not en else ''}" for p, en in self.model_paths)
             msg = (
-                f"Models folder not found:\n  {self.models_path}\n\n"
-                "Use '📂 Models folder' to pick the right location,\n"
-                "or set the AUTOTUNER_MODELS environment variable."
+                "Keine aktiven Model-Pfade verfügbar.\n\n"
+                "Aktiviere oder füge Pfade über '📂 Models folder' hinzu."
             )
+            if configured:
+                msg += "\n\nKonfiguriert:\n" + configured
             self._config_preview.setPlainText(msg)
-            self._status.showMessage(f"Folder not found: {self.models_path}")
+            self._status.showMessage("No active model folders.")
             self._btn_refresh.setEnabled(True)
             return
 
-        worker = _ScanWorker(self.models_path)
+        worker = _ScanWorker(roots)
         thread = QThread(self)
         self._scan_worker = worker
         self._scan_thread = thread
@@ -2928,16 +3249,19 @@ class MainWindow(QMainWindow):
         self._all_entries = entries
         self._btn_refresh.setEnabled(True)
         if not entries:
+            roots = getattr(self, "_last_scan_roots", [])
+            root_lines = "\n".join(f"  {p}" for p in roots)
             self._config_preview.setPlainText(
-                f"No *.gguf files found in:\n  {self.models_path}"
+                "No *.gguf files found in active folders:\n" + root_lines
             )
             self._status.showMessage("No models found.")
-            self._log("No models found.")
+            self._log("No models found in active folders.")
             return
         self._populate_list(entries)
         self._btn_launch.setEnabled(True)
-        self._status.showMessage(f"{len(entries)} model(s) loaded.")
-        self._log(f"Found {len(entries)} model(s).")
+        roots = getattr(self, "_last_scan_roots", [])
+        self._status.showMessage(f"{len(entries)} model(s) loaded from {len(roots)} folder(s).")
+        self._log(f"Found {len(entries)} model(s) from {len(roots)} active folder(s).")
 
     def _on_scan_error(self, msg: str) -> None:
         self._btn_refresh.setEnabled(True)
@@ -3031,17 +3355,29 @@ class MainWindow(QMainWindow):
         )
 
     def _browse_models(self) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select models folder", str(self.models_path)
+        dlg = _PathListDialog(
+            self,
+            "Model-Pfade verwalten",
+            self.model_paths,
+            "Model-Ordner auswählen",
         )
-        if folder:
-            self.models_path = Path(folder)
-            try:
-                app_settings.set_models_path(self.models_path)
-                self._log(f"[Models] Saved as default: {self.models_path}")
-            except Exception as exc:
-                self._log(f"[Warning] Could not save models path: {exc}")
-            self._start_scan()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.model_paths = dlg.paths()
+        first = next((p for p, enabled in self.model_paths if enabled), None)
+        if first is None and self.model_paths:
+            first = self.model_paths[0][0]
+        if first is not None:
+            self.models_path = first
+        try:
+            app_settings.set_model_paths(self.model_paths)
+            self._log(
+                f"[Models] Saved {len(self.model_paths)} path(s), "
+                f"{len(self._active_model_paths())} active."
+            )
+        except Exception as exc:
+            self._log(f"[Warning] Could not save model paths: {exc}")
+        self._start_scan()
 
     # ------------------------------------------------------------------
     # Config preview + options (single-click)

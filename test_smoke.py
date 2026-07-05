@@ -2861,6 +2861,22 @@ def _isolated_settings(tmp_path, monkeypatch):
     return target
 
 
+def test_multi_folder_settings_round_trip(_isolated_settings, tmp_path) -> None:
+    import app_settings
+
+    a = tmp_path / "models-a"
+    b = tmp_path / "models-b"
+    app_settings.set_model_paths([(a, True), (b, False), (a, True)])
+
+    got = app_settings.get_model_paths()
+    assert got == [(a.resolve(strict=False), True), (b.resolve(strict=False), False)]
+    assert app_settings.get_models_path() is None  # folders need not exist in UI list
+
+    llama = tmp_path / "ai-local"
+    app_settings.set_llama_build_paths([(llama, False)])
+    assert app_settings.get_llama_build_paths() == [(llama.resolve(strict=False), False)]
+
+
 def test_expert_override_round_trip(_isolated_settings) -> None:
     import app_settings
 

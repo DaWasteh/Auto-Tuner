@@ -163,9 +163,9 @@
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAhwAAAFAwAADZAAAAmNAAAIcAAABQMAAA2QAAAJjQAAAAAAAAAADXAAAAhwAAAFAwAADZAAAAmN",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABSEAAARVAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
-  "font_size": 10,
+  "window_geometry": "AdnQywADAAAAAAhlAAAE0gAADcgAAAmYAAAIcAAABQMAAA29AAAJjQAAAAAAAAAADXAAAAhwAAAFAwAADb0AAAmN",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABU4AAARSAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "font_size": 11,
   "gpu_overrides": {
     "AMD Radeon AI PRO R9700": {
       "enabled": true,
@@ -177,7 +177,7 @@
     }
   },
   "splitter_states": {
-    "top_split": "AAAA/wAAAAEAAAACAAACWQAAAkUA/////wEAAAABAA==",
+    "top_split": "AAAA/wAAAAEAAAACAAACpgAAApwA/////wEAAAABAA==",
     "main_split": "AAAA/wAAAAEAAAACAAADMAAAAAAA/////wEAAAACAA=="
   },
   "mmproj_selection": {
@@ -369,5 +369,11 @@
       "saved_at": "2026-07-03T23:13:44"
     }
   },
-  "fork_container_path": "/home/dawasteh/local_ai"
+  "fork_container_path": "/home/dawasteh/local_ai",
+  "model_paths": [
+    {
+      "path": "/run/media/dawasteh/OneDrive/models",
+      "enabled": true
+    }
+  ]
 }
