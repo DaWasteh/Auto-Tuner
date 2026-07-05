@@ -1,5 +1,5 @@
 #Requires -RunAsAdministrator
-# Vollautomatisches Setup: llama-cpp-turboquant (TheTom Fork) mit CUDA auf M:\kilocal
+# Vollautomatisches Setup: llama-cpp-turboquant (TheTom Fork) mit CUDA im aktuellen Script-Ordner
 # Ausfuehren als Admin:
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\setup_llamacpp_turboquant_cuda.ps1
@@ -8,7 +8,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
 # --- KONFIGURATION ---
-$INSTALL_DIR   = "M:\kilocal"
+$INSTALL_DIR   = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $PARALLEL_JOBS = 12
 $CUDA_VERSION  = "12.6"
 $CUDA_BASE     = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
