@@ -402,10 +402,82 @@ class _UpdateWorker(QObject):
 
     def __init__(self, repo_root: Path) -> None:
         super().__init__()
-        self._repo_root = repo_root
+        # Skript-Verzeichnis merken für verständliche Fehlermeldungen.
+        self._script_dir = repo_root
+        # Echten Git-Root suchen: vom Skript-Verzeichnis aus aufwärts, bis ein
+        # `.git`-Marker gefunden wird. Funktioniert auch, wenn qt_launcher.py
+        # in einem Unterordner liegt, und liefert saubere Fehler, falls das
+        # Projekt als ZIP (ohne .git) vorliegt.
+        self._repo_root = self._find_git_root(repo_root)
+        # Git-Executable plattformübergreifend auflösen. `shutil.which` reicht
+        # normalerweise; unter Windows suchen wir zusätzlich in den üblichen
+        # "Git for Windows"-Installationspfaden, weil pythonw-basierte Starter
+        # teilweise einen reduzierten PATH haben.
+        self._git_bin = shutil.which("git") or self._find_git_windows_fallback()
+
+    # Maximale Suchtiefe beim Aufwärtslaufen nach `.git`. qt_launcher.py liegt
+    # normalerweise direkt im Repo-Root; 5 Ebenen decken auch verschachtelte
+    # Layouts ab, verhindern aber, dass wir in völlig unrelated Eltern-Repos
+    # (z. B. ein ~/.git für Dotfile-Management) landen.
+    _GIT_ROOT_MAX_DEPTH = 5
+
+    @classmethod
+    def _find_git_root(cls, start: Path) -> Optional[Path]:
+        """Sucht aufwärts nach einem `.git`-Verzeichnis oder -File (Worktree).
+
+        Liefert None, wenn innerhalb von `_GIT_ROOT_MAX_DEPTH` Ebenen kein
+        Marker gefunden wurde.
+        """
+        try:
+            cur = start.resolve()
+        except (OSError, RuntimeError):
+            cur = start
+        for _ in range(cls._GIT_ROOT_MAX_DEPTH):
+            try:
+                if (cur / ".git").exists():
+                    return cur
+            except OSError:
+                pass
+            if cur.parent == cur:
+                return None
+            cur = cur.parent
+        return None
+
+    @staticmethod
+    def _find_git_windows_fallback() -> Optional[str]:
+        """Sucht Git for Windows in typischen Installationspfaden.
+
+        Wird nur gebraucht, wenn `git` nicht auf PATH ist (z. B. bei Start über
+        pythonw.exe mit reduziertem PATH). Auf Nicht-Windows liefert die
+        Funktion None.
+        """
+        if os.name != "nt":
+            return None
+        candidate_roots: List[Path] = []
+        for env_var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            val = os.environ.get(env_var)
+            if val:
+                candidate_roots.append(Path(val) / "Git")
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            candidate_roots.append(Path(local_appdata) / "Programs" / "Git")
+        for sub in ("cmd", "bin", "mingw64\\bin", "mingw32\\bin"):
+            for root in candidate_roots:
+                cand = root / sub / "git.exe"
+                try:
+                    if cand.is_file():
+                        return str(cand)
+                except OSError:
+                    continue
+        return None
 
     def _run_git(self, *args: str, check: bool = True, timeout: float = 180.0) -> str:
-        return self._run(["git", *args], check=check, timeout=timeout)
+        if not self._git_bin:
+            raise RuntimeError(
+                "Git executable not found. Please install Git "
+                "(https://git-scm.com) and restart AutoTuner."
+            )
+        return self._run([self._git_bin, *args], check=check, timeout=timeout)
 
     def _run(self, cmd: List[str], check: bool = True, timeout: float = 600.0) -> str:
         pretty = " ".join(cmd)
@@ -479,8 +551,25 @@ class _UpdateWorker(QObject):
         backups: Dict[Path, Optional[bytes]] = {}
         settings_restored = False
         try:
+            if not self._git_bin:
+                raise RuntimeError(
+                    "Git executable not found. Please install Git "
+                    "(https://git-scm.com) and restart AutoTuner."
+                )
+            if self._repo_root is None:
+                raise RuntimeError(
+                    "This AutoTuner folder is not a git checkout "
+                    f"(no .git found at or above:\n  {self._script_dir}).\n\n"
+                    "The update button needs a real `git clone`. Please clone the "
+                    "repository once with\n"
+                    "    git clone <repo-url>\n"
+                    "and run AutoTuner from that clone instead of a downloaded ZIP."
+                )
             if self._run_git("rev-parse", "--is-inside-work-tree").strip() != "true":
-                raise RuntimeError("This AutoTuner folder is not a git checkout.")
+                raise RuntimeError(
+                    f"`git rev-parse` reports {self._repo_root} is not inside a "
+                    "work tree. Refusing to continue."
+                )
 
             branch = self._run_git("rev-parse", "--abbrev-ref", "HEAD").strip()
             if branch == "HEAD":

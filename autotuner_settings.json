@@ -163,8 +163,8 @@
     }
   },
   "mode": "coding",
-  "window_geometry": "AdnQywADAAAAAAhlAAAE0gAADcgAAAmYAAAIcAAABQMAAA29AAAJjQAAAAAAAAAADXAAAAhwAAAFAwAADb0AAAmN",
-  "window_state": "AAAA/wAAAAD9AAAAAAAABU4AAARSAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
+  "window_geometry": "AdnQywADAAAAAALbAAAAcQAAB/4AAAU2AAAC2wAAAJAAAAf+AAAFNgAAAAAAAAAADXAAAALbAAAAkAAAB/4AAAU2",
+  "window_state": "AAAA/wAAAAD9AAAAAAAABSQAAARsAAAABAAAAAQAAAAIAAAACPwAAAABAAAAAgAAAAH/////AQAAAAD/////AAAAAAAAAAA=",
   "font_size": 11,
   "gpu_overrides": {
     "AMD Radeon AI PRO R9700": {
@@ -177,7 +177,7 @@
     }
   },
   "splitter_states": {
-    "top_split": "AAAA/wAAAAEAAAACAAACpgAAApwA/////wEAAAABAA==",
+    "top_split": "AAAA/wAAAAEAAAACAAACmAAAAoAA/////wEAAAABAA==",
     "main_split": "AAAA/wAAAAEAAAACAAADMAAAAAAA/////wEAAAACAA=="
   },
   "mmproj_selection": {
