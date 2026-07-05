@@ -1063,7 +1063,6 @@ class _BinaryUpdateWorker(QObject):
         ``.exe``; on Linux it is the ``AutoTuner-Linux`` / ``AutoTuner`` ELF.
         Extracts next to the running binary (same volume → atomic swap).
         """
-        target_suffix = ".exe" if os.name == "nt" else ""
         member_name: Optional[str] = None
         with zipfile.ZipFile(zip_path) as zf:
             for info in zf.infolist():
