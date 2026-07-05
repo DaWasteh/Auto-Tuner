@@ -1,5 +1,5 @@
 {
-  "models_path": "/run/media/dawasteh/OneDrive/models",
+  "models_path": "L:\\run\\media\\dawasteh\\OneDrive\\models",
   "fork_path": "/home/dawasteh/local_ai/b9873_ubuntu_llama.cpp",
   "performance_target": "throughput",
   "model_overrides": {
@@ -372,7 +372,11 @@
   "fork_container_path": "/home/dawasteh/local_ai",
   "model_paths": [
     {
-      "path": "/run/media/dawasteh/OneDrive/models",
+      "path": "L:\\run\\media\\dawasteh\\OneDrive\\models",
+      "enabled": true
+    },
+    {
+      "path": "I:\\models",
       "enabled": true
     }
   ]

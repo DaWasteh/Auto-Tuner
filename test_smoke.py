@@ -3491,4 +3491,71 @@ def test_forced_gpu_token_matches_both_os_name_styles(tmp_path) -> None:
         assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "0", (
             f"pin '9070' must select the 9070 XT (Vulkan0) for names={names}"
         )
-        
+
+
+# ---------------------------------------------------------------------------
+# GUI updater
+
+
+def test_update_worker_archive_overlay_preserves_settings(tmp_path, monkeypatch) -> None:
+    """Downloaded ZIP installs must update code without clobbering settings."""
+    import shutil
+    import zipfile
+
+    import qt_launcher
+
+    app = tmp_path / "Auto-Tuner-main"
+    app.mkdir()
+    (app / "autotuner_settings.json").write_text("USER", encoding="utf-8")
+    (app / "requirements.txt").write_text("old", encoding="utf-8")
+
+    source_root = tmp_path / "src" / "Auto-Tuner-main"
+    source_root.mkdir(parents=True)
+    (source_root / "qt_launcher.py").write_text("NEW", encoding="utf-8")
+    (source_root / "requirements.txt").write_text("new", encoding="utf-8")
+    (source_root / "autotuner_settings.json").write_text("REMOTE", encoding="utf-8")
+    (source_root / "settings").mkdir()
+    (source_root / "settings" / "profile.yaml").write_text("profile", encoding="utf-8")
+
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for path in source_root.rglob("*"):
+            zf.write(path, path.relative_to(tmp_path / "src"))
+
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: app / "autotuner_settings.json",
+    )
+    worker = qt_launcher._UpdateWorker(app)
+    # Force the release-ZIP path regardless of where pytest's tmpdir lives.
+    worker._repo_root = None
+    monkeypatch.setattr(
+        worker,
+        "_github_archive_info",
+        lambda: ("main", "abcdef1234567890", "local"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_download_file",
+        lambda _url, dest: shutil.copy2(archive, dest),
+    )
+    pip_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_run",
+        lambda cmd, check=True, timeout=600.0, cwd=None: pip_calls.append((cmd, cwd))
+        or "",
+    )
+
+    finished = []
+    worker.finished.connect(lambda ok, msg: finished.append((ok, msg)))
+    worker.run()
+
+    assert finished and finished[0][0]
+    assert "GitHub archive" in finished[0][1]
+    assert (app / "qt_launcher.py").read_text(encoding="utf-8") == "NEW"
+    assert (app / "settings" / "profile.yaml").read_text(encoding="utf-8") == "profile"
+    assert (app / "autotuner_settings.json").read_text(encoding="utf-8") == "USER"
+    assert (app / ".autotuner_update.json").exists()
+    assert pip_calls, "requirements.txt change should reinstall dependencies"

@@ -12,14 +12,20 @@ from __future__ import annotations
 
 import base64
 import copy
+import json
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
-from datetime import datetime
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, cast, Tuple
 
@@ -392,27 +398,57 @@ class _ScanWorker(QObject):
 
 
 class _UpdateWorker(QObject):
-    """Fetch and fast-forward the current git checkout without losing settings."""
+    """Update a git checkout or a downloaded GitHub ZIP without losing settings."""
 
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
     _SETTINGS_NAME = "autotuner_settings.json"
     _SETTINGS_BACKUP_NAME = "autotuner_settings.json.update-backup"
+    _UPDATE_STATE_NAME = ".autotuner_update.json"
+    _GITHUB_REPO = "DaWasteh/Auto-Tuner"
+    _GITHUB_BRANCH = "main"
+    _ARCHIVE_SKIP_DIRS = {
+        ".git",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        ".venv_linux",
+        "venv",
+        "env",
+        "ENV",
+    }
+    _ARCHIVE_SKIP_FILES = {
+        _SETTINGS_NAME,
+        _SETTINGS_BACKUP_NAME,
+        _UPDATE_STATE_NAME,
+    }
 
     def __init__(self, repo_root: Path) -> None:
         super().__init__()
         # Skript-Verzeichnis merken für verständliche Fehlermeldungen.
-        self._script_dir = repo_root
+        try:
+            self._script_dir = repo_root.resolve()
+        except (OSError, RuntimeError):
+            self._script_dir = repo_root
         # Echten Git-Root suchen: vom Skript-Verzeichnis aus aufwärts, bis ein
         # `.git`-Marker gefunden wird. Funktioniert auch, wenn qt_launcher.py
-        # in einem Unterordner liegt, und liefert saubere Fehler, falls das
-        # Projekt als ZIP (ohne .git) vorliegt.
-        self._repo_root = self._find_git_root(repo_root)
+        # in einem Unterordner liegt. Wenn kein Marker existiert, behandeln wir
+        # den Ordner als GitHub-Archiv/Release-ZIP und aktualisieren per
+        # heruntergeladenem Source-ZIP statt per git pull.
+        self._repo_root = self._find_git_root(self._script_dir)
+        # App files/settings live next to qt_launcher.py. Git commands still run
+        # from _repo_root, but archive updates must never target an unrelated
+        # parent repo that happens to contain a .git directory.
+        self._app_root = self._script_dir
         # Git-Executable plattformübergreifend auflösen. `shutil.which` reicht
         # normalerweise; unter Windows suchen wir zusätzlich in den üblichen
         # "Git for Windows"-Installationspfaden, weil pythonw-basierte Starter
-        # teilweise einen reduzierten PATH haben.
+        # teilweise einen reduzierten PATH haben. Für ZIP-Installationen ist Git
+        # nicht nötig.
         self._git_bin = shutil.which("git") or self._find_git_windows_fallback()
 
     # Maximale Suchtiefe beim Aufwärtslaufen nach `.git`. qt_launcher.py liegt
@@ -472,14 +508,27 @@ class _UpdateWorker(QObject):
         return None
 
     def _run_git(self, *args: str, check: bool = True, timeout: float = 180.0) -> str:
+        if self._repo_root is None:
+            raise RuntimeError("Git update requested, but this folder has no .git metadata.")
         if not self._git_bin:
             raise RuntimeError(
                 "Git executable not found. Please install Git "
                 "(https://git-scm.com) and restart AutoTuner."
             )
-        return self._run([self._git_bin, *args], check=check, timeout=timeout)
+        return self._run(
+            [self._git_bin, *args],
+            check=check,
+            timeout=timeout,
+            cwd=self._repo_root,
+        )
 
-    def _run(self, cmd: List[str], check: bool = True, timeout: float = 600.0) -> str:
+    def _run(
+        self,
+        cmd: List[str],
+        check: bool = True,
+        timeout: float = 600.0,
+        cwd: Optional[Path] = None,
+    ) -> str:
         pretty = " ".join(cmd)
         self.progress.emit(f"[Update] $ {pretty}")
         kwargs: dict = {}
@@ -487,7 +536,7 @@ class _UpdateWorker(QObject):
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         cp = subprocess.run(
             cmd,
-            cwd=self._repo_root,
+            cwd=cwd or self._repo_root or self._app_root,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -513,8 +562,23 @@ class _UpdateWorker(QObject):
             p = p.split(" -> ", 1)[1]
         return p.strip().strip('"')
 
+    def _launcher_is_tracked_by_git(self) -> bool:
+        if self._repo_root is None:
+            return False
+        try:
+            launcher_rel = (
+                (self._script_dir / "qt_launcher.py")
+                .resolve()
+                .relative_to(self._repo_root.resolve())
+                .as_posix()
+            )
+        except (OSError, RuntimeError, ValueError):
+            return False
+        tracked = self._run_git("ls-files", "--", launcher_rel, check=False)
+        return any(line.strip().replace("\\", "/") == launcher_rel for line in tracked.splitlines())
+
     def _backup_settings(self) -> Dict[Path, Optional[bytes]]:
-        paths = {self._repo_root / self._SETTINGS_NAME}
+        paths = {self._app_root / self._SETTINGS_NAME}
         try:
             paths.add(app_settings._settings_file())  # portable path or home fallback
         except Exception:
@@ -524,11 +588,11 @@ class _UpdateWorker(QObject):
             try:
                 data = p.read_bytes() if p.exists() else None
                 backups[p] = data
-                if p == self._repo_root / self._SETTINGS_NAME and data is not None:
+                if p == self._app_root / self._SETTINGS_NAME and data is not None:
                     # Crash-safe belt-and-braces backup: the in-memory copy is
                     # enough for normal operation, but this file lets a user
                     # recover settings even if the app/PC dies mid-update.
-                    (self._repo_root / self._SETTINGS_BACKUP_NAME).write_bytes(data)
+                    (self._app_root / self._SETTINGS_BACKUP_NAME).write_bytes(data)
             except OSError:
                 backups[p] = None
         return backups
@@ -543,33 +607,223 @@ class _UpdateWorker(QObject):
             except OSError as exc:
                 self.progress.emit(f"[Update] Warning: could not restore {p}: {exc}")
         try:
-            (self._repo_root / self._SETTINGS_BACKUP_NAME).unlink(missing_ok=True)
+            (self._app_root / self._SETTINGS_BACKUP_NAME).unlink(missing_ok=True)
         except OSError:
             pass
+
+    @staticmethod
+    def _read_bytes(path: Path) -> Optional[bytes]:
+        try:
+            return path.read_bytes() if path.exists() else None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _is_relative_to(path: Path, parent: Path) -> bool:
+        try:
+            path.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    def _github_request(self, url: str) -> urllib.request.Request:
+        headers = {
+            "Accept": "application/vnd.github+json"
+            if "api.github.com" in url
+            else "application/octet-stream",
+            "User-Agent": "AutoTuner-updater",
+        }
+        if "api.github.com" in url:
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+        return urllib.request.Request(url, headers=headers)
+
+    def _fetch_json(self, url: str, timeout: float = 30.0) -> Dict[str, object]:
+        with urllib.request.urlopen(self._github_request(url), timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            data = resp.read().decode(charset, errors="replace")
+        parsed = json.loads(data)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"GitHub returned unexpected JSON for {url}")
+        return parsed
+
+    def _github_archive_info(self) -> Tuple[str, Optional[str], str]:
+        branch = self._GITHUB_BRANCH
+        sha: Optional[str] = None
+        api_root = f"https://api.github.com/repos/{self._GITHUB_REPO}"
+
+        try:
+            repo_info = self._fetch_json(api_root)
+            default_branch = repo_info.get("default_branch")
+            if isinstance(default_branch, str) and default_branch:
+                branch = default_branch
+        except Exception as exc:
+            self.progress.emit(
+                f"[Update] Warning: could not query GitHub default branch: {exc}"
+            )
+
+        try:
+            branch_info = self._fetch_json(
+                f"{api_root}/branches/{urllib.parse.quote(branch, safe='')}"
+            )
+            commit = branch_info.get("commit")
+            if isinstance(commit, dict):
+                commit_sha = commit.get("sha")
+                if isinstance(commit_sha, str) and commit_sha:
+                    sha = commit_sha
+        except Exception as exc:
+            self.progress.emit(
+                f"[Update] Warning: could not query GitHub branch SHA: {exc}"
+            )
+
+        archive_url = (
+            f"https://github.com/{self._GITHUB_REPO}/archive/refs/heads/"
+            f"{urllib.parse.quote(branch, safe='')}.zip"
+        )
+        return branch, sha, archive_url
+
+    def _read_update_state(self) -> Dict[str, str]:
+        state_path = self._app_root / self._UPDATE_STATE_NAME
+        try:
+            parsed = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {str(k): str(v) for k, v in parsed.items() if isinstance(v, str)}
+
+    def _write_update_state(self, branch: str, sha: Optional[str]) -> None:
+        state: Dict[str, str] = {
+            "repo": self._GITHUB_REPO,
+            "branch": branch,
+            "installed_at_utc": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        }
+        if sha:
+            state["sha"] = sha
+        try:
+            (self._app_root / self._UPDATE_STATE_NAME).write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self.progress.emit(f"[Update] Warning: could not write update state: {exc}")
+
+    def _download_file(self, url: str, destination: Path) -> None:
+        self.progress.emit(f"[Update] Downloading {url}")
+        try:
+            with urllib.request.urlopen(self._github_request(url), timeout=300.0) as resp:
+                with destination.open("wb") as fh:
+                    shutil.copyfileobj(resp, fh)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not download update archive: {exc}") from exc
+
+    def _safe_extract_zip(self, zip_path: Path, extract_dir: Path) -> Path:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        base = extract_dir.resolve()
+        with zipfile.ZipFile(zip_path) as zf:
+            for member in zf.infolist():
+                target = (extract_dir / member.filename).resolve()
+                if not self._is_relative_to(target, base):
+                    raise RuntimeError(f"Unsafe path in update ZIP: {member.filename}")
+            zf.extractall(extract_dir)
+
+        children = [p for p in extract_dir.iterdir() if p.name != "__MACOSX"]
+        if len(children) == 1 and children[0].is_dir():
+            return children[0]
+        return extract_dir
+
+    def _copy_archive_tree(self, source_root: Path) -> int:
+        copied = 0
+        for src in source_root.rglob("*"):
+            rel = src.relative_to(source_root)
+            if any(part in self._ARCHIVE_SKIP_DIRS for part in rel.parts):
+                continue
+            if rel.as_posix() in self._ARCHIVE_SKIP_FILES or rel.name in self._ARCHIVE_SKIP_FILES:
+                continue
+
+            dst = self._app_root / rel
+            if src.is_dir():
+                dst.mkdir(parents=True, exist_ok=True)
+                continue
+            if not src.is_file():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+        return copied
+
+    def _run_archive_update(self, backups: Dict[Path, Optional[bytes]]) -> bool:
+        self.progress.emit(
+            "[Update] No usable AutoTuner git checkout found; using GitHub "
+            "source archive updater."
+        )
+        branch, sha, archive_url = self._github_archive_info()
+        state = self._read_update_state()
+        if sha and state.get("repo") == self._GITHUB_REPO and state.get("sha") == sha:
+            self._restore_settings(backups)
+            self.finished.emit(True, "AutoTuner is already up to date.")
+            return True
+
+        old_requirements = self._read_bytes(self._app_root / "requirements.txt")
+        with tempfile.TemporaryDirectory(prefix="autotuner-update-") as td:
+            tmp = Path(td)
+            zip_path = tmp / "autotuner-source.zip"
+            extract_dir = tmp / "extract"
+            self._download_file(archive_url, zip_path)
+            source_root = self._safe_extract_zip(zip_path, extract_dir)
+            copied = self._copy_archive_tree(source_root)
+            self.progress.emit(f"[Update] Copied {copied} file(s) from GitHub archive.")
+
+        # Restore before installing dependencies so the GUI can keep using the
+        # user's current settings even if pip takes a while.
+        self._restore_settings(backups)
+        new_requirements = self._read_bytes(self._app_root / "requirements.txt")
+        if new_requirements is not None and new_requirements != old_requirements:
+            self.progress.emit(
+                "[Update] requirements.txt changed; installing dependencies …"
+            )
+            self._run(
+                [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+                timeout=900.0,
+                cwd=self._app_root,
+            )
+
+        self._write_update_state(branch, sha)
+        short = sha[:8] if sha else branch
+        self.finished.emit(
+            True,
+            f"Update installed from GitHub archive ({short}). Local settings were "
+            "restored. Please restart AutoTuner.",
+        )
+        return True
 
     def run(self) -> None:
         backups: Dict[Path, Optional[bytes]] = {}
         settings_restored = False
         try:
+            if self._repo_root is None:
+                backups = self._backup_settings()
+                settings_restored = self._run_archive_update(backups)
+                return
             if not self._git_bin:
                 raise RuntimeError(
                     "Git executable not found. Please install Git "
                     "(https://git-scm.com) and restart AutoTuner."
-                )
-            if self._repo_root is None:
-                raise RuntimeError(
-                    "This AutoTuner folder is not a git checkout "
-                    f"(no .git found at or above:\n  {self._script_dir}).\n\n"
-                    "The update button needs a real `git clone`. Please clone the "
-                    "repository once with\n"
-                    "    git clone <repo-url>\n"
-                    "and run AutoTuner from that clone instead of a downloaded ZIP."
                 )
             if self._run_git("rev-parse", "--is-inside-work-tree").strip() != "true":
                 raise RuntimeError(
                     f"`git rev-parse` reports {self._repo_root} is not inside a "
                     "work tree. Refusing to continue."
                 )
+            if not self._launcher_is_tracked_by_git():
+                self.progress.emit(
+                    "[Update] Found a parent .git directory, but this AutoTuner "
+                    "folder is not tracked by it; using GitHub source archive updater."
+                )
+                backups = self._backup_settings()
+                settings_restored = self._run_archive_update(backups)
+                return
 
             branch = self._run_git("rev-parse", "--abbrev-ref", "HEAD").strip()
             if branch == "HEAD":
@@ -2003,8 +2257,8 @@ class MainWindow(QMainWindow):
             elif "Update" in label:
                 self._btn_update = btn
                 btn.setToolTip(
-                    "Check GitHub for AutoTuner updates, install them, and\n"
-                    "restore autotuner_settings.json afterwards."
+                    "Check GitHub for AutoTuner updates, install them via git\n"
+                    "or source ZIP, and restore autotuner_settings.json afterwards."
                 )
             tb.addWidget(btn)
 
@@ -3370,7 +3624,9 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "AutoTuner update",
-            "GitHub nach Updates prüfen und diese per git pull installieren?\n\n"
+            "GitHub nach Updates prüfen und installieren?\n\n"
+            "Bei Git-Klonen nutzt AutoTuner git pull --ff-only; bei heruntergeladenen "
+            "ZIP/Release-Ordnern wird das aktuelle GitHub-Source-ZIP eingespielt.\n\n"
             "autotuner_settings.json wird vorher gesichert und danach wiederhergestellt.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )

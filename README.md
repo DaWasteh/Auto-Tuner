@@ -265,9 +265,11 @@ You also need a working `llama-server` binary. The tuner automatically discovers
 ## Update (GUI-Button oder Terminal)
 
 In der Qt-GUI gibt es oben in der Toolbar den Button **⬆ Update**. Er
-prüft `origin`/GitHub auf neue AutoTuner-Versionen, installiert sie per
-`git pull --ff-only` und führt bei geänderter `requirements.txt` automatisch
-`pip install -r requirements.txt` aus. Vor dem Pull wird
+prüft GitHub auf neue AutoTuner-Versionen. In einem echten `git clone` nutzt
+er `git pull --ff-only`; in einem heruntergeladenen ZIP/Release-Ordner ohne
+`.git` lädt er automatisch das aktuelle GitHub-Source-ZIP herunter und spielt
+es über die bestehende Installation. Bei geänderter `requirements.txt` führt
+er automatisch `pip install -r requirements.txt` aus. Vor dem Update wird
 `autotuner_settings.json` gesichert und danach wiederhergestellt — deine
 lokalen Pfade, Ports, Overrides und UI-Einstellungen werden also nicht
 überschrieben (auch bei älteren Klonen, in denen die Datei noch versehentlich

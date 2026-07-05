@@ -67,4 +67,5 @@ BitNet/
 .env.local
 *.local
 autotuner_settings.json
+.autotuner_update.json
 llama.log
