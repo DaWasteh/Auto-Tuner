@@ -21,7 +21,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, cast, Tuple
+from typing import Dict, List, Optional, cast, Tuple
 
 from PyQt6.QtCore import Qt, QByteArray, QObject, QThread, QTimer, pyqtSignal, QSize
 from PyQt6.QtGui import QCloseEvent, QFont
@@ -230,6 +230,203 @@ class _ScanWorker(QObject):
             self.finished.emit(scan_models(self._root))
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# GitHub update worker
+
+
+class _UpdateWorker(QObject):
+    """Fetch and fast-forward the current git checkout without losing settings."""
+
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    _SETTINGS_NAME = "autotuner_settings.json"
+    _SETTINGS_BACKUP_NAME = "autotuner_settings.json.update-backup"
+
+    def __init__(self, repo_root: Path) -> None:
+        super().__init__()
+        self._repo_root = repo_root
+
+    def _run_git(self, *args: str, check: bool = True, timeout: float = 180.0) -> str:
+        return self._run(["git", *args], check=check, timeout=timeout)
+
+    def _run(self, cmd: List[str], check: bool = True, timeout: float = 600.0) -> str:
+        pretty = " ".join(cmd)
+        self.progress.emit(f"[Update] $ {pretty}")
+        kwargs: dict = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        cp = subprocess.run(
+            cmd,
+            cwd=self._repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            **kwargs,
+        )
+        out = (cp.stdout or "").strip()
+        if out:
+            if len(out) > 4000:
+                out = out[-4000:]
+            for line in out.splitlines():
+                self.progress.emit(f"[Update] {line}")
+        if check and cp.returncode != 0:
+            raise RuntimeError(f"Command failed ({cp.returncode}): {pretty}\n{out}")
+        return out
+
+    @staticmethod
+    def _status_path(line: str) -> str:
+        # Porcelain v1: two status columns, a space, then the path. Renames are
+        # shown as "old -> new"; the destination is what matters for safety.
+        p = line[3:] if len(line) > 3 else ""
+        if " -> " in p:
+            p = p.split(" -> ", 1)[1]
+        return p.strip().strip('"')
+
+    def _backup_settings(self) -> Dict[Path, Optional[bytes]]:
+        paths = {self._repo_root / self._SETTINGS_NAME}
+        try:
+            paths.add(app_settings._settings_file())  # portable path or home fallback
+        except Exception:
+            pass
+        backups: Dict[Path, Optional[bytes]] = {}
+        for p in paths:
+            try:
+                data = p.read_bytes() if p.exists() else None
+                backups[p] = data
+                if p == self._repo_root / self._SETTINGS_NAME and data is not None:
+                    # Crash-safe belt-and-braces backup: the in-memory copy is
+                    # enough for normal operation, but this file lets a user
+                    # recover settings even if the app/PC dies mid-update.
+                    (self._repo_root / self._SETTINGS_BACKUP_NAME).write_bytes(data)
+            except OSError:
+                backups[p] = None
+        return backups
+
+    def _restore_settings(self, backups: Dict[Path, Optional[bytes]]) -> None:
+        for p, data in backups.items():
+            try:
+                if data is None:
+                    continue
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+            except OSError as exc:
+                self.progress.emit(f"[Update] Warning: could not restore {p}: {exc}")
+        try:
+            (self._repo_root / self._SETTINGS_BACKUP_NAME).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def run(self) -> None:
+        backups: Dict[Path, Optional[bytes]] = {}
+        settings_restored = False
+        try:
+            if self._run_git("rev-parse", "--is-inside-work-tree").strip() != "true":
+                raise RuntimeError("This AutoTuner folder is not a git checkout.")
+
+            branch = self._run_git("rev-parse", "--abbrev-ref", "HEAD").strip()
+            if branch == "HEAD":
+                raise RuntimeError("Detached HEAD: automatic update is not supported.")
+
+            upstream = self._run_git(
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{u}",
+                check=False,
+            ).strip()
+            if not upstream:
+                upstream = f"origin/{branch}"
+
+            dirty = self._run_git(
+                "status", "--porcelain", "--untracked-files=no", check=False
+            )
+            dirty_lines = [ln for ln in dirty.splitlines() if ln.strip()]
+            unsafe_dirty = [
+                ln
+                for ln in dirty_lines
+                if self._status_path(ln).replace("\\", "/") != self._SETTINGS_NAME
+            ]
+            if unsafe_dirty:
+                raise RuntimeError(
+                    "Local code changes would make the update unsafe. "
+                    "Commit/stash them first:\n" + "\n".join(unsafe_dirty[:12])
+                )
+
+            backups = self._backup_settings()
+
+            # Older clones accidentally still track autotuner_settings.json.
+            # To make a fast-forward possible, temporarily restore the tracked
+            # copy, then write the user's exact bytes back in finally.
+            settings_dirty = any(
+                self._status_path(ln).replace("\\", "/") == self._SETTINGS_NAME
+                for ln in dirty_lines
+            )
+            tracked_settings = bool(
+                self._run_git(
+                    "ls-files", "--error-unmatch", self._SETTINGS_NAME, check=False
+                ).strip()
+            )
+            if settings_dirty and tracked_settings:
+                self.progress.emit(
+                    "[Update] Backing up local settings before git fast-forward …"
+                )
+                self._run_git("checkout", "--", self._SETTINGS_NAME)
+
+            self._run_git("fetch", "--prune", "origin", timeout=300.0)
+            counts = self._run_git(
+                "rev-list", "--left-right", "--count", f"HEAD...{upstream}"
+            ).split()
+            ahead = int(counts[0]) if counts else 0
+            behind = int(counts[1]) if len(counts) > 1 else 0
+            if behind == 0:
+                if backups:
+                    self._restore_settings(backups)
+                    settings_restored = True
+                self.finished.emit(True, "AutoTuner is already up to date.")
+                return
+            if ahead:
+                raise RuntimeError(
+                    f"Local branch has {ahead} commit(s) not on {upstream}; "
+                    "refusing to auto-merge."
+                )
+
+            old_head = self._run_git("rev-parse", "HEAD").strip()
+            self._run_git("pull", "--ff-only", timeout=300.0)
+            new_head = self._run_git("rev-parse", "HEAD").strip()
+            changed = self._run_git(
+                "diff", "--name-only", f"{old_head}..{new_head}", check=False
+            ).splitlines()
+
+            # Restore before installing dependencies so the GUI can keep using
+            # the user's current settings even if pip takes a while.
+            self._restore_settings(backups)
+            settings_restored = True
+
+            if "requirements.txt" in changed and (
+                self._repo_root / "requirements.txt"
+            ).exists():
+                self.progress.emit(
+                    "[Update] requirements.txt changed; installing dependencies …"
+                )
+                self._run(
+                    [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+                    timeout=900.0,
+                )
+
+            short = new_head[:8]
+            self.finished.emit(
+                True,
+                f"Update installed ({short}). Local settings were restored. "
+                "Please restart AutoTuner.",
+            )
+        except Exception as exc:
+            if backups and not settings_restored:
+                self._restore_settings(backups)
+            self.finished.emit(False, str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1512,6 +1709,8 @@ class MainWindow(QMainWindow):
 
         self._scan_thread: Optional[QThread] = None
         self._scan_worker: Optional[_ScanWorker] = None
+        self._update_thread: Optional[QThread] = None
+        self._update_worker: Optional[_UpdateWorker] = None
         self._sysinfo_busy = False
         # Persisted font size — falls back to 10pt on first launch.
         self._font_size = app_settings.get_font_size()
@@ -1551,11 +1750,18 @@ class MainWindow(QMainWindow):
         for label, slot in (
             ("📂 Models folder", self._browse_models),
             ("🔄 Refresh", self._start_scan),
+            ("⬆ Update", self._start_update),
         ):
             btn = QPushButton(label)
             btn.clicked.connect(slot)
             if label.startswith("🔄"):
                 self._btn_refresh = btn
+            elif "Update" in label:
+                self._btn_update = btn
+                btn.setToolTip(
+                    "Check GitHub for AutoTuner updates, install them, and\n"
+                    "restore autotuner_settings.json afterwards."
+                )
             tb.addWidget(btn)
 
         tb.addSeparator()
@@ -1785,8 +1991,9 @@ class MainWindow(QMainWindow):
         self._cb_draft = QComboBox()
         self._cb_draft.setToolTip(
             "Draft model for speculative decoding. Lists every draft/assistant\n"
-            "GGUF in the model's folder; '⚠' marks ones that don't match this\n"
-            "model (selectable anyway for experimenting). Remembered per model."
+            "GGUF in the model's folder, including EAGLE-3 and DFlash heads;\n"
+            "'⚠' marks ones that don't match this model (selectable anyway for\n"
+            "experimenting). Remembered per model."
         )
         self._cb_draft.currentIndexChanged.connect(self._on_draft_combo_changed)
         _draft_l.addWidget(self._cb_draft, 1)
@@ -2737,6 +2944,53 @@ class MainWindow(QMainWindow):
         self._log(f"[Error] Scan failed: {msg}")
         self._status.showMessage(f"Scan error: {msg}")
 
+    # ------------------------------------------------------------------
+    # GitHub updater
+    # ------------------------------------------------------------------
+    def _start_update(self) -> None:
+        try:
+            if self._update_thread is not None and self._update_thread.isRunning():
+                return
+        except RuntimeError:
+            self._update_thread = None
+
+        reply = QMessageBox.question(
+            self,
+            "AutoTuner update",
+            "GitHub nach Updates prüfen und diese per git pull installieren?\n\n"
+            "autotuner_settings.json wird vorher gesichert und danach wiederhergestellt.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._btn_update.setEnabled(False)
+        self._status.showMessage("Checking GitHub for AutoTuner updates …")
+        self._log("[Update] Checking GitHub for AutoTuner updates …")
+
+        worker = _UpdateWorker(Path(__file__).resolve().parent)
+        thread = QThread(self)
+        self._update_worker = worker
+        self._update_thread = thread
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._log)
+        worker.finished.connect(self._on_update_done)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_update_done(self, ok: bool, msg: str) -> None:
+        self._btn_update.setEnabled(True)
+        if ok:
+            self._status.showMessage(msg)
+            self._log(f"[Update] {msg}")
+            QMessageBox.information(self, "AutoTuner update", msg)
+        else:
+            self._status.showMessage("Update failed.")
+            self._log(f"[Update] ERROR: {msg}")
+            QMessageBox.warning(self, "AutoTuner update failed", msg)
+
     def _populate_list(self, entries: List[ModelEntry]) -> None:
         self._model_list.clear()
         groups = group_entries(entries)
@@ -3022,7 +3276,8 @@ class MainWindow(QMainWindow):
         Mirrors :meth:`_populate_mmproj_combo`. Lists a leading
         "— no draft —" entry, an "MTP (embedded in GGUF)" entry when the model
         carries an embedded MTP head, then every draft GGUF in the folder
-        (incompatible ones flagged with '⚠'). Resolves and applies the
+        (DFlash/EAGLE-3/MTP heads labelled explicitly; incompatible ones
+        flagged with '⚠'). Resolves and applies the
         per-model selection onto ``self._current_draft`` (a draft ModelEntry
         with metadata, or None). The remembered choice wins; otherwise the
         scanner's auto pick (``entry.draft``) is preselected, falling back to
@@ -3050,7 +3305,15 @@ class MainWindow(QMainWindow):
         for c in folder:
             md = read_gguf_metadata(c)
             compatible = is_draft_compatible(entry.path, c, md)
-            label = f"{c.name}   ({c.stat().st_size / (1024**3):.1f} GB)"
+            arch = str(md.get("general.architecture", "") or "").lower().strip()
+            kind = ""
+            if arch == "dflash":
+                kind = "  [DFlash]"
+            elif arch == "eagle3":
+                kind = "  [EAGLE-3]"
+            elif arch.endswith("-assistant") or arch.endswith("_assistant"):
+                kind = "  [MTP]"
+            label = f"{c.name}{kind}   ({c.stat().st_size / (1024**3):.1f} GB)"
             if auto is not None and c == auto:
                 label += "  (auto)"
             if not compatible:
@@ -4762,6 +5025,14 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
         self._scan_thread = None
+
+        try:
+            if self._update_thread is not None and self._update_thread.isRunning():
+                self._update_thread.quit()
+                self._update_thread.wait(3000)
+        except RuntimeError:
+            pass
+        self._update_thread = None
 
         # Clean up the initial hardware-detection thread.  If it is still
         # running (slow WMI / PowerShell on new RDNA5 hardware) we ask it to

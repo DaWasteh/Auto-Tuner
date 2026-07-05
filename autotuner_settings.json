@@ -1,6 +1,6 @@
 {
-  "models_path": "I:\\models",
-  "fork_path": "L:\\LAB\\ai-local\\b9867_llama.cpp",
+  "models_path": "/run/media/dawasteh/OneDrive/models",
+  "fork_path": "/home/dawasteh/local_ai/b9873_ubuntu_llama.cpp",
   "performance_target": "throughput",
   "model_overrides": {
     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q6_K": {
@@ -67,7 +67,7 @@
       "draft": true
     },
     "gemma-4-31B-it-UD-Q6_K_XL": {
-      "draft": false,
+      "draft": true,
       "vision": false
     },
     "qwen3.6-35b-a3b-mxfp4_moe": {
@@ -208,7 +208,7 @@
     "gemma-4-12b-it-BF16": "<none>",
     "Qwen3.6-35B-A3B-UD-Q6_K": "<none>",
     "gemma-4-26B-A4B-it-UD-Q8_K_XL": "<none>",
-    "gemma-4-31B-it-UD-Q6_K_XL": "<none>"
+    "gemma-4-31B-it-UD-Q6_K_XL": "gemma-4-31B-it-assistant.Q8_0.gguf"
   },
   "base_port": 1234,
   "port_offset": 0,

@@ -262,12 +262,22 @@ pip install -r requirements.txt
 
 You also need a working `llama-server` binary. The tuner automatically discovers binaries in common local setups (like `C:\LAB\ai-local\`), or you can specify one via `--server`.
 
-## Update (über das Terminal)
+## Update (GUI-Button oder Terminal)
 
-Wenn du AutoTuner per `git clone` installiert hast, holst du neue
-Versionen ganz einfach über das Terminal. Deine persönlichen
-Einstellungen bleiben dabei erhalten — `autotuner_settings.json` steht
-in der `.gitignore` und wird von `git pull` niemals angefasst.
+In der Qt-GUI gibt es oben in der Toolbar den Button **⬆ Update**. Er
+prüft `origin`/GitHub auf neue AutoTuner-Versionen, installiert sie per
+`git pull --ff-only` und führt bei geänderter `requirements.txt` automatisch
+`pip install -r requirements.txt` aus. Vor dem Pull wird
+`autotuner_settings.json` gesichert und danach wiederhergestellt — deine
+lokalen Pfade, Ports, Overrides und UI-Einstellungen werden also nicht
+überschrieben (auch bei älteren Klonen, in denen die Datei noch versehentlich
+von Git getrackt wird). Nach einem erfolgreichen Update AutoTuner neu starten.
+
+Danke für die Update-Button-Idee an [nextscript](https://github.com/nextscript).
+
+Wenn du AutoTuner per `git clone` installiert hast, kannst du neue Versionen
+weiterhin über das Terminal holen. Deine persönlichen Einstellungen bleiben
+auch dabei erhalten, solange `autotuner_settings.json` lokal ignoriert ist.
 
 **1. In den App-Ordner wechseln** (dorthin, wo du geklont hast):
 
@@ -291,8 +301,10 @@ git stash drop       # beiseite gelegte Änderungen verwerfen
 # oder: git stash pop  → Änderungen wiederherstellen (evtl. Konflikte lösen)
 ```
 
-> ⚠️ `git stash` berührt **nicht** `autotuner_settings.json` (gitignored) —
-> deine Pfade, Port-Einstellungen, Overrides usw. sind in jedem Fall sicher.
+> ⚠️ In aktuellen Klonen ist `autotuner_settings.json` gitignored; `git stash`
+> berührt sie dann nicht. Wenn dein alter Klon die Datei noch als geändert
+> anzeigt, nutze bevorzugt den **⬆ Update**-Button — er sichert und restored
+> die Datei explizit.
 
 **3. Abhängigkeiten aktualisieren** (nur nötig, wenn sich `requirements.txt`
 geändert hat — schadet aber nie):
@@ -826,8 +838,11 @@ Changes this round are AutoTuner-side additions and fork-build fixes:
   auto-paired like any draft; `scanner.py` reclassifies an `eagle3`-arch GGUF
   into the draft pool (never listed as a choosable model).
 - **DFlash speculative decoding (PR #22105).** `--spec-type draft-dflash` is
-  emitted when the paired drafter declares `general.architecture = dflash`
-  (block-diffusion; emits a whole block per step).
+  emitted automatically when the paired drafter declares
+  `general.architecture = dflash` (block-diffusion; emits a whole block per
+  step). If auto-pairing misses a custom filename, pick the DFlash GGUF in
+  the GUI's **draft** dropdown; it is labelled `[DFlash]` and remembered per
+  model.
 - **Fork discovery hardened.** Versioned fork dirs (`2b_b8840_llama.cpp`,
   `tq_b9632_llama.cpp`, …) now resolve correctly — a profile hint like
   `2b_llama/llama-server` matches the on-disk `2b_b8840_llama.cpp` after
