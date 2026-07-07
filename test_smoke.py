@@ -257,6 +257,68 @@ def test_huge_model_falls_back_to_partial_or_cpu(tmp_path) -> None:
     assert cfg.ctx >= 2048  # always at least the floor
 
 
+def _mistral_dense_md(tmp_path, size_gb):
+    """A realistic dense hybrid model (Mistral-Medium: 88 layers, GQA-8)."""
+    return _fake_model_md(
+        tmp_path,
+        "Mistral-Medium-3.5-128B-UD-Q3_K_XL",
+        size_gb,
+        {
+            "general.architecture": "mistral3",
+            "mistral3.block_count": 88,
+            "mistral3.context_length": 262144,
+            "mistral3.embedding_length": 12288,
+            "mistral3.attention.head_count": 96,
+            "mistral3.attention.head_count_kv": 8,
+        },
+    )
+
+
+def test_dense_too_big_tier_context_is_monotonic(tmp_path) -> None:
+    """A dense model larger than VRAM must give MORE context on safe than on
+    balanced than on throughput. Before the fix the dense path packed weights
+    until VRAM was full (no KV reservation) and divided context by n_parallel,
+    so 'safe' paradoxically produced the SMALLEST context."""
+    from performance_target import get_target
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _mistral_dense_md(tmp_path, size_gb=57.0)
+    profile = match_profile(model.name, profiles)
+    # 48 GB VRAM (16+32), 45 GB RAM — the reporter's system.
+    sys_info = _fake_system(
+        ram_total=45.2, ram_free=38.0, vram_total=47.8, vram_free=46.2
+    )
+
+    ctxs = {}
+    for tier in ("safe", "balanced", "throughput"):
+        cfg = compute_config(
+            model, sys_info, profile, perf_target=get_target(tier)
+        )
+        ctxs[tier] = cfg.ctx
+        assert cfg.n_parallel == 1, f"{tier} should default to 1 slot"
+
+    assert ctxs["safe"] > ctxs["balanced"] > ctxs["throughput"], ctxs
+    # All three must clear the old broken 3k/12k and actually use the RAM.
+    assert ctxs["throughput"] >= 16384, ctxs
+
+
+def test_dense_that_fits_vram_keeps_full_offload(tmp_path) -> None:
+    """A dense model that FITS in VRAM must not have weights spilled to CPU by
+    the KV reservation — it stays full-offload and draws KV from leftover VRAM
+    (the reservation only trades weights for KV when the model is too big)."""
+    from performance_target import get_target
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _mistral_dense_md(tmp_path, size_gb=20.0)  # fits in 48 GB
+    profile = match_profile(model.name, profiles)
+    sys_info = _fake_system(
+        ram_total=45.2, ram_free=38.0, vram_total=47.8, vram_free=46.2
+    )
+    cfg = compute_config(model, sys_info, profile, perf_target=get_target("safe"))
+    assert cfg.full_offload is True
+    assert cfg.ngl == 999
+
+
 def test_no_gpu_falls_back_to_cpu(tmp_path) -> None:
     """No GPU → ngl=0, no full_offload."""
     profiles = load_profiles(SETTINGS_DIR)

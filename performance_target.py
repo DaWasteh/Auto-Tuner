@@ -82,12 +82,33 @@ class PerformanceTarget:
     # calculation (kv_budget_per_slot = kv_budget / n_parallel) so the
     # auto-tuned context is sized correctly for a SINGLE slot.
     #
-    # Tier defaults:
-    #   throughput  1  — single-user, every token as fast as possible
-    #   balanced    2  — dual-user or light agentic workflows
-    #   safe        4  — traditional multi-slot, long-context sessions
-    #   low_vram    1  — single slot, every spare RAM byte goes to KV
+    # Tier defaults (all 1 — single-user desktop is the common case):
+    # every tier gives the FULL context to one slot instead of dividing it.
+    # A user who actually serves concurrent requests raises --parallel
+    # explicitly (Expert panel / profile), which flows through
+    # compute_config(force_n_parallel=...) and re-sizes the per-slot KV.
+    # Previously safe=4 / balanced=2 silently divided the context, so "safe"
+    # paradoxically showed the SMALLEST context (÷4) — the opposite of what
+    # the name promises.
     n_parallel: int = 1
+
+    # -- Dense KV-cache VRAM reservation (safe/balanced/throughput).
+    # A dense model larger than VRAM used to be packed layer-by-layer until
+    # VRAM was FULL, leaving ~0 GB for the KV cache → tiny context. The MoE
+    # path already reserves VRAM for KV before placing experts; this is the
+    # dense equivalent. compute_config reserves VRAM for this many context
+    # tokens' worth of KV BEFORE choosing ngl, so a few dense layers move to
+    # CPU to make room for a usable GPU-resident KV cache. Kept modest
+    # (dense CPU layers are far slower than MoE experts): throughput reserves
+    # least (max layers on GPU), safe reserves most (max context).
+    # 0 = no reservation (low_vram puts the whole KV in RAM instead).
+    dense_kv_reserve_ctx: int = 16384
+
+    # -- Dense-hybrid KV RAM cap (GB). The CPU-resident layers' KV lives in
+    # system RAM; this bounds how much RAM the hybrid KV budget may use,
+    # scaled per tier and always clamped to what is actually free. Replaces
+    # the old flat 4 GB that ignored high-RAM systems.
+    dense_kv_ram_cap_gb: float = 16.0
 
     # -- LOW-VRAM escape hatch (``low_vram`` tier only).
     # When True, compute_config moves the *entire* KV cache into system
@@ -128,11 +149,13 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # different tier anyway.
         moe_hybrid_batch=1024,
         moe_hybrid_ubatch=1024,
-        n_parallel=4,
+        n_parallel=1,
+        dense_kv_reserve_ctx=65536,  # reserve most VRAM for KV → max context
+        dense_kv_ram_cap_gb=24.0,
         description=(
-            "Conservative. KV reserved for 128k context, generous "
-            "safety bands. 4 parallel slots. Pick this for long-context "
-            "sessions or multi-user setups."
+            "Conservative. KV reserved for 128k (MoE) / 32k (dense) context, "
+            "generous safety bands. Single slot with the full context. Pick "
+            "this for long-context sessions."
         ),
     ),
     "balanced": PerformanceTarget(
@@ -145,11 +168,13 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # 16 GB-class GPUs on Qwen3.6-A3B / Gemma-4-26B-A4B / GLM-4.7-MoE.
         moe_hybrid_batch=2048,
         moe_hybrid_ubatch=2048,
-        n_parallel=2,
+        n_parallel=1,
+        dense_kv_reserve_ctx=32768,  # balanced VRAM split weights ↔ KV
+        dense_kv_ram_cap_gb=16.0,
         description=(
-            "Default. KV reserved for 64k context — enough headroom "
-            "for most chats while letting more expert layers fit on GPU. "
-            "2 parallel slots."
+            "Default. KV reserved for 64k (MoE) / 16k (dense) context — "
+            "enough headroom for most chats while letting more weight/expert "
+            "layers fit on GPU. Single slot."
         ),
     ),
     "throughput": PerformanceTarget(
@@ -165,11 +190,12 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         moe_hybrid_batch=4096,
         moe_hybrid_ubatch=4096,
         n_parallel=1,
+        dense_kv_reserve_ctx=16384,  # reserve least → max weight layers on GPU
+        dense_kv_ram_cap_gb=8.0,
         description=(
-            "Aggressive. KV reserved for only 32k — every spare GB "
-            "of VRAM goes to expert layers. Single parallel slot "
-            "(--parallel 1) for max tokens/s. Not recommended above ~32k "
-            "context or multi-user setups."
+            "Aggressive. KV reserved for only 32k (MoE) / 8k (dense) — every "
+            "spare GB of VRAM goes to weight/expert layers for max tokens/s. "
+            "Single slot. Not recommended for very long context."
         ),
     ),
     "low_vram": PerformanceTarget(
@@ -194,6 +220,11 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # The defining lever: force the KV cache into system RAM.
         kv_to_ram=True,
         kv_ram_cap_gb=32.0,
+        # KV lives in RAM here, so reserve no VRAM for it (every VRAM byte
+        # goes to weights/experts); the dense-hybrid RAM cap is unused because
+        # the kv_to_ram branch owns KV placement.
+        dense_kv_reserve_ctx=0,
+        dense_kv_ram_cap_gb=32.0,
         description=(
             "Max context for low-VRAM / high-RAM systems (e.g. 8 GB VRAM, "
             "64 GB RAM). KV cache moves to system RAM (--no-kv-offload), "

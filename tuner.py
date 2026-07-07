@@ -793,24 +793,37 @@ def _decide_offload(
     n_layers: int,
     has_gpu: bool,
     vram_headroom_gb: float = DEFAULT_VRAM_SAFETY_GB,
+    kv_reserve_gb: float = 0.0,
 ) -> Tuple[int, float, float, bool]:
     if not has_gpu or free_vram_gb < 1.0:
         return 0, 0.0, model_size_gb, False
 
     usable = max(0.0, free_vram_gb - vram_headroom_gb)
+
+    # Reserve VRAM for the KV cache BEFORE packing weight layers, symmetric
+    # with the MoE placement path (_decide_moe_offload). A dense model that
+    # nearly fills VRAM used to be packed until VRAM was full, leaving ~0 GB
+    # for KV → the context collapsed to a couple thousand tokens. By trimming
+    # the weight budget by the KV reserve, a few layers move to CPU and the
+    # freed VRAM becomes a usable GPU-resident KV cache. The reserve is
+    # clamped so it can never strand the GPU entirely (keep >=60% of the
+    # weight-only budget for layers) — better a smaller KV than an idle GPU.
+    kv_reserve_gb = max(0.0, kv_reserve_gb)
+    weight_budget = max(usable * 0.60, usable - kv_reserve_gb)
+
     # Full offload needs room for the weights AND the compute buffer
     # (see FULL_OFF_HEADROOM_GB). Below that threshold the model falls
     # through to PARTIAL offload — excess layers spill to CPU and the
     # server keeps running instead of being refused at launch.
-    if usable >= model_size_gb + FULL_OFF_HEADROOM_GB:
+    if weight_budget >= model_size_gb + FULL_OFF_HEADROOM_GB:
         return 999, model_size_gb, 0.0, True
 
-    if usable < 0.5:
+    if weight_budget < 0.5:
         return 0, 0.0, model_size_gb, False
 
     if n_layers > 0:
         per_layer_gb = model_size_gb / n_layers
-        ngl = int(usable / per_layer_gb)
+        ngl = int(weight_budget / per_layer_gb)
         ngl = max(0, min(n_layers, ngl))
         model_vram = ngl * per_layer_gb
         residual_overhead = model_size_gb * 0.02  # Reduced overhead
@@ -818,9 +831,9 @@ def _decide_offload(
         return ngl, model_vram, model_ram, False
 
     estimated_layers = 50
-    fraction = usable / model_size_gb
+    fraction = weight_budget / model_size_gb
     ngl = max(0, int(fraction * estimated_layers))
-    return ngl, usable, max(0.0, model_size_gb - usable), False
+    return ngl, weight_budget, max(0.0, model_size_gb - weight_budget), False
 
 
 def _decide_moe_offload(
@@ -1606,12 +1619,43 @@ def compute_config(
         if n_cpu_moe == 0:
             n_cpu_moe = None
     else:
+        # Reserve VRAM for the KV cache before placing dense weight layers,
+        # sized by the tier's dense_kv_reserve_ctx (0 for low_vram, whose KV
+        # goes to RAM instead). Assume q5_0 KV for the reservation — matches
+        # the MoE path and stays conservative vs. the q4_0/q8_0 the caller may
+        # finally pick. Capped at the model's native context so we never
+        # reserve for tokens the model can't address.
+        #
+        # CRITICAL: only reserve when the model does NOT already fully fit in
+        # (combined) VRAM. A model that fits with room to spare should keep all
+        # its weights on GPU and draw KV from the leftover VRAM (the full_off
+        # branch below) — reserving there would needlessly spill weights to CPU
+        # AND, on multi-GPU, shrink model_vram enough that the model suddenly
+        # "fits" the primary card and stops spreading. The trade only makes
+        # sense for a model too big for VRAM (the genuine hybrid case).
+        dense_kv_reserve_gb = 0.0
+        model_fits_vram = (
+            model.size_gb + FULL_OFF_HEADROOM_GB
+            <= effective_free_vram - vram_safety_gb
+        )
+        if (
+            not perf_target.kv_to_ram
+            and perf_target.dense_kv_reserve_ctx > 0
+            and not model_fits_vram
+        ):
+            reserve_ctx = perf_target.dense_kv_reserve_ctx
+            if native_ctx > 0:
+                reserve_ctx = min(reserve_ctx, native_ctx)
+            dense_kv_reserve_gb = (
+                reserve_ctx * base_kv_mb * kv_quant_factor("q5_0")
+            ) / 1024.0
         ngl, model_vram, model_ram, full_off = _decide_offload(
             model_size_gb=model.size_gb,
             free_vram_gb=effective_free_vram,
             n_layers=n_layers,
             has_gpu=has_gpu,
             vram_headroom_gb=vram_safety_gb,
+            kv_reserve_gb=dense_kv_reserve_gb,
         )
 
     # ---- (1.5) Expert overrides: force_ngl / force_n_cpu_moe -----------
@@ -1678,15 +1722,9 @@ def compute_config(
     #     11 GB KV cache living in RAM, dragging inference to a crawl.
     #   - CPU-only: KV lives entirely in RAM.
     #
-    # Cap RAM-resident KV at this many GB for hybrid placements. The
-    # value is chosen so even a tight 30B hybrid (free_vram_after ≈ 0.25 GB)
-    # can reach the 32k context floor when enough system RAM is available.
-    # (2 GB was too small: 0.25 + 2.0 = 2.25 GB → ~27k tokens for a
-    # 64-layer model with 8 GQA heads at q4_0, just below the 32k target.)
-    # 4 GB raises that to ~53k so the floor clamps correctly to 32k.
-    # The cap still prevents the multi-GB-KV-in-RAM trap from the old
-    # uncapped formula.
-    HYBRID_KV_RAM_CAP_GB = 4.0
+    # The dense-hybrid RAM-KV cap is now tier-scaled (perf_target.
+    # dense_kv_ram_cap_gb) and clamped to free RAM, replacing the old flat
+    # 4 GB that ignored high-RAM systems. See the dense-hybrid branch below.
 
     no_kv_offload = False
     if perf_target.kv_to_ram and has_gpu:
@@ -1727,33 +1765,34 @@ def compute_config(
         ram_supplement = min(free_ram_after, DENSE_FULL_KV_RAM_CAP_GB)
         kv_budget_gb = free_vram_after + ram_supplement
     elif ngl > 0 and n_layers > 0:
-        # Dense hybrid: derive max total-KV budget so neither the GPU
-        # nor the (capped) RAM share blows past its limit. The actual
-        # ctx in step (3) picks whichever quant fits this total budget.
+        # Dense hybrid: llama.cpp splits the KV cache BY LAYER — the KV of
+        # GPU-resident layers lives in VRAM, the KV of CPU-resident layers in
+        # RAM (no --no-kv-offload here). So the total context is bounded by
+        # whichever SIDE fills first, not by a single additive pool:
+        #     gpu_frac * kv_total <= free_vram_after   (VRAM side)
+        #     cpu_frac * kv_total <= ram_cap           (RAM side)
+        # => kv_total <= min(free_vram_after / gpu_frac, ram_cap / cpu_frac)
+        #
+        # This physically-correct per-side binding is only usable because
+        # _decide_offload now RESERVES VRAM for KV (dense_kv_reserve_gb), so
+        # free_vram_after is no longer ~0 and the VRAM term no longer collapses
+        # to zero the way it did before the reservation existed (which is why
+        # the old code fell back to an additive pool). The RAM cap is
+        # tier-scaled and clamped to what is actually free — high-RAM systems
+        # get a much larger CPU-side budget than the old flat 4 GB allowed.
         gpu_layer_fraction = ngl / n_layers
+        ram_cap = min(free_ram_after, perf_target.dense_kv_ram_cap_gb)
         if gpu_layer_fraction >= 0.99:
             # Effectively full offload — treat KV as VRAM-only.
             kv_budget_gb = free_vram_after
         elif gpu_layer_fraction <= 0.0:
             # No GPU layers — should not happen (ngl > 0) but stay defensive.
-            kv_budget_gb = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
+            kv_budget_gb = ram_cap
         else:
-            # Dense hybrid: KV budget = whatever VRAM headroom remains
-            # PLUS a capped RAM supplement.
-            #
-            # Old formula: min(free_vram/gpu_frac, ram_cap/cpu_frac)
-            # Problem: when VRAM is nearly full (e.g. model + vision leaves
-            # only 0.05 GB), the VRAM term collapses to 0.06 GB and the
-            # min drives kv_budget to ~0 → context 2048. The proportional
-            # formula assumed VRAM is never the exhausted resource.
-            #
-            # Additive approach: use every byte of remaining VRAM for KV,
-            # then top up with up to HYBRID_KV_RAM_CAP_GB from system RAM.
-            # The cap still prevents the "10 GB KV in RAM" trap that
-            # motivated the previous formula; it just handles the VRAM-
-            # exhausted case gracefully.
-            ram_supplement = min(free_ram_after, HYBRID_KV_RAM_CAP_GB)
-            kv_budget_gb = free_vram_after + ram_supplement
+            cpu_layer_fraction = 1.0 - gpu_layer_fraction
+            vram_side = free_vram_after / gpu_layer_fraction
+            ram_side = ram_cap / cpu_layer_fraction
+            kv_budget_gb = max(0.0, min(vram_side, ram_side))
     else:
         # CPU-only — KV lives entirely in RAM.
         kv_budget_gb = free_ram_after
