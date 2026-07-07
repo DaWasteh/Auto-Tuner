@@ -364,7 +364,10 @@ def _is_runnable_binary(path: Path) -> bool:
     except OSError:
         return False
     if os.name == "nt":
-        return True
+        # Shared dual-boot build folders can hold a Linux ELF "llama-server"
+        # right next to "llama-server.exe" — CreateProcess cannot run the
+        # extension-less ELF, so only accept Windows-executable suffixes.
+        return path.suffix.lower() in (".exe", ".bat", ".cmd", ".com")
     if path.suffix.lower() == ".exe":
         return False
     return os.access(path, os.X_OK)

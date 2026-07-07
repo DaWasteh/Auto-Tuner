@@ -1060,8 +1060,10 @@ class _BinaryUpdateWorker(QObject):
         Linux   → name contains ``linux`` (zip or raw ELF).
         macOS   → name contains ``macos``, ``darwin`` or ``osx``.
         """
+        # Decide by platform.system() alone (never os.name): the real OS is
+        # always reported correctly, and tests can monkeypatch it on any runner.
         system = platform.system().lower()
-        if os.name == "nt" or system == "windows":
+        if system == "windows":
             for a in assets:
                 name = str(a.get("name", "")).lower()
                 if "windows" in name:
@@ -1106,7 +1108,7 @@ class _BinaryUpdateWorker(QObject):
                 if info.is_dir():
                     continue
                 base = Path(info.filename).name.lower()
-                if os.name == "nt":
+                if platform.system() == "Windows":
                     if base.endswith(".exe"):
                         member_name = info.filename
                         break
@@ -3261,7 +3263,10 @@ class MainWindow(QMainWindow):
         except OSError:
             return False
         if os.name == "nt":
-            return True
+            # Shared dual-boot build folders can hold a Linux ELF
+            # "llama-server" next to "llama-server.exe" — only accept
+            # Windows-executable suffixes (mirrors auto_tuner._is_runnable_binary).
+            return path.suffix.lower() in (".exe", ".bat", ".cmd", ".com")
         if path.suffix.lower() == ".exe":
             return False
         return os.access(path, os.X_OK)

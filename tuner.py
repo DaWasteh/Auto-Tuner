@@ -69,6 +69,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-a",
     "-b",
     "-c",
+    "-cram",
     "-ctk",
     "-ctv",
     "-fa",
@@ -107,6 +108,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--port",
     "--predict",
     "--presence-penalty",
+    "--prompt",
     "--repeat-penalty",
     "--rope-scale",
     "--rope-scaling",
@@ -194,21 +196,43 @@ def _filter_command_for_supported_flags(
     if "-m" not in supported and "--model" not in supported:
         return list(cmd), []
 
+    def _is_flag_token(token: str) -> bool:
+        # A value can start with "-" too (e.g. --cache-ram -1, -n -1), so only
+        # treat tokens that look like a named option as flags.
+        return bool(token not in ("-", "--") and _FLAG_RE.match(token))
+
     filtered: List[str] = [cmd[0]]
     removed: List[str] = []
     i = 1
     while i < len(cmd):
         tok = cmd[i]
-        if tok.startswith("-") and tok not in ("-", "--"):
+        if _is_flag_token(tok):
             flag = _flag_name(tok)
+            takes_value = "=" not in tok and flag in _ARG_FLAGS_WITH_VALUES
             if flag not in supported:
                 chunk = [tok]
                 i += 1
-                if "=" not in tok and flag in _ARG_FLAGS_WITH_VALUES and i < len(cmd):
+                # Consume the flag's value as well: for known value-flags
+                # always, otherwise when the next token is not a flag itself
+                # (llama-server has no positional arguments, so a left-behind
+                # value would abort the launch just like the unknown flag).
+                if (
+                    "=" not in tok
+                    and i < len(cmd)
+                    and (takes_value or not _is_flag_token(cmd[i]))
+                ):
                     chunk.append(cmd[i])
                     i += 1
                 removed.append(" ".join(chunk))
                 continue
+            filtered.append(tok)
+            i += 1
+            # Keep the kept flag's value verbatim — never scan it as a flag
+            # (it may be negative, e.g. --cache-ram -1).
+            if takes_value and i < len(cmd):
+                filtered.append(cmd[i])
+                i += 1
+            continue
         filtered.append(tok)
         i += 1
     return filtered, removed

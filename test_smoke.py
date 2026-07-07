@@ -406,6 +406,56 @@ def test_prepare_command_for_binary_prunes_unsupported_flags(tmp_path) -> None:
     assert removed == ["--fit off", "--cache-ram -1", "--metrics"]
 
 
+def test_filter_command_keeps_negative_values_of_supported_flags() -> None:
+    """Values like ``--cache-ram -1`` / ``-n -1`` start with '-' but are NOT
+    flags. Pruning must never strip them from a supported flag (regression:
+    ``--cache-ram -1 -n -1`` became ``--cache-ram -n``, aborting every launch
+    on a probed binary)."""
+    from tuner import _filter_command_for_supported_flags
+
+    supported = {"-m", "--cache-ram", "-n", "-c", "-ngl"}
+    cmd = [
+        "llama-server",
+        "-m",
+        "model.gguf",
+        "-c",
+        "8192",
+        "-ngl",
+        "99",
+        "--cache-ram",
+        "-1",
+        "-n",
+        "-1",
+        "--fit",
+        "off",
+        "--metrics",
+    ]
+    filtered, removed = _filter_command_for_supported_flags(cmd, supported)
+    assert filtered == cmd[:11]
+    assert removed == ["--fit off", "--metrics"]
+
+
+def test_filter_command_removes_stray_value_of_unknown_flag() -> None:
+    """An unknown fork flag with a separate value (e.g. from extra_args) must
+    take its value with it — llama-server has no positional arguments, so a
+    left-behind value aborts the launch exactly like the unknown flag."""
+    from tuner import _filter_command_for_supported_flags
+
+    supported = {"-m", "--port"}
+    cmd = [
+        "llama-server",
+        "-m",
+        "model.gguf",
+        "--some-fork-knob",
+        "42",
+        "--port",
+        "1234",
+    ]
+    filtered, removed = _filter_command_for_supported_flags(cmd, supported)
+    assert filtered == ["llama-server", "-m", "model.gguf", "--port", "1234"]
+    assert removed == ["--some-fork-knob 42"]
+
+
 # ---------------------------------------------------------------------------
 # MTP detection (scanner.metadata_has_embedded_mtp) — tri-state scan logic
 
