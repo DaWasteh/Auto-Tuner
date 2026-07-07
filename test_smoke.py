@@ -499,14 +499,15 @@ def test_terminal_process_streams_output_live(tmp_path, monkeypatch) -> None:
     assert "42.0 t/s" in content
 
 
-@pytest.mark.skipif(os.name == "nt", reason="RLIMIT_MEMLOCK gate is POSIX-only")
-def test_mlock_disabled_when_memlock_limit_too_small(tmp_path, monkeypatch) -> None:
-    """Desktop Linux defaults RLIMIT_MEMLOCK to 8 MiB; --mlock then aborts
-    llama.cpp b9895 with GGML_ASSERT(addr) in llama_mlock::grow_to during
-    tensor load. The tuner must not emit --mlock/--no-mmap in that case."""
+def test_mlock_disabled_when_gpu_present(tmp_path, monkeypatch) -> None:
+    """llama.cpp b9895 aborts with GGML_ASSERT(addr) in llama_mlock::grow_to
+    whenever --mlock is combined with a loaded GPU backend (Vulkan host
+    buffer with NULL base) — independent of RLIMIT_MEMLOCK and even with
+    -ngl 0. With GPUs in the system the tuner must never auto-emit
+    --mlock/--no-mmap."""
     import tuner
 
-    monkeypatch.setattr(tuner, "_memlock_limit_gb", lambda: 8 / 1024)
+    monkeypatch.setattr(tuner, "_memlock_limit_gb", lambda: None)  # unlimited
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Bonsai-8B", size_gb=5.0)
     profile = match_profile(model.name, profiles)
@@ -516,16 +517,32 @@ def test_mlock_disabled_when_memlock_limit_too_small(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.skipif(os.name == "nt", reason="RLIMIT_MEMLOCK gate is POSIX-only")
-def test_mlock_allowed_when_memlock_unlimited(tmp_path, monkeypatch) -> None:
-    """With RLIM_INFINITY the gate must not disable the mlock feature for a
-    fully offloaded model that passes the resource checks."""
+def test_mlock_disabled_when_memlock_limit_too_small(tmp_path, monkeypatch) -> None:
+    """Desktop Linux defaults RLIMIT_MEMLOCK to 8 MiB; a non-root process
+    cannot pin a model then. Checked on a CPU-only system so the RLIMIT gate
+    (not the GPU gate) is what decides."""
+    import tuner
+
+    monkeypatch.setattr(tuner, "_memlock_limit_gb", lambda: 8 / 1024)
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Bonsai-8B", size_gb=5.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(vram_total=0), profile)
+    assert cfg.mlock is False
+    assert cfg.no_mmap is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="RLIMIT_MEMLOCK gate is POSIX-only")
+def test_mlock_allowed_cpu_only_with_unlimited_memlock(tmp_path, monkeypatch) -> None:
+    """CPU-only systems (no GPU backend, plain malloc buffers) keep the mlock
+    feature when RLIMIT_MEMLOCK is unlimited and the RAM checks pass."""
     import tuner
 
     monkeypatch.setattr(tuner, "_memlock_limit_gb", lambda: None)
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Bonsai-8B", size_gb=5.0)
     profile = match_profile(model.name, profiles)
-    cfg = compute_config(model, _fake_system(), profile)
+    cfg = compute_config(model, _fake_system(vram_total=0), profile)
     assert cfg.mlock is True
     assert cfg.no_mmap is True
 

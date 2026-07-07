@@ -2090,12 +2090,21 @@ def compute_config(
                 and ram_resident_gb < (system.free_ram_gb - 8)
                 and (not is_windows or is_admin)
             )
+    # GPU-Gate: llama.cpp b9895 bricht mit --mlock IMMER ab, sobald das
+    # Vulkan-Backend geladen ist — unabhängig von RLIMIT_MEMLOCK und auch
+    # mit -ngl 0 (auf RDNA4 reproduziert). Ursache: CPU-Gewichte landen im
+    # "host"-(pinned)-Buffer des GPU-Backends; ggml_vk_host_malloc kann
+    # nullptr OHNE Exception liefern (der CPU-Fallback greift nur bei
+    # vk::SystemError), llama-model.cpp ruft dann mlock.init(NULL) und
+    # llama_mlock::grow_to stirbt an GGML_ASSERT(addr) (llama-mmap.cpp:744).
+    # Bis das upstream gefixt ist: mit GPUs im System kein automatisches
+    # mlock. --force-mlock übergeht das bewusst (z. B. für gefixte Builds).
+    if mlock and not force_mlock and system.gpus:
+        mlock = False
     # POSIX-Gate: mlock ist durch RLIMIT_MEMLOCK gedeckelt (Desktop-Linux
-    # default: 8 MiB). Ein nicht-root Prozess kann damit kein Modell pinnen —
-    # und llama.cpp (b9895, --mlock + --no-mmap) bricht dann mit
-    # GGML_ASSERT(addr) in llama_mlock::grow_to beim Tensor-Laden ab, statt
-    # nur zu warnen. mlock daher nur aktivieren, wenn das Limit das komplette
-    # Modell abdeckt (root/CAP_IPC_LOCK umgeht das Limit → is_admin reicht).
+    # default: 8 MiB). Ein nicht-root Prozess kann damit kein Modell pinnen;
+    # mlock daher nur aktivieren, wenn das Limit das komplette Modell
+    # abdeckt (root/CAP_IPC_LOCK umgeht das Limit → is_admin reicht).
     if mlock and not is_windows and not is_admin:
         memlock_limit_gb = _memlock_limit_gb()
         model_total_gb = ram_resident_gb + vram_resident_gb
