@@ -3174,7 +3174,8 @@ def build_command(
     #     abort when -md and --mmproj are both given ("speculative decoding
     #     is not supported with multimodal") — Path A is skipped for those.
     #   - CURRENT builds load draft + mmproj side by side: verified against
-    #     b9940 server-context.cpp — the draft/MTP context and mtmd_init
+    #     b9940 server-context.cpp (unverändert bis einschließlich b9963) —
+    #     the draft/MTP context and mtmd_init
     #     coexist and can_speculate() ignores mctx entirely. Path A must
     #     stay ACTIVE there: every Gemma 4 GGUF ships with an mmproj, so the
     #     old unconditional "vision wins" skip silently disabled the Gemma

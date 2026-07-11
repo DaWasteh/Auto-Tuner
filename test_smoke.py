@@ -4332,7 +4332,7 @@ def test_vision_no_longer_suppresses_external_draft_on_spec_type_builds(
     tmp_path,
 ) -> None:
     """-md + --mmproj coexist on --spec-type builds (verified against b9940
-    server sources). The old unconditional 'vision wins' skip silently
+    server sources, unchanged through b9963). The old unconditional 'vision wins' skip silently
     disabled the Gemma-4 drafter whenever Vision was on; only builds without
     --spec-type may still drop Path A."""
     modern = tmp_path / "llama-server"

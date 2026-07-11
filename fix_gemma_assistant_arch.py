@@ -20,7 +20,9 @@ gemergten llama.cpp-Stand in drei Punkten; alle drei werden repariert:
        ``mtp.token_ordering.weight``  → ``masked_embd_ordering``
 
 Verifiziert am 2026-07-09 gegen b9940: Target + reparierter Drafter +
-Vision (--mmproj) laufen zusammen, draft acceptance ~0.80.
+Vision (--mmproj) laufen zusammen, draft acceptance ~0.80. Zwischen b9940
+und b9963 gab es keine Änderungen an der gemma4-assistant-Arch oder am
+Draft-/mtmd-Pfad des Servers — der Fix gilt unverändert.
 
 Benötigt das ``gguf``-Python-Paket aus einem llama.cpp-Checkout (gguf-py)
 sowie numpy. Der gguf-py-Pfad wird aus ``--gguf-py``, ``LLAMA_CPP_DIR``

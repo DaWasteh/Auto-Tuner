@@ -4642,7 +4642,8 @@ class MainWindow(QMainWindow):
         )
         # External draft (-md) + --mmproj: only OLD builds (pre --spec-type,
         # b9190) abort on that combination — current mainline loads draft
-        # and vision side by side (verified against b9940 server sources),
+        # and vision side by side (verified against b9940 server sources,
+        # unverändert bis b9963),
         # and build_command gates -md on the same probe. Blocking here on a
         # modern build forced users to choose between Vision and the Gemma-4
         # drafter for no reason. Integrated MTP was never blocked (in-GGUF,
