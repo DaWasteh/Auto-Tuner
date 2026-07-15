@@ -1,0 +1,47 @@
+display_name: "Ternary-Bonsai 27B (PrismML, 1.71-bit)"
+patterns:
+  # Länger als sowohl "ternary-bonsai" als auch "bonsai-27b" und gewinnt
+  # deshalb zuverlässig vor den bestehenden Bonsai-8B-Familienprofilen.
+  - ternary-bonsai-27b
+
+# Qwen3.6-27B-Hybrid-Backbone: 262,144 Tokens nativ.
+max_context: 262144
+
+# Der Tuner beginnt mit Q8 und fällt bei langen Kontexten automatisch auf
+# Q5/Q4 zurück. Mit Q4_0-KV passt laut PrismML auch der volle 262k-Kontext
+# zusammen mit den rund 7.2 GB Modellgewichten auf eine einzelne GPU.
+recommended_kv_quant: q8_0
+
+# Das veröffentlichte Q2_0-g128-GGUF braucht weiterhin PrismMLs prism-Fork.
+# Auto Tuner findet damit versionierte Ordner wie 2b_bXXXX_llama.cpp.
+server_binary: "2b_llama/llama-server"
+
+# Erforderlich für natives OpenAI-Tool-Calling des Qwen3.6-Backbones.
+extra_args:
+  - --jinja
+
+# Offizielle Bonsai-27B-Referenzwerte (Thinking-Modus). PrismML verwendet
+# dieselben Werte auch für die veröffentlichten Coding-Benchmarks.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  PrismML Ternary-Bonsai 27B auf Qwen3.6-27B-Basis: multimodal, Thinking-
+  und Tool-Calling-fähig, 262k nativer Kontext. Die Q2_0-g128-Gewichte
+  ({-1, 0, +1}) belegen rund 7.2 GB; der optionale Vision-Projektor weitere
+  rund 0.63 GB. Für die veröffentlichte Q2_0-g128-Datei den PrismML-prism-
+  Fork verwenden. Die separate Q2_0_g64-Datei ist für aktuelles Mainline-
+  llama.cpp (derzeit CPU/Metal; weitere Backends folgen) vorgesehen.

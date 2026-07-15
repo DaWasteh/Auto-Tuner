@@ -1,0 +1,45 @@
+display_name: "Bonsai 27B (PrismML, 1-bit)"
+patterns:
+  # Das längere Ternary-Pattern aus bonsai-ternary-27b.yaml gewinnt bei
+  # Ternary-Bonsai-27B; dieses Profil bleibt dadurch auf der 1-bit-Variante.
+  - bonsai-27b
+
+# Qwen3.6-27B-Hybrid-Backbone: 262,144 Tokens nativ.
+max_context: 262144
+
+# Der Tuner beginnt mit Q8 und fällt bei langen Kontexten automatisch auf
+# Q5/Q4 zurück. PrismMLs optionaler Q4_0-KV-Pfad bringt den vollen 262k-
+# Kontext selbst auf kleineren GPUs unter; FP16/Q8 bleibt die Qualitätswahl,
+# wenn genug Speicher vorhanden ist.
+recommended_kv_quant: q8_0
+
+# Q1_0 ist inzwischen in aktuellem Mainline-llama.cpp verfügbar, daher kein
+# server_binary-Override. --jinja wird für natives Tool-Calling benötigt.
+extra_args:
+  - --jinja
+
+# Offizielle Bonsai-27B-Referenzwerte (Thinking-Modus). PrismML verwendet
+# dieselben Werte auch für die veröffentlichten Coding-Benchmarks.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  PrismML Bonsai 27B auf Qwen3.6-27B-Basis: multimodal, Thinking- und
+  Tool-Calling-fähig, 262k nativer Kontext. Die Q1_0-g128-Sprachgewichte
+  belegen rund 3.9 GB; der optionale Vision-Projektor belegt weitere rund
+  0.63 GB. Aktuelles Mainline-llama.cpp unterstützt Q1_0 auf CPU, Metal,
+  CUDA und Vulkan. PrismMLs Q4_0-KV-Cache spart bei sehr langem Kontext
+  deutlich Speicher, ist aber kein Geschwindigkeits-Feature.
