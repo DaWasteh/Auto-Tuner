@@ -259,14 +259,17 @@ git pull && python qt_launcher.py
 
 Für Einsteiger gibt es eine kompilierte **noconsole**-Version — keine
 Python-Installation, kein Terminalfenster, einfach Doppelklick. Sie läuft auf
-**Windows 10/11** (`.exe`) und **Ubuntu** (Linux-Binary) und lässt sich über
+**Windows 10/11** (`.exe`), **macOS** und Linux. Der Linux-Build wird bei jedem
+Release automatisiert auf **Ubuntu, Fedora, Arch Linux, Linux Mint, CachyOS,
+Kali Linux und Debian** gestartet und lässt sich wie die anderen Builds über
 denselben **⬆ Update**-Button self-updaten.
 
 ### Bauen
 
-PyInstaller kann nicht cross-kompilieren — die `.exe` wird **auf Windows**
-gemacht, der Linux-Binary **auf Linux**. Beide landen als Assets im selben
-GitHub-Release.
+PyInstaller kann nicht cross-kompilieren — die `.exe` wird **auf Windows**,
+der Linux-Binary **auf Linux** und der macOS-Build **auf macOS** erzeugt. Alle
+landen als Assets im selben GitHub-Release. GitHub Actions prüft den Quellcode
+zusätzlich in nativen Containern der oben genannten Linux-Distributionen.
 
 ```bash
 # einmalig im Build-Environment:
@@ -288,8 +291,9 @@ persistent neben dem Binary und bleibt bei Updates erhalten.
 1. `autotuner_version.py` → `VERSION` hochzählen (z. B. `"1.1.0"`).
 2. Commit + Tag **`v1.1.0`** (das Tag-Format `v<VERSION>` ist Pflicht — der
    Updater streift das führende `v` vor dem Vergleich).
-3. Ein GitHub-Release mit Tag `v1.1.0` erstellen und **beide** Assets hochladen:
-   `AutoTuner.exe` (Windows) und `AutoTuner-Linux` (Linux).
+3. Der Release-Workflow erstellt die drei ZIP-Assets für Windows, Linux und
+   macOS. Veröffentlicht wird erst, nachdem das Linux-Binary die Smoke-Tests
+   auf allen unterstützten Distributionen bestanden hat.
 4. Der Update-Button in der kompilierten Version holt sich automatisch das
    zum laufenden OS passende Asset, lädt es herunter und tauscht das Binary
    über einen Swap-Shim nach Neustart aus (Windows sperrt die laufende `.exe`,

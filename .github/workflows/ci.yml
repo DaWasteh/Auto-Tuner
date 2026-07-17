@@ -76,3 +76,39 @@ jobs:
 
       - name: Run pytest
         run: pytest -v
+
+  # GitHub only provides hosted Ubuntu runners. The additional Linux
+  # distributions therefore run in their native containers on an Ubuntu host.
+  linux-distros:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Fedora
+            image: fedora:latest
+          - name: Arch Linux
+            image: archlinux:latest
+          - name: Linux Mint 22.3
+            image: linuxmintd/mint22.3-amd64:latest
+          - name: CachyOS
+            image: cachyos/cachyos:latest
+          - name: Kali Linux
+            image: kalilinux/kali-rolling:latest
+          - name: Debian stable
+            image: debian:stable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull ${{ matrix.name }} container
+        run: docker pull "${{ matrix.image }}"
+
+      - name: Run source tests on ${{ matrix.name }}
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            "${{ matrix.image }}" \
+            bash /workspace/.github/scripts/linux-distro-ci.sh source
