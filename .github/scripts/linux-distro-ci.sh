@@ -28,7 +28,7 @@ install_runtime_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     retry apt-get update
     retry apt-get install -y --no-install-recommends \
-      ca-certificates coreutils unzip procps pciutils \
+      ca-certificates coreutils util-linux unzip procps pciutils \
       libegl1 libgl1 libglib2.0-0 libfontconfig1 libdbus-1-3 \
       libxkbcommon0 libxkbcommon-x11-0 libxcb1 libxcb-cursor0 \
       libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
@@ -39,7 +39,7 @@ install_runtime_dependencies() {
     fi
   elif command -v dnf >/dev/null 2>&1; then
     retry dnf -y install \
-      ca-certificates coreutils unzip procps-ng pciutils \
+      ca-certificates coreutils util-linux unzip procps-ng pciutils \
       mesa-libEGL mesa-libGL glib2 fontconfig dbus-libs \
       libxkbcommon libxkbcommon-x11 libxcb xcb-util-cursor xcb-util-wm \
       xcb-util-image xcb-util-keysyms xcb-util-renderutil
@@ -49,7 +49,7 @@ install_runtime_dependencies() {
   elif command -v pacman >/dev/null 2>&1; then
     retry pacman -Syu --noconfirm
     retry pacman -S --needed --noconfirm \
-      ca-certificates coreutils unzip procps-ng pciutils \
+      ca-certificates coreutils util-linux unzip procps-ng pciutils \
       libglvnd glib2 fontconfig dbus libxkbcommon libxkbcommon-x11 \
       libxcb xcb-util-cursor xcb-util-wm xcb-util-image \
       xcb-util-keysyms xcb-util-renderutil
@@ -88,7 +88,7 @@ run_source_checks() {
   local workdir=/tmp/autotuner-source
   rm -rf "$workdir"
   mkdir -p "$workdir"
-  cp -a /workspace/. "$workdir/"
+  cp -R /workspace/. "$workdir/"
   cd "$workdir"
 
   python3 -m venv .venv
@@ -165,7 +165,21 @@ case "$mode" in
 esac
 
 show_distribution
-install_runtime_dependencies
+
+if [[ "${AUTOTUNER_CI_DEPENDENCIES_READY:-0}" != "1" ]]; then
+  install_runtime_dependencies
+
+  # Docker starts as root so dependencies can be installed. AutoTuner is a
+  # desktop application, and its mlock safety behavior intentionally differs
+  # for root. Run the actual tests/binary as an ordinary user (UID 65534) to
+  # match how viewers launch it on their desktop distributions.
+  if [[ "$(id -u)" == "0" ]]; then
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+      env AUTOTUNER_CI_DEPENDENCIES_READY=1 \
+      bash "$0" "$@"
+  fi
+fi
+
 prepare_runtime_environment
 
 if [[ "$mode" == "source" ]]; then
