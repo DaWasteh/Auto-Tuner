@@ -3188,6 +3188,13 @@ class MainWindow(QMainWindow):
         ol.addWidget(self._draft_row)
 
         self._chk_vision = QCheckBox("Vision (mmproj)")
+        self._chk_mmproj_cpu = QCheckBox(
+            "Keep mmproj in RAM (--no-mmproj-offload)"
+        )
+        self._chk_mmproj_cpu.setToolTip(
+            "Keep the multimodal projector on the CPU. This frees VRAM but\n"
+            "uses the projector file size in system RAM and slows vision encoding."
+        )
         self._chk_draft = QCheckBox("Draft model (speculative decoding)")
         # NEW: Turbo KV-quant toggle. Sits between Draft and Thinking,
         # as requested. When on, the AutoTuner maps the chosen KV
@@ -3213,14 +3220,24 @@ class MainWindow(QMainWindow):
         self._chk_prompt_cache.setToolTip(
             "Cache computed prompt prefixes in system RAM so repeated/similar\n"
             "prompts (long system prompts, RAG scaffolds, Roo-Code preambles)\n"
-            "skip re-processing and hit first-token faster.\n"
-            "Vision caching is active with llama.cpp b10045+; older or\n"
-            "unprobeable builds fall back to --cache-ram 0 safely."
+            "skip re-processing and hit first-token faster. The MiB limit is\n"
+            "included in the RAM budget. Vision needs llama.cpp b10045+."
+        )
+        self._sp_prompt_cache_mib = QSpinBox()
+        self._sp_prompt_cache_mib.setRange(-1, 65536)
+        self._sp_prompt_cache_mib.setSpecialValueText("Unlimited (-1)")
+        self._sp_prompt_cache_mib.setSuffix(" MiB cache limit")
+        self._sp_prompt_cache_mib.setSingleStep(256)
+        self._sp_prompt_cache_mib.setValue(app_settings.get_prompt_cache_ram_mib())
+        self._sp_prompt_cache_mib.setToolTip(
+            "Maximum host-RAM prompt cache size. -1 is unlimited, 0 disables;\n"
+            "2048 MiB is the bounded default."
         )
         self._chk_thinking = QCheckBox("Thinking / Reasoning")
 
         for chk in (
             self._chk_vision,
+            self._chk_mmproj_cpu,
             self._chk_draft,
             self._chk_turbo_kv,
             self._chk_ngram,
@@ -3229,17 +3246,22 @@ class MainWindow(QMainWindow):
         ):
             chk.setEnabled(False)
             ol.addWidget(chk)
+        ol.addWidget(self._sp_prompt_cache_mib)
 
         # Checkbox toggles → persist the override AND refresh the
         # context / memory estimates. Each slot knows which option it owns.
         self._chk_vision.toggled.connect(self._on_vision_toggled)
+        self._chk_mmproj_cpu.toggled.connect(self._on_mmproj_cpu_toggled)
         self._chk_draft.toggled.connect(self._on_draft_toggled)
         self._chk_turbo_kv.toggled.connect(self._on_turbo_toggled)
         self._chk_ngram.toggled.connect(self._on_ngram_toggled)
         self._chk_prompt_cache.toggled.connect(self._on_prompt_cache_toggled)
+        self._sp_prompt_cache_mib.valueChanged.connect(
+            self._on_prompt_cache_limit_changed
+        )
         self._chk_thinking.toggled.connect(self._on_thinking_toggled)
 
-        opts.setMaximumHeight(220)
+        opts.setMaximumHeight(285)
 
         right = QWidget()
         rl2 = QVBoxLayout(right)
@@ -4811,6 +4833,16 @@ class MainWindow(QMainWindow):
             self._chk_vision.setText("Vision (no mmproj found)")
         self._chk_vision.blockSignals(False)
 
+        # ── mmproj CPU placement ────────────────────────────────────
+        # This option is meaningful only while Vision is active. The state is
+        # persisted per model because projector size and available VRAM vary.
+        mmproj_cpu_state = ov.get("mmproj_cpu", False)
+        mmproj_cpu_enabled = has_vision and bool(vision_state)
+        self._chk_mmproj_cpu.blockSignals(True)
+        self._chk_mmproj_cpu.setEnabled(mmproj_cpu_enabled)
+        self._chk_mmproj_cpu.setChecked(mmproj_cpu_enabled and mmproj_cpu_state)
+        self._chk_mmproj_cpu.blockSignals(False)
+
         # ── Draft ───────────────────────────────────────────────────
         draft = self._current_draft
         has_draft = draft is not None or is_embedded_mtp
@@ -4880,6 +4912,7 @@ class MainWindow(QMainWindow):
         self._chk_prompt_cache.setChecked(pc_state)
         self._chk_prompt_cache.setText("Prompt caching (host RAM, -cram)")
         self._chk_prompt_cache.blockSignals(False)
+        self._sp_prompt_cache_mib.setEnabled(pc_state)
 
     def _populate_mmproj_combo(self, entry: ModelEntry, ov: dict) -> None:
         """Fill the always-on mmproj dropdown from ``entry.folder_mmprojs``.
@@ -5099,6 +5132,10 @@ class MainWindow(QMainWindow):
             self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
+    def _on_mmproj_cpu_toggled(self, checked: bool) -> None:
+        self._record_override("mmproj_cpu", checked)
+        self._refresh_config_preview()
+
     def _on_draft_toggled(self, checked: bool) -> None:
         self._record_override("draft", checked)
         # Toggling draft changes whether vision is blocked (external draft
@@ -5135,6 +5172,11 @@ class MainWindow(QMainWindow):
         # Persist the per-model prompt-cache choice. build_command applies the
         # conservative version gate when Vision is active.
         self._record_override("prompt_cache", checked)
+        self._sp_prompt_cache_mib.setEnabled(checked)
+        self._refresh_config_preview()
+
+    def _on_prompt_cache_limit_changed(self, value: int) -> None:
+        app_settings.set_prompt_cache_ram_mib(value)
         self._refresh_config_preview()
 
     def _on_mmproj_changed(self, index: int) -> None:
@@ -5243,6 +5285,16 @@ class MainWindow(QMainWindow):
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
         turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
+        no_mmproj_offload = (
+            self._chk_mmproj_cpu.isChecked()
+            and self._chk_mmproj_cpu.isEnabled()
+        )
+        prompt_cache_ram_mib = (
+            self._sp_prompt_cache_mib.value()
+            if self._chk_prompt_cache.isChecked()
+            and self._chk_prompt_cache.isEnabled()
+            else 0
+        )
 
         entry_for_cfg = copy.copy(entry)
         if not use_vision:
@@ -5264,6 +5316,8 @@ class MainWindow(QMainWindow):
                 perf_target=self._resolve_perf_target_for_profile(profile),
                 mode=self._current_mode(),
                 turbo_kv=turbo_kv,
+                no_mmproj_offload=no_mmproj_offload,
+                prompt_cache_ram_mib=prompt_cache_ram_mib,
                 gpu_priorities=app_settings.get_gpu_priorities(),
                 force_gpu=app_settings.get_forced_gpu(),
                 **kwargs,
@@ -5388,15 +5442,19 @@ class MainWindow(QMainWindow):
                 lines.append(f"{prefix}{profile.notes.strip()[i : i + W - 10]}")
         if entry.mmproj:
             vis = "✓" if use_vision else "✗"
-            lines.append(f"Vision  : {entry.mmproj.name}  [{vis}]")
+            placement = "RAM" if cfg.no_mmproj_offload else "VRAM"
+            lines.append(f"Vision  : {entry.mmproj.name}  [{vis}, {placement}]")
         if self._current_draft:
             drf = "✓" if use_draft else "✗"
             lines.append(f"Draft   : {self._current_draft.name}  [{drf}]")
         if use_ngram:
             lines.append("n-gram  : ngram-mod (self-speculative)  [✓]")
 
+        cache_limit = cfg.prompt_cache_ram_mib
+        cache_label = "unlimited" if cache_limit == -1 else f"{cache_limit} MiB"
         lines.append(
-            f"Prompt$ : host-RAM cache (-cram)  [{'✓' if use_prompt_cache else '✗'}]"
+            f"Prompt$ : host-RAM cache (-cram)  [{'✓' if use_prompt_cache else '✗'}] "
+            f"[{cache_label}]"
             + (" (Vision requires b10045+)" if use_vision else "")
         )
         if profile.server_binary:
@@ -5469,8 +5527,14 @@ class MainWindow(QMainWindow):
             + cfg.vision_vram_gb
             + cfg.draft_vram_gb
             + cfg.kv_vram_gb
+            + cfg.runtime_vram_overhead_gb
         )
-        total_cpu = cfg.estimated_model_ram_gb + cfg.kv_ram_gb
+        total_cpu = (
+            cfg.estimated_model_ram_gb
+            + cfg.vision_ram_gb
+            + cfg.kv_ram_gb
+            + cfg.prompt_cache_ram_gb
+        )
         lines += [bar, "Memory estimate (with current options):"]
         lines.append(
             f"  Model GPU : ~{cfg.estimated_model_vram_gb:5.1f} GB"
@@ -5478,6 +5542,8 @@ class MainWindow(QMainWindow):
         )
         if cfg.vision_vram_gb > 0.05:
             lines.append(f"  Vision GPU: ~{cfg.vision_vram_gb:5.1f} GB")
+        if cfg.vision_ram_gb > 0.05:
+            lines.append(f"  Vision RAM: ~{cfg.vision_ram_gb:5.1f} GB")
         if cfg.draft_vram_gb > 0.05:
             lines.append(f"  Draft GPU : ~{cfg.draft_vram_gb:5.1f} GB")
         # KV split: show both parts when hybrid; otherwise the single number.
@@ -5488,6 +5554,10 @@ class MainWindow(QMainWindow):
             )
         else:
             lines.append(f"  KV cache  : ~{cfg.estimated_kv_gb:5.1f} GB")
+        if cfg.runtime_vram_overhead_gb > 0.05:
+            lines.append(
+                f"  Runtime GPU: ~{cfg.runtime_vram_overhead_gb:5.1f} GB"
+            )
         lines.append(
             f"  Total GPU : ~{total_gpu:5.1f} GB"
             f"   of {self._system.free_vram_gb:.1f} GB free"
@@ -5496,6 +5566,10 @@ class MainWindow(QMainWindow):
             f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB"
             f"   (free RAM:  {self._system.free_ram_gb:.1f} GB)"
         )
+        if cfg.prompt_cache_ram_gb > 0.05:
+            lines.append(
+                f"  Prompt RAM: ~{cfg.prompt_cache_ram_gb:5.1f} GB"
+            )
         if total_cpu > cfg.estimated_model_ram_gb + 0.05:
             lines.append(f"  Total CPU : ~{total_cpu:5.1f} GB")
         if cfg.warning:
@@ -5954,6 +6028,7 @@ class MainWindow(QMainWindow):
             + float(cfg.kv_vram_gb)
             + float(cfg.vision_vram_gb)
             + float(cfg.draft_vram_gb)
+            + float(cfg.runtime_vram_overhead_gb)
         )
         # A little breathing room so we don't fill a card to the last MB.
         SAFETY_GB = 1.0
@@ -5997,6 +6072,7 @@ class MainWindow(QMainWindow):
                     + float(cfg.kv_vram_gb)
                     + float(cfg.vision_vram_gb)
                     + float(cfg.draft_vram_gb)
+                    + float(cfg.runtime_vram_overhead_gb)
                 )
                 if g.free_vram_gb >= hard_footprint:
                     self._log(
@@ -6197,6 +6273,7 @@ class MainWindow(QMainWindow):
                 + float(cfg.kv_vram_gb)
                 + float(cfg.vision_vram_gb)
                 + float(cfg.draft_vram_gb)
+                + float(cfg.runtime_vram_overhead_gb)
             )
             if forced_here.free_vram_gb < need:
                 self._log(
@@ -6438,7 +6515,13 @@ class MainWindow(QMainWindow):
             "ready": False,
             "model": entry.name,
             "gpu": getattr(self, "_last_pinned_gpu", None),
-            "vram_gb": float(cfg.estimated_model_vram_gb) + float(cfg.kv_vram_gb),
+            "vram_gb": (
+                float(cfg.estimated_model_vram_gb)
+                + float(cfg.kv_vram_gb)
+                + float(cfg.vision_vram_gb)
+                + float(cfg.draft_vram_gb)
+                + float(cfg.runtime_vram_overhead_gb)
+            ),
             "metrics_enabled": metrics_active,
             "slots_api_enabled": slots_active,
             "slots_summary": "",

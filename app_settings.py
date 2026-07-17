@@ -31,6 +31,8 @@ Public API:
     set_base_port(int)
     get_port_offset()      -> int
     set_port_offset(int)
+    get_prompt_cache_ram_mib() -> int
+    set_prompt_cache_ram_mib(int)
     get_reasoning_effort(model_name) -> Optional[str]
     set_reasoning_effort(model_name, value)
     get_expert_override(model_name) -> Optional[dict]   # saved Expert-panel state
@@ -317,7 +319,7 @@ def set_llama_build_paths(paths: List[PathEnabled]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-model option overrides (vision / draft / thinking)
+# Per-model option overrides (vision / mmproj CPU / draft / thinking)
 #
 # Once a user toggles vision/draft/thinking for a specific model they
 # expect that choice to stick — across performance-target changes,
@@ -329,6 +331,7 @@ def set_llama_build_paths(paths: List[PathEnabled]) -> None:
 #   "model_overrides": {
 #       "Qwen3.5-30B-A3B-UD-Q4_K_XL": {
 #           "vision":       true,
+#           "mmproj_cpu":   false,
 #           "draft":        false,
 #           "thinking":     true,
 #           "ngram":        false,
@@ -340,7 +343,14 @@ def set_llama_build_paths(paths: List[PathEnabled]) -> None:
 # Absent keys mean "use the model's default capability detection" so
 # turning a feature back on is just a matter of clearing the override.
 
-_OVERRIDE_KEYS = ("vision", "draft", "thinking", "ngram", "prompt_cache")
+_OVERRIDE_KEYS = (
+    "vision",
+    "mmproj_cpu",
+    "draft",
+    "thinking",
+    "ngram",
+    "prompt_cache",
+)
 
 
 def get_model_overrides(model_name: str) -> Dict[str, bool]:
@@ -361,8 +371,8 @@ def get_model_overrides(model_name: str) -> Dict[str, bool]:
 def set_model_override(model_name: str, key: str, value: bool) -> None:
     """Persist a single (model, option) → bool override.
 
-    `key` must be one of "vision", "draft", "thinking", "ngram",
-    "prompt_cache"; anything else is silently ignored to keep the JSON
+    `key` must be one of "vision", "mmproj_cpu", "draft", "thinking",
+    "ngram", "prompt_cache"; anything else is silently ignored to keep the JSON
     file uncluttered.
     """
     if not model_name or key not in _OVERRIDE_KEYS:
@@ -759,6 +769,10 @@ _PORT_OFFSET_MIN = 0
 _PORT_OFFSET_MAX = 10
 _PORT_OFFSET_DEFAULT = 0
 
+_PROMPT_CACHE_RAM_MIB_MIN = -1
+_PROMPT_CACHE_RAM_MIB_MAX = 65536
+_PROMPT_CACHE_RAM_MIB_DEFAULT = 2048
+
 
 def get_base_port() -> int:
     """Return the persisted server base port (default 1234, clamped to 1..65535)."""
@@ -796,6 +810,32 @@ def set_port_offset(offset: int) -> None:
     except (TypeError, ValueError):
         return
     _update("port_offset", max(_PORT_OFFSET_MIN, min(_PORT_OFFSET_MAX, n)))
+
+
+def get_prompt_cache_ram_mib() -> int:
+    """Return the global host prompt-cache limit in MiB (default 2048).
+
+    ``-1`` preserves llama.cpp's unlimited mode, while ``0`` disables the
+    cache. The launch checkbox remains the authoritative on/off control.
+    """
+    val = load_settings().get("prompt_cache_ram_mib")
+    try:
+        n = int(val) if val is not None else _PROMPT_CACHE_RAM_MIB_DEFAULT
+    except (TypeError, ValueError):
+        return _PROMPT_CACHE_RAM_MIB_DEFAULT
+    return max(_PROMPT_CACHE_RAM_MIB_MIN, min(_PROMPT_CACHE_RAM_MIB_MAX, n))
+
+
+def set_prompt_cache_ram_mib(value: int) -> None:
+    """Persist the global host prompt-cache limit in MiB."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return
+    _update(
+        "prompt_cache_ram_mib",
+        max(_PROMPT_CACHE_RAM_MIB_MIN, min(_PROMPT_CACHE_RAM_MIB_MAX, n)),
+    )
 
 
 def get_font_size() -> int:

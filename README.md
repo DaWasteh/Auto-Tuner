@@ -103,7 +103,8 @@ the RAM/VRAM you actually have free — without manual edits.
   time-to-first-token on repeated prompts. Current llama.cpp builds
   (**b10045+**) support this for Vision/`mtmd` too; older or unprobeable
   builds conservatively receive `--cache-ram 0` when Vision is active.
-  Default cap is `-1` (no byte limit; uses available RAM).
+  The default cap is **2048 MiB**, editable in the GUI or with
+  `--cache-ram-mib`; the reserved amount is included in the RAM estimate.
 - **Sticky GUI choices** — the Qt launcher remembers per-model
   vision / draft / thinking / **n-gram** / **prompt-cache** toggles **and
   the chosen mmproj projector** in `autotuner_settings.json`. Switch to
@@ -146,7 +147,9 @@ You can disable vision (mmproj) support in two ways:
    python auto_tuner.py --model "Qwen3.6" --novision
    ```
 
-2. **GUI checkbox** in *Launch options*. When the model ships several
+2. **GUI checkbox** in *Launch options*. A second checkbox can keep an
+   active projector in system RAM (`--no-mmproj-offload`); the memory preview
+   then moves its footprint from VRAM to RAM. When the model ships several
    projector precisions (`…-bf16` / `…-f16` / `…-f32`), an **mmproj
    dropdown** appears above the checkboxes so you can pick which one to
    load. The chosen projector is remembered per model in
@@ -401,6 +404,8 @@ that only make sense with persistent state:
 | `--model SUBSTR` | Skip the menu, pick a model by name substring |
 | `--gpu NAME` | Hard-pin the server to a single GPU by name substring (e.g. `--gpu 9070`, `--gpu R9700`). Overrides the persisted `forced_gpu`; omit for free-VRAM-aware auto selection. The GUI exposes the same pin via the toolbar **GPU** dropdown |
 | `--ngram` | Enable n-gram (ngram-mod) self-speculative decoding |
+| `--no-mmproj-offload` | Keep an active vision projector in system RAM instead of VRAM; its size is moved into the RAM budget |
+| `--cache-ram-mib MIB` | Bound host prompt caching (default 2048 MiB; `-1` unlimited, `0` disabled) and reserve that amount in the RAM estimate |
 | `--no-prompt-cache` | Disable host-memory prompt caching (`--cache-ram 0`). Caching is auto-on; Vision requires llama.cpp b10045+ and falls back to off on older/unprobeable builds |
 | `--dry-run` | Print the command, don't start the server |
 | `--yes / -y` | Skip the launch confirmation prompt |
@@ -715,7 +720,7 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s. Current mainline already defaults timings on; users can append `--no-perf`. |
 | `--metrics` | ✅ Prometheus endpoint `GET /metrics` on the same host:port (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
-| `--cache-ram` / `-cram` | ✅ Host-memory prompt caching (PR #16391), auto-on (`-1`, unlimited), switchable off. Vision caching is enabled for b10045+ and forced to `0` for older/unprobeable builds. |
+| `--cache-ram` / `-cram` | ✅ Host-memory prompt caching (PR #16391), auto-on with a 2048 MiB bounded default, adjustable in GUI/CLI and included in RAM planning. Vision caching is enabled for b10045+ and forced to `0` for older/unprobeable builds. |
 | `--reasoning on/off/auto` | ✅ Via dropdown |
 | `--reasoning-budget N` | ✅ Via spin-box. **Renamed from `--think-budget` at b9625** (the old spelling is gone, not an alias); AutoTuner emits the new name and still reads the legacy one back from older persisted settings |
 | `--reasoning-preserve` | ✅ Optional Expert checkbox; omitted means template default |
@@ -1055,13 +1060,15 @@ system RAM and swaps them back into the `llama_context` when a new request
 shares a long prefix (system prompt, RAG scaffold, Roo-Code preamble). This
 massively lowers time-to-first-token on repeated prompts.
 
-- **Auto-on** with a default cap of `-1` (no byte limit, uses available RAM).
+- **Auto-on** with a bounded default cap of **2048 MiB**. The GUI spinbox
+  and CLI `--cache-ram-mib` accept a positive limit, `-1` (unlimited), or
+  `0` (disabled); the planned amount is subtracted from the RAM/KV budget.
 - **Switchable off** via the *Prompt caching* checkbox in the Launch
   options or with CLI `--no-prompt-cache` (emits `--cache-ram 0`).
 - **Vision support on b10045+.** Current builds deep-copy multimodal prompt
   state and reuse repeated image prompts. Older or unprobeable builds retain
   the conservative `--cache-ram 0` fallback. The per-model choice is
-  remembered like vision/draft/thinking.
+  remembered like vision/draft/thinking; the MiB limit is global.
 
 ### Choosing among several mmproj precisions
 

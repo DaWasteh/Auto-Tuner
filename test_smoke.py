@@ -471,11 +471,85 @@ def test_vision_prompt_cache_is_build_gated(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10045)
     current_cmd = build_command(model, cfg, profile, enable_prompt_cache=True)
     current_idx = current_cmd.index("--cache-ram")
-    assert current_cmd[current_idx + 1] == "-1"
+    assert current_cmd[current_idx + 1] == "2048"
+
+    cfg.prompt_cache_ram_mib = 4096
+    bounded_cmd = build_command(model, cfg, profile, enable_prompt_cache=True)
+    bounded_idx = bounded_cmd.index("--cache-ram")
+    assert bounded_cmd[bounded_idx + 1] == "4096"
 
     disabled_cmd = build_command(model, cfg, profile, enable_prompt_cache=False)
     disabled_idx = disabled_cmd.index("--cache-ram")
     assert disabled_cmd[disabled_idx + 1] == "0"
+
+
+def test_mmproj_cpu_offload_moves_memory_and_emits_flag(tmp_path, monkeypatch) -> None:
+    """--no-mmproj-offload moves the projector estimate from VRAM to RAM,
+    and the command flag is emitted only while a projector is loaded."""
+    import tuner
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "gemma-4-12b-it-qat-q4_0", size_gb=6.5)
+    mmproj = tmp_path / "mmproj-gemma-4-12b-it-f16.gguf"
+    mmproj.write_bytes(b"x" * (4 * 1024 * 1024))
+    model.mmproj = mmproj
+    profile = match_profile(model.name, profiles)
+
+    gpu_cfg = compute_config(
+        model, _fake_system(), profile, no_mmproj_offload=False,
+        prompt_cache_ram_mib=0,
+    )
+    cpu_cfg = compute_config(
+        model, _fake_system(), profile, no_mmproj_offload=True,
+        prompt_cache_ram_mib=0,
+    )
+    expected_gb = mmproj.stat().st_size / 1024**3
+    assert gpu_cfg.vision_vram_gb == pytest.approx(expected_gb)
+    assert gpu_cfg.vision_ram_gb == 0
+    assert cpu_cfg.vision_vram_gb == 0
+    assert cpu_cfg.vision_ram_gb == pytest.approx(expected_gb)
+
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10045)
+    cmd = build_command(model, cpu_cfg, profile)
+    assert "--no-mmproj-offload" in cmd
+
+    no_vision = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
+    no_vision_cfg = compute_config(
+        no_vision, _fake_system(), match_profile(no_vision.name, profiles),
+        no_mmproj_offload=True, prompt_cache_ram_mib=0,
+    )
+    no_vision_cmd = build_command(
+        no_vision, no_vision_cfg, match_profile(no_vision.name, profiles)
+    )
+    assert "--no-mmproj-offload" not in no_vision_cmd
+
+
+def test_prompt_cache_limit_reduces_ram_kv_budget(tmp_path) -> None:
+    """A bounded host prompt cache competes with RAM-resident KV and must
+    lower the safe context; legacy unlimited mode uses a finite 2 GiB reserve."""
+    from performance_target import get_target
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _mistral_dense_md(tmp_path, size_gb=20.0)
+    profile = match_profile(model.name, profiles)
+    system = _fake_system(
+        ram_total=40, ram_free=30, vram_total=8, vram_free=7.5
+    )
+    target = get_target("low_vram")
+    assert target is not None
+    uncached = compute_config(
+        model, system, profile, perf_target=target, prompt_cache_ram_mib=0
+    )
+    bounded = compute_config(
+        model, system, profile, perf_target=target, prompt_cache_ram_mib=4096
+    )
+    unlimited = compute_config(
+        model, system, profile, perf_target=target, prompt_cache_ram_mib=-1
+    )
+    assert bounded.prompt_cache_ram_gb == pytest.approx(4.0)
+    assert bounded.ctx < uncached.ctx
+    assert unlimited.prompt_cache_ram_gb == pytest.approx(2.0)
+    assert 2048 <= unlimited.ctx < uncached.ctx
 
 
 @pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell-script fake binary")
@@ -3142,13 +3216,84 @@ def _fake_diffusion_model():
         path=Path("/models/diffusiongemma-26B-A4B-it-Q8_0.gguf"),
         name="diffusiongemma-26B-A4B-it-Q8_0",
         group=".",
-        size_bytes=20 * 1024**3,
+        size_bytes=25 * 1024**3,
         metadata={
             "general.architecture": "diffusion-gemma",
-            "diffusion-gemma.block_count": 48,
+            "diffusion-gemma.block_count": 30,
             "diffusion-gemma.context_length": 262144,
+            "diffusion-gemma.embedding_length": 2816,
+            "diffusion-gemma.attention.head_count": 16,
+            "diffusion-gemma.attention.head_count_kv": [2],
+            "diffusion-gemma.attention.key_length": 512,
+            "diffusion-gemma.attention.value_length": 512,
+            "diffusion-gemma.attention.sliding_window_pattern": [False],
+            "diffusion-gemma.expert_count": 128,
         },
     )
+
+
+def test_diffusiongemma_auto_memory_contract() -> None:
+    """The dedicated PR #24427 server runs F16 KV and cannot apply
+    expert-only CPU offload, so Auto must report that exact runtime contract."""
+    from hardware import GPUInfo, SystemInfo
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_diffusion_model()
+    profile = match_profile(model.name, profiles)
+    system = SystemInfo(
+        os_name="Windows test",
+        cpu_name="Test CPU",
+        cpu_cores_physical=24,
+        cpu_cores_logical=24,
+        total_ram_gb=48,
+        free_ram_gb=40,
+        gpus=[
+            GPUInfo(
+                index=0, name="RX 9070 XT", vendor="amd",
+                total_vram_mb=16 * 1024, free_vram_mb=15 * 1024, hip_index=0,
+            ),
+            GPUInfo(
+                index=1, name="Radeon AI PRO R9700", vendor="amd",
+                total_vram_mb=32 * 1024, free_vram_mb=31 * 1024, hip_index=1,
+            ),
+        ],
+    )
+    cfg = compute_config(
+        model, system, profile, prompt_cache_ram_mib=0,
+        gpu_priorities={"Radeon AI PRO R9700": 2, "RX 9070 XT": 1},
+    )
+    assert cfg.ctx == 4096
+    assert (cfg.cache_k, cfg.cache_v) == ("f16", "f16")
+    assert cfg.estimated_kv_gb == pytest.approx(0.46875, rel=0.02)
+    assert cfg.n_cpu_moe is None
+    assert cfg.runtime_vram_overhead_gb == pytest.approx(1.5)
+    total_gpu = (
+        cfg.estimated_model_vram_gb + cfg.kv_vram_gb
+        + cfg.vision_vram_gb + cfg.draft_vram_gb
+        + cfg.runtime_vram_overhead_gb
+    )
+    assert total_gpu >= model.size_gb + 1.9
+    assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "1"
+
+    # The 4096 limit is an Auto safety default, not an unconditional model
+    # cap: an explicit pin remains available for the HIP build and is still
+    # clamped by the real F16 VRAM budget.
+    pinned = compute_config(
+        model, system, profile, user_ctx=8192, prompt_cache_ram_mib=0,
+        gpu_priorities={"Radeon AI PRO R9700": 2, "RX 9070 XT": 1},
+    )
+    assert pinned.ctx == 8192
+    assert pinned.estimated_kv_gb == pytest.approx(0.9375, rel=0.02)
+
+    from performance_target import get_target
+
+    low_vram = compute_config(
+        model, system, profile, perf_target=get_target("low_vram"),
+        prompt_cache_ram_mib=0,
+    )
+    assert low_vram.no_kv_offload is False
+    assert low_vram.kv_vram_gb == pytest.approx(low_vram.estimated_kv_gb)
+    assert low_vram.kv_ram_gb == 0
 
 
 def test_build_diffusion_command_mainline_flags() -> None:
@@ -3572,6 +3717,21 @@ def test_application_close_preference_is_opt_in(_isolated_settings) -> None:
     assert app_settings.get_minimize_on_close() is True
     app_settings.set_minimize_on_close(False)
     assert app_settings.get_minimize_on_close() is False
+
+
+def test_prompt_cache_limit_and_mmproj_cpu_override_persist(
+    _isolated_settings,
+) -> None:
+    import app_settings
+
+    assert app_settings.get_prompt_cache_ram_mib() == 2048
+    app_settings.set_prompt_cache_ram_mib(4096)
+    assert app_settings.get_prompt_cache_ram_mib() == 4096
+    app_settings.set_prompt_cache_ram_mib(-99)
+    assert app_settings.get_prompt_cache_ram_mib() == -1
+
+    app_settings.set_model_override("VisionModel", "mmproj_cpu", True)
+    assert app_settings.get_model_overrides("VisionModel")["mmproj_cpu"] is True
 
 
 def test_system_tray_support_is_native_on_windows_and_macos(monkeypatch) -> None:

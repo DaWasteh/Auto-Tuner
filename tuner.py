@@ -47,6 +47,21 @@ MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[
 ].moe_placement_ctx_target
 MOE_KV_RESERVE_FRAC = 0.06
 
+# Default host-RAM prompt-cache size in MiB (``--cache-ram``). A bounded,
+# computed default replaces the previous unlimited/uncomputed value so the
+# cache no longer silently consumes all available RAM. -1 keeps the legacy
+# "unlimited" semantics (planned conservatively as a 2 GiB reservation).
+PROMPT_CACHE_RAM_MIB_DEFAULT = 2048
+# Conservative reservation used when the legacy -1 (unlimited) cache is
+# requested, so the RAM budget never under-provisions against an unbounded
+# host-RAM cache.
+PROMPT_CACHE_UNLIMITED_RESERVE_GB = 2.0
+# Extra VRAM the DiffusionGemma diffusion-server (PR #24427) reserves for its
+# diffusion-runtime buffers beyond weights + KV. The PR server parses common
+# args but ignores cache_type_k/v and n_cpu_moe overrides, so this overhead
+# plus a forced-F16 KV estimate hardens the config against Vulkan OOM.
+DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB = 1.5
+
 # Compute-buffer headroom a model needs ON TOP of its weights before the
 # AutoTuner will commit to a FULL GPU offload (ngl 999). llama.cpp allocates
 # a flash-attention / compute workspace on top of the weights (~0.3–0.8 GB
@@ -844,7 +859,36 @@ class TunedConfig:
     # counter-intuitive context changes the user could not explain.
     # Surfacing both here lets the GUI render the FULL GPU picture.
     vision_vram_gb: float = 0.0
+    vision_ram_gb: float = 0.0
     draft_vram_gb: float = 0.0
+
+    # ---- mmproj host-RAM offload (``--no-mmproj-offload``) -------------
+    # When True the multimodal projector (mmproj) is forced to stay in
+    # system RAM instead of being offloaded to the GPU. compute_config
+    # then reports the projector size as ``vision_ram_gb`` (it leaves
+    # ``vision_vram_gb`` at 0) so the RAM budget reflects the real host
+    # footprint. build_command emits ``--no-mmproj-offload`` ONLY when an
+    # mmproj is actually loaded AND this flag is set.
+    no_mmproj_offload: bool = False
+
+    # ---- Host-memory prompt cache (``--cache-ram``) --------------------
+    # Size of the host-RAM prompt cache in MiB. Semantics:
+    #   * positive value → reserve exactly that many MiB;
+    #   * 0              → prompt cache disabled (--cache-ram 0);
+    #   * -1             → legacy "unlimited"; planned conservatively as a
+    #     2 GiB reservation so the RAM budget never silently explodes.
+    # The computed GiB equivalent (``prompt_cache_ram_gb``) is what the
+    # RAM budget subtracts and what the preview/preflight/registry show.
+    prompt_cache_ram_mib: int = 2048
+    prompt_cache_ram_gb: float = 0.0
+
+    # ---- Runner-specific VRAM overhead --------------------------------
+    # Extra VRAM a particular server binary reserves beyond weights + KV
+    # (e.g. DiffusionGemma's diffusion-runtime buffers). compute_config
+    # subtracts this from the placement / KV budget and the preview /
+    # preflight / registry add it to the total GPU footprint so the
+    # displayed picture matches the real on-device allocation.
+    runtime_vram_overhead_gb: float = 0.0
     # KV split between VRAM and RAM (set by compute_config). For
     # full-offload / MoE-on-GPU the entire KV cache lives in VRAM and
     # `kv_ram_gb == 0`. For dense-hybrid placement the small RAM share
@@ -1448,6 +1492,22 @@ def compute_config(
     # of letting it pile onto an already-full one. Matched case-insensitively
     # against GPUInfo.name; an unknown name is ignored (falls back to auto).
     force_gpu: Optional[str] = None,
+    # ---- mmproj host-RAM offload (``--no-mmproj-offload``) -------------
+    # When True the multimodal projector is forced to stay in system RAM
+    # instead of being offloaded to the GPU. The projector size then shows
+    # up as ``vision_ram_gb`` (and is subtracted from the RAM budget)
+    # rather than ``vision_vram_gb``. build_command emits the flag only
+    # when an mmproj is actually loaded AND this is True.
+    no_mmproj_offload: bool = False,
+    # ---- Host-memory prompt cache (``--cache-ram``) --------------------
+    # Size of the host-RAM prompt cache in MiB. Semantics:
+    #   * positive -> reserve exactly that many MiB;
+    #   * 0        -> cache disabled (--cache-ram 0), no RAM reservation;
+    #   * -1        -> legacy "unlimited"; planned conservatively as a
+    #     PROMPT_CACHE_UNLIMITED_RESERVE_GB reservation so the RAM budget
+    #     never silently explodes. build_command emits the resolved value
+    #     (unless an explicit caller override is supplied).
+    prompt_cache_ram_mib: int = PROMPT_CACHE_RAM_MIB_DEFAULT,
 ) -> TunedConfig:
     """Compute a TunedConfig that fits this model on this system.
 
@@ -1637,33 +1697,91 @@ def compute_config(
         profile_max = min(profile_max, native_ctx)
     target_ctx_for_placement = user_ctx if user_ctx is not None else profile_max
 
+    # ---- DiffusionGemma runner special case ---------------------------
+    # PR #24427's llama-diffusion-gemma-server parses the common llama.cpp
+    # load flags but its model/context params do NOT apply cache_type_k/v,
+    # tensor_buft_overrides (n_cpu_moe) or main_gpu/tensor_split the way
+    # llama-server does. Treat it as a special runner:
+    #   * force F16 KV (the fork ignores -ctk/-ctv anyway, so a denser
+    #     quant is a lie — surface the honest F16 number and labels);
+    #   * do NOT use the n_cpu_moe expert-only placement path even though
+    #     the GGUF reports expert_count>1 (the fork's op-offload is
+    #     layer-based like a dense model). We keep is_moe=True for display /
+    #     architecture info but route placement + multi-GPU split through
+    #     the dense -ngl path;
+    #   * reserve DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB of extra VRAM
+    #     for the diffusion-runtime buffers the server allocates beyond
+    #     weights + KV, so the placement / KV budget / footprint all harden
+    #     against the Vulkan OOM that motivated this;
+    #   * cap auto context at the profile's max_context (4096), because the
+    #     server's huge F16 KV cache OOMs long before the generic 32k floor
+    #     would ever bind.
+    is_diffusion_gemma = (
+        getattr(profile, "runner", "") == "llama-diffusion-gemma-server"
+    )
+    runtime_vram_overhead_gb = (
+        DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB if is_diffusion_gemma else 0.0
+    )
+
     # ---- (0.5) Calculate VRAM reserved for Vision + Draft models
-    # These MUST be on GPU for optimal performance.
+    # These MUST be on GPU for optimal performance — UNLESS the user asked
+    # to keep the mmproj in system RAM (--no-mmproj-offload). In that case
+    # the projector size is reported as ``vision_ram_gb`` (and subtracted
+    # from the RAM budget below) while ``vision_vram_gb`` stays 0.
     vision_vram_gb = 0.0
+    vision_ram_gb = 0.0
     draft_vram_gb = 0.0
 
     if model.mmproj is not None:
         # Vision model (mmproj) — estimate from file size
         try:
             mmproj_size_bytes = model.mmproj.stat().st_size
-            vision_vram_gb = mmproj_size_bytes / (1024**3)
+            mmproj_gb = mmproj_size_bytes / (1024**3)
         except (OSError, AttributeError):
             # Fallback: ~6 GB for typical F16 mmproj files
-            vision_vram_gb = 6.0
+            mmproj_gb = 6.0
+        if no_mmproj_offload:
+            # Projector forced to host RAM (--no-mmproj-offload).
+            vision_ram_gb = mmproj_gb
+        else:
+            vision_vram_gb = mmproj_gb
 
     if draft_model is not None:
         # Draft model — must fit in VRAM for speculative decoding to work well
         draft_vram_gb = draft_model.size_gb
 
-    # Effective VRAM available for main model placement
-    effective_free_vram = free_vram - vision_vram_gb - draft_vram_gb
+    # ---- Host-memory prompt cache RAM reservation ---------------------
+    # Resolve the configured prompt-cache size to a GiB figure the RAM
+    # budget subtracts (and the preview/preflight/registry display). A
+    # positive value is reserved exactly; 0 disables the cache (no RAM);
+    # -1 (legacy "unlimited") is planned conservatively as a bounded
+    # PROMPT_CACHE_UNLIMITED_RESERVE_GB so the budget never under-
+    # provisions against an unbounded host cache.
+    if prompt_cache_ram_mib > 0:
+        prompt_cache_ram_gb = prompt_cache_ram_mib / 1024.0
+    elif prompt_cache_ram_mib == -1:
+        prompt_cache_ram_gb = PROMPT_CACHE_UNLIMITED_RESERVE_GB
+    else:
+        prompt_cache_ram_gb = 0.0
+
+    # Effective VRAM available for main model placement. Vision/draft that
+    # live on the GPU AND the runner's runtime overhead are subtracted up
+    # front so placement + KV sizing see the real headroom.
+    effective_free_vram = (
+        free_vram - vision_vram_gb - draft_vram_gb - runtime_vram_overhead_gb
+    )
     if effective_free_vram < 0:
         effective_free_vram = 0.0
 
     # Same, but scoped to the PRIMARY GPU only — MoE expert placement must
     # use this (experts spill to CPU, never to the secondary GPU). On
     # single-GPU systems this equals effective_free_vram.
-    effective_primary_free_vram = primary_free_vram_gb - vision_vram_gb - draft_vram_gb
+    effective_primary_free_vram = (
+        primary_free_vram_gb
+        - vision_vram_gb
+        - draft_vram_gb
+        - runtime_vram_overhead_gb
+    )
     if effective_primary_free_vram < 0:
         effective_primary_free_vram = 0.0
 
@@ -1685,15 +1803,31 @@ def compute_config(
         combined_usable_vram_gb = sum(
             _gpu_usable_cap_gb(g, g is primary_gpu) for g in system.gpus
         )
-        effective_moe_vram = combined_usable_vram_gb - vision_vram_gb - draft_vram_gb
+        effective_moe_vram = (
+            combined_usable_vram_gb
+            - vision_vram_gb
+            - draft_vram_gb
+            - runtime_vram_overhead_gb
+        )
     else:
         effective_moe_vram = effective_primary_free_vram
     if effective_moe_vram < 0:
         effective_moe_vram = 0.0
 
     # ---- (1) Model placement
+    # DiffusionGemma is architecturally a MoE (expert_count>1) but its
+    # dedicated server (PR #24427) ignores n_cpu_moe and uses layer-based
+    # -ngl offload like a dense model, so we skip the expert-only
+    # placement branch entirely. is_moe stays True for display / split
+    # decisions are handled below via the disable_moe_placement flag.
+    disable_moe_placement = is_diffusion_gemma
     n_cpu_moe: Optional[int] = None
-    if is_moe and has_gpu and n_layers > 0:
+    if (
+        is_moe
+        and has_gpu
+        and n_layers > 0
+        and not disable_moe_placement
+    ):
         ngl, n_cpu_moe, model_vram, model_ram, full_off = _decide_moe_offload(
             model_size_gb=model.size_gb,
             free_vram_gb=effective_moe_vram,
@@ -1793,7 +1927,13 @@ def compute_config(
     # estimates reflect the user's pinned values. The user owns the
     # consequences (over/undercommit); we only redistribute the model
     # size estimate to match the new layer split.
-    if force_n_cpu_moe is not None and is_moe and has_gpu and n_layers > 0:
+    if (
+        force_n_cpu_moe is not None
+        and is_moe
+        and has_gpu
+        and n_layers > 0
+        and not disable_moe_placement
+    ):
         new_cpu_moe = max(0, min(n_layers, int(force_n_cpu_moe)))
         # Re-derive model_vram/ram from the new split, holding shared
         # overhead constant (it scales with model size, not layer
@@ -1809,7 +1949,9 @@ def compute_config(
         full_off = new_cpu_moe == 0
         ngl = 999
 
-    if force_ngl is not None and n_layers > 0 and not (is_moe and has_gpu):
+    if force_ngl is not None and n_layers > 0 and not (
+        is_moe and has_gpu and not disable_moe_placement
+    ):
         new_ngl = max(0, min(n_layers, int(force_ngl)))
         per_layer_gb = model.size_gb / n_layers
         ngl = new_ngl if new_ngl < n_layers else 999
@@ -1829,9 +1971,25 @@ def compute_config(
     )
     free_vram_after = max(
         0.0,
-        free_vram - effective_vram_safety - model_vram - vision_vram_gb - draft_vram_gb,
+        free_vram
+        - effective_vram_safety
+        - model_vram
+        - vision_vram_gb
+        - draft_vram_gb
+        - runtime_vram_overhead_gb,
     )
-    free_ram_after = max(0.0, system.free_ram_gb - ram_safety_gb - model_ram)
+    # The RAM budget must also account for the mmproj when it is forced
+    # into host RAM (--no-mmproj-offload → vision_ram_gb) and for the
+    # host-memory prompt cache (prompt_cache_ram_gb). Without these the
+    # KV-to-RAM budget (low_vram) silently over-commits system RAM.
+    free_ram_after = max(
+        0.0,
+        system.free_ram_gb
+        - ram_safety_gb
+        - model_ram
+        - vision_ram_gb
+        - prompt_cache_ram_gb,
+    )
 
     # KV-cache placement rules:
     #   - kv_to_ram (low_vram): the ENTIRE KV cache lives in system RAM via
@@ -1857,14 +2015,21 @@ def compute_config(
     # 4 GB that ignored high-RAM systems. See the dense-hybrid branch below.
 
     no_kv_offload = False
-    if perf_target.kv_to_ram and has_gpu:
+    if is_diffusion_gemma and has_gpu:
+        # The dedicated PR #24427 server keeps its F16 KV on the GPU and does
+        # not copy common_params.no_kv_offload into its context params. This
+        # runner-specific contract wins even over the generic low_vram tier:
+        # budgeting against host RAM would approve a context the process still
+        # allocates in VRAM.
+        kv_budget_gb = free_vram_after
+    elif perf_target.kv_to_ram and has_gpu:
         # LOW-VRAM mode: KV cache → system RAM via --no-kv-offload.
         # Budget is the RAM headroom (capped by the tier), NOT the VRAM
         # remainder — with KV offload disabled, no KV lands in VRAM.
         ram_kv = min(free_ram_after, perf_target.kv_ram_cap_gb)
         kv_budget_gb = ram_kv
         no_kv_offload = True
-    elif is_moe and has_gpu:
+    elif is_moe and has_gpu and not disable_moe_placement:
         if has_multiple_gpus:
             # MoE KV lives in VRAM and follows the layer split, so it must
             # fit inside the SAME per-card caps the spread enforces. Using
@@ -1878,7 +2043,8 @@ def compute_config(
                 - effective_vram_safety
                 - model_vram
                 - vision_vram_gb
-                - draft_vram_gb,
+                - draft_vram_gb
+                - runtime_vram_overhead_gb,
             )
         else:
             kv_budget_gb = free_vram_after
@@ -2043,6 +2209,13 @@ def compute_config(
     model_ctx_limit = rope_scaled_ctx if rope_scaled_ctx > 0 else native_ctx
     if model_ctx_limit <= 0:
         model_ctx_limit = profile_max
+    # DiffusionGemma's dedicated server has a huge F16 KV cache that OOMs
+    # long before the generic 32k auto floor would ever bind, and its
+    # canvas-based generation (256-token blocks) needs little context. Cap
+    # the model limit at the profile's max_context (4096) so the auto path
+    # honours it instead of being overridden by native_ctx (262144).
+    if is_diffusion_gemma and user_ctx is None:
+        model_ctx_limit = min(model_ctx_limit, profile_max)
 
     # Expert overrides for KV-quant: when both K and V are pinned we
     # respect the user's pair as-is; when only one is pinned we still
@@ -2062,7 +2235,16 @@ def compute_config(
     auto_asymmetric_kv = primary_vendor != "nvidia"
 
     kv_quant_strategy = "symmetric"
-    if force_cache_k is not None and force_cache_v is not None:
+    if is_diffusion_gemma:
+        # PR #24427's llama-diffusion-gemma-server ignores -ctk/-ctv (its
+        # model/context params do not apply cache_type_k/v), so any denser
+        # quant the AutoTuner would pick is a lie. Surface the honest F16
+        # estimate (base_kv_mb is already metadata-F16) and F16 labels so
+        # the displayed KV footprint matches what the server actually
+        # allocates, hardening the placement against the Vulkan OOM.
+        cache_k, cache_v = "f16", "f16"
+        kv_quant_strategy = "symmetric"
+    elif force_cache_k is not None and force_cache_v is not None:
         cache_k, cache_v = force_cache_k, force_cache_v
         if turbo_kv:
             cache_k = _turbo_quant_for(cache_k)
@@ -2183,11 +2365,17 @@ def compute_config(
         # every low_vram run would false-positive a "VRAM budget tight"
         # warning for KV that isn't even on the GPU).
         vram_kv_component = 0.0 if no_kv_offload else estimated_kv_gb
-        gpu_total = model_vram + vram_kv_component + effective_vram_safety
+        gpu_total = (
+            model_vram
+            + vram_kv_component
+            + runtime_vram_overhead_gb
+            + effective_vram_safety
+        )
         if gpu_total > free_vram * 0.98:
             tight = (
                 f"VRAM budget tight: model {model_vram:.1f} GB + KV "
-                f"{vram_kv_component:.1f} GB + safety "
+                f"{vram_kv_component:.1f} GB + runtime "
+                f"{runtime_vram_overhead_gb:.1f} GB + safety "
                 f"{effective_vram_safety:.1f} GB ≈ {gpu_total:.1f} GB of "
                 f"{free_vram:.1f} GB free."
             )
@@ -2361,7 +2549,7 @@ def compute_config(
         # the secondary card half-empty. Use the architectural is_moe flag
         # (combined with has_gpu) so EVERY MoE that spreads uses the
         # capacity-fill strategy, whether or not any experts spilled to CPU.
-        is_moe_cfg = is_moe and has_gpu
+        is_moe_cfg = is_moe and has_gpu and not disable_moe_placement
 
         primary_cap = _gpu_usable_cap_gb(primary_gpu, True)
 
@@ -2370,7 +2558,12 @@ def compute_config(
         # the KV cache is dynamically allocated and won't consume the entire
         # budget. This allows smaller models to be pinned to the primary GPU
         # even when their theoretical max-KV footprint exceeds the cap.
-        model_footprint_gb = model_vram + vision_vram_gb + draft_vram_gb
+        model_footprint_gb = (
+            model_vram
+            + vision_vram_gb
+            + draft_vram_gb
+            + runtime_vram_overhead_gb
+        )
 
         # Pin the whole model to the primary GPU when its GPU-resident
         # weight footprint fits the primary's usable cap. This holds for
@@ -2662,7 +2855,7 @@ def compute_config(
     if no_kv_offload:
         kv_vram_gb = 0.0
         kv_ram_gb = estimated_kv_gb
-    elif is_moe and has_gpu:
+    elif is_moe and has_gpu and not disable_moe_placement:
         kv_vram_gb = estimated_kv_gb
         kv_ram_gb = 0.0
     elif full_off:
@@ -2711,7 +2904,12 @@ def compute_config(
         estimated_kv_gb=estimated_kv_gb,
         full_offload=full_off,
         vision_vram_gb=vision_vram_gb,
+        vision_ram_gb=vision_ram_gb,
         draft_vram_gb=draft_vram_gb,
+        no_mmproj_offload=bool(no_mmproj_offload and model.mmproj is not None),
+        prompt_cache_ram_mib=prompt_cache_ram_mib,
+        prompt_cache_ram_gb=prompt_cache_ram_gb,
+        runtime_vram_overhead_gb=runtime_vram_overhead_gb,
         kv_vram_gb=kv_vram_gb,
         kv_ram_gb=kv_ram_gb,
         kv_quant_strategy=kv_quant_strategy,
@@ -3071,7 +3269,7 @@ def build_command(
     enable_speculative: bool = True,
     enable_ngram: bool = False,
     enable_prompt_cache: bool = True,
-    prompt_cache_ram_mib: int = -1,
+    prompt_cache_ram_mib: Optional[int] = None,
     enable_metrics: Optional[bool] = None,
     enable_slots_api: Optional[bool] = None,
 ) -> List[str]:
@@ -3194,10 +3392,18 @@ def build_command(
             and build_number >= _MIN_VISION_PROMPT_CACHE_BUILD
         )
 
+    resolved_cache_ram_mib = (
+        int(config.prompt_cache_ram_mib)
+        if prompt_cache_ram_mib is None
+        else int(prompt_cache_ram_mib)
+    )
     if enable_prompt_cache and vision_cache_ok:
-        cmd += ["--cache-ram", str(int(prompt_cache_ram_mib))]
+        cmd += ["--cache-ram", str(resolved_cache_ram_mib)]
     else:
         cmd += ["--cache-ram", "0"]
+
+    if vision_active and config.no_mmproj_offload:
+        cmd.append("--no-mmproj-offload")
 
     # Speculative decoding — composable paths combined into one --spec-type:
     #   - sibling drafter passed in        → Path A (-md, auto-detected type)

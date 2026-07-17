@@ -42,9 +42,11 @@ runner: llama-diffusion-gemma-server
 # Modell-Maximum; der KV-Cache (k/v_length=512, 30 Layer) wächst dabei auf
 # ~30 GiB, was auf 16-GB-Vulkan-Karten crash ("failed to allocate Vulkan0
 # buffer of size 1073741824"). compute_config deckelt den Kontext anhand der
-# echten KV-Schätzung automatisch nach unten; 8192 ist ein sicherer
-# Praxis-Wert (KV ~0,9 GiB) für lokale Diffusions-Workloads.
-max_context: 8192
+# echten F16-KV-Schätzung automatisch nach unten. 4096 ist der sichere
+# Auto-Wert (KV ~0,47 GiB); 8192 erreicht mit Allocator-Overhead eine
+# zusammenhängende ~1-GiB-Vulkan-Allokation und kann trotz freiem Gesamt-VRAM
+# scheitern. Größere explizite Context-Pins bleiben für HIP-Builds möglich.
+max_context: 4096
 
 # Diffusions-Parameter (nur auf dem Diffusionspfad ausgewertet). Mapping auf
 # die b9672-Mainline-Flags:
@@ -99,7 +101,9 @@ notes: >
   ENTWEDER --diffusion-eps ODER --diffusion-block-length, nicht beides
   (DiffusionGemma nutzt Block-Scheduling). Fork-spezifische Flags müssen
   über diffusion.fork_args zugeschaltet werden, falls dein Build sie kennt.
-  WICHTIG VRAM: DiffusionGemma hat extrem großen KV-Cache (k/v_length=512,
-  5x normal); max_context ist daher auf 8192 gedeckelt (KV ~0,9 GiB), damit
-  der Start auf Vulkan/16-GB-Karten nicht an der 1-GiB-Allocationsgrenze
-  crasht. Pinnen auf die 32-GB-R9700 geschieht automatisch (env_overrides).
+  WICHTIG VRAM: DiffusionGemma hat einen extrem großen F16-KV-Cache
+  (k/v_length=512, 5x normal). Auto ist daher auf 4096 gedeckelt
+  (KV ~0,47 GiB); 8192 kann mit Allocator-Overhead eine zusammenhängende
+  1-GiB-Vulkan-Allokation erreichen und trotz freiem Gesamt-VRAM crashen.
+  Die Rechnung reserviert außerdem 1,5 GiB Diffusions-Runtime-Overhead.
+  Pinnen auf die 32-GB-R9700 geschieht automatisch (env_overrides).

@@ -180,7 +180,15 @@ def _print_config(
     print(
         f"    Model CPU : ~ {cfg.estimated_model_ram_gb:5.1f} GB   (free RAM:  {system.free_ram_gb:5.1f} GB)"
     )
+    if cfg.vision_vram_gb:
+        print(f"    Vision GPU: ~ {cfg.vision_vram_gb:5.1f} GB")
+    if cfg.vision_ram_gb:
+        print(f"    Vision RAM: ~ {cfg.vision_ram_gb:5.1f} GB")
+    if cfg.runtime_vram_overhead_gb:
+        print(f"    Runtime GPU:~ {cfg.runtime_vram_overhead_gb:5.1f} GB")
     print(f"    KV cache  : ~ {cfg.estimated_kv_gb:5.1f} GB")
+    if cfg.prompt_cache_ram_gb:
+        print(f"    Prompt RAM: ~ {cfg.prompt_cache_ram_gb:5.1f} GB")
     print(_BAR)
 
 
@@ -970,12 +978,26 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "reasoning models and summarisation.",
     )
     p.add_argument(
+        "--no-mmproj-offload",
+        action="store_true",
+        help="Keep an active vision projector in system RAM instead of VRAM. "
+        "The AutoTuner moves its estimated footprint to the RAM budget.",
+    )
+    p.add_argument(
         "--no-prompt-cache",
         action="store_true",
         dest="no_prompt_cache",
         help="Disable host-memory prompt caching (--cache-ram 0). By default "
         "prompt caching is auto-enabled; Vision caching requires llama.cpp "
         "b10045+ and safely falls back to off on older/unprobeable builds.",
+    )
+    p.add_argument(
+        "--cache-ram-mib",
+        type=int,
+        default=2048,
+        metavar="MIB",
+        help="Maximum host prompt-cache size in MiB (default: 2048; "
+        "-1 unlimited, 0 disabled). --no-prompt-cache wins.",
     )
     p.add_argument(
         "--no-metrics",
@@ -1306,6 +1328,14 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             user_ctx=args.ctx,
             force_mlock=getattr(args, "force_mlock", False),
             perf_target=perf_target,
+            no_mmproj_offload=bool(
+                getattr(args, "no_mmproj_offload", False) and model.mmproj is not None
+            ),
+            prompt_cache_ram_mib=(
+                0
+                if getattr(args, "no_prompt_cache", False)
+                else max(-1, int(getattr(args, "cache_ram_mib", 2048)))
+            ),
             gpu_priorities=app_settings.get_gpu_priorities(),
             force_gpu=getattr(args, "gpu", None) or app_settings.get_forced_gpu(),
         )
