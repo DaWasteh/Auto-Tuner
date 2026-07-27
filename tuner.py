@@ -90,6 +90,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-fa",
     "-m",
     "-md",
+    "-lm",
     "-n",
     "-ngl",
     "-np",
@@ -112,7 +113,10 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--flash-attn",
     "--gpu-layers",
     "--host",
+    "--load-mode",
     "--main-gpu",
+    "--mcp-servers-config",
+    "--mcp-servers-json",
     "--min-p",
     "--mmproj",
     "--model",
@@ -159,6 +163,7 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-fa", "--flash-attn"},
     {"-m", "--model"},
     {"-md", "--model-draft"},
+    {"-lm", "--load-mode"},
     {"-n", "--predict"},
     {"-ngl", "--gpu-layers", "--n-gpu-layers"},
     {"-np", "--parallel"},
@@ -306,6 +311,9 @@ def _probe_supported_flags(binary: str) -> Optional[Set[str]]:
 
 
 _MIN_VISION_PROMPT_CACHE_BUILD = 10045
+# b10151 split the old mmap-backed ``mlock`` mode into two explicit choices:
+# ``mlock`` (normal reads + lock) and ``mmap+mlock`` (mapped + lock).
+_MIN_DISTINCT_MLOCK_BUILD = 10151
 
 
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
@@ -369,20 +377,77 @@ def _memlock_limit_gb() -> Optional[float]:
     return soft / (1024**3)
 
 
+def _adapt_load_mode_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
+    """Adapt b10151's split locking modes for older versioned binaries.
+
+    Before b10151, ``--load-mode mlock`` meant mmap + mlock and there was no
+    way to request non-mmap mlock. On those builds ``mmap+mlock`` is therefore
+    translated to the legacy equivalent, while the new non-mmap ``mlock``
+    choice is removed rather than silently changing its meaning.
+    """
+    if not cmd:
+        return [], []
+    build = _probe_binary_build_number(cmd[0])
+    if build is None or build >= _MIN_DISTINCT_MLOCK_BUILD:
+        return list(cmd), []
+
+    adapted = list(cmd)
+    notes: List[str] = []
+    i = 1
+    while i < len(adapted):
+        token = adapted[i]
+        flag = _flag_name(token)
+        if flag not in ("-lm", "--load-mode"):
+            i += 1
+            continue
+        # Inline form (--load-mode=MODE / -lm=MODE) keeps the value in the
+        # same token after '='. The space-separated form holds it in the
+        # following argv slot.
+        inline = "=" in token
+        if inline:
+            mode = token.split("=", 1)[1].strip().lower()
+        elif i + 1 < len(adapted):
+            mode = adapted[i + 1].strip().lower()
+        else:
+            i += 1
+            continue
+        if mode == "mmap+mlock":
+            replacement = flag + "=mlock" if inline else "mlock"
+            if inline:
+                adapted[i] = replacement
+            else:
+                adapted[i + 1] = replacement
+            notes.append(
+                "--load-mode mmap+mlock -> --load-mode mlock "
+                "(legacy equivalent before b10151)"
+            )
+        elif mode == "mlock":
+            if inline:
+                del adapted[i]
+            else:
+                del adapted[i : i + 2]
+            notes.append("--load-mode mlock (non-mmap mlock requires b10151+)")
+            continue
+        i += 1 if inline else 2
+    return adapted, notes
+
+
 def prepare_command_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
-    """Return ``cmd`` pruned for the selected binary plus removed chunks.
+    """Return ``cmd`` adapted/pruned for the selected binary plus changes.
 
     If the binary cannot be probed (missing, not executable, or --help times
     out), the command is returned unchanged. This keeps explicit user paths and
     very unusual forks working while still protecting normal launches from
-    older binaries that would crash on unknown arguments.
+    older binaries that would crash on unknown arguments or changed mode values.
     """
     if not cmd:
         return [], []
     flags = _probe_supported_flags(cmd[0])
     if not flags:
         return list(cmd), []
-    return _filter_command_for_supported_flags(cmd, flags)
+    adapted, mode_changes = _adapt_load_mode_for_binary(cmd)
+    filtered, removed = _filter_command_for_supported_flags(adapted, flags)
+    return filtered, mode_changes + removed
 
 
 def gemma_draft_needs_ik_fork(
@@ -836,6 +901,10 @@ class TunedConfig:
     flash_attn: bool
     sampling: Dict[str, Any] = field(default_factory=dict)
 
+    # Explicit llama.cpp model-loading strategy. ``auto`` leaves the binary's
+    # default (currently mmap) untouched. The legacy booleans remain for saved
+    # settings/API compatibility and are normalized by ``effective_load_mode``.
+    load_mode: str = "auto"
     mlock: bool = False
     no_mmap: bool = False
     numa: Optional[str] = None
@@ -1412,32 +1481,49 @@ def _kv_headroom_reserve(
 # mlock safety
 
 
-def _mlock_unsafe_with_gpu(system: SystemInfo, force_mlock: bool) -> bool:
-    """True when enabling --mlock would abort this llama.cpp build.
+def effective_load_mode(config: "TunedConfig") -> Optional[str]:
+    """Return the normalized llama.cpp load mode for a tuned configuration."""
+    mode = str(getattr(config, "load_mode", "auto") or "auto").strip().lower()
+    if mode in {"none", "mmap", "mlock", "mmap+mlock", "dio"}:
+        return mode
+    # Legacy configs/snapshots used two independent checkboxes. Preserve their
+    # intended combinations while moving command generation to --load-mode.
+    if bool(getattr(config, "mlock", False)):
+        return "mlock" if bool(getattr(config, "no_mmap", False)) else "mmap+mlock"
+    if bool(getattr(config, "no_mmap", False)):
+        return "none"
+    return None
 
-    A loaded GPU backend puts even CPU-resident weights into its pinned host
-    buffer, and b9895's Vulkan host allocation can hand back a NULL base
-    WITHOUT raising, so --mlock dies in llama_mlock::grow_to
-    (llama-mmap.cpp:744) — for ANY -ngl (even 0) and independent of
-    RLIMIT_MEMLOCK. ``--force-mlock`` is the opt-out for patched upstream
-    builds.
+
+def _mlock_unsafe_with_gpu(
+    system: SystemInfo,
+    force_mlock: bool,
+    binary: Optional[str] = None,
+) -> bool:
+    """True when enabling a locking load mode may abort this llama.cpp build.
+
+    The old Vulkan pinned-host-buffer crash is conservatively assumed for
+    unknown/older binaries. b10151's split load-mode implementation is allowed:
+    both ``mlock`` and ``mmap+mlock`` were live-tested on Windows/Vulkan.
     """
-    return bool(system.gpus) and not force_mlock
+    if not system.gpus or force_mlock:
+        return False
+    build = _probe_binary_build_number(binary) if binary else None
+    return build is None or build < _MIN_DISTINCT_MLOCK_BUILD
 
 
 def veto_unsafe_mlock(
-    config: "TunedConfig", system: SystemInfo, force_mlock: bool = False
+    config: "TunedConfig",
+    system: SystemInfo,
+    force_mlock: bool = False,
+    binary: Optional[str] = None,
 ) -> bool:
-    """Final safety net: strip --mlock/--no-mmap from a config that would crash.
-
-    compute_config already applies this gate, but GUI per-model overrides,
-    expert-panel checkboxes and persisted settings can re-enable mlock on a
-    TunedConfig AFTER compute_config ran (a stale ``"mlock": true`` saved back
-    when an older llama.cpp only warned). Every launch path calls this right
-    before building the command. Returns True when it disabled mlock so the
-    caller can log it.
-    """
-    if config.mlock and _mlock_unsafe_with_gpu(system, force_mlock):
+    """Final safety net for locking modes on old/unprobeable GPU builds."""
+    mode = effective_load_mode(config)
+    if mode in {"mlock", "mmap+mlock"} and _mlock_unsafe_with_gpu(
+        system, force_mlock, binary
+    ):
+        config.load_mode = "auto"
         config.mlock = False
         config.no_mmap = False
         return True
@@ -3615,10 +3701,9 @@ def build_command(
         cmd += ["-fa", "on"]
     if config.numa:
         cmd += ["--numa", config.numa]
-    if config.mlock:
-        cmd.append("--mlock")
-    if config.no_mmap:
-        cmd.append("--no-mmap")
+    load_mode = effective_load_mode(config)
+    if load_mode is not None:
+        cmd += ["--load-mode", load_mode]
     if config.no_context_shift:
         cmd.append("--no-context-shift")
     # LOW-VRAM lever (low_vram perf-target): keep the KV cache in system
@@ -3689,16 +3774,58 @@ def build_command(
     # this also catches the case where a profile lists "--no-context-shift"
     # in extra_args *and* the tuner separately decided to emit it (line
     # 1408): without prepopulating, the same flag would land twice.
-    seen: set = set(cmd)
+    #
+    # Value-flags (those in _ARG_FLAGS_WITH_VALUES) are keyed on the FLAG
+    # NAME so a duplicate ``--load-mode none`` in the free-form Extras
+    # field is dropped entirely (flag + value) when the dropdown already
+    # emitted ``--load-mode mlock`` — no stray value token leaks.
+    def _flag_keys(seq: List[str]) -> List[str]:
+        keys: List[str] = []
+        j = 0
+        n = len(seq)
+        while j < n:
+            tok = seq[j]
+            flag = _flag_name(tok)
+            takes_value = flag in _ARG_FLAGS_WITH_VALUES
+            if "=" in tok:
+                keys.append(flag)
+                j += 1
+            elif takes_value and j + 1 < n:
+                keys.append(flag)
+                j += 2
+            else:
+                keys.append(tok)
+                j += 1
+        return keys
+
+    seen: set = set(_flag_keys(cmd))
 
     def _append_unique(src: Optional[List[str]]) -> None:
         if not src:
             return
-        for arg in src:
-            if arg in seen:
+        j = 0
+        n = len(src)
+        while j < n:
+            tok = src[j]
+            flag = _flag_name(tok)
+            inline = "=" in tok
+            takes_value = flag in _ARG_FLAGS_WITH_VALUES
+            if inline:
+                key = flag
+                chunk = [tok]
+                j += 1
+            elif takes_value and j + 1 < n:
+                key = flag
+                chunk = [tok, src[j + 1]]
+                j += 2
+            else:
+                key = tok
+                chunk = [tok]
+                j += 1
+            if key in seen:
                 continue
-            seen.add(arg)
-            cmd.append(arg)
+            seen.add(key)
+            cmd.extend(chunk)
 
     _append_unique(getattr(profile, "extra_args", None))
     _append_unique(config.extra_cli_flags)

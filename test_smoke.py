@@ -438,6 +438,110 @@ def test_build_command_includes_essentials(tmp_path) -> None:
     assert "--metrics" in cmd
 
 
+def test_build_command_emits_explicit_load_modes(tmp_path) -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile)
+
+    cfg.load_mode = "mlock"
+    cmd = build_command(model, cfg, profile)
+    idx = cmd.index("--load-mode")
+    assert cmd[idx + 1] == "mlock"
+    assert "--mlock" not in cmd and "--no-mmap" not in cmd
+
+    cfg.load_mode = "mmap+mlock"
+    cmd = build_command(model, cfg, profile)
+    idx = cmd.index("--load-mode")
+    assert cmd[idx + 1] == "mmap+mlock"
+
+
+def test_build_command_dedupes_value_flag_pair_in_extras(tmp_path) -> None:
+    """A duplicate --load-mode in Extras must not leak its value token.
+
+    When the dropdown selects a load mode and the free-form Extras field
+    repeats --load-mode with a different value, only the modeled pair
+    survives; the stray value must not be appended as a bare token."""
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile)
+    cfg.load_mode = "mlock"
+    cfg.extra_cli_flags = ["--load-mode", "none"]
+    cmd = build_command(model, cfg, profile, extra_args=["--load-mode", "dio"])
+    # The modeled pair is present exactly once.
+    assert cmd.count("--load-mode") == 1
+    idx = cmd.index("--load-mode")
+    assert cmd[idx + 1] == "mlock"
+    # No stray value tokens leaked from the duplicate Extras entries.
+    assert "none" not in cmd[idx + 1 :]
+    assert "dio" not in cmd[idx + 1 :]
+
+
+def test_load_mode_b10151_compatibility_adaptation(monkeypatch) -> None:
+    import tuner
+
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10114)
+    legacy, notes = tuner._adapt_load_mode_for_binary(
+        ["llama-server", "--load-mode", "mmap+mlock", "-m", "model.gguf"]
+    )
+    assert legacy[1:3] == ["--load-mode", "mlock"]
+    assert "legacy equivalent" in notes[0]
+
+    unavailable, notes = tuner._adapt_load_mode_for_binary(
+        ["llama-server", "--load-mode", "mlock", "-m", "model.gguf"]
+    )
+    assert unavailable == ["llama-server", "-m", "model.gguf"]
+    assert "requires b10151+" in notes[0]
+
+    # Inline form (--load-mode=MODE / -lm=MODE) is adapted the same way.
+    inline_legacy, notes = tuner._adapt_load_mode_for_binary(
+        ["llama-server", "--load-mode=mmap+mlock", "-m", "model.gguf"]
+    )
+    assert inline_legacy == ["llama-server", "--load-mode=mlock", "-m", "model.gguf"]
+    assert "legacy equivalent" in notes[0]
+
+    inline_removed, notes = tuner._adapt_load_mode_for_binary(
+        ["llama-server", "-lm=mlock", "-m", "model.gguf"]
+    )
+    assert inline_removed == ["llama-server", "-m", "model.gguf"]
+    assert "requires b10151+" in notes[0]
+
+    # b10151+ leaves both locking modes untouched.
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10151)
+    current, notes = tuner._adapt_load_mode_for_binary(
+        ["llama-server", "--load-mode", "mmap+mlock"]
+    )
+    assert current == ["llama-server", "--load-mode", "mmap+mlock"]
+    assert notes == []
+
+
+def test_effective_load_mode_normalizes_legacy_and_garbage(tmp_path) -> None:
+    from tuner import TunedConfig, effective_load_mode
+
+    cfg = TunedConfig(
+        ctx=2048, ngl=99, threads=4, batch_threads=4, batch=2048, ubatch=512,
+        cache_k="f16", cache_v="f16", flash_attn=True,
+    )
+    # Explicit modes pass through and are case-normalized.
+    for mode in ("none", "mmap", "mlock", "mmap+mlock", "dio"):
+        cfg.load_mode = mode.upper()
+        assert effective_load_mode(cfg) == mode
+    # Legacy coupled booleans migrate to the b10151 split semantics.
+    cfg.load_mode = "auto"
+    cfg.mlock, cfg.no_mmap = True, False
+    assert effective_load_mode(cfg) == "mmap+mlock"
+    cfg.mlock, cfg.no_mmap = True, True
+    assert effective_load_mode(cfg) == "mlock"
+    cfg.mlock, cfg.no_mmap = False, True
+    assert effective_load_mode(cfg) == "none"
+    cfg.mlock, cfg.no_mmap = False, False
+    assert effective_load_mode(cfg) is None
+    # Garbage falls back to the legacy-boolean path, then None.
+    cfg.load_mode = "nonsense"
+    assert effective_load_mode(cfg) is None
+
+
 def test_build_command_passes_extra_args(tmp_path) -> None:
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
@@ -611,6 +715,8 @@ def test_prepare_command_for_binary_prunes_unsupported_flags(tmp_path) -> None:
         "off",
         "--cache-ram",
         "-1",
+        "--mcp-servers-config",
+        "-trusted-mcp.json",
         "--host",
         "127.0.0.1",
         "--metrics",
@@ -621,11 +727,18 @@ def test_prepare_command_for_binary_prunes_unsupported_flags(tmp_path) -> None:
 
     assert "--fit" not in filtered and "off" not in filtered
     assert "--cache-ram" not in filtered and "-1" not in filtered
+    assert "--mcp-servers-config" not in filtered
+    assert "-trusted-mcp.json" not in filtered
     assert "--metrics" not in filtered
     assert ["-m", "model.gguf"] == filtered[1:3]
     assert "--host" in filtered and "127.0.0.1" in filtered
     assert "--port" in filtered and "1234" in filtered
-    assert removed == ["--fit off", "--cache-ram -1", "--metrics"]
+    assert removed == [
+        "--fit off",
+        "--cache-ram -1",
+        "--mcp-servers-config -trusted-mcp.json",
+        "--metrics",
+    ]
 
 
 def test_filter_command_keeps_negative_values_of_supported_flags() -> None:
@@ -724,7 +837,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_btn_auto", "_btn_manual", "_btn_reset", "_btn_close", "_sp_ctx",
         "_cb_cache_k", "_cb_cache_v", "_sp_ngl", "_sp_ncpumoe", "_sp_threads",
         "_sp_batch_threads", "_sp_batch", "_sp_ubatch", "_chk_parallel",
-        "_sp_parallel", "_chk_fa", "_chk_mlock", "_chk_no_mmap", "_chk_jinja",
+        "_sp_parallel", "_chk_fa", "_cb_load_mode", "_chk_jinja",
         "_chk_verbose", "_chk_metrics", "_chk_slots_api", "_cb_numa", "_chk_rope",
         "_sp_rope_factor", "_sp_temp", "_sp_top_k", "_sp_top_p", "_sp_min_p",
         "_sp_rep", "_sp_presence", "_sp_draft_n_max", "_cb_reasoning",
@@ -858,6 +971,30 @@ def test_veto_unsafe_mlock_overrides_gui_reenabled_mlock(tmp_path, monkeypatch) 
     assert veto_unsafe_mlock(cfg, system) is True
     assert cfg.mlock is False
     assert cfg.no_mmap is False
+
+
+def test_veto_unsafe_mlock_allows_b10151_gpu_build(tmp_path, monkeypatch) -> None:
+    import tuner
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Bonsai-8B", size_gb=5.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile)
+    cfg.load_mode = "mlock"
+    cfg.mlock = True
+    cfg.no_mmap = True
+
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10151)
+    assert tuner.veto_unsafe_mlock(
+        cfg, _fake_system(), binary="llama-server"
+    ) is False
+    assert cfg.load_mode == "mlock"
+
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10114)
+    assert tuner.veto_unsafe_mlock(
+        cfg, _fake_system(), binary="llama-server"
+    ) is True
+    assert cfg.load_mode == "auto"
 
 
 def test_veto_unsafe_mlock_respects_force_and_cpu_only(tmp_path) -> None:
@@ -4226,7 +4363,7 @@ def test_apply_expert_values_only_overlays_noncascading(tmp_path) -> None:
         "threads": 42,  # must be APPLIED
         "ubatch": 1234,  # must be APPLIED
         "flash_attn": True,
-        "mlock": True,
+        "load_mode": "mlock",
         "metrics_enabled": False,
         "slots_api_enabled": True,
         "numa": "isolate",
@@ -4247,7 +4384,8 @@ def test_apply_expert_values_only_overlays_noncascading(tmp_path) -> None:
     assert out.threads == 42
     assert out.ubatch == 1234
     assert out.flash_attn is True
-    assert out.mlock is True
+    assert out.load_mode == "mlock"
+    assert out.mlock is True and out.no_mmap is True
     assert out.metrics_enabled is False
     assert out.slots_api_enabled is True
     assert out.numa == "isolate"
@@ -4257,6 +4395,18 @@ def test_apply_expert_values_only_overlays_noncascading(tmp_path) -> None:
     assert "--reasoning" in out.extra_cli_flags  # from reasoning=off
     assert "--reasoning-preserve" in out.extra_cli_flags
     assert out.draft_n_max == 5
+
+
+def test_expert_load_mode_migrates_legacy_checkbox_snapshots(tmp_path) -> None:
+    from qt_launcher import apply_expert_values
+
+    base = _base_cfg(tmp_path)
+    cfg = apply_expert_values(base, {"mlock": True, "no_mmap": False})
+    assert cfg.load_mode == "mmap+mlock"
+    cfg = apply_expert_values(base, {"mlock": True, "no_mmap": True})
+    assert cfg.load_mode == "mlock"
+    cfg = apply_expert_values(base, {"mlock": False, "no_mmap": True})
+    assert cfg.load_mode == "none"
 
 
 def test_expert_cfg_from_values_is_frozen_manual(tmp_path) -> None:

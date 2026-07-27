@@ -418,7 +418,7 @@ that only make sense with persistent state:
 | `--no-prompt-cache` | Disable host-memory prompt caching (`--cache-ram 0`). Caching is auto-on; Vision requires llama.cpp b10045+ and falls back to off on older/unprobeable builds |
 | `--dry-run` | Print the command, don't start the server |
 | `--yes / -y` | Skip the launch confirmation prompt |
-| `--force-mlock` | Force `--mlock` / `--no-mmap` (prevents VRAM/RAM paging) |
+| `--force-mlock` | Force the non-mmap locking path when resources/OS permissions allow it (Expert GUI exposes all `--load-mode` choices) |
 | `--performance-target {safe,balanced,throughput,low_vram}` | VRAM utilisation preset (see below) |
 | `-- <args...>` | Anything after `--` is forwarded to `llama-server` |
 
@@ -465,19 +465,26 @@ performance_target: throughput   # MoE — wants every spare GB on the GPU
 
 The user choice (CLI / GUI) always wins over the profile recommendation.
 
-### Memory locking (`--mlock` / `--no-mmap`)
+### Model loading and memory locking (`--load-mode`)
 
-The auto-tuner automatically decides whether to enable `--mlock` and `--no-mmap`
-based on available system resources. These flags pin model data in physical
-memory (RAM/VRAM) and prevent the OS from paging it to disk, which is critical
-for stable inference performance.
+The Expert panel exposes llama.cpp's complete model-loading strategy: `auto`
+(default mmap), `none`, `mmap`, `mlock`, `mmap+mlock`, and `dio`. Starting with
+**b10151**, `mlock` means lock normally-read model memory **without mmap**, while
+`mmap+mlock` explicitly combines mapping and locking. AutoTuner emits the
+non-deprecated `--load-mode MODE` form and migrates old per-model
+`mlock`/`no_mmap` checkbox snapshots automatically.
+
+The automatic tuner still enables locking only when available RAM/VRAM and OS
+permissions make it safe. Old or unprobeable GPU builds retain the conservative
+Vulkan host-buffer crash guard; versioned b10151+ builds allow the Expert
+locking choices.
 
 **Automatic behavior:**
 
 | Scenario | Condition | Result |
 |---|---|---|
-| **Full GPU offload** | `total_vram > 8 GB` AND `free_vram > model_size + 2 GB` | `--mlock --no-mmap` enabled |
-| **Partial / CPU offload** | `total_ram > 32 GB` AND `free_ram > model_ram_on_cpu + 8 GB` | `--mlock --no-mmap` enabled |
+| **GPU backend present** | Any detected GPU; automatic config has no resolved binary yet | Locking stays off conservatively; Expert mode permits it after verifying b10151+ |
+| **CPU-only model** | `total_ram > 32 GB` AND `free_ram > model_ram_on_cpu + 8 GB` | non-mmap `mlock` selected when OS permissions allow it; on b10107–b10150 binaries non-mmap locking is unavailable and silently drops to mmap |
 | **Insufficient memory** | Safety reserve not met | Disabled (fallback to default mmap) |
 
 **Force memory locking:**
@@ -717,7 +724,7 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (as of b10056)
+## Server features (as of b10151)
 
 The following `llama-server` features are supported (verified against `llama-server --help` / `tools/server/README.md`):
 
@@ -735,7 +742,7 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--reasoning-preserve` | ✅ Optional Expert checkbox; omitted means template default |
 | `--chat-template-kwargs ...` | ✅ The dropdown produces this automatically |
 | `--jinja` | ✅ Ticked visibly |
-| `--mlock` / `--no-mmap` | ✅ Windows guard; manually overridable |
+| `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
 | `-md` external drafter | ✅ Without `--spec-type` — the presence of `-md` enables the draft path automatically in mainline (verified b9442) |
 | `--spec-type draft-mtp` | ✅ Integrated MTP (Qwen3.6-MTP etc.) — `draft-mtp` is the mainline name since PR #22673 merged (16 May 2026) |
 | `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
@@ -750,6 +757,27 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--rope-scaling yarn` | ✅ Already present |
 | `--numa` | ✅ Already present |
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
+
+### Review b10107 → b10151
+
+Reviewed all **44 upstream commits** from tag **b10107** (`c0bc859`) through
+**b10151** (`8e8681e`). The only new/expanded launcher inputs are the split
+`--load-mode` semantics and two experimental stdio-MCP configuration flags.
+
+- **Integrated:** Expert model-load dropdown for `none`, `mmap`, non-mmap
+  `mlock`, `mmap+mlock`, and `dio`; compatibility adaptation for pre-b10151
+  binaries; current-build GPU locking no longer hits the old unconditional
+  veto.
+- **Not promoted to tuning controls:** `--mcp-servers-config PATH` and
+  `--mcp-servers-json JSON` spawn external processes and change CORS behavior.
+  They are server integrations rather than performance knobs, remain available
+  through **Extra CLI flags**, and should only be used with trusted configs.
+- **Automatic upstream benefits:** explicit `-md` now wins over discovered
+  draft sidecars; reasoning budgets recognize multiple end sequences;
+  MiniMax-M3/GLM indexer and backend/KV fixes require no new AutoTuner setting.
+- **No change required:** KV types/cache sizing, context/batching, GPU-layer
+  offload, tensor split, and speculative token-count flags did not gain new
+  controls or incompatible defaults in this range.
 
 ### Review b9963 → b10056
 

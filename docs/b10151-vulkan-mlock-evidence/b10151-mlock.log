@@ -1,0 +1,19 @@
+0.00.164.539 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.170.749 W srv  llama_server: -----------------
+0.00.170.754 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.170.755 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.170.756 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.170.756 W srv  llama_server: -----------------
+0.00.187.129 I srv    load_model: loading model 'I:\models\Microsoft\fastcontext-1.0-4b-rl-q8_0.gguf'
+0.00.328.586 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.808.533 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 2048, kv_unified = 'false'
+0.02.808.709 W srv          init: --cache-idle-slots requires --cache-ram, disabling
+0.02.813.111 I srv  llama_server: model loaded
+0.02.813.119 I srv  llama_server: listening on http://127.0.0.1:12499
+0.03.580.904 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.03.580.939 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.03.670.726 I slot print_timing: id  0 | task 0 | prompt eval time =      23.11 ms /     4 tokens (    5.78 ms per token,   173.09 tokens per second)
+0.03.670.732 I slot print_timing: id  0 | task 0 |        eval time =      66.65 ms /     8 tokens (    8.33 ms per token,   120.03 tokens per second)
+0.03.670.732 I slot print_timing: id  0 | task 0 |       total time =      89.76 ms /    12 tokens
+0.03.670.733 I slot print_timing: id  0 | task 0 |    graphs reused =          7
+0.03.670.751 I slot      release: id  0 | task 0 | stop processing: n_tokens = 11, truncated = 0

@@ -1015,8 +1015,9 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument(
         "--force-mlock",
         action="store_true",
-        help="Force --mlock / --no-mmap even for full-GPU-offload models "
-        "(prevents VRAM paging when enough free VRAM is available)",
+        help="Force a locking --load-mode (mlock/mmap+mlock) even when the "
+        "auto-tuner would otherwise skip it; requires sufficient free "
+        "RAM/VRAM and OS privileges, and a b10151+ build on GPU systems",
     )
     p.add_argument(
         "--performance-target",

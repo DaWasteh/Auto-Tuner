@@ -91,6 +91,7 @@ from tuner import (
     _probe_supported_flags,
     build_command,
     compute_config,
+    effective_load_mode,
     gemma_draft_needs_ik_fork,
     match_gpu_by_token,
     prepare_command_for_binary,
@@ -1696,7 +1697,7 @@ def _clean_model_name(name: str) -> str:
 # can never drift apart.
 #
 # ``values`` keys: ctx, cache_k, cache_v, ngl, n_cpu_moe, threads,
-# batch_threads, batch, ubatch, flash_attn, mlock, no_mmap, jinja,
+# batch_threads, batch, ubatch, flash_attn, load_mode, jinja,
 # verbose, numa, rope_scaling, rope_factor, temperature, top_k,
 # top_p, min_p, repeat_penalty, presence_penalty, reasoning,
 # think_budget, reasoning_preserve, parallel_enabled, parallel_count,
@@ -1759,6 +1760,23 @@ def _expert_extras_from_values(vals: dict) -> List[str]:
     return extras
 
 
+_EXPERT_LOAD_MODES = {"auto", "none", "mmap", "mlock", "mmap+mlock", "dio"}
+
+
+def _expert_load_mode_from_values(cfg: TunedConfig, vals: dict) -> str:
+    """Normalize new load-mode snapshots and migrate the old checkboxes."""
+    if "load_mode" in vals:
+        mode = str(vals.get("load_mode") or "auto").strip().lower()
+        return mode if mode in _EXPERT_LOAD_MODES else "auto"
+    if "mlock" in vals or "no_mmap" in vals:
+        locked = bool(vals.get("mlock", getattr(cfg, "mlock", False)))
+        no_mmap = bool(vals.get("no_mmap", getattr(cfg, "no_mmap", False)))
+        if locked:
+            return "mlock" if no_mmap else "mmap+mlock"
+        return "none" if no_mmap else "auto"
+    return effective_load_mode(cfg) or "auto"
+
+
 def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
     """Overlay the NON-cascading values onto ``cfg`` (in place + returned).
 
@@ -1779,8 +1797,12 @@ def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
         if vals.get("ubatch"):
             cfg.ubatch = int(vals["ubatch"]) or cfg.ubatch
         cfg.flash_attn = bool(vals.get("flash_attn", cfg.flash_attn))
-        cfg.mlock = bool(vals.get("mlock", cfg.mlock))
-        cfg.no_mmap = bool(vals.get("no_mmap", cfg.no_mmap))
+        load_mode = _expert_load_mode_from_values(cfg, vals)
+        cfg.load_mode = load_mode
+        # Keep the legacy fields synchronized for external callers and the
+        # conservative mlock safety gate. Command generation uses load_mode.
+        cfg.mlock = load_mode in {"mlock", "mmap+mlock"}
+        cfg.no_mmap = load_mode in {"none", "mlock"}
         numa_choice = str(vals.get("numa", "off") or "off")
         cfg.numa = None if numa_choice == "off" else numa_choice
         cfg.sampling = _expert_sampling_from_values(vals)
@@ -2302,31 +2324,25 @@ class ExpertPanel(QWidget):
             ),
         )
 
-        self._chk_mlock = QCheckBox("--mlock")
+        self._cb_load_mode = QComboBox()
+        self._cb_load_mode.addItem("auto (mmap default)", "auto")
+        self._cb_load_mode.addItem("none (normal reads)", "none")
+        self._cb_load_mode.addItem("mmap", "mmap")
+        self._cb_load_mode.addItem("mlock (without mmap, b10151+)", "mlock")
+        self._cb_load_mode.addItem("mmap + mlock", "mmap+mlock")
+        self._cb_load_mode.addItem("direct I/O", "dio")
         _add(
-            "",
-            self._chk_mlock,
+            "model load mode",
+            self._cb_load_mode,
             _setting_tooltip(
-                "Tries to keep model data in physical RAM instead of letting the "
-                "operating system page it to disk. This can prevent severe stalls, "
-                "but reserves memory more aggressively.",
-                "Passed as --mlock. Linux/macOS use memory-locking limits; Windows "
-                "requires the SeLockMemoryPrivilege. AutoTuner vetoes unsafe locking "
-                "when the estimated resident model would leave too little usable RAM.",
-            ),
-        )
-
-        self._chk_no_mmap = QCheckBox("--no-mmap")
-        _add(
-            "",
-            self._chk_no_mmap,
-            _setting_tooltip(
-                "Loads the model through normal memory reads instead of mapping its "
-                "file on demand. Startup may take longer and use more committed RAM.",
-                "Passed as --no-mmap. Without it, llama.cpp memory-maps GGUF data so "
-                "the OS can fault pages in and share file-backed pages. Disable mmap "
-                "mainly for problematic filesystems, storage drivers, or deliberate "
-                "fully-resident loading tests.",
+                "Chooses whether model weights are mapped, read normally, locked in "
+                "RAM, or loaded through direct I/O. Auto keeps llama.cpp's default.",
+                "Passed as --load-mode MODE. Since b10151, mlock means locking without "
+                "mmap and mmap+mlock explicitly combines both. none disables mapping "
+                "without locking; dio requests DirectIO when the platform supports it. "
+                "Locking still requires sufficient RAM and OS privileges. AutoTuner "
+                "blocks it on old or unprobeable GPU builds with the historic Vulkan "
+                "host-buffer crash.",
             ),
         )
 
@@ -2649,12 +2665,13 @@ class ExpertPanel(QWidget):
         ):
             sp.valueChanged.connect(self._schedule_save)
         for cb in (
-            self._cb_cache_k, self._cb_cache_v, self._cb_numa, self._cb_reasoning,
+            self._cb_cache_k, self._cb_cache_v, self._cb_load_mode, self._cb_numa,
+            self._cb_reasoning,
         ):
             cb.currentTextChanged.connect(self._schedule_save)
         for chk in (
-            self._chk_fa, self._chk_mlock, self._chk_no_mmap, self._chk_jinja,
-            self._chk_verbose, self._chk_metrics, self._chk_slots_api,
+            self._chk_fa, self._chk_jinja, self._chk_verbose, self._chk_metrics,
+            self._chk_slots_api,
             self._chk_reasoning_preserve, self._chk_rope, self._chk_parallel,
         ):
             chk.toggled.connect(self._schedule_save)
@@ -2759,8 +2776,10 @@ class ExpertPanel(QWidget):
 
             # Flags
             self._chk_fa.setChecked(cfg.flash_attn)
-            self._chk_mlock.setChecked(cfg.mlock)
-            self._chk_no_mmap.setChecked(cfg.no_mmap)
+            load_mode = effective_load_mode(cfg) or "auto"
+            load_mode_idx = self._cb_load_mode.findData(load_mode)
+            if load_mode_idx >= 0:
+                self._cb_load_mode.setCurrentIndex(load_mode_idx)
             extras_in = list(cfg.extra_cli_flags or [])
             self._chk_jinja.setChecked("--jinja" in extras_in)
             self._chk_verbose.setChecked("--verbose" in extras_in)
@@ -3033,8 +3052,7 @@ class ExpertPanel(QWidget):
             "batch": self._sp_batch.value(),
             "ubatch": self._sp_ubatch.value(),
             "flash_attn": self._chk_fa.isChecked(),
-            "mlock": self._chk_mlock.isChecked(),
-            "no_mmap": self._chk_no_mmap.isChecked(),
+            "load_mode": str(self._cb_load_mode.currentData() or "auto"),
             "jinja": self._chk_jinja.isChecked(),
             "verbose": self._chk_verbose.isChecked(),
             "metrics_enabled": self._chk_metrics.isChecked(),
@@ -6137,8 +6155,9 @@ class MainWindow(QMainWindow):
             f"slots={'on' if cfg.slots_api_enabled else 'off'}",
             f"Flash attention : {'on' if cfg.flash_attn else 'off'}",
         ]
-        if cfg.mlock:
-            lines.append("mlock           : on")
+        load_mode = effective_load_mode(cfg)
+        if load_mode is not None:
+            lines.append(f"load mode       : {load_mode}")
         if cfg.no_kv_offload:
             # LOW-VRAM lever (low_vram perf-target): the KV cache lives in
             # system RAM, attention compute runs on CPU. Surface it so the
@@ -6850,17 +6869,6 @@ class MainWindow(QMainWindow):
         # for static checkers (Pylance / mypy) that cannot prove this.
         assert cfg is not None
 
-        # Final mlock safety net. A stale per-model override or the expert
-        # --mlock checkbox can re-enable mlock AFTER compute_config's gate.
-        # On a GPU system that guarantees a GGML_ASSERT(addr) abort in
-        # llama_mlock::grow_to on this llama.cpp build (see veto_unsafe_mlock).
-        if self._system is not None and veto_unsafe_mlock(cfg, self._system):
-            self._log(
-                "[Compat] --mlock/--no-mmap deaktiviert: mit geladenem "
-                "GPU-Backend bricht dieser llama.cpp-Build sonst beim "
-                "Modell-Laden ab (llama_mlock::grow_to)."
-            )
-
         # ── Diffusion routing ────────────────────────────────────────
         # llama-diffusion-gemma-server (PR #24427) is a REAL persistent
         # OpenAI HTTP server (/health, /v1/chat/completions, port) → run it
@@ -7037,6 +7045,16 @@ class MainWindow(QMainWindow):
             )
         else:
             server_binary = self._resolve_binary(profile, use_draft, entry.name)
+            # Locking is safe with the new split load-mode implementation, but
+            # older/unprobeable GPU builds may still hit the historic Vulkan
+            # host-buffer assertion. Resolve the exact binary before the veto.
+            if self._system is not None and veto_unsafe_mlock(
+                cfg, self._system, binary=server_binary
+            ):
+                self._log(
+                    "[Compat] Locking load mode disabled: the selected GPU build "
+                    "is older than b10151 or its version could not be probed safely."
+                )
             cmd = build_command(
                 model=entry,
                 config=cfg,
@@ -7056,10 +7074,10 @@ class MainWindow(QMainWindow):
             )
 
         cmd, removed_args = prepare_command_for_binary(cmd)
-        for removed in removed_args:
+        for adjustment in removed_args:
             self._log(
-                "[Compat] Selected llama.cpp binary does not advertise "
-                f"argument(s); removed: {removed}"
+                "[Compat] Selected llama.cpp binary required an argument "
+                f"adjustment/removal: {adjustment}"
             )
 
         if use_prompt_cache and use_vision and "--cache-ram" in cmd:
@@ -7264,10 +7282,10 @@ class MainWindow(QMainWindow):
         )
 
         cmd, removed_args = prepare_command_for_binary(cmd)
-        for removed in removed_args:
+        for adjustment in removed_args:
             self._log(
-                "[Compat] Selected llama.cpp binary does not advertise "
-                f"argument(s); removed: {removed}"
+                "[Compat] Selected llama.cpp binary required an argument "
+                f"adjustment/removal: {adjustment}"
             )
 
         self._log("\n" + "─" * 60)

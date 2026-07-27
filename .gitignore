@@ -77,6 +77,11 @@ autotuner_settings.json
 llama.log
 logs/
 
+# Pi coding agent session artifacts (subagent outputs, async-run dirs)
+.pi-subagents/
+.pi/
+.fallow/
+
 # PyInstaller (compiled .exe / Linux/macOS binary) — build_exe.py output
 *.spec
 autotuner_console.log
