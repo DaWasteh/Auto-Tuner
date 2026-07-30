@@ -35,6 +35,9 @@ Public API:
     set_prompt_cache_ram_mib(int)
     get_reasoning_effort(model_name) -> Optional[str]
     set_reasoning_effort(model_name, value)
+    favorite_model_key(model_path) -> str
+    get_favorite_models() -> set[str]
+    set_model_favorite(model_path, favorite)
     get_expert_override(model_name) -> Optional[dict]   # saved Expert-panel state
     set_expert_override(model_name, snapshot: dict)
     clear_expert_override(model_name)
@@ -143,7 +146,9 @@ def _update(key: str, value: Any) -> None:
 # existing files migrate seamlessly, and it is mirrored on write so an older
 # AutoTuner version on the same OS keeps working.
 
-_OS_KEY_SUFFIX = "windows" if os.name == "nt" else "linux"
+_OS_KEY_SUFFIX = (
+    "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
+)
 
 
 def _os_path_key(key: str) -> str:
@@ -400,6 +405,55 @@ def clear_model_overrides(model_name: str) -> None:
         overrides.pop(model_name, None)
         s["model_overrides"] = overrides
         save_settings(s)
+
+
+# ---------------------------------------------------------------------------
+# Favorite models
+#
+# Favorites are keyed by normalized absolute GGUF paths so identically named
+# models in different configured roots can be marked independently. Like all
+# persisted paths, the compact list is OS-namespaced because one settings file
+# may be shared across Windows, Linux, and macOS installations.
+
+
+def favorite_model_key(model_path: Path) -> str:
+    """Return the normalized identity used for one favorite GGUF path."""
+    try:
+        path = Path(model_path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+    return os.path.normcase(str(path))
+
+
+def get_favorite_models() -> set[str]:
+    """Return normalized favorite GGUF identities for the current OS."""
+    settings = load_settings()
+    raw = settings.get(_os_path_key("favorite_models"))
+    if not isinstance(raw, list):
+        return set()
+    favorites: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        key = favorite_model_key(Path(value))
+        if key:
+            favorites.add(key)
+    return favorites
+
+
+def set_model_favorite(model_path: Path, favorite: bool) -> None:
+    """Persist or clear the favorite marker for one GGUF path."""
+    key = favorite_model_key(model_path)
+    if not key:
+        return
+    favorites = get_favorite_models()
+    if favorite:
+        favorites.add(key)
+    else:
+        favorites.discard(key)
+    settings = load_settings()
+    settings[_os_path_key("favorite_models")] = sorted(favorites, key=str.casefold)
+    save_settings(settings)
 
 
 # ---------------------------------------------------------------------------

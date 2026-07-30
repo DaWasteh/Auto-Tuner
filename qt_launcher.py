@@ -35,15 +35,24 @@ from typing import Callable, Dict, List, Optional, cast, Tuple
 from PyQt6.QtCore import (
     Qt,
     QByteArray,
+    QEvent,
     QObject,
     QPoint,
+    QRect,
     QThread,
     QTimer,
     QUrl,
     pyqtSignal,
     QSize,
 )
-from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon
+from PyQt6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -69,6 +78,9 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QStatusBar,
     QSystemTrayIcon,
     QTextEdit,
@@ -1664,6 +1676,81 @@ def _capability_markers(entry: ModelEntry) -> str:
     if entry.supports_tool_use:
         syms.append("🛠")
     return " ".join(syms)
+
+
+_FAVORITE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+class _FavoriteStarDelegate(QStyledItemDelegate):
+    """Draw and handle the favorite star without replacing list-row widgets."""
+
+    favoriteToggled = pyqtSignal(object, bool)
+
+    @staticmethod
+    def _star_rect(option) -> QRect:
+        return QRect(
+            option.rect.left() + 3,
+            option.rect.top(),
+            24,
+            option.rect.height(),
+        )
+
+    @staticmethod
+    def _text_rect(option) -> QRect:
+        # Reserve a fixed device-independent area instead of relying on spaces,
+        # whose width varies across fonts, DPI settings, and operating systems.
+        return option.rect.adjusted(31, 0, 0, 0)
+
+    def paint(self, painter, option, index) -> None:
+        text_option = QStyleOptionViewItem(option)
+        text_option.rect = self._text_rect(option)
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+        # Let Qt render focus, text, and platform theming in the remaining area.
+        super().paint(painter, text_option, index)
+        favorite = bool(index.data(_FAVORITE_ROLE))
+        painter.save()
+        font = painter.font()
+        font.setBold(favorite)
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(13.0, font.pointSizeF()))
+        painter.setFont(font)
+        painter.setPen(QColor("#ffd54f" if favorite else "#777777"))
+        painter.drawText(
+            self._star_rect(option),
+            Qt.AlignmentFlag.AlignCenter,
+            "★",
+        )
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        if (
+            event.type() == QEvent.Type.MouseButtonRelease
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._star_rect(option).contains(event.position().toPoint())
+        ):
+            entry = index.data(Qt.ItemDataRole.UserRole)
+            if entry is not None:
+                self.favoriteToggled.emit(entry, not bool(index.data(_FAVORITE_ROLE)))
+                return True
+        return super().editorEvent(event, model, option, index)
+
+
+def _sort_model_entries(
+    entries: List[ModelEntry], favorite_models: set[str]
+) -> List[ModelEntry]:
+    """Keep the established group/name order, with all favorites first."""
+    groups = group_entries(entries)
+    ordered = [
+        entry
+        for group_name in sorted(groups.keys())
+        for entry in sorted(groups[group_name], key=lambda model: model.name.lower())
+    ]
+    return sorted(
+        ordered,
+        key=lambda entry: app_settings.favorite_model_key(entry.path)
+        not in favorite_models,
+    )
 
 
 def _clean_model_name(name: str) -> str:
@@ -3289,6 +3376,7 @@ class MainWindow(QMainWindow):
         # choice also survives an app restart.
         # Shape:  { "<model_name>": {"vision": bool, "draft": bool, "thinking": bool} }
         self._option_overrides: dict = {}
+        self._favorite_models = app_settings.get_favorite_models()
 
         # Track whether the user has manually overridden the fork selection
         self._fork_manual_override = False
@@ -3554,6 +3642,9 @@ class MainWindow(QMainWindow):
         frl.addWidget(self._search)
 
         self._model_list = QListWidget()
+        self._favorite_delegate = _FavoriteStarDelegate(self._model_list)
+        self._favorite_delegate.favoriteToggled.connect(self._set_model_favorite)
+        self._model_list.setItemDelegate(self._favorite_delegate)
         self._model_list.currentItemChanged.connect(self._on_selection_changed)
         self._model_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
@@ -5285,35 +5376,66 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "AutoTuner update failed", msg)
 
     def _populate_list(self, entries: List[ModelEntry]) -> None:
+        selected_path: Optional[Path] = None
+        current = self._model_list.currentItem()
+        if current is not None:
+            selected: Optional[ModelEntry] = current.data(Qt.ItemDataRole.UserRole)
+            if selected is not None:
+                selected_path = selected.path
+
         self._model_list.clear()
-        groups = group_entries(entries)
-        for group_name in sorted(groups.keys()):
-            for entry in sorted(groups[group_name], key=lambda e: e.name.lower()):
-                marks = _capability_markers(entry)
-                # Right-align the size so capabilities stay readable when
-                # filenames vary in length.
-                tail = f"  ({entry.size_gb:.1f} GB)"
-                if marks:
-                    item = QListWidgetItem(f"{entry.name}  {marks}{tail}")
-                else:
-                    item = QListWidgetItem(f"{entry.name}{tail}")
-                item.setData(Qt.ItemDataRole.UserRole, entry)
-                # Tooltip lists what each symbol means and which assets
-                # are paired. Use explicit `is not None` checks instead of
-                # the convenience `has_*` properties so Pylance/Mypy can
-                # narrow Optional[Path] → Path on the next line.
-                lines = [entry.name, ""]
-                if entry.mmproj is not None:
-                    lines.append(f"👁  Vision      {entry.mmproj.name}")
-                if entry.draft is not None:
-                    lines.append(f"⚡  Draft       {entry.draft.name}")
-                if entry.supports_thinking:
-                    lines.append("🧠  Thinking    chat template emits <think>")
-                if entry.supports_tool_use:
-                    lines.append("🛠  Tool use    chat template supports tool_calls")
-                if len(lines) > 2:
-                    item.setToolTip("\n".join(lines))
-                self._model_list.addItem(item)
+        selected_item: Optional[QListWidgetItem] = None
+        for entry in _sort_model_entries(entries, self._favorite_models):
+            marks = _capability_markers(entry)
+            # Right-align the size so capabilities stay readable when
+            # filenames vary in length. The delegate geometrically reserves
+            # and paints the favorite-star area left of this text.
+            tail = f"  ({entry.size_gb:.1f} GB)"
+            if marks:
+                text = f"{entry.name}  {marks}{tail}"
+            else:
+                text = f"{entry.name}{tail}"
+            item = QListWidgetItem(text)
+            favorite = (
+                app_settings.favorite_model_key(entry.path) in self._favorite_models
+            )
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setData(_FAVORITE_ROLE, favorite)
+            # Tooltip lists what each symbol means and which assets
+            # are paired. Use explicit `is not None` checks instead of
+            # the convenience `has_*` properties so Pylance/Mypy can
+            # narrow Optional[Path] → Path on the next line.
+            state = (
+                "Favorit — anklicken zum Entfernen"
+                if favorite
+                else "Kein Favorit — Stern anklicken zum Markieren"
+            )
+            lines = [entry.name, "", f"★  {state}"]
+            if entry.mmproj is not None:
+                lines.append(f"👁  Vision      {entry.mmproj.name}")
+            if entry.draft is not None:
+                lines.append(f"⚡  Draft       {entry.draft.name}")
+            if entry.supports_thinking:
+                lines.append("🧠  Thinking    chat template emits <think>")
+            if entry.supports_tool_use:
+                lines.append("🛠  Tool use    chat template supports tool_calls")
+            item.setToolTip("\n".join(lines))
+            self._model_list.addItem(item)
+            if selected_path is not None and entry.path == selected_path:
+                selected_item = item
+
+        if selected_item is not None:
+            self._model_list.setCurrentItem(selected_item)
+
+    def _set_model_favorite(self, entry: ModelEntry, favorite: bool) -> None:
+        """Persist a star click and rebuild the filtered list in favorite order."""
+        key = app_settings.favorite_model_key(entry.path)
+        if favorite:
+            self._favorite_models.add(key)
+        else:
+            self._favorite_models.discard(key)
+        app_settings.set_model_favorite(entry.path, favorite)
+        self._apply_filter(self._search.text())
 
     def _apply_filter(self, text: str) -> None:
         q = text.strip().lower()

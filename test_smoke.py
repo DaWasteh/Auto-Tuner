@@ -218,6 +218,78 @@ def test_group_entries_buckets_by_folder(tmp_path) -> None:
     assert "Vendor2" in groups
 
 
+def test_model_list_sorts_favorites_first_without_losing_group_order(tmp_path) -> None:
+    import app_settings
+    from qt_launcher import _sort_model_entries
+
+    alpha = _fake_model(tmp_path, "Alpha", 1.0)
+    beta = _fake_model(tmp_path, "Beta", 1.0)
+    gamma = _fake_model(tmp_path, "Gamma", 1.0)
+    alpha.group = "VendorB"
+    beta.group = "VendorA"
+    gamma.group = "VendorA"
+
+    favorite_keys = {
+        app_settings.favorite_model_key(alpha.path),
+        app_settings.favorite_model_key(gamma.path),
+    }
+    ordered = _sort_model_entries([alpha, gamma, beta], favorite_keys)
+    assert [entry.name for entry in ordered] == ["Gamma", "Alpha", "Beta"]
+
+
+def test_favorite_star_click_selects_row_and_emits_both_states(tmp_path) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_core = pytest.importorskip("PyQt6.QtCore")
+    qt_test = pytest.importorskip("PyQt6.QtTest")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+
+    model_list = qt_widgets.QListWidget()
+    delegate = qt_launcher._FavoriteStarDelegate(model_list)
+    model_list.setItemDelegate(delegate)
+    first_entry = _fake_model(tmp_path, "FirstModel", 1.0)
+    target_entry = _fake_model(tmp_path, "FavoriteTarget", 1.0)
+    first_item = qt_widgets.QListWidgetItem(first_entry.name)
+    first_item.setData(qt_core.Qt.ItemDataRole.UserRole, first_entry)
+    first_item.setData(qt_launcher._FAVORITE_ROLE, False)
+    target_item = qt_widgets.QListWidgetItem(target_entry.name)
+    target_item.setData(qt_core.Qt.ItemDataRole.UserRole, target_entry)
+    target_item.setData(qt_launcher._FAVORITE_ROLE, False)
+    model_list.addItem(first_item)
+    model_list.addItem(target_item)
+    model_list.setCurrentItem(first_item)
+    model_list.resize(400, 100)
+    model_list.show()
+    _QT_TEST_APP.processEvents()
+
+    toggles = []
+    delegate.favoriteToggled.connect(
+        lambda toggled_entry, favorite: toggles.append(
+            (toggled_entry.name, favorite)
+        )
+    )
+    rect = model_list.visualItemRect(target_item)
+    star_position = qt_core.QPoint(rect.left() + 12, rect.center().y())
+    qt_test.QTest.mouseClick(
+        model_list.viewport(),
+        qt_core.Qt.MouseButton.LeftButton,
+        pos=star_position,
+    )
+    assert model_list.currentItem() is target_item
+    assert toggles == [("FavoriteTarget", True)]
+
+    target_item.setData(qt_launcher._FAVORITE_ROLE, True)
+    qt_test.QTest.mouseClick(
+        model_list.viewport(),
+        qt_core.Qt.MouseButton.LeftButton,
+        pos=star_position,
+    )
+    assert toggles[-1] == ("FavoriteTarget", False)
+    model_list.close()
+
+
 # ---------------------------------------------------------------------------
 # Tuner
 
@@ -4102,6 +4174,39 @@ def test_prompt_cache_limit_and_mmproj_cpu_override_persist(
 
     app_settings.set_model_override("VisionModel", "mmproj_cpu", True)
     assert app_settings.get_model_overrides("VisionModel")["mmproj_cpu"] is True
+
+
+def test_model_favorites_persist_and_ignore_invalid_values(
+    _isolated_settings, tmp_path
+) -> None:
+    import json
+
+    import app_settings
+
+    model_a = tmp_path / "root-a" / "SharedName.gguf"
+    model_b = tmp_path / "root-b" / "SharedName.gguf"
+    key_a = app_settings.favorite_model_key(model_a)
+    key_b = app_settings.favorite_model_key(model_b)
+
+    assert app_settings.get_favorite_models() == set()
+    app_settings.set_model_favorite(model_b, True)
+    app_settings.set_model_favorite(model_a, True)
+    app_settings.set_model_favorite(model_b, True)
+    assert app_settings.get_favorite_models() == {key_a, key_b}
+
+    raw = json.loads(_isolated_settings.read_text(encoding="utf-8"))
+    setting_key = f"favorite_models.{app_settings._OS_KEY_SUFFIX}"
+    assert raw[setting_key] == sorted([key_a, key_b], key=str.casefold)
+
+    app_settings.set_model_favorite(model_a, False)
+    assert app_settings.get_favorite_models() == {key_b}
+
+    raw = json.loads(_isolated_settings.read_text(encoding="utf-8"))
+    raw[setting_key] = [key_b, " ", 42, None]
+    _isolated_settings.write_text(
+        json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    assert app_settings.get_favorite_models() == {key_b}
 
 
 def test_system_tray_support_is_native_on_windows_and_macos(monkeypatch) -> None:
