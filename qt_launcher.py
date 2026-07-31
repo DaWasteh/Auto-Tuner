@@ -50,7 +50,6 @@ from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
     QDesktopServices,
-    QFont,
     QIcon,
 )
 from PyQt6.QtWidgets import (
@@ -75,6 +74,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -119,6 +119,8 @@ from performance_target import (
 import app_settings
 import startup_manager
 from autotuner_version import VERSION, GITHUB_REPO, USER_AGENT
+from theme_dialog import ThemeEditorDialog
+from theme_manager import SYSTEM_THEME_ID, ThemeManager
 
 
 def _get_fork_tools():
@@ -135,6 +137,20 @@ def _get_fork_tools():
 def _bundled_resource(*parts: str) -> Path:
     """Return a source-tree or PyInstaller-bundled resource path."""
     return Path(__file__).resolve().parent.joinpath(*parts)
+
+
+def _application_theme_manager(
+    app: QApplication, builtin_dir: Optional[Path] = None
+) -> ThemeManager:
+    """Return the single ThemeManager attached to this QApplication."""
+    manager = getattr(app, "theme_manager", None)
+    if isinstance(manager, ThemeManager):
+        return manager
+    manager = ThemeManager(builtin_dir)
+    # QApplication is a C++ wrapper without arbitrary attributes in its stubs;
+    # setattr/getattr deliberately retain this one process-wide manager.
+    setattr(app, "theme_manager", manager)
+    return manager
 
 
 def _setting_tooltip(summary: str, technical: str) -> str:
@@ -601,19 +617,77 @@ class _ApplicationSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.setMinimumWidth(500)
+        self.setMaximumWidth(800)
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Application behaviour for this installation. Both options are "
-            "disabled by default."
+            "Appearance and application behaviour for this installation. Startup and "
+            "notification-area options are disabled by default."
         )
         intro.setWordWrap(True)
+        intro.setMaximumWidth(760)
         layout.addWidget(intro)
 
-        self.autostart_checkbox = QCheckBox(
-            f"Start AutoTuner automatically after {startup_manager.platform_name()} login"
+        appearance = QGroupBox("Appearance")
+        appearance.setMaximumWidth(760)
+        appearance_layout = QGridLayout(appearance)
+        theme_label = QLabel("&Theme:")
+        self.theme_combo = QComboBox()
+        self.theme_combo.setMinimumWidth(80)
+        self.theme_combo.setMaximumWidth(500)
+        self.theme_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
+        self.theme_combo.setMinimumContentsLength(6)
+        self.theme_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.theme_combo.setAccessibleName("Theme")
+        theme_label.setBuddy(self.theme_combo)
+        self.theme_combo.setToolTip(
+            _setting_tooltip(
+                "Previews and selects the application's color and font theme.",
+                "Built-ins are read-only; custom JSON themes are discovered from the per-installation user theme folder.",
+            )
+        )
+        app = cast(Optional[QApplication], QApplication.instance())
+        if app is not None:
+            manager = _application_theme_manager(app)
+            for theme in manager.available():
+                self.theme_combo.addItem(
+                    f"{theme.name} ({theme.source})", theme.qualified_id
+                )
+            index = self.theme_combo.findData(manager.current_id)
+            self.theme_combo.setCurrentIndex(max(0, index))
+        self.reload_themes_button = QPushButton("Reload")
+        self.customize_theme_button = QPushButton("Customize…")
+        self.open_themes_button = QPushButton("Open folder")
+        self.reload_themes_button.setToolTip(
+            _setting_tooltip(
+                "Reloads JSON files copied into the user theme folder.",
+                "Invalid files are ignored and listed in a warning; the selected valid theme is reapplied.",
+            )
+        )
+        self.customize_theme_button.setToolTip(
+            _setting_tooltip(
+                "Copies the selected theme into the safe color and font editor.",
+                "Built-ins are never changed. Saving creates a validated user JSON theme with a new ID.",
+            )
+        )
+        self.open_themes_button.setToolTip(
+            _setting_tooltip(
+                "Opens the folder used for your own themes.",
+                "Files in this persistent folder survive source updates and compiled-binary swaps; click Reload after copying a JSON file.",
+            )
+        )
+        appearance_layout.addWidget(theme_label, 0, 0)
+        appearance_layout.addWidget(self.theme_combo, 0, 1)
+        appearance_layout.addWidget(self.reload_themes_button, 1, 0, 1, 2)
+        appearance_layout.addWidget(self.customize_theme_button, 2, 0, 1, 2)
+        appearance_layout.addWidget(self.open_themes_button, 3, 0, 1, 2)
+        layout.addWidget(appearance)
+
+        self.autostart_checkbox = QCheckBox("Start after login")
         self.autostart_was_enabled = startup_manager.is_autostart_enabled()
         self.autostart_checkbox.setChecked(self.autostart_was_enabled)
         self.autostart_checkbox.setToolTip(
@@ -628,9 +702,7 @@ class _ApplicationSettingsDialog(QDialog):
         )
         layout.addWidget(self.autostart_checkbox)
 
-        self.minimize_checkbox = QCheckBox(
-            "Hide in the notification area when the title-bar X is pressed"
-        )
+        self.minimize_checkbox = QCheckBox("Hide on close")
         tray_available = _system_tray_supported()
         self.minimize_checkbox.setChecked(
             app_settings.get_minimize_on_close() and tray_available
@@ -648,9 +720,7 @@ class _ApplicationSettingsDialog(QDialog):
                 )
             )
         else:
-            self.minimize_checkbox.setText(
-                self.minimize_checkbox.text() + " (not available on this desktop)"
-            )
+            self.minimize_checkbox.setText("Hide on close (unavailable)")
             self.minimize_checkbox.setToolTip(
                 _setting_tooltip(
                     "This option cannot be used because no notification area was "
@@ -664,8 +734,7 @@ class _ApplicationSettingsDialog(QDialog):
         layout.addWidget(self.minimize_checkbox)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -857,7 +926,9 @@ class _UpdateWorker(QObject):
 
     def _run_git(self, *args: str, check: bool = True, timeout: float = 180.0) -> str:
         if self._repo_root is None:
-            raise RuntimeError("Git update requested, but this folder has no .git metadata.")
+            raise RuntimeError(
+                "Git update requested, but this folder has no .git metadata."
+            )
         if not self._git_bin:
             raise RuntimeError(
                 "Git executable not found. Please install Git "
@@ -923,7 +994,10 @@ class _UpdateWorker(QObject):
         except (OSError, RuntimeError, ValueError):
             return False
         tracked = self._run_git("ls-files", "--", launcher_rel, check=False)
-        return any(line.strip().replace("\\", "/") == launcher_rel for line in tracked.splitlines())
+        return any(
+            line.strip().replace("\\", "/") == launcher_rel
+            for line in tracked.splitlines()
+        )
 
     def _backup_settings(self) -> Dict[Path, Optional[bytes]]:
         paths = {self._app_root / self._SETTINGS_NAME}
@@ -1060,7 +1134,9 @@ class _UpdateWorker(QObject):
     def _download_file(self, url: str, destination: Path) -> None:
         self.progress.emit(f"[Update] Downloading {url}")
         try:
-            with urllib.request.urlopen(self._github_request(url), timeout=300.0) as resp:
+            with urllib.request.urlopen(
+                self._github_request(url), timeout=300.0
+            ) as resp:
                 with destination.open("wb") as fh:
                     shutil.copyfileobj(resp, fh)
         except urllib.error.URLError as exc:
@@ -1087,7 +1163,10 @@ class _UpdateWorker(QObject):
             rel = src.relative_to(source_root)
             if any(part in self._ARCHIVE_SKIP_DIRS for part in rel.parts):
                 continue
-            if rel.as_posix() in self._ARCHIVE_SKIP_FILES or rel.name in self._ARCHIVE_SKIP_FILES:
+            if (
+                rel.as_posix() in self._ARCHIVE_SKIP_FILES
+                or rel.name in self._ARCHIVE_SKIP_FILES
+            ):
                 continue
 
             dst = self._app_root / rel
@@ -1252,9 +1331,10 @@ class _UpdateWorker(QObject):
             self._restore_settings(backups)
             settings_restored = True
 
-            if "requirements.txt" in changed and (
-                self._repo_root / "requirements.txt"
-            ).exists():
+            if (
+                "requirements.txt" in changed
+                and (self._repo_root / "requirements.txt").exists()
+            ):
                 self.progress.emit(
                     "[Update] requirements.txt changed; installing dependencies …"
                 )
@@ -1437,9 +1517,7 @@ class _BinaryUpdateWorker(QObject):
                         member_name = info.filename
                         break
             if member_name is None:
-                raise RuntimeError(
-                    f"No AutoTuner binary found inside {zip_path.name}"
-                )
+                raise RuntimeError(f"No AutoTuner binary found inside {zip_path.name}")
             suffix = ".exe" if os.name == "nt" else ".new"
             out_fd, out_path = tempfile.mkstemp(
                 prefix="autotuner_update_bin_", suffix=suffix, dir=str(self._data_dir)
@@ -1562,20 +1640,23 @@ class _BinaryUpdateWorker(QObject):
             size_raw = asset.get("size") or 0
             size = int(size_raw) if isinstance(size_raw, (int, float)) else 0
             self.progress.emit(
-                f"[Update] Downloading {name} "
-                f"({size / 1048576:.1f} MB) …"
+                f"[Update] Downloading {name} ({size / 1048576:.1f} MB) …"
             )
 
             # Temp file on the SAME volume as the binary → atomic move.
-            suffix = ".zip" if name.lower().endswith(".zip") else (
-                ".exe" if os.name == "nt" else ".new"
+            suffix = (
+                ".zip"
+                if name.lower().endswith(".zip")
+                else (".exe" if os.name == "nt" else ".new")
             )
             tmp_fd, tmp_path = tempfile.mkstemp(
                 prefix="autotuner_update_", suffix=suffix, dir=str(self._data_dir)
             )
             os.close(tmp_fd)
             tmp_file = Path(tmp_path)
-            with urllib.request.urlopen(self._github_request(url), timeout=600.0) as resp:
+            with urllib.request.urlopen(
+                self._github_request(url), timeout=600.0
+            ) as resp:
                 with tmp_file.open("wb") as fh:
                     shutil.copyfileobj(resp, fh)
             if tmp_file.stat().st_size == 0:
@@ -1715,7 +1796,13 @@ class _FavoriteStarDelegate(QStyledItemDelegate):
         if font.pointSizeF() > 0:
             font.setPointSizeF(max(13.0, font.pointSizeF()))
         painter.setFont(font)
-        painter.setPen(QColor("#ffd54f" if favorite else "#777777"))
+        manager = getattr(QApplication.instance(), "theme_manager", None)
+        color = (
+            manager.selected_favorite_color(favorite)
+            if isinstance(manager, ThemeManager)
+            else "#777777"
+        )
+        painter.setPen(QColor(color))
         painter.drawText(
             self._star_rect(option),
             Qt.AlignmentFlag.AlignCenter,
@@ -1748,8 +1835,9 @@ def _sort_model_entries(
     ]
     return sorted(
         ordered,
-        key=lambda entry: app_settings.favorite_model_key(entry.path)
-        not in favorite_models,
+        key=lambda entry: (
+            app_settings.favorite_model_key(entry.path) not in favorite_models
+        ),
     )
 
 
@@ -1837,7 +1925,9 @@ def _expert_extras_from_values(vals: dict) -> List[str]:
     if vals.get("verbose"):
         extras.append("--verbose")
     extras.extend(
-        _reasoning_flags_from_values(vals.get("reasoning", "auto"), vals.get("think_budget", -1))
+        _reasoning_flags_from_values(
+            vals.get("reasoning", "auto"), vals.get("think_budget", -1)
+        )
     )
     if vals.get("reasoning_preserve"):
         extras.append("--reasoning-preserve")
@@ -1912,7 +2002,9 @@ def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
         # derived from the performance target and clear the flag.
         if vals.get("parallel_enabled"):
             try:
-                cfg.n_parallel = max(1, int(vals.get("parallel_count", cfg.n_parallel) or cfg.n_parallel))
+                cfg.n_parallel = max(
+                    1, int(vals.get("parallel_count", cfg.n_parallel) or cfg.n_parallel)
+                )
             except (TypeError, ValueError):
                 pass
             cfg.n_parallel_forced = True
@@ -1943,7 +2035,9 @@ def expert_cfg_from_values(base: TunedConfig, vals: dict) -> TunedConfig:
     cfg.n_cpu_moe = n_cpu if n_cpu > 0 else None
     cfg.rope_scaling = bool(vals.get("rope_scaling", base.rope_scaling))
     try:
-        cfg.rope_scale_factor = float(vals.get("rope_factor", base.rope_scale_factor) or 1.0)
+        cfg.rope_scale_factor = float(
+            vals.get("rope_factor", base.rope_scale_factor) or 1.0
+        )
     except (TypeError, ValueError):
         cfg.rope_scale_factor = float(base.rope_scale_factor or 1.0)
     # Non-cascading overlay (threads / batch / flags / sampling / reasoning)
@@ -2122,7 +2216,7 @@ class ExpertPanel(QWidget):
         # programmatic load / restore / reset (those bypass
         # `_emit_state_changed` via the `_populating` guard).
         self._saved_lbl = QLabel("✓ gespeichert")
-        self._saved_lbl.setStyleSheet("color:#6c6;font-style:italic;")
+        self._saved_lbl.setProperty("themeRole", "saved")
         self._saved_lbl.setVisible(False)
         mode_row.addWidget(self._saved_lbl)
 
@@ -2178,7 +2272,7 @@ class ExpertPanel(QWidget):
         def _add(label: str, widget: QWidget, tip: str = "") -> None:
             nonlocal row
             label_widget = QLabel(label)
-            label_widget.setStyleSheet("color:#bbb;")
+            label_widget.setProperty("themeRole", "muted")
             grid.addWidget(label_widget, row, 0)
             grid.addWidget(widget, row, 1)
             if tip:
@@ -2189,7 +2283,7 @@ class ExpertPanel(QWidget):
         def _section(title: str) -> None:
             nonlocal row
             section_label = QLabel(f"── {title} ──")
-            section_label.setStyleSheet("color:#8be;padding-top:4px;")
+            section_label.setProperty("themeRole", "section")
             grid.addWidget(section_label, row, 0, 1, 2)
             row += 1
 
@@ -2367,9 +2461,7 @@ class ExpertPanel(QWidget):
 
         self._chk_parallel = QCheckBox("Parallel slots (--parallel / -np)")
         self._chk_parallel.toggled.connect(self._sp_parallel.setEnabled)
-        self._chk_parallel.toggled.connect(
-            lambda _: self._on_edit("force_n_parallel")
-        )
+        self._chk_parallel.toggled.connect(lambda _: self._on_edit("force_n_parallel"))
         _add(
             "",
             self._chk_parallel,
@@ -2744,22 +2836,42 @@ class ExpertPanel(QWidget):
         # `_schedule_save` keeps programmatic population (load / reset)
         # from firing a spurious save.
         for sp in (
-            self._sp_ctx, self._sp_ngl, self._sp_ncpumoe, self._sp_threads,
-            self._sp_batch_threads, self._sp_batch, self._sp_ubatch,
-            self._sp_rope_factor, self._sp_temp, self._sp_top_k, self._sp_top_p,
-            self._sp_min_p, self._sp_rep, self._sp_presence, self._sp_think_budget,
-            self._sp_parallel, self._sp_draft_n_max,
+            self._sp_ctx,
+            self._sp_ngl,
+            self._sp_ncpumoe,
+            self._sp_threads,
+            self._sp_batch_threads,
+            self._sp_batch,
+            self._sp_ubatch,
+            self._sp_rope_factor,
+            self._sp_temp,
+            self._sp_top_k,
+            self._sp_top_p,
+            self._sp_min_p,
+            self._sp_rep,
+            self._sp_presence,
+            self._sp_think_budget,
+            self._sp_parallel,
+            self._sp_draft_n_max,
         ):
             sp.valueChanged.connect(self._schedule_save)
         for cb in (
-            self._cb_cache_k, self._cb_cache_v, self._cb_load_mode, self._cb_numa,
+            self._cb_cache_k,
+            self._cb_cache_v,
+            self._cb_load_mode,
+            self._cb_numa,
             self._cb_reasoning,
         ):
             cb.currentTextChanged.connect(self._schedule_save)
         for chk in (
-            self._chk_fa, self._chk_jinja, self._chk_verbose, self._chk_metrics,
+            self._chk_fa,
+            self._chk_jinja,
+            self._chk_verbose,
+            self._chk_metrics,
             self._chk_slots_api,
-            self._chk_reasoning_preserve, self._chk_rope, self._chk_parallel,
+            self._chk_reasoning_preserve,
+            self._chk_rope,
+            self._chk_parallel,
         ):
             chk.toggled.connect(self._schedule_save)
         self._le_extra.textChanged.connect(self._schedule_save)
@@ -2856,9 +2968,7 @@ class ExpertPanel(QWidget):
             self._chk_parallel.setChecked(parallel_on)
             self._sp_parallel.setEnabled(parallel_on)
             self._sp_parallel.setValue(
-                int(cfg.n_parallel)
-                if parallel_on
-                else self._suggested_parallel_count()
+                int(cfg.n_parallel) if parallel_on else self._suggested_parallel_count()
             )
 
             # Flags
@@ -2876,9 +2986,7 @@ class ExpertPanel(QWidget):
             self._chk_slots_api.setChecked(
                 bool(getattr(cfg, "slots_api_enabled", False)) or "--slots" in extras_in
             )
-            self._chk_reasoning_preserve.setChecked(
-                "--reasoning-preserve" in extras_in
-            )
+            self._chk_reasoning_preserve.setChecked("--reasoning-preserve" in extras_in)
             self._set_combo(self._cb_numa, cfg.numa or "off")
 
             self._chk_rope.setChecked(cfg.rope_scaling)
@@ -3035,9 +3143,7 @@ class ExpertPanel(QWidget):
             # around N slots; unchecking releases the pin so the
             # performance-target default (1/2/4) takes over again.
             if self._chk_parallel.isChecked():
-                self._user_pins["force_n_parallel"] = max(
-                    1, self._sp_parallel.value()
-                )
+                self._user_pins["force_n_parallel"] = max(1, self._sp_parallel.value())
             else:
                 self._user_pins["force_n_parallel"] = None
         elif kind == "force_rope_scale":
@@ -3090,9 +3196,7 @@ class ExpertPanel(QWidget):
         """
         sysinfo = self._system
         if sysinfo and getattr(sysinfo, "gpus", None):
-            biggest_free = max(
-                (g.free_vram_gb for g in sysinfo.gpus), default=0.0
-            )
+            biggest_free = max((g.free_vram_gb for g in sysinfo.gpus), default=0.0)
             return 3 if biggest_free >= 24.0 else 2
         return 2
 
@@ -3403,6 +3507,10 @@ class MainWindow(QMainWindow):
         self._tray_menu: Optional[QMenu] = None
         self._tray_hint_shown = False
         self._tray_restore_maximized = False
+        app = cast(Optional[QApplication], QApplication.instance())
+        if app is None:  # QMainWindow requires a QApplication in normal Qt use.
+            raise RuntimeError("MainWindow requires a QApplication")
+        self._theme_manager = _application_theme_manager(app)
 
         self._build_ui()
         # Wire background → GUI signals BEFORE the first scan kicks off,
@@ -3616,11 +3724,11 @@ class MainWindow(QMainWindow):
         self._ram_lbl = QLabel("RAM: —")
         self._gpu_lbl = QLabel("GPU: —")
         for lbl in (self._cpu_lbl, self._vram_lbl, self._ram_lbl, self._gpu_lbl):
-            lbl.setStyleSheet("color:#8be;padding:0 12px;")
+            lbl.setProperty("themeRole", "sysbar")
             sl.addWidget(lbl)
         sl.addStretch()
         sysbar.setMaximumHeight(24)
-        sysbar.setStyleSheet("background:#161625;")
+        sysbar.setProperty("themeRole", "sysbar")
 
         # ── Filter + model list ────────────────────────────────────────
         fr = QWidget()
@@ -3646,9 +3754,7 @@ class MainWindow(QMainWindow):
         self._favorite_delegate.favoriteToggled.connect(self._set_model_favorite)
         self._model_list.setItemDelegate(self._favorite_delegate)
         self._model_list.currentItemChanged.connect(self._on_selection_changed)
-        self._model_list.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
+        self._model_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._model_list.customContextMenuRequested.connect(
             self._show_model_context_menu
         )
@@ -3793,9 +3899,7 @@ class MainWindow(QMainWindow):
                 "warning for advanced testing.",
             )
         )
-        self._chk_mmproj_cpu = QCheckBox(
-            "Keep mmproj in RAM (--no-mmproj-offload)"
-        )
+        self._chk_mmproj_cpu = QCheckBox("Keep mmproj in RAM (--no-mmproj-offload)")
         self._chk_mmproj_cpu.setToolTip(
             _setting_tooltip(
                 "Keeps the vision projector in system memory. This frees GPU memory "
@@ -4027,7 +4131,12 @@ class MainWindow(QMainWindow):
             self._port_offset_combo.addItem(str(i))
         # Restore the persisted offset selection (clamped to the combo range).
         self._port_offset_combo.setCurrentIndex(
-            max(0, min(self._port_offset_combo.count() - 1, app_settings.get_port_offset()))
+            max(
+                0,
+                min(
+                    self._port_offset_combo.count() - 1, app_settings.get_port_offset()
+                ),
+            )
         )
         self._port_offset_combo.currentIndexChanged.connect(
             lambda _i: app_settings.set_port_offset(
@@ -4147,9 +4256,99 @@ class MainWindow(QMainWindow):
         self._restore_splitter_states()
 
     def _open_application_settings(self) -> None:
-        """Open and persist application-level startup/window behaviour."""
+        """Preview application appearance and persist it only on confirmation."""
         dialog = _ApplicationSettingsDialog(self)
+        app = cast(Optional[QApplication], QApplication.instance())
+        original = copy.deepcopy(self._theme_manager.current_definition)
+
+        def refresh_widgets() -> None:
+            self._apply_mono_font(self._config_preview)
+            self._apply_mono_font(self._log_panel)
+            viewport = self._model_list.viewport()
+            if viewport is not None:
+                viewport.update()
+
+        def apply_definition(theme) -> None:
+            if app is not None:
+                self._theme_manager.apply_definition(app, theme, self._font_size)
+                refresh_widgets()
+
+        def apply_selected() -> None:
+            apply_definition(
+                self._theme_manager.get(str(dialog.theme_combo.currentData()))
+            )
+
+        def rollback() -> None:
+            apply_definition(original)
+
+        def repopulate(selected: str) -> None:
+            dialog.theme_combo.blockSignals(True)
+            dialog.theme_combo.clear()
+            for theme in self._theme_manager.available():
+                dialog.theme_combo.addItem(
+                    f"{theme.name} ({theme.source})", theme.qualified_id
+                )
+            dialog.theme_combo.setCurrentIndex(
+                max(0, dialog.theme_combo.findData(selected))
+            )
+            dialog.theme_combo.blockSignals(False)
+
+        def reload_themes() -> None:
+            self._theme_manager.reload()
+            selected = str(dialog.theme_combo.currentData())
+            if selected not in self._theme_manager.themes:
+                selected = SYSTEM_THEME_ID
+            repopulate(selected)
+            apply_selected()
+            if self._theme_manager.errors:
+                QMessageBox.warning(
+                    dialog,
+                    "Theme files ignored",
+                    "\n".join(self._theme_manager.errors[:8]),
+                )
+
+        def preview_editor(edited) -> None:
+            apply_definition(edited)
+
+        def customize() -> None:
+            theme = self._theme_manager.get(str(dialog.theme_combo.currentData()))
+            editor = ThemeEditorDialog(theme, dialog, preview_editor)
+            if editor.exec() != QDialog.DialogCode.Accepted:
+                apply_selected()
+                return
+            try:
+                saved = editor.theme()
+                self._theme_manager.save_user_theme(saved)
+            except FileExistsError:
+                QMessageBox.warning(
+                    dialog,
+                    "Theme exists",
+                    "Choose a different ID; existing themes are never overwritten here.",
+                )
+                apply_selected()
+                return
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Could not save theme", str(exc))
+                apply_selected()
+                return
+            repopulate(saved.qualified_id)
+            apply_selected()
+
+        dialog.theme_combo.currentIndexChanged.connect(lambda _index: apply_selected())
+        dialog.reload_themes_button.clicked.connect(reload_themes)
+        dialog.customize_theme_button.clicked.connect(customize)
+
+        def open_theme_folder() -> None:
+            try:
+                self._theme_manager.user_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                QMessageBox.warning(dialog, "Theme folder", str(exc))
+                return
+            _open_local_folder(self._theme_manager.user_dir)
+
+        dialog.open_themes_button.clicked.connect(open_theme_folder)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            rollback()
             return
 
         try:
@@ -4157,11 +4356,15 @@ class MainWindow(QMainWindow):
             if autostart_enabled != dialog.autostart_was_enabled:
                 startup_manager.set_autostart_enabled(autostart_enabled)
         except startup_manager.AutostartError as exc:
+            rollback()
             QMessageBox.critical(self, "Autostart", str(exc))
             return
 
         minimize_to_tray = dialog.minimize_checkbox.isChecked()
         app_settings.set_minimize_on_close(minimize_to_tray)
+        selected_theme = str(dialog.theme_combo.currentData())
+        if selected_theme in self._theme_manager.themes:
+            app_settings.set_theme_id(selected_theme)
         if not minimize_to_tray:
             self._destroy_tray_icon()
         self._status.showMessage("Settings saved", 3000)
@@ -4232,9 +4435,7 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def _on_tray_activated(
-        self, reason: QSystemTrayIcon.ActivationReason
-    ) -> None:
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
             QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.DoubleClick,
@@ -4417,10 +4618,7 @@ class MainWindow(QMainWindow):
         app_settings.set_base_port(port)
 
     def _apply_mono_font(self, w: QTextEdit) -> None:
-        f = QFont("Consolas")
-        f.setStyleHint(QFont.StyleHint.Monospace)
-        f.setPointSize(self._font_size)
-        w.setFont(f)
+        w.setFont(self._theme_manager.mono_font(self._font_size))
 
     def _change_font(self, delta: int) -> None:
         """A+/A- handler — scale the WHOLE UI, not just two text panels.
@@ -4590,7 +4788,9 @@ class MainWindow(QMainWindow):
             forks.append((name, rp))
 
         for root in roots:
-            if self._looks_like_llama_dir_name(root.name) and self._is_llama_build_dir(root):
+            if self._looks_like_llama_dir_name(root.name) and self._is_llama_build_dir(
+                root
+            ):
                 add(root.name, root)
             for name, fork_path in self._expand_fork_container(root):
                 add(name, fork_path)
@@ -4686,9 +4886,7 @@ class MainWindow(QMainWindow):
                     f"{len(active_roots)} active llama path(s)."
                 )
             else:
-                self._log(
-                    "[Warning] No llama.cpp builds found in active llama paths."
-                )
+                self._log("[Warning] No llama.cpp builds found in active llama paths.")
             self._start_hardware_detection()
             return
 
@@ -5212,7 +5410,10 @@ class MainWindow(QMainWindow):
             self._log(f"  - {root}")
 
         if not roots:
-            configured = "\n".join(f"  - {p} {'(deaktiviert)' if not en else ''}" for p, en in self.model_paths)
+            configured = "\n".join(
+                f"  - {p} {'(deaktiviert)' if not en else ''}"
+                for p, en in self.model_paths
+            )
             msg = (
                 "Keine aktiven Model-Pfade verfügbar.\n\n"
                 "Aktiviere oder füge Pfade über '📂 Models folder' hinzu."
@@ -5255,7 +5456,9 @@ class MainWindow(QMainWindow):
         self._populate_list(entries)
         self._btn_launch.setEnabled(True)
         roots = getattr(self, "_last_scan_roots", [])
-        self._status.showMessage(f"{len(entries)} model(s) loaded from {len(roots)} folder(s).")
+        self._status.showMessage(
+            f"{len(entries)} model(s) loaded from {len(roots)} folder(s)."
+        )
         self._log(f"Found {len(entries)} model(s) from {len(roots)} active folder(s).")
 
     def _on_scan_error(self, msg: str) -> None:
@@ -5326,7 +5529,9 @@ class MainWindow(QMainWindow):
 
         self._btn_update.setEnabled(False)
         self._status.showMessage("Checking GitHub for a newer release …")
-        self._log(f"[Update] Running v{VERSION} on {platform.system()}; checking GitHub …")
+        self._log(
+            f"[Update] Running v{VERSION} on {platform.system()}; checking GitHub …"
+        )
 
         worker = _BinaryUpdateWorker()
         thread = QThread(self)
@@ -6066,13 +6271,11 @@ class MainWindow(QMainWindow):
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
         turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
         no_mmproj_offload = (
-            self._chk_mmproj_cpu.isChecked()
-            and self._chk_mmproj_cpu.isEnabled()
+            self._chk_mmproj_cpu.isChecked() and self._chk_mmproj_cpu.isEnabled()
         )
         prompt_cache_ram_mib = (
             self._sp_prompt_cache_mib.value()
-            if self._chk_prompt_cache.isChecked()
-            and self._chk_prompt_cache.isEnabled()
+            if self._chk_prompt_cache.isChecked() and self._chk_prompt_cache.isEnabled()
             else 0
         )
 
@@ -6139,9 +6342,7 @@ class MainWindow(QMainWindow):
             # live VRAM / checkbox state), then overlay the saved
             # non-cascading widget values (threads / batch / flags / …).
             pins = {
-                k: v
-                for k, v in (override.get("pins") or {}).items()
-                if v is not None
+                k: v for k, v in (override.get("pins") or {}).items() if v is not None
             }
             cascaded = self._build_auto_config(entry, profile, pins) or base
             if vals:
@@ -6154,9 +6355,7 @@ class MainWindow(QMainWindow):
             )
             return base
 
-    def _load_expert_panel(
-        self, entry: ModelEntry, profile: ModelProfile
-    ) -> None:
+    def _load_expert_panel(self, entry: ModelEntry, profile: ModelProfile) -> None:
         """Bind the Expert panel to the current model + apply any saved
         Expert override. Used when entering Expert mode and when a
         checkbox toggles while the panel is already open."""
@@ -6234,8 +6433,7 @@ class MainWindow(QMainWindow):
         cache_label = "unlimited" if cache_limit == -1 else f"{cache_limit} MiB"
         lines.append(
             f"Prompt$ : host-RAM cache (-cram)  [{'✓' if use_prompt_cache else '✗'}] "
-            f"[{cache_label}]"
-            + (" (Vision requires b10045+)" if use_vision else "")
+            f"[{cache_label}]" + (" (Vision requires b10045+)" if use_vision else "")
         )
         if profile.server_binary:
             lines.append(f"Requires: {profile.server_binary}")
@@ -6285,8 +6483,7 @@ class MainWindow(QMainWindow):
             # system RAM, attention compute runs on CPU. Surface it so the
             # user understands why context is huge but generation is slower.
             lines.append(
-                "KV in RAM       : on (--no-kv-offload)  "
-                "[slower gen, max context]"
+                "KV in RAM       : on (--no-kv-offload)  [slower gen, max context]"
             )
         if cfg.rope_scaling:
             lines.append(f"RoPE scaling    : on (factor {cfg.rope_scale_factor:.1f}×)")
@@ -6336,9 +6533,7 @@ class MainWindow(QMainWindow):
         else:
             lines.append(f"  KV cache  : ~{cfg.estimated_kv_gb:5.1f} GB")
         if cfg.runtime_vram_overhead_gb > 0.05:
-            lines.append(
-                f"  Runtime GPU: ~{cfg.runtime_vram_overhead_gb:5.1f} GB"
-            )
+            lines.append(f"  Runtime GPU: ~{cfg.runtime_vram_overhead_gb:5.1f} GB")
         lines.append(
             f"  Total GPU : ~{total_gpu:5.1f} GB"
             f"   of {self._system.free_vram_gb:.1f} GB free"
@@ -6348,9 +6543,7 @@ class MainWindow(QMainWindow):
             f"   (free RAM:  {self._system.free_ram_gb:.1f} GB)"
         )
         if cfg.prompt_cache_ram_gb > 0.05:
-            lines.append(
-                f"  Prompt RAM: ~{cfg.prompt_cache_ram_gb:5.1f} GB"
-            )
+            lines.append(f"  Prompt RAM: ~{cfg.prompt_cache_ram_gb:5.1f} GB")
         if total_cpu > cfg.estimated_model_ram_gb + 0.05:
             lines.append(f"  Total CPU : ~{total_cpu:5.1f} GB")
         if cfg.warning:
@@ -6625,7 +6818,9 @@ class MainWindow(QMainWindow):
 
         # CPU-Anzeige
         if s.cpu_name:
-            display_cpu = (s.cpu_name[:40] + '...') if len(s.cpu_name) > 40 else s.cpu_name
+            display_cpu = (
+                (s.cpu_name[:40] + "...") if len(s.cpu_name) > 40 else s.cpu_name
+            )
             self._cpu_lbl.setText(f"CPU: {display_cpu}")
 
         # GPU-Anzeige mit Utilization
@@ -6633,7 +6828,7 @@ class MainWindow(QMainWindow):
             gpu_parts = []
             for g in s.gpus:
                 util = f"{g.gpu_util_percent:.0f}%" if g.gpu_util_percent > 0 else "—"
-                display_name = (g.name[:25] + '...') if len(g.name) > 25 else g.name
+                display_name = (g.name[:25] + "...") if len(g.name) > 25 else g.name
                 gpu_parts.append(f"{display_name} ({util})")
             txt = "GPU: " + ", ".join(gpu_parts)
             # Ignorierte GPUs (iGPU etc.) auch zeigen — Transparenz darüber, was
@@ -6646,7 +6841,9 @@ class MainWindow(QMainWindow):
                         if g.total_vram_mb > 0
                         else "VRAM unknown"
                     )
-                    display_ign_name = (g.name[:20] + '...') if len(g.name) > 20 else g.name
+                    display_ign_name = (
+                        (g.name[:20] + "...") if len(g.name) > 20 else g.name
+                    )
                     ign_parts.append(f"{display_ign_name} ({size}, ignored)")
                 txt += "  ·  " + ", ".join(ign_parts)
             self._gpu_lbl.setText(txt)
@@ -7000,12 +7197,10 @@ class MainWindow(QMainWindow):
         # no /health, no registry. The binary is found in the SELECTED fork
         # (the fork dropdown points LLAMA_CPP_DIR at it).
         if profile.runner == "llama-diffusion-cli" or (
-            entry.is_diffusion
-            and profile.runner != "llama-diffusion-gemma-server"
+            entry.is_diffusion and profile.runner != "llama-diffusion-gemma-server"
         ):
             self._launch_diffusion(entry, cfg, profile)
             return
-
 
         # ── Load-balancing across GPUs for a 2nd/3rd concurrent model ──
         # When at least one server is already running, re-check live VRAM
@@ -7133,16 +7328,14 @@ class MainWindow(QMainWindow):
                 )
                 return
             arch = (entry.metadata or {}).get("general.architecture")
-            gemma_server_bin = resolve_diff(
-                "llama-diffusion-gemma-server", arch=arch
-            )
+            gemma_server_bin = resolve_diff("llama-diffusion-gemma-server", arch=arch)
             self._log(
                 f"[Diffusion-Server] binary: 'llama-diffusion-gemma-server' "
                 f"→ {gemma_server_bin} (arch={arch!r})"
             )
-            if not self._is_runnable_binary(Path(gemma_server_bin)) and not shutil.which(
-                gemma_server_bin
-            ):
+            if not self._is_runnable_binary(
+                Path(gemma_server_bin)
+            ) and not shutil.which(gemma_server_bin):
                 self._log(
                     f"[Diffusion-Server] Binary nicht gefunden: {gemma_server_bin}"
                 )
@@ -7362,7 +7555,9 @@ class MainWindow(QMainWindow):
         diffusion_bin = resolve_diffusion(request, arch=arch)
         self._log(f"[Diffusion] binary: {request!r} → {diffusion_bin} (arch={arch!r})")
 
-        if not self._is_runnable_binary(Path(diffusion_bin)) and not shutil.which(diffusion_bin):
+        if not self._is_runnable_binary(Path(diffusion_bin)) and not shutil.which(
+            diffusion_bin
+        ):
             self._log(f"[Diffusion] Binary not found: {diffusion_bin}")
             QMessageBox.warning(
                 self,
@@ -7443,8 +7638,7 @@ class MainWindow(QMainWindow):
         self._log(f"[Diffusion] Started — PID: {pid}")
         if proc.log_path is not None:
             self._log(
-                "[Diffusion] Output → live below + terminal, "
-                f"log file: {proc.log_path}"
+                f"[Diffusion] Output → live below + terminal, log file: {proc.log_path}"
             )
         else:
             self._log("[Diffusion] Output → separate terminal window")
@@ -7894,9 +8088,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             import ctypes
 
-            set_app_id = (
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
-            )
+            set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
             set_app_id.argtypes = [ctypes.c_wchar_p]
             set_app_id.restype = ctypes.c_long
             set_app_id("DaWasteh.AutoTuner")
@@ -7909,6 +8101,13 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("AutoTuner")
+    manager = _application_theme_manager(app, _bundled_resource("assets", "themes"))
+    selected_theme = app_settings.get_theme_id()
+    applied_theme = manager.apply(app, selected_theme, app_settings.get_font_size())
+    if selected_theme != applied_theme:
+        app_settings.set_theme_id(applied_theme)
+    for warning in manager.errors:
+        print(f"[Warning] Theme ignored: {warning}")
     icon_path = _bundled_resource("assets", "AutoTuner.png")
     if icon_path.is_file():
         app_icon = QIcon(str(icon_path))

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "system",
+  "name": "System",
+  "description": "Native-inspired default theme",
+  "colors": {
+    "window_bg": "#202124",
+    "panel_bg": "#292a2d",
+    "control_bg": "#35363a",
+    "control_hover": "#44464d",
+    "control_pressed": "#55575e",
+    "text": "#f1f3f4",
+    "muted_text": "#b8bcc2",
+    "accent": "#8ab4f8",
+    "accent_text": "#101214",
+    "border": "#5f6368",
+    "selection_bg": "#3c6eae",
+    "selection_text": "#ffffff",
+    "disabled_text": "#8a8d91",
+    "success": "#66cc88",
+    "warning": "#f0c75e",
+    "error": "#f07878",
+    "favorite_active": "#ffd54f",
+    "favorite_inactive": "#777777",
+    "sysbar_bg": "#161625",
+    "sysbar_text": "#88bbee",
+    "section_text": "#88bbee"
+  },
+  "font": {
+    "ui_family": "",
+    "mono_family": ""
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "light",
+  "name": "Light",
+  "description": "Bright light theme",
+  "colors": {
+    "window_bg": "#f5f7fa",
+    "panel_bg": "#ffffff",
+    "control_bg": "#e8edf3",
+    "control_hover": "#dce6f1",
+    "control_pressed": "#cad9e9",
+    "text": "#18212b",
+    "muted_text": "#586674",
+    "accent": "#1769aa",
+    "accent_text": "#ffffff",
+    "border": "#aab8c6",
+    "selection_bg": "#2878ba",
+    "selection_text": "#ffffff",
+    "disabled_text": "#82909d",
+    "success": "#237a45",
+    "warning": "#9a6800",
+    "error": "#b42929",
+    "favorite_active": "#b77800",
+    "favorite_inactive": "#778390",
+    "sysbar_bg": "#e7eef7",
+    "sysbar_text": "#1769aa",
+    "section_text": "#1769aa"
+  },
+  "font": {
+    "ui_family": "",
+    "mono_family": ""
+  }
+}

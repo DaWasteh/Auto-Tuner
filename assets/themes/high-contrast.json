@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "high-contrast",
+  "name": "High Contrast",
+  "description": "High contrast accessibility theme",
+  "colors": {
+    "window_bg": "#000000",
+    "panel_bg": "#000000",
+    "control_bg": "#151515",
+    "control_hover": "#303030",
+    "control_pressed": "#555555",
+    "text": "#ffffff",
+    "muted_text": "#e2e2e2",
+    "accent": "#00d7ff",
+    "accent_text": "#000000",
+    "border": "#ffffff",
+    "selection_bg": "#005f87",
+    "selection_text": "#ffffff",
+    "disabled_text": "#c0c0c0",
+    "success": "#00ff6a",
+    "warning": "#ffff00",
+    "error": "#ff5555",
+    "favorite_active": "#ffff00",
+    "favorite_inactive": "#b0b0b0",
+    "sysbar_bg": "#000000",
+    "sysbar_text": "#00d7ff",
+    "section_text": "#00d7ff"
+  },
+  "font": {
+    "ui_family": "",
+    "mono_family": ""
+  }
+}

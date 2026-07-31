@@ -917,7 +917,14 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     )
     widgets = [getattr(expert, name) for name in expert_names]
     widgets.extend(
-        [app_dialog.autostart_checkbox, app_dialog.minimize_checkbox]
+        [
+            app_dialog.autostart_checkbox,
+            app_dialog.minimize_checkbox,
+            app_dialog.theme_combo,
+            app_dialog.reload_themes_button,
+            app_dialog.customize_theme_button,
+            app_dialog.open_themes_button,
+        ]
     )
     widgets.extend(
         [

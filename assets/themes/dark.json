@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "dark",
+  "name": "Dark",
+  "description": "Dark blue-gray theme",
+  "colors": {
+    "window_bg": "#15181d",
+    "panel_bg": "#20252d",
+    "control_bg": "#2b333e",
+    "control_hover": "#384554",
+    "control_pressed": "#46586b",
+    "text": "#edf3fa",
+    "muted_text": "#b4c1ce",
+    "accent": "#67b7f7",
+    "accent_text": "#07121d",
+    "border": "#536577",
+    "selection_bg": "#276c9e",
+    "selection_text": "#ffffff",
+    "disabled_text": "#78838e",
+    "success": "#67cb91",
+    "warning": "#efc75e",
+    "error": "#ef8080",
+    "favorite_active": "#ffd45a",
+    "favorite_inactive": "#89929b",
+    "sysbar_bg": "#111820",
+    "sysbar_text": "#9bd0ff",
+    "section_text": "#9bd0ff"
+  },
+  "font": {
+    "ui_family": "",
+    "mono_family": ""
+  }
+}

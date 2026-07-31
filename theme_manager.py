@@ -1,0 +1,427 @@
+"""Safe, declarative application themes for AutoTuner.
+
+Theme files are JSON data, never QSS. This module validates their small schema
+and generates the complete internal stylesheet itself.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette
+from PyQt6.QtWidgets import QApplication
+
+import app_settings
+
+SCHEMA_VERSION = 1
+SYSTEM_THEME_ID = "builtin:system"
+REQUIRED_BUILTIN_IDS = {"system", "dark", "light", "high-contrast"}
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+MAX_THEME_BYTES = 64 * 1024
+MAX_THEMES = 128
+COLOR_ROLES = (
+    "window_bg",
+    "panel_bg",
+    "control_bg",
+    "control_hover",
+    "control_pressed",
+    "text",
+    "muted_text",
+    "accent",
+    "accent_text",
+    "border",
+    "selection_bg",
+    "selection_text",
+    "disabled_text",
+    "success",
+    "warning",
+    "error",
+    "favorite_active",
+    "favorite_inactive",
+    "sysbar_bg",
+    "sysbar_text",
+    "section_text",
+)
+
+# This is deliberately embedded: a damaged/missing resource must not prevent
+# the launcher from opening, including in a partially extracted frozen build.
+_EMERGENCY_SYSTEM_COLORS = {
+    "window_bg": "#202124",
+    "panel_bg": "#292a2d",
+    "control_bg": "#35363a",
+    "control_hover": "#44464d",
+    "control_pressed": "#55575e",
+    "text": "#f1f3f4",
+    "muted_text": "#b8bcc2",
+    "accent": "#8ab4f8",
+    "accent_text": "#101214",
+    "border": "#5f6368",
+    "selection_bg": "#3c6eae",
+    "selection_text": "#ffffff",
+    "disabled_text": "#8a8d91",
+    "success": "#66cc88",
+    "warning": "#f0c75e",
+    "error": "#f07878",
+    "favorite_active": "#ffd54f",
+    "favorite_inactive": "#777777",
+    "sysbar_bg": "#161625",
+    "sysbar_text": "#88bbee",
+    "section_text": "#88bbee",
+}
+
+
+class ThemeLoadError(ValueError):
+    """A theme file is malformed or unsupported."""
+
+
+@dataclass(frozen=True)
+class ThemeDefinition:
+    id: str
+    name: str
+    description: str
+    colors: Dict[str, str]
+    ui_family: str = ""
+    mono_family: str = ""
+    source: str = "builtin"
+
+    @property
+    def qualified_id(self) -> str:
+        return f"{self.source}:{self.id}"
+
+
+def emergency_system_theme() -> ThemeDefinition:
+    return ThemeDefinition(
+        "system",
+        "System",
+        "Native system palette and font",
+        dict(_EMERGENCY_SYSTEM_COLORS),
+    )
+
+
+def _json_object(text: str) -> dict:
+    def no_duplicates(pairs: List[Tuple[str, object]]) -> dict:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ThemeLoadError(f"Duplicate key: {key}")
+            result[key] = value
+        return result
+
+    def no_constant(value: str) -> None:
+        raise ThemeLoadError(f"Unsupported JSON value: {value}")
+
+    try:
+        value = json.loads(
+            text, object_pairs_hook=no_duplicates, parse_constant=no_constant
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        raise ThemeLoadError(f"Invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ThemeLoadError("Theme root must be a JSON object")
+    return value
+
+
+def parse_theme(text: str, source: str) -> ThemeDefinition:
+    raw = _json_object(text)
+    required = {"schema_version", "id", "name", "description", "colors", "font"}
+    if set(raw) != required:
+        raise ThemeLoadError(
+            "Theme must contain exactly schema_version, id, name, description, colors and font"
+        )
+    if raw["schema_version"] != SCHEMA_VERSION or isinstance(
+        raw["schema_version"], bool
+    ):
+        raise ThemeLoadError(f"Only schema_version {SCHEMA_VERSION} is supported")
+    theme_id = raw["id"]
+    if not isinstance(theme_id, str) or not ID_RE.fullmatch(theme_id):
+        raise ThemeLoadError("id must match [a-z0-9][a-z0-9_-]{0,63}")
+    for key in ("name", "description"):
+        if not isinstance(raw[key], str) or len(raw[key]) > 160:
+            raise ThemeLoadError(f"{key} must be text no longer than 160 characters")
+    colors = raw["colors"]
+    if not isinstance(colors, dict) or set(colors) != set(COLOR_ROLES):
+        raise ThemeLoadError(
+            "colors must contain every documented color role and no others"
+        )
+    for role, color in colors.items():
+        if (
+            not isinstance(color, str)
+            or not COLOR_RE.fullmatch(color)
+            or not QColor(color).isValid()
+        ):
+            raise ThemeLoadError(f"{role} must be an opaque #RRGGBB color")
+    font = raw["font"]
+    if not isinstance(font, dict) or set(font) != {"ui_family", "mono_family"}:
+        raise ThemeLoadError("font must contain ui_family and mono_family")
+    for value in font.values():
+        if not isinstance(value, str) or len(value) > 120 or "\x00" in value:
+            raise ThemeLoadError("font families must be short text")
+    return ThemeDefinition(
+        theme_id,
+        raw["name"],
+        raw["description"],
+        dict(colors),
+        font["ui_family"],
+        font["mono_family"],
+        source,
+    )
+
+
+def theme_to_json(theme: ThemeDefinition) -> str:
+    return (
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "id": theme.id,
+                "name": theme.name,
+                "description": theme.description,
+                "colors": theme.colors,
+                "font": {
+                    "ui_family": theme.ui_family,
+                    "mono_family": theme.mono_family,
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+
+
+def contrast_ratio(first: str, second: str) -> float:
+    """Return WCAG contrast ratio for two validated opaque hex colors."""
+
+    def luminance(value: str) -> float:
+        channels = [int(value[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    first_lum, second_lum = luminance(first), luminance(second)
+    return (max(first_lum, second_lum) + 0.05) / (min(first_lum, second_lum) + 0.05)
+
+
+class ThemeManager:
+    def __init__(
+        self, builtin_dir: Optional[Path] = None, user_dir: Optional[Path] = None
+    ) -> None:
+        root = Path(__file__).resolve().parent
+        self.builtin_dir = builtin_dir or root / "assets" / "themes"
+        self.user_dir = user_dir or app_settings.app_data_dir() / "autotuner_themes"
+        self.errors: List[str] = []
+        self.themes: Dict[str, ThemeDefinition] = {}
+        self.builtin_resource_ids: set[str] = set()
+        self.current_id = SYSTEM_THEME_ID
+        self.current_definition = emergency_system_theme()
+        self._base_palette: Optional[QPalette] = None
+        self._base_font: Optional[QFont] = None
+        self.reload()
+
+    def _discover(self, directory: Path, source: str) -> Iterable[ThemeDefinition]:
+        try:
+            paths = sorted(
+                directory.glob("*.json"), key=lambda path: path.name.casefold()
+            )[:MAX_THEMES]
+        except OSError as exc:
+            self.errors.append(f"Could not read {source} themes: {exc}")
+            return []
+        result: List[ThemeDefinition] = []
+        seen = set()
+        for path in paths:
+            try:
+                if path.stat().st_size > MAX_THEME_BYTES:
+                    raise ThemeLoadError("file is larger than 64 KiB")
+                theme = parse_theme(path.read_text(encoding="utf-8"), source)
+                if theme.id.casefold() in seen:
+                    raise ThemeLoadError("duplicate id in theme directory")
+                seen.add(theme.id.casefold())
+                result.append(theme)
+            except (OSError, UnicodeError, RecursionError, ThemeLoadError) as exc:
+                self.errors.append(f"{path.name}: {exc}")
+        return result
+
+    def reload(self) -> None:
+        self.errors.clear()
+        self.builtin_resource_ids.clear()
+        themes: Dict[str, ThemeDefinition] = {SYSTEM_THEME_ID: emergency_system_theme()}
+        for theme in self._discover(self.builtin_dir, "builtin"):
+            self.builtin_resource_ids.add(theme.id)
+            themes[theme.qualified_id] = theme
+        for theme in self._discover(self.user_dir, "user"):
+            themes[theme.qualified_id] = theme
+        self.themes = themes
+
+    def available(self) -> List[ThemeDefinition]:
+        return sorted(
+            self.themes.values(),
+            key=lambda theme: (theme.source != "builtin", theme.name.casefold()),
+        )
+
+    def get(self, qualified_id: str) -> ThemeDefinition:
+        return self.themes.get(qualified_id, self.themes[SYSTEM_THEME_ID])
+
+    def is_valid_builtin_set(self) -> bool:
+        return self.builtin_resource_ids == REQUIRED_BUILTIN_IDS and not self.errors
+
+    def stylesheet(self, theme: ThemeDefinition) -> str:
+        c = theme.colors
+        if theme.qualified_id == SYSTEM_THEME_ID:
+            return f"""QLabel[themeRole="saved"] {{ color: {c["success"]}; font-style: italic; }}
+QLabel[themeRole="muted"] {{ color: {c["muted_text"]}; }}
+QLabel[themeRole="section"] {{ color: {c["section_text"]}; padding-top: 4px; }}
+QWidget[themeRole="sysbar"] {{ background: {c["sysbar_bg"]}; }}
+QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
+        return f"""QWidget {{ background: {c["window_bg"]}; color: {c["text"]}; }}
+QToolBar, QStatusBar, QMenuBar, QMenu {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; }}
+QGroupBox, QTextEdit, QListWidget, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; }}
+QPushButton {{ background: {c["control_bg"]}; border: 1px solid {c["border"]}; padding: 4px; border-radius: 3px; }}
+QPushButton:hover {{ background: {c["control_hover"]}; }}
+QPushButton:pressed {{ background: {c["control_pressed"]}; }}
+QPushButton:checked, QPushButton:default {{ background: {c["accent"]}; color: {c["accent_text"]}; }}
+QWidget:disabled {{ color: {c["disabled_text"]}; }}
+QListWidget::item:selected, QComboBox QAbstractItemView::item:selected, QMenu::item:selected {{ background: {c["selection_bg"]}; color: {c["selection_text"]}; }}
+QPushButton:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QListWidget:focus, QTextEdit:focus {{ border: 2px solid {c["accent"]}; }}
+QToolTip {{ background: {c["panel_bg"]}; color: {c["text"]}; border: 1px solid {c["border"]}; }}
+QScrollBar:vertical {{ background: {c["panel_bg"]}; width: 12px; }}
+QScrollBar::handle:vertical {{ background: {c["control_hover"]}; min-height: 20px; border: 1px solid {c["border"]}; }}
+QLabel[themeRole="saved"] {{ color: {c["success"]}; font-style: italic; }}
+QLabel[themeRole="muted"] {{ color: {c["muted_text"]}; }}
+QLabel[themeRole="section"] {{ color: {c["section_text"]}; padding-top: 4px; }}
+QWidget[themeRole="sysbar"] {{ background: {c["sysbar_bg"]}; }}
+QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
+
+    def apply(
+        self, app: QApplication, qualified_id: str, font_size: Optional[int] = None
+    ) -> str:
+        return self.apply_definition(app, self.get(qualified_id), font_size)
+
+    def apply_definition(
+        self, app: QApplication, theme: ThemeDefinition, font_size: Optional[int] = None
+    ) -> str:
+        if self._base_palette is None:
+            self._base_palette = QPalette(app.palette())
+            self._base_font = QFont(app.font())
+        if theme.qualified_id == SYSTEM_THEME_ID:
+            app.setPalette(QPalette(self._base_palette))
+            font = QFont(self._base_font)
+        else:
+            c = theme.colors
+            palette = QPalette(self._base_palette)
+            for role, color in (
+                (QPalette.ColorRole.Window, c["window_bg"]),
+                (QPalette.ColorRole.Base, c["panel_bg"]),
+                (QPalette.ColorRole.Button, c["control_bg"]),
+                (QPalette.ColorRole.Text, c["text"]),
+                (QPalette.ColorRole.WindowText, c["text"]),
+                (QPalette.ColorRole.ButtonText, c["text"]),
+                (QPalette.ColorRole.Highlight, c["selection_bg"]),
+                (QPalette.ColorRole.HighlightedText, c["selection_text"]),
+            ):
+                palette.setColor(role, QColor(color))
+            palette.setColor(
+                QPalette.ColorGroup.Disabled,
+                QPalette.ColorRole.Text,
+                QColor(c["disabled_text"]),
+            )
+            palette.setColor(
+                QPalette.ColorGroup.Disabled,
+                QPalette.ColorRole.WindowText,
+                QColor(c["disabled_text"]),
+            )
+            app.setPalette(palette)
+            font = QFont(self._base_font)
+            if theme.ui_family:
+                font.setFamily(theme.ui_family)
+        if font_size is not None:
+            font.setPointSize(font_size)
+        app.setStyleSheet(self.stylesheet(theme))
+        app.setFont(font)
+        self.current_id = theme.qualified_id
+        self.current_definition = theme
+        return self.current_id
+
+    def mono_font(self, point_size: int) -> QFont:
+        if self.current_definition.mono_family:
+            font = QFont(self.current_definition.mono_family)
+        else:
+            font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        font.setPointSize(point_size)
+        return font
+
+    def selected_favorite_color(self, favorite: bool) -> str:
+        color = self.current_definition.colors[
+            "favorite_active" if favorite else "favorite_inactive"
+        ]
+        return (
+            color
+            if contrast_ratio(color, self.current_definition.colors["selection_bg"])
+            >= 3
+            else self.current_definition.colors["selection_text"]
+        )
+
+    def save_user_theme(self, theme: ThemeDefinition) -> Path:
+        """Atomically create a new user theme without ever replacing one."""
+        if theme.source != "user":
+            raise ThemeLoadError("Only a user theme can be saved")
+        # The parser is the single schema authority. A successful save can now
+        # never be rejected by reload for shape/content reasons.
+        validated = parse_theme(theme_to_json(theme), "user")
+        self.user_dir.mkdir(parents=True, exist_ok=True)
+        root = self.user_dir.resolve()
+        target = (root / f"{validated.id}.json").resolve()
+        if target.parent != root:
+            raise ThemeLoadError("Invalid theme id")
+        if target.exists():
+            raise FileExistsError(target)
+        theme_files = list(root.glob("*.json"))
+        if len(theme_files) >= MAX_THEMES:
+            raise ThemeLoadError(f"Theme folder is limited to {MAX_THEMES} files")
+        for existing in self._discover(root, "user"):
+            if existing.id.casefold() == validated.id.casefold():
+                raise ThemeLoadError("A user theme with this id already exists")
+        data = theme_to_json(validated)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{validated.id}-", suffix=".tmp", dir=root, text=True
+        )
+        tmp = Path(tmp_name)
+        created_target = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
+            try:
+                # Atomic no-replace operation supported by Windows and POSIX.
+                os.link(tmp, target)
+                created_target = True
+            except FileExistsError:
+                raise FileExistsError(target) from None
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+            self.reload()
+            loaded = self.themes.get(validated.qualified_id)
+            if loaded != validated:
+                raise ThemeLoadError("Saved theme could not be loaded")
+            return target
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            if created_target:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                self.reload()
+            raise

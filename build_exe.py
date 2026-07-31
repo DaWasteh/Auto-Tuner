@@ -45,6 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 ENTRY = REPO_ROOT / "qt_launcher.py"
 SETTINGS_DIR = REPO_ROOT / "settings"
 ASSETS_DIR = REPO_ROOT / "assets"
+THEMES_DIR = ASSETS_DIR / "themes"
 ICON_ICO = ASSETS_DIR / "AutoTuner.ico"
 DIST = REPO_ROOT / "dist"
 BUILD = REPO_ROOT / "build"
@@ -92,6 +93,19 @@ def main() -> int:
     if not ASSETS_DIR.is_dir():
         print(f"[build] assets/ not found at {ASSETS_DIR}", file=sys.stderr)
         return 1
+    # Themes are bundled under assets/. Validate before PyInstaller spends
+    # minutes building an executable that would only fall back at runtime.
+    try:
+        from theme_manager import ThemeManager
+
+        themes = ThemeManager(
+            builtin_dir=THEMES_DIR, user_dir=REPO_ROOT / ".build_no_user_themes"
+        )
+        if not themes.is_valid_builtin_set():
+            raise ValueError("; ".join(themes.errors) or "expected system, dark, light and high-contrast built-ins")
+    except Exception as exc:
+        print(f"[build] bundled themes are invalid: {exc}", file=sys.stderr)
+        return 1
     if os.name == "nt" and not ICON_ICO.is_file():
         print(f"[build] Windows icon not found at {ICON_ICO}", file=sys.stderr)
         return 1
@@ -124,6 +138,8 @@ def main() -> int:
         "app_settings",
         "startup_manager",
         "autotuner_version",
+        "theme_manager",
+        "theme_dialog",
     ]
 
     cmd = [

@@ -25,6 +25,8 @@ Public API:
     set_mmproj_selection(model_name, filename)
     get_font_size()        -> Optional[int]
     set_font_size(int)
+    get_theme_id()         -> str
+    set_theme_id(str)
     get_minimize_on_close() -> bool
     set_minimize_on_close(bool)
     get_base_port()        -> int
@@ -101,7 +103,10 @@ def load_settings() -> Dict[str, Any]:
     if not f.exists():
         return {}
     try:
-        return json.loads(f.read_text(encoding="utf-8")) or {}
+        data = json.loads(f.read_text(encoding="utf-8"))
+        # A valid JSON scalar/list is not a settings document.  Treat it like
+        # corrupt data so all accessors remain safe.
+        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -910,6 +915,22 @@ def set_font_size(size: int) -> None:
         return
     n = max(_FONT_SIZE_MIN, min(_FONT_SIZE_MAX, n))
     _update("font_size", n)
+
+
+# ---------------------------------------------------------------------------
+# Appearance theme
+
+
+def get_theme_id() -> str:
+    """Return the selected namespaced theme, defaulting safely to System."""
+    value = load_settings().get("theme_id")
+    return value if isinstance(value, str) and value else "builtin:system"
+
+
+def set_theme_id(theme_id: str) -> None:
+    """Persist a namespaced ThemeManager id; validation happens at load time."""
+    if isinstance(theme_id, str) and theme_id:
+        _update("theme_id", theme_id)
 
 
 # ---------------------------------------------------------------------------
