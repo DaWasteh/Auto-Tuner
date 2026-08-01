@@ -102,7 +102,10 @@ def main() -> int:
             builtin_dir=THEMES_DIR, user_dir=REPO_ROOT / ".build_no_user_themes"
         )
         if not themes.is_valid_builtin_set():
-            raise ValueError("; ".join(themes.errors) or "expected system, dark, light and high-contrast built-ins")
+            raise ValueError(
+                "; ".join(themes.errors)
+                or "expected system, dark, dark-gray, light and high-contrast built-ins"
+            )
     except Exception as exc:
         print(f"[build] bundled themes are invalid: {exc}", file=sys.stderr)
         return 1
@@ -147,7 +150,7 @@ def main() -> int:
         "-m",
         "PyInstaller",
         "--onefile",
-        "--windowed",          # noconsole: no terminal on Windows, none on Linux
+        "--windowed",  # noconsole: no terminal on Windows, none on Linux
         "--name",
         _exe_name(),
         "--noconfirm",

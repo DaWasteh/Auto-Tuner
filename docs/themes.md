@@ -1,6 +1,6 @@
 # AutoTuner themes
 
-AutoTuner v5.0.4 ships **System**, **Dark**, **Light**, and **High Contrast** themes. **System** keeps the operating system's native palette and controls; the other themes apply AutoTuner's complete color palette. Open **⚙ Settings** and select a theme. The change is previewed immediately; **Cancel** restores the previous appearance and **OK** remembers it. Font size remains the separate toolbar **A− / A+** accessibility setting.
+AutoTuner ships **System**, **Dark**, **Dark Gray**, **Light**, and **High Contrast** themes. **System** keeps the operating system's native palette and controls; the other themes apply AutoTuner's complete color palette. Open **⚙ Settings** and select a theme. The change is previewed immediately; **Cancel** restores the previous appearance and **OK** remembers it. Font size remains the separate toolbar **A− / A+** accessibility setting.
 
 ## Create a theme
 
@@ -47,7 +47,7 @@ Themes are UTF-8 JSON files smaller than 64 KiB. They may contain **only** the d
 | `accent`, `accent_text`, `border` | accent and outlines |
 | `selection_bg`, `selection_text` | selected list/combo entries |
 | `success`, `warning`, `error` | semantic status colors |
-| `favorite_active`, `favorite_inactive` | model star states |
+| `favorite_active`, `favorite_inactive` | model star states; the configured colors are rendered exactly |
 | `sysbar_bg`, `sysbar_text`, `section_text` | hardware bar and section headings |
 
 Empty font families use the platform UI font and Qt's fixed-width font. A named font must be installed on the current OS; unavailable fonts simply fall back through Qt.

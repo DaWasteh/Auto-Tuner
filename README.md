@@ -61,10 +61,10 @@ the RAM/VRAM you actually have free — without manual edits.
     decoding (smallest matching sibling wins). A leading `mtp-` explicitly
     marks an external draft head even when newer Qwen-based heads are several
     GiB; large infix `…-MTP-…` target models remain normal runnable models.
-- **Themes and appearance editor** — choose built-in System, Dark, Light, or High Contrast themes in **⚙ Settings**, or copy one in the in-app color/font editor and save it as a safe JSON user theme. See the complete [theme guide](docs/themes.md).
+- **Themes and appearance editor** — choose built-in System, Dark, Dark Gray, Light, or High Contrast themes in **⚙ Settings**, or copy one in the in-app color/font editor and save it as a safe JSON user theme. See the complete [theme guide](docs/themes.md).
 - **Favorite models stay at the top** — click the star left of a model name
-  to mark it. Favorites use a yellow star, unmarked models keep a gray star,
-  and the choice is persisted across AutoTuner restarts.
+  to mark it. Active and inactive star colors follow the selected theme, and
+  the choice is persisted across AutoTuner restarts.
 - **Capability badges in the model list** — symbols make it obvious
   what each model can do at a glance:
   - 👁 vision (mmproj projector paired)

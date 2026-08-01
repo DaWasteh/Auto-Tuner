@@ -21,7 +21,7 @@ import app_settings
 
 SCHEMA_VERSION = 1
 SYSTEM_THEME_ID = "builtin:system"
-REQUIRED_BUILTIN_IDS = {"system", "dark", "light", "high-contrast"}
+REQUIRED_BUILTIN_IDS = {"system", "dark", "dark-gray", "light", "high-contrast"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_THEME_BYTES = 64 * 1024
@@ -195,23 +195,6 @@ def theme_to_json(theme: ThemeDefinition) -> str:
     )
 
 
-def contrast_ratio(first: str, second: str) -> float:
-    """Return WCAG contrast ratio for two validated opaque hex colors."""
-
-    def luminance(value: str) -> float:
-        channels = [int(value[index : index + 2], 16) / 255 for index in (1, 3, 5)]
-        linear = [
-            channel / 12.92
-            if channel <= 0.04045
-            else ((channel + 0.055) / 1.055) ** 2.4
-            for channel in channels
-        ]
-        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-
-    first_lum, second_lum = luminance(first), luminance(second)
-    return (max(first_lum, second_lum) + 0.05) / (min(first_lum, second_lum) + 0.05)
-
-
 class ThemeManager:
     def __init__(
         self, builtin_dir: Optional[Path] = None, user_dir: Optional[Path] = None
@@ -359,16 +342,11 @@ QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
         font.setPointSize(point_size)
         return font
 
-    def selected_favorite_color(self, favorite: bool) -> str:
-        color = self.current_definition.colors[
+    def favorite_color(self, favorite: bool) -> str:
+        """Return the exact configured star color for the requested state."""
+        return self.current_definition.colors[
             "favorite_active" if favorite else "favorite_inactive"
         ]
-        return (
-            color
-            if contrast_ratio(color, self.current_definition.colors["selection_bg"])
-            >= 3
-            else self.current_definition.colors["selection_text"]
-        )
 
     def save_user_theme(self, theme: ThemeDefinition) -> Path:
         """Atomically create a new user theme without ever replacing one."""

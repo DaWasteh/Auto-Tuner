@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "dark-gray",
+  "name": "Dark Gray",
+  "description": "Pure dark gray theme centered on #636363",
+  "colors": {
+    "window_bg": "#1a1a1a",
+    "panel_bg": "#141414",
+    "control_bg": "#2a2a2a",
+    "control_hover": "#3a3a3a",
+    "control_pressed": "#636363",
+    "text": "#e8e8e8",
+    "muted_text": "#888888",
+    "accent": "#636363",
+    "accent_text": "#141414",
+    "border": "#2a2a2a",
+    "selection_bg": "#636363",
+    "selection_text": "#141414",
+    "disabled_text": "#4a4a4a",
+    "success": "#6aaa6a",
+    "warning": "#c8a040",
+    "error": "#c05050",
+    "favorite_active": "#9999ff",
+    "favorite_inactive": "#bbbbbb",
+    "sysbar_bg": "#141414",
+    "sysbar_text": "#777777",
+    "section_text": "#636363"
+  },
+  "font": {
+    "ui_family": "",
+    "mono_family": ""
+  }
+}

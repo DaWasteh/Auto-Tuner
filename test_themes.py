@@ -42,6 +42,7 @@ def test_builtins_are_valid_and_namespaced(tmp_path):
     assert {theme.qualified_id for theme in manager.available()} >= {
         "builtin:system",
         "builtin:dark",
+        "builtin:dark-gray",
         "builtin:light",
         "builtin:high-contrast",
     }
@@ -94,6 +95,36 @@ def test_apply_palette_qss_and_mono_font(tmp_path):
     assert "QPushButton" in app.styleSheet()
     assert app.font().pointSize() == 13
     assert manager.mono_font(11).pointSize() == 11
+
+
+@pytest.mark.parametrize(
+    ("favorite_active", "selection_bg"),
+    [
+        ("#9999ff", "#636363"),
+        ("#ffff00", "#7d9b7e"),
+    ],
+)
+def test_custom_favorite_colors_are_applied_exactly(
+    tmp_path, favorite_active, selection_bg
+):
+    app = QApplication.instance() or QApplication([])
+    manager = ThemeManager(ROOT / "assets" / "themes", tmp_path / "user")
+    colors = dict(manager.get("builtin:dark-gray").colors)
+    colors["favorite_active"] = favorite_active
+    colors["selection_bg"] = selection_bg
+    theme = ThemeDefinition(
+        "custom-gray",
+        "Custom Gray",
+        "Low-contrast star regression",
+        colors,
+        source="user",
+    )
+
+    manager.apply_definition(app, theme, 12)
+
+    assert manager.current_id == "user:custom-gray"
+    assert manager.favorite_color(True) == favorite_active
+    assert manager.favorite_color(False) == "#bbbbbb"
 
 
 def test_settings_json_root_and_theme_roundtrip(tmp_path, monkeypatch):

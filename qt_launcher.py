@@ -1808,7 +1808,7 @@ class _FavoriteStarDelegate(QStyledItemDelegate):
         painter.setFont(font)
         manager = getattr(QApplication.instance(), "theme_manager", None)
         color = (
-            manager.selected_favorite_color(favorite)
+            manager.favorite_color(favorite)
             if isinstance(manager, ThemeManager)
             else "#777777"
         )
