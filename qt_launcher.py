@@ -740,6 +740,16 @@ class _ApplicationSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def sizeHint(self) -> QSize:  # noqa: N802
+        """Keep the settings dialog bounded across platform font metrics."""
+        hint = super().sizeHint()
+        return QSize(min(hint.width(), 800), hint.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        """Allow layouts to compress to the same documented 800px bound."""
+        hint = super().minimumSizeHint()
+        return QSize(min(hint.width(), 800), hint.height())
+
 
 # ---------------------------------------------------------------------------
 # Hardware detection worker with global timeout

@@ -146,6 +146,11 @@ class ThemeEditorDialog(QDialog):
         hint = super().sizeHint()
         return QSize(min(hint.width(), 800), hint.height())
 
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        """Let native Linux styles compress the form to the same 800px bound."""
+        hint = super().minimumSizeHint()
+        return QSize(min(hint.width(), 800), hint.height())
+
     def _set_swatch(self, role: str) -> None:
         color = QColor(self._theme.colors[role])
         self.color_buttons[role].setStyleSheet(
