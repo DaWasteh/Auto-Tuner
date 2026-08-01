@@ -53,6 +53,23 @@ def _swatch_text_color(color: QColor) -> str:
     return "#000000" if black >= white else "#ffffff"
 
 
+def editable_theme_copy(theme: ThemeDefinition) -> ThemeDefinition:
+    """Return the user-theme draft shown by the editor."""
+    if theme.source == "builtin":
+        editable_id = f"{theme.id}-user"
+        editable_name = f"{theme.name}-user"
+    else:
+        editable_id = theme.id
+        editable_name = theme.name
+    return replace(
+        theme,
+        id=editable_id,
+        name=editable_name,
+        colors=dict(theme.colors),
+        source="user",
+    )
+
+
 class ThemeEditorDialog(QDialog):
     """Edit a copy of a theme; callers decide when/how to save it."""
 
@@ -65,7 +82,7 @@ class ThemeEditorDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Customize theme")
         self.setMaximumWidth(800)
-        self._theme = replace(theme, colors=dict(theme.colors), source="user")
+        self._theme = editable_theme_copy(theme)
         self._preview = preview
         layout = QVBoxLayout(self)
         form = QFormLayout()

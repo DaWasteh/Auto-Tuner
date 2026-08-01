@@ -348,44 +348,111 @@ QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
             "favorite_active" if favorite else "favorite_inactive"
         ]
 
-    def save_user_theme(self, theme: ThemeDefinition) -> Path:
-        """Atomically create a new user theme without ever replacing one."""
+    def save_user_theme(
+        self, theme: ThemeDefinition, *, replace_id: Optional[str] = None
+    ) -> Path:
+        """Atomically create a user theme or replace the selected user theme.
+
+        ``replace_id`` is the original id of the user theme being edited. It
+        deliberately identifies the selected theme instead of granting a
+        general "overwrite any id" permission when the editor's ID field is
+        changed.
+        """
         if theme.source != "user":
             raise ThemeLoadError("Only a user theme can be saved")
         # The parser is the single schema authority. A successful save can now
         # never be rejected by reload for shape/content reasons.
         validated = parse_theme(theme_to_json(theme), "user")
+        if replace_id is not None and not ID_RE.fullmatch(replace_id):
+            raise ThemeLoadError("Invalid replacement theme id")
         self.user_dir.mkdir(parents=True, exist_ok=True)
         root = self.user_dir.resolve()
-        target = (root / f"{validated.id}.json").resolve()
-        if target.parent != root:
+        canonical_target = root / f"{validated.id}.json"
+        if canonical_target.resolve().parent != root:
             raise ThemeLoadError("Invalid theme id")
-        if target.exists():
-            raise FileExistsError(target)
+
         theme_files = list(root.glob("*.json"))
-        if len(theme_files) >= MAX_THEMES:
-            raise ThemeLoadError(f"Theme folder is limited to {MAX_THEMES} files")
-        for existing in self._discover(root, "user"):
-            if existing.id.casefold() == validated.id.casefold():
-                raise ThemeLoadError("A user theme with this id already exists")
+        existing: List[Tuple[Path, ThemeDefinition]] = []
+        for path in theme_files:
+            try:
+                if path.is_symlink():
+                    raise ThemeLoadError("symbolic-link theme files cannot be replaced")
+                if path.resolve().parent != root:
+                    raise ThemeLoadError("theme file resolves outside the theme folder")
+                if path.stat().st_size > MAX_THEME_BYTES:
+                    continue
+                existing.append(
+                    (path, parse_theme(path.read_text(encoding="utf-8"), "user"))
+                )
+            except (OSError, UnicodeError, RecursionError, ThemeLoadError):
+                continue
+
+        replacement: Optional[Path] = None
+        if replace_id is not None:
+            replacement = next(
+                (
+                    path
+                    for path, current in existing
+                    if current.id.casefold() == replace_id.casefold()
+                ),
+                None,
+            )
+            if replacement is None:
+                raise ThemeLoadError(
+                    "The user theme being edited no longer exists; reload themes"
+                )
+
+        for path, current in existing:
+            if current.id.casefold() != validated.id.casefold():
+                continue
+            if replacement is None or path != replacement:
+                raise FileExistsError(f"A user theme with id {validated.id!r} exists")
+
+        target = replacement or canonical_target
+        if replacement is None:
+            if target.exists():
+                raise FileExistsError(target)
+            if len(theme_files) >= MAX_THEMES:
+                raise ThemeLoadError(f"Theme folder is limited to {MAX_THEMES} files")
+
         data = theme_to_json(validated)
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{validated.id}-", suffix=".tmp", dir=root, text=True
         )
         tmp = Path(tmp_name)
+        original_data: Optional[bytes] = None
+        if replacement is not None:
+            try:
+                original_data = target.read_bytes()
+            except OSError as exc:
+                try:
+                    os.close(fd)
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise ThemeLoadError(
+                    f"Could not back up the user theme: {exc}"
+                ) from exc
         created_target = False
+        replaced_target = False
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(data)
-            try:
-                # Atomic no-replace operation supported by Windows and POSIX.
-                os.link(tmp, target)
-                created_target = True
-            except FileExistsError:
-                raise FileExistsError(target) from None
-            finally:
-                if tmp.exists():
-                    tmp.unlink()
+                handle.flush()
+                os.fsync(handle.fileno())
+            if replacement is not None:
+                os.replace(tmp, target)
+                replaced_target = True
+            else:
+                try:
+                    # Atomic no-replace operation supported by Windows and POSIX.
+                    os.link(tmp, target)
+                    created_target = True
+                except FileExistsError:
+                    raise FileExistsError(target) from None
+                finally:
+                    if tmp.exists():
+                        tmp.unlink()
             self.reload()
             loaded = self.themes.get(validated.qualified_id)
             if loaded != validated:
@@ -402,4 +469,36 @@ QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
                 except OSError:
                     pass
                 self.reload()
+            elif replaced_target and original_data is not None:
+                restore_fd = -1
+                restore_tmp: Optional[Path] = None
+                try:
+                    restore_fd, restore_name = tempfile.mkstemp(
+                        prefix=f".{validated.id}-restore-",
+                        suffix=".tmp",
+                        dir=root,
+                    )
+                    restore_tmp = Path(restore_name)
+                    with os.fdopen(restore_fd, "wb") as handle:
+                        restore_fd = -1
+                        handle.write(original_data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(restore_tmp, target)
+                    self.reload()
+                except Exception:
+                    # Preserve the original save exception. A failed rollback is
+                    # still visible on the next explicit reload/startup.
+                    pass
+                finally:
+                    if restore_fd >= 0:
+                        try:
+                            os.close(restore_fd)
+                        except OSError:
+                            pass
+                    if restore_tmp is not None:
+                        try:
+                            restore_tmp.unlink()
+                        except OSError:
+                            pass
             raise

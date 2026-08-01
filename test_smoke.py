@@ -877,6 +877,20 @@ def test_setting_tooltip_has_beginner_and_technical_layers() -> None:
     assert "--technical-flag<br>Second line" in tooltip
 
 
+def test_theme_replacement_is_only_authorized_for_selected_unchanged_user_id():
+    qt_launcher = pytest.importorskip("qt_launcher")
+    from theme_manager import ThemeDefinition
+
+    builtin = ThemeDefinition("dark", "Dark", "", {}, source="builtin")
+    user = ThemeDefinition("ocean", "Ocean", "", {}, source="user")
+    unchanged = ThemeDefinition("ocean", "Edited", "", {}, source="user")
+    renamed = ThemeDefinition("forest", "Renamed", "", {}, source="user")
+
+    assert qt_launcher._theme_replace_id(builtin, unchanged) is None
+    assert qt_launcher._theme_replace_id(user, unchanged) == "ocean"
+    assert qt_launcher._theme_replace_id(user, renamed) is None
+
+
 def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> None:
     """Lock in complete beginner + technical help for settings dialogs."""
     global _QT_TEST_APP

@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 import app_settings
+from theme_dialog import editable_theme_copy
 from theme_manager import (
     COLOR_ROLES,
     SYSTEM_THEME_ID,
@@ -86,6 +87,114 @@ def test_atomic_user_save_reload_and_traversal_guard(tmp_path):
         manager.save_user_theme(
             ThemeDefinition("../bad", "x", "x", dict(base.colors), source="user")
         )
+
+
+def test_existing_user_theme_can_be_atomically_overwritten(tmp_path):
+    user = tmp_path / "user"
+    manager = ThemeManager(ROOT / "assets" / "themes", user)
+    base = manager.get(SYSTEM_THEME_ID)
+    original = ThemeDefinition(
+        "ocean", "Ocean", "original", dict(base.colors), source="user"
+    )
+    path = manager.save_user_theme(original)
+    updated_colors = dict(base.colors)
+    updated_colors["accent"] = "#123456"
+    updated = ThemeDefinition(
+        "ocean", "Ocean edited", "updated", updated_colors, source="user"
+    )
+
+    replaced = manager.save_user_theme(updated, replace_id="ocean")
+
+    assert replaced == path
+    assert len(list(user.glob("*.json"))) == 1
+    assert manager.get("user:ocean") == updated
+
+
+def test_user_overwrite_rolls_back_if_post_replace_reload_fails(tmp_path, monkeypatch):
+    user = tmp_path / "user"
+    manager = ThemeManager(ROOT / "assets" / "themes", user)
+    colors = dict(manager.get(SYSTEM_THEME_ID).colors)
+    original = ThemeDefinition("ocean", "Ocean", "original", colors, source="user")
+    path = manager.save_user_theme(original)
+    edited = ThemeDefinition("ocean", "Ocean", "edited", dict(colors), source="user")
+
+    def fail_reload():
+        raise RuntimeError("injected reload failure")
+
+    monkeypatch.setattr(manager, "reload", fail_reload)
+    with pytest.raises(RuntimeError, match="injected"):
+        manager.save_user_theme(edited, replace_id="ocean")
+
+    assert parse_theme(path.read_text(encoding="utf-8"), "user") == original
+    assert not list(user.glob("*.tmp"))
+
+
+def test_user_overwrite_targets_selected_theme_and_rejects_other_id(tmp_path):
+    user = tmp_path / "user"
+    manager = ThemeManager(ROOT / "assets" / "themes", user)
+    colors = dict(manager.get(SYSTEM_THEME_ID).colors)
+    ocean = ThemeDefinition("ocean", "Ocean", "", colors, source="user")
+    forest = ThemeDefinition("forest", "Forest", "", colors, source="user")
+    manager.save_user_theme(ocean)
+    manager.save_user_theme(forest)
+    collision = ThemeDefinition("forest", "Changed id", "", dict(colors), source="user")
+
+    with pytest.raises(FileExistsError):
+        manager.save_user_theme(collision, replace_id="ocean")
+
+    assert manager.get("user:ocean") == ocean
+    assert manager.get("user:forest") == forest
+
+
+def test_imported_user_theme_with_noncanonical_filename_can_be_overwritten(tmp_path):
+    user = tmp_path / "user"
+    user.mkdir()
+    imported_path = user / "shared-by-a-user.json"
+    imported_path.write_text(json.dumps(_raw("ocean")), encoding="utf-8")
+    manager = ThemeManager(ROOT / "assets" / "themes", user)
+    edited = ThemeDefinition(
+        "ocean",
+        "Edited imported theme",
+        "updated",
+        dict(manager.get("user:ocean").colors),
+        source="user",
+    )
+
+    assert manager.save_user_theme(edited, replace_id="ocean") == imported_path
+    assert manager.get("user:ocean") == edited
+    assert not (user / "ocean.json").exists()
+
+
+def test_editor_suffixes_builtins_but_preserves_user_theme_identity(tmp_path):
+    manager = ThemeManager(ROOT / "assets" / "themes", tmp_path / "user")
+    builtin = manager.get("builtin:dark")
+    builtin_copy = editable_theme_copy(builtin)
+    assert builtin_copy.id == "dark-user"
+    assert builtin_copy.name == "Dark-user"
+    assert builtin_copy.qualified_id == "user:dark-user"
+    assert builtin_copy.colors == builtin.colors
+    assert builtin_copy.colors is not builtin.colors
+
+    existing_user = ThemeDefinition(
+        "ocean", "Ocean", "", dict(builtin.colors), source="user"
+    )
+    user_copy = editable_theme_copy(existing_user)
+    assert user_copy.id == "ocean"
+    assert user_copy.name == "Ocean"
+    assert user_copy.qualified_id == "user:ocean"
+
+
+def test_builtin_user_suffix_is_revalidated_before_save(tmp_path):
+    manager = ThemeManager(ROOT / "assets" / "themes", tmp_path / "user")
+    too_long = ThemeDefinition(
+        "a" * 64,
+        "Name",
+        "",
+        dict(manager.get(SYSTEM_THEME_ID).colors),
+        source="builtin",
+    )
+    with pytest.raises(ThemeLoadError, match="id must match"):
+        manager.save_user_theme(editable_theme_copy(too_long))
 
 
 def test_apply_palette_qss_and_mono_font(tmp_path):
@@ -167,7 +276,7 @@ def test_save_validates_full_document_and_duplicate_semantic_id(tmp_path):
         json.dumps({**_raw("duplicate"), "name": "Existing"}), encoding="utf-8"
     )
     manager.reload()
-    with pytest.raises(ThemeLoadError):
+    with pytest.raises(FileExistsError):
         manager.save_user_theme(other)
 
 

@@ -4,7 +4,7 @@ AutoTuner ships **System**, **Dark**, **Dark Gray**, **Light**, and **High Contr
 
 ## Create a theme
 
-Use **⚙ Settings → Customize…** to copy any built-in theme, choose colors and UI/monospace fonts, and save it under a new ID. Built-ins are read-only. **Open folder** opens the place for manually installed themes; click **Reload** after copying a file there.
+Use **⚙ Settings → Customize…** to edit the selected theme's colors and UI/monospace fonts. Built-ins stay read-only: their editor draft automatically appends `-user` to the ID and name and saves as a new user theme. Selecting an existing user theme lets you edit and overwrite it with the same ID; changing its ID creates a separate theme instead. **Open folder** opens the place for manually installed themes; click **Reload** after copying a file there.
 
 User themes are kept beside the source clone or executable:
 

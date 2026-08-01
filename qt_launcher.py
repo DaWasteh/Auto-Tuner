@@ -120,7 +120,7 @@ import app_settings
 import startup_manager
 from autotuner_version import VERSION, GITHUB_REPO, USER_AGENT
 from theme_dialog import ThemeEditorDialog
-from theme_manager import SYSTEM_THEME_ID, ThemeManager
+from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
 
 
 def _get_fork_tools():
@@ -151,6 +151,15 @@ def _application_theme_manager(
     # setattr/getattr deliberately retain this one process-wide manager.
     setattr(app, "theme_manager", manager)
     return manager
+
+
+def _theme_replace_id(
+    original: ThemeDefinition, edited: ThemeDefinition
+) -> Optional[str]:
+    """Authorize replacement only for the selected user theme's unchanged id."""
+    if original.source == "user" and edited.id.casefold() == original.id.casefold():
+        return original.id
+    return None
 
 
 def _setting_tooltip(summary: str, technical: str) -> str:
@@ -647,7 +656,7 @@ class _ApplicationSettingsDialog(QDialog):
         self.theme_combo.setToolTip(
             _setting_tooltip(
                 "Previews and selects the application's color and font theme.",
-                "Built-ins are read-only; custom JSON themes are discovered from the per-installation user theme folder.",
+                "Built-ins stay read-only; edited built-ins are saved as new '-user' themes, while selected user themes can be updated in the per-installation theme folder.",
             )
         )
         app = cast(Optional[QApplication], QApplication.instance())
@@ -670,8 +679,8 @@ class _ApplicationSettingsDialog(QDialog):
         )
         self.customize_theme_button.setToolTip(
             _setting_tooltip(
-                "Copies the selected theme into the safe color and font editor.",
-                "Built-ins are never changed. Saving creates a validated user JSON theme with a new ID.",
+                "Opens the selected theme in the safe color and font editor.",
+                "Built-ins are copied to a draft with '-user' appended to the ID and name; Save validates it. Saving an existing user theme with the same ID atomically updates it.",
             )
         )
         self.open_themes_button.setToolTip(
@@ -4266,7 +4275,11 @@ class MainWindow(QMainWindow):
         self._restore_splitter_states()
 
     def _open_application_settings(self) -> None:
-        """Preview application appearance and persist it only on confirmation."""
+        """Preview appearance and persist selection only on confirmation.
+
+        Theme-editor Save is intentionally immediate and independent from the
+        outer settings dialog's selection/behaviour confirmation.
+        """
         dialog = _ApplicationSettingsDialog(self)
         app = cast(Optional[QApplication], QApplication.instance())
         original = copy.deepcopy(self._theme_manager.current_definition)
@@ -4328,12 +4341,13 @@ class MainWindow(QMainWindow):
                 return
             try:
                 saved = editor.theme()
-                self._theme_manager.save_user_theme(saved)
+                replace_id = _theme_replace_id(theme, saved)
+                self._theme_manager.save_user_theme(saved, replace_id=replace_id)
             except FileExistsError:
                 QMessageBox.warning(
                     dialog,
                     "Theme exists",
-                    "Choose a different ID; existing themes are never overwritten here.",
+                    "Choose a different ID. Only the selected user theme can be overwritten.",
                 )
                 apply_selected()
                 return
