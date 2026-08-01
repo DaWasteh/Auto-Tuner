@@ -46,6 +46,7 @@ def test_builtins_are_valid_and_namespaced(tmp_path):
         "builtin:dark-gray",
         "builtin:light",
         "builtin:high-contrast",
+        "builtin:midnight-rose",
     }
     assert manager.errors == []
 
@@ -288,6 +289,8 @@ def test_system_keeps_native_palette_and_other_themes_have_focus_qss(tmp_path):
     manager.apply(app, "builtin:dark", 10)
     assert "QPushButton:focus" in app.styleSheet()
     assert "border: 2px solid" in app.styleSheet()
+    assert "QGroupBox::title" in app.styleSheet()
+    assert "subcontrol-origin: margin" in app.styleSheet()
 
 
 def test_promised_builtin_preflight_set(tmp_path):
@@ -352,9 +355,14 @@ def test_application_uses_one_theme_manager_and_22pt_dialogs_fit(tmp_path):
             assert dialog.maximumWidth() == 800
             assert dialog.minimumSizeHint().width() <= 800
             assert dialog.sizeHint().width() <= 800
-        assert settings.theme_combo.width() >= 80
-        assert editor.ui_font.width() >= 80
-        assert editor.mono_font.width() >= 80
+        assert editor.maximumHeight() <= app.primaryScreen().availableGeometry().height()
+        assert settings.theme_combo.width() >= 160
+        assert settings.theme_combo.itemData(
+            settings.theme_combo.currentIndex(), qt_launcher.Qt.ItemDataRole.ToolTipRole
+        ) == settings.theme_combo.currentText()
+        assert "<b>In short:</b>" in settings.theme_combo.toolTip()
+        assert editor.ui_font.width() >= 160
+        assert editor.mono_font.width() >= 160
         print('22pt dialogs and singleton OK', flush=True)
         os._exit(0)
         """

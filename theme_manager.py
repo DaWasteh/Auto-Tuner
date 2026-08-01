@@ -21,7 +21,14 @@ import app_settings
 
 SCHEMA_VERSION = 1
 SYSTEM_THEME_ID = "builtin:system"
-REQUIRED_BUILTIN_IDS = {"system", "dark", "dark-gray", "light", "high-contrast"}
+REQUIRED_BUILTIN_IDS = {
+    "system",
+    "dark",
+    "dark-gray",
+    "light",
+    "high-contrast",
+    "midnight-rose",
+}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_THEME_BYTES = 64 * 1024
@@ -267,7 +274,9 @@ QWidget[themeRole="sysbar"] {{ background: {c["sysbar_bg"]}; }}
 QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
         return f"""QWidget {{ background: {c["window_bg"]}; color: {c["text"]}; }}
 QToolBar, QStatusBar, QMenuBar, QMenu {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; }}
-QGroupBox, QTextEdit, QListWidget, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; }}
+QGroupBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; margin-top: 0.8em; padding-top: 0.35em; }}
+QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 8px; padding: 0 4px; color: {c["text"]}; }}
+QTextEdit, QListWidget, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; }}
 QPushButton {{ background: {c["control_bg"]}; border: 1px solid {c["border"]}; padding: 4px; border-radius: 3px; }}
 QPushButton:hover {{ background: {c["control_hover"]}; }}
 QPushButton:pressed {{ background: {c["control_pressed"]}; }}

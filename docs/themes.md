@@ -1,6 +1,6 @@
 # AutoTuner themes
 
-AutoTuner ships **System**, **Dark**, **Dark Gray**, **Light**, and **High Contrast** themes. **System** keeps the operating system's native palette and controls; the other themes apply AutoTuner's complete color palette. Open **⚙ Settings** and select a theme. The change is previewed immediately; **Cancel** restores the previous appearance and **OK** remembers it. Font size remains the separate toolbar **A− / A+** accessibility setting.
+AutoTuner ships **System**, **Dark**, **Dark Gray**, **Light**, **High Contrast**, and the pink-accented **Midnight Rose** themes. **System** keeps the operating system's native palette and controls; the other themes apply AutoTuner's complete color palette. Open **⚙ Settings** and select a theme. The change is previewed immediately; **Cancel** restores the previous appearance and **OK** remembers it. Font size remains the separate toolbar **A− / A+** accessibility setting.
 
 ## Create a theme
 

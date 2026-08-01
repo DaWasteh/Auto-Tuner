@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "midnight-rose",
+  "name": "Midnight Rose",
+  "description": "Deep plum surfaces with accessible pink and rose accents",
+  "colors": {
+    "window_bg": "#160E14",
+    "panel_bg": "#21151D",
+    "control_bg": "#33212B",
+    "control_hover": "#60354D",
+    "control_pressed": "#8A4669",
+    "text": "#F8EDF3",
+    "muted_text": "#C9AAB9",
+    "accent": "#F28BB8",
+    "accent_text": "#240A15",
+    "border": "#93657B",
+    "selection_bg": "#AE396E",
+    "selection_text": "#FFFFFF",
+    "disabled_text": "#A27F90",
+    "success": "#75D69C",
+    "warning": "#F3C969",
+    "error": "#FF8C86",
+    "favorite_active": "#FFA6C8",
+    "favorite_inactive": "#DAB7C5",
+    "sysbar_bg": "#100A0F",
+    "sysbar_text": "#F19BC0",
+    "section_text": "#F19BC0"
+  },
+  "font": {
+    "ui_family": "",
+    "mono_family": ""
+  }
+}

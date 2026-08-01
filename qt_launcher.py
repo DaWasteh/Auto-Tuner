@@ -139,6 +139,17 @@ def _bundled_resource(*parts: str) -> Path:
     return Path(__file__).resolve().parent.joinpath(*parts)
 
 
+def _source_update_message(detail: str) -> str:
+    """Keep source-update feedback as explicit about the running version as EXE updates."""
+    return f"AutoTuner v{VERSION}: {detail}"
+
+
+def _about_text() -> str:
+    """Return static, network-free application information for the About dialog."""
+    url = f"https://github.com/{GITHUB_REPO}"
+    return f'<b>AutoTuner</b><br>Version v{VERSION}<br><a href="{url}">{url}</a>'
+
+
 def _application_theme_manager(
     app: QApplication, builtin_dir: Optional[Path] = None
 ) -> ThemeManager:
@@ -642,12 +653,11 @@ class _ApplicationSettingsDialog(QDialog):
         appearance_layout = QGridLayout(appearance)
         theme_label = QLabel("&Theme:")
         self.theme_combo = QComboBox()
-        self.theme_combo.setMinimumWidth(80)
+        self.theme_combo.setMinimumWidth(160)
         self.theme_combo.setMaximumWidth(500)
         self.theme_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            QComboBox.SizeAdjustPolicy.AdjustToContents
         )
-        self.theme_combo.setMinimumContentsLength(6)
         self.theme_combo.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
@@ -662,15 +672,30 @@ class _ApplicationSettingsDialog(QDialog):
         app = cast(Optional[QApplication], QApplication.instance())
         if app is not None:
             manager = _application_theme_manager(app)
+            widest = 0
             for theme in manager.available():
-                self.theme_combo.addItem(
-                    f"{theme.name} ({theme.source})", theme.qualified_id
+                text = f"{theme.name} ({theme.source})"
+                self.theme_combo.addItem(text, theme.qualified_id)
+                self.theme_combo.setItemData(
+                    self.theme_combo.count() - 1, text, Qt.ItemDataRole.ToolTipRole
                 )
+                widest = max(
+                    widest, self.theme_combo.fontMetrics().horizontalAdvance(text)
+                )
+            self.theme_combo.setMinimumWidth(min(500, max(160, widest + 48)))
             index = self.theme_combo.findData(manager.current_id)
             self.theme_combo.setCurrentIndex(max(0, index))
         self.reload_themes_button = QPushButton("Reload")
         self.customize_theme_button = QPushButton("Customize…")
         self.open_themes_button = QPushButton("Open folder")
+        self.about_button = QPushButton("About AutoTuner")
+        self.about_button.setAccessibleName("About AutoTuner")
+        self.about_button.setToolTip(
+            _setting_tooltip(
+                "Shows the running AutoTuner version and GitHub project page.",
+                "The dialog is local and does not contact GitHub; use Update to check for newer source or release versions.",
+            )
+        )
         self.reload_themes_button.setToolTip(
             _setting_tooltip(
                 "Reloads JSON files copied into the user theme folder.",
@@ -694,6 +719,7 @@ class _ApplicationSettingsDialog(QDialog):
         appearance_layout.addWidget(self.reload_themes_button, 1, 0, 1, 2)
         appearance_layout.addWidget(self.customize_theme_button, 2, 0, 1, 2)
         appearance_layout.addWidget(self.open_themes_button, 3, 0, 1, 2)
+        appearance_layout.addWidget(self.about_button, 4, 0, 1, 2)
         layout.addWidget(appearance)
 
         self.autostart_checkbox = QCheckBox("Start after login")
@@ -1208,7 +1234,12 @@ class _UpdateWorker(QObject):
         state = self._read_update_state()
         if sha and state.get("repo") == self._GITHUB_REPO and state.get("sha") == sha:
             self._restore_settings(backups)
-            self.finished.emit(True, "AutoTuner is already up to date.")
+            self.finished.emit(
+                True,
+                _source_update_message(
+                    "Source files already match the current GitHub branch."
+                ),
+            )
             return True
 
         old_requirements = self._read_bytes(self._app_root / "requirements.txt")
@@ -1239,8 +1270,10 @@ class _UpdateWorker(QObject):
         short = sha[:8] if sha else branch
         self.finished.emit(
             True,
-            f"Update installed from GitHub archive ({short}). Local settings were "
-            "restored. Please restart AutoTuner.",
+            _source_update_message(
+                f"GitHub archive source update installed ({short}). Local settings "
+                "were restored. Please restart AutoTuner."
+            ),
         )
         return True
 
@@ -1326,17 +1359,22 @@ class _UpdateWorker(QObject):
             ).split()
             ahead = int(counts[0]) if counts else 0
             behind = int(counts[1]) if len(counts) > 1 else 0
-            if behind == 0:
-                if backups:
-                    self._restore_settings(backups)
-                    settings_restored = True
-                self.finished.emit(True, "AutoTuner is already up to date.")
-                return
             if ahead:
                 raise RuntimeError(
                     f"Local branch has {ahead} commit(s) not on {upstream}; "
                     "refusing to auto-merge."
                 )
+            if behind == 0:
+                if backups:
+                    self._restore_settings(backups)
+                    settings_restored = True
+                self.finished.emit(
+                    True,
+                    _source_update_message(
+                        "Source files already match the current Git branch."
+                    ),
+                )
+                return
 
             old_head = self._run_git("rev-parse", "HEAD").strip()
             self._run_git("pull", "--ff-only", timeout=300.0)
@@ -1365,8 +1403,10 @@ class _UpdateWorker(QObject):
             short = new_head[:8]
             self.finished.emit(
                 True,
-                f"Update installed ({short}). Local settings were restored. "
-                "Please restart AutoTuner.",
+                _source_update_message(
+                    f"Source update from Git branch installed ({short}). Local "
+                    "settings were restored. Please restart AutoTuner."
+                ),
             )
         except Exception as exc:
             if backups and not settings_restored:
@@ -3434,10 +3474,11 @@ class MainWindow(QMainWindow):
     _FORK_COMBO_MIN_WIDTH = 220
     _FORK_COMBO_TEXT_PADDING = 72
     _WIN_SETTINGS_COMMAND_ID = 0x1FFE
+    _WIN_ABOUT_COMMAND_ID = 0x1FFD
 
     def __init__(self, models_path: Path, settings_path: Path) -> None:
         super().__init__()
-        self.setWindowTitle("AutoTuner Qt Launcher")
+        self.setWindowTitle(f"AutoTuner v{VERSION}")
         # Hard-coded default size — only kicks in when no persisted
         # geometry exists (first launch on this machine, or the JSON
         # was wiped). `restoreGeometry` below replaces this when a
@@ -3849,6 +3890,7 @@ class MainWindow(QMainWindow):
 
         # ── Launch options (checkboxes) ────────────────────────────────
         opts = QGroupBox("Launch options")
+        self._launch_options_group = opts
         ol = QVBoxLayout(opts)
         ol.setSpacing(4)
 
@@ -4040,7 +4082,8 @@ class MainWindow(QMainWindow):
         )
         self._chk_thinking.toggled.connect(self._on_thinking_toggled)
 
-        opts.setMaximumHeight(285)
+        # Let the group use its style/font-dependent size hint. A fixed cap
+        # clips launch controls with large fonts or themed group-box titles.
 
         right = QWidget()
         rl2 = QVBoxLayout(right)
@@ -4292,9 +4335,7 @@ class MainWindow(QMainWindow):
                 viewport.update()
 
         def apply_definition(theme) -> None:
-            if app is not None:
-                self._theme_manager.apply_definition(app, theme, self._font_size)
-                refresh_widgets()
+            self._apply_theme_definition(theme, app, refresh_widgets)
 
         def apply_selected() -> None:
             apply_definition(
@@ -4307,10 +4348,19 @@ class MainWindow(QMainWindow):
         def repopulate(selected: str) -> None:
             dialog.theme_combo.blockSignals(True)
             dialog.theme_combo.clear()
+            widest = 0
             for theme in self._theme_manager.available():
-                dialog.theme_combo.addItem(
-                    f"{theme.name} ({theme.source})", theme.qualified_id
+                text = f"{theme.name} ({theme.source})"
+                dialog.theme_combo.addItem(text, theme.qualified_id)
+                dialog.theme_combo.setItemData(
+                    dialog.theme_combo.count() - 1,
+                    text,
+                    Qt.ItemDataRole.ToolTipRole,
                 )
+                widest = max(
+                    widest, dialog.theme_combo.fontMetrics().horizontalAdvance(text)
+                )
+            dialog.theme_combo.setMinimumWidth(min(500, max(160, widest + 48)))
             dialog.theme_combo.setCurrentIndex(
                 max(0, dialog.theme_combo.findData(selected))
             )
@@ -4371,6 +4421,7 @@ class MainWindow(QMainWindow):
             _open_local_folder(self._theme_manager.user_dir)
 
         dialog.open_themes_button.clicked.connect(open_theme_folder)
+        dialog.about_button.clicked.connect(lambda: self._show_about(dialog))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             rollback()
             return
@@ -4392,6 +4443,44 @@ class MainWindow(QMainWindow):
         if not minimize_to_tray:
             self._destroy_tray_icon()
         self._status.showMessage("Settings saved", 3000)
+
+    def _apply_theme_definition(
+        self,
+        theme: ThemeDefinition,
+        app: Optional[QApplication],
+        refresh_widgets: Callable[[], None],
+    ) -> None:
+        """Apply a preview while preserving the user's pane arrangement."""
+        if app is None:
+            return
+        window_size = self.size()
+        splitter_sizes = [(splitter, splitter.sizes()) for splitter in self._splitters]
+        self._theme_manager.apply_definition(app, theme, self._font_size)
+        refresh_widgets()
+
+        def restore_layout() -> None:
+            if not self.isMaximized():
+                self.resize(window_size)
+            for splitter, sizes in splitter_sizes:
+                splitter.setSizes(sizes)
+            central = self.centralWidget()
+            if central is not None and central.layout() is not None:
+                central.layout().activate()
+            for splitter, sizes in splitter_sizes:
+                splitter.setSizes(sizes)
+
+        QTimer.singleShot(0, restore_layout)
+
+    def _show_about(self, parent: Optional[QWidget] = None) -> None:
+        """Show static version and repository information without a network request."""
+        dialog = QMessageBox(parent or self)
+        dialog.setWindowTitle("About AutoTuner")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setTextFormat(Qt.TextFormat.RichText)
+        dialog.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        dialog.setText(_about_text())
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
 
     def _ensure_tray_icon(self) -> bool:
         """Create and show the notification-area icon on demand."""
@@ -4475,7 +4564,7 @@ class MainWindow(QMainWindow):
         self._tray_menu = None
 
     def _install_windows_system_menu(self) -> None:
-        """Add Settings above Close in Windows' title-bar system menu."""
+        """Add Info and Settings above Close in Windows' title-bar system menu."""
         if sys.platform != "win32":
             return
         try:
@@ -4503,8 +4592,8 @@ class MainWindow(QMainWindow):
             if not menu:
                 return
             count = user32.GetMenuItemCount(menu)
-            # Standard order ends in: Maximize, separator, Close. Insert just
-            # before that separator, matching the location shown by the user.
+            # Standard order ends in: Maximize, separator, Close. Insert both
+            # entries just before that separator, matching the symbol menu.
             position = max(0, count - 2)
             mf_byposition = 0x00000400
             mf_string = 0x00000000
@@ -4514,6 +4603,13 @@ class MainWindow(QMainWindow):
                 mf_byposition | mf_string,
                 self._WIN_SETTINGS_COMMAND_ID,
                 "Settings…",
+            )
+            user32.InsertMenuW(
+                menu,
+                position,
+                mf_byposition | mf_string,
+                self._WIN_ABOUT_COMMAND_ID,
+                "About AutoTuner",
             )
             user32.DrawMenuBar(hwnd)
         except (AttributeError, OSError, TypeError, ValueError):
@@ -4527,12 +4623,14 @@ class MainWindow(QMainWindow):
                 from ctypes import wintypes
 
                 msg = wintypes.MSG.from_address(int(message))
-                if (
-                    msg.message == 0x0112  # WM_SYSCOMMAND
-                    and int(msg.wParam) == self._WIN_SETTINGS_COMMAND_ID
-                ):
-                    QTimer.singleShot(0, self._open_application_settings)
-                    return True, 0
+                if msg.message == 0x0112:  # WM_SYSCOMMAND
+                    command = int(msg.wParam)
+                    if command == self._WIN_SETTINGS_COMMAND_ID:
+                        QTimer.singleShot(0, self._open_application_settings)
+                        return True, 0
+                    if command == self._WIN_ABOUT_COMMAND_ID:
+                        QTimer.singleShot(0, self._show_about)
+                        return True, 0
             except (AttributeError, TypeError, ValueError):
                 pass
         # Calling QWidget.nativeEvent() after inspecting the MSG crashes in
@@ -5511,9 +5609,11 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "AutoTuner update",
-            "GitHub nach Updates prüfen und installieren?\n\n"
-            "Bei Git-Klonen nutzt AutoTuner git pull --ff-only; bei heruntergeladenen "
-            "ZIP/Release-Ordnern wird das aktuelle GitHub-Source-ZIP eingespielt.\n\n"
+            f"GitHub nach Source-Updates für AutoTuner v{VERSION} prüfen und "
+            "installieren?\n\n"
+            "Bei Git-Klonen nutzt AutoTuner git pull --ff-only auf dem aktuellen "
+            "Branch; bei heruntergeladenen Ordnern wird das aktuelle GitHub-Source-ZIP "
+            "eingespielt. Dieser Source-Updater lädt keine Release-Assets.\n\n"
             "autotuner_settings.json wird vorher gesichert und danach wiederhergestellt.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
@@ -5521,8 +5621,8 @@ class MainWindow(QMainWindow):
             return
 
         self._btn_update.setEnabled(False)
-        self._status.showMessage("Checking GitHub for AutoTuner updates …")
-        self._log("[Update] Checking GitHub for AutoTuner updates …")
+        self._status.showMessage(f"Checking GitHub for source updates (v{VERSION}) …")
+        self._log(f"[Update] Running source v{VERSION}; checking GitHub branch …")
 
         worker = _UpdateWorker(Path(__file__).resolve().parent)
         thread = QThread(self)
@@ -5532,7 +5632,9 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress.connect(self._log)
         worker.finished.connect(self._on_update_done)
+        worker.finished.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda: self._clear_update_references(thread))
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -5565,9 +5667,17 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress.connect(self._log)
         worker.finished.connect(self._on_binary_update_done)
+        worker.finished.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda: self._clear_update_references(thread))
         thread.finished.connect(thread.deleteLater)
         thread.start()
+
+    def _clear_update_references(self, finished_thread: QThread) -> None:
+        """Drop stale update QObject/thread references after a clean finish."""
+        if self._update_thread is finished_thread:
+            self._update_thread = None
+            self._update_worker = None
 
     def _on_binary_update_done(self, ok: bool, msg: str, needs_restart: bool) -> None:
         self._btn_update.setEnabled(True)
@@ -7975,6 +8085,28 @@ class MainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:  # noqa: N802
+        # An updater may be replacing files or installing dependencies. QThread.quit()
+        # cannot interrupt its active worker safely, so leave the window alive until
+        # completion rather than destroying a still-running thread.
+        try:
+            update_running = (
+                self._update_thread is not None and self._update_thread.isRunning()
+            )
+        except RuntimeError:
+            self._update_thread = None
+            self._update_worker = None
+            update_running = False
+        if update_running:
+            self._force_quit = False
+            QMessageBox.information(
+                self,
+                "Update in progress",
+                "AutoTuner is still updating. Please wait until the update finishes before closing the application.",
+            )
+            if a0 is not None:
+                a0.ignore()
+            return
+
         # Snapshot the current window layout BEFORE any potential
         # "are you sure?" dialog, so even an Escape-out of that dialog
         # has saved state. The save itself never blocks the close.
@@ -8020,14 +8152,6 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
         self._scan_thread = None
-
-        try:
-            if self._update_thread is not None and self._update_thread.isRunning():
-                self._update_thread.quit()
-                self._update_thread.wait(3000)
-        except RuntimeError:
-            pass
-        self._update_thread = None
 
         # Clean up the initial hardware-detection thread.  If it is still
         # running (slow WMI / PowerShell on new RDNA5 hardware) we ask it to

@@ -23,12 +23,15 @@ Environment variables:
 from __future__ import annotations
 
 import argparse
+import builtins
 import os
 import re
 import shutil
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from autotuner_version import VERSION
 
 from hardware import detect_system, format_system, SystemInfo
 from launcher import launch
@@ -51,11 +54,161 @@ from performance_target import (
 import app_settings
 
 # ---------------------------------------------------------------------------
-# Pretty-printing helpers
+# Terminal presentation helpers
 
-_BAR = "─" * 64
 _DEBUG_MODE = False
 _DEBUG_CATEGORIES: set[str] = set()
+_BAR = "─" * 64
+
+
+def _ascii_safe(value: object) -> str:
+    """Normalize AutoTuner-owned output for legacy consoles and log files."""
+    replacements = str.maketrans(
+        {
+            "—": "-",
+            "–": "-",
+            "…": "...",
+            "→": "->",
+            "←": "<-",
+            "·": "/",
+            "⚠": "WARNING:",
+            "👁": "[V]",
+            "⚡": "[D]",
+            "🧠": "[T]",
+            "🛠": "[U]",
+            "═": "=",
+            "─": "-",
+            "╌": "-",
+        }
+    )
+    return (
+        str(value)
+        .translate(replacements)
+        .encode("ascii", "backslashreplace")
+        .decode("ascii")
+    )
+
+
+def _tui_print(*values: object, **kwargs: object) -> None:
+    """ASCII-normalize this module's output without changing child process streams."""
+    if _RENDERER.plain:
+        separator = str(kwargs.pop("sep", " "))
+        ending = str(kwargs.pop("end", "\n"))
+        text = separator.join(_ascii_safe(value) for value in values)
+        width = max(20, _RENDERER.width)
+        lines = []
+        for raw_line in text.splitlines() or [""]:
+            lines.extend(
+                raw_line[i : i + width] for i in range(0, len(raw_line), width)
+            )
+        builtins.print("\n".join(lines), end=ending, **kwargs)
+        return
+    builtins.print(*values, **kwargs)
+
+
+print = _tui_print  # type: ignore[assignment]
+
+
+def _windows_vt_enabled() -> bool:
+    """Allow Windows ANSI only when the active console accepts VT processing."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        handle = ctypes.windll.kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not handle or not ctypes.windll.kernel32.GetConsoleMode(
+            handle, ctypes.byref(mode)
+        ):
+            return False
+        enable_vt = 0x0004
+        return bool(
+            mode.value & enable_vt
+            or ctypes.windll.kernel32.SetConsoleMode(handle, mode.value | enable_vt)
+        )
+    except (AttributeError, OSError):
+        return False
+
+
+class _TerminalRenderer:
+    """Small dependency-free renderer with safe ANSI and ASCII fallbacks."""
+
+    def __init__(self, *, plain: bool = False, no_color: bool = False) -> None:
+        encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+        utf_capable = encoding.startswith("utf") or encoding == "cp65001"
+        self.plain = plain or not sys.stdout.isatty() or not utf_capable
+        self.width = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        self.rule_width = min(self.width, 110)
+        self.color = (
+            not self.plain
+            and not no_color
+            and sys.stdout.isatty()
+            and os.environ.get("TERM", "").lower() != "dumb"
+            and "NO_COLOR" not in os.environ
+            and _windows_vt_enabled()
+        )
+        self.line = ("-" if self.plain else "─") * self.rule_width
+
+    def style(self, text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def _lines(self, text: str, indent: int = 2) -> List[str]:
+        usable = max(8, self.width - indent)
+        return [text[i : i + usable] for i in range(0, len(text), usable)] or [""]
+
+    def heading(self, text: str) -> None:
+        print(self.line)
+        for line in self._lines(text):
+            print(self.style(f"  {line}", "1;36"))
+        print(self.line)
+
+    def section(self, text: str) -> None:
+        print()
+        for line in self._lines(text):
+            print(self.style(f"  {line}", "1;35"))
+        print(
+            self.style(
+                "  " + ("-" if self.plain else "╌") * min(self.rule_width - 2, 48), "2"
+            )
+        )
+
+    def truncate(self, text: str, width: int) -> str:
+        if len(text) <= width:
+            return text
+        suffix = "..." if self.plain else "…"
+        return text[: max(1, width - len(suffix))] + suffix
+
+
+_RENDERER = _TerminalRenderer(plain=True)
+
+
+def _configure_renderer(args: argparse.Namespace) -> None:
+    global _RENDERER, _BAR
+    _RENDERER = _TerminalRenderer(
+        plain=bool(getattr(args, "plain", False)),
+        no_color=bool(getattr(args, "no_color", False)),
+    )
+    _BAR = _RENDERER.line
+
+
+def _effective_mode(args: argparse.Namespace) -> str:
+    """Resolve CLI mode first, then the shared persisted GUI preference."""
+    return args.mode or app_settings.get_mode() or "chat"
+
+
+def _effective_prompt_cache_mib(args: argparse.Namespace) -> int:
+    """Resolve the CLI cache limit while retaining the shared saved default."""
+    if args.no_prompt_cache:
+        return 0
+    return max(
+        -1,
+        int(
+            args.cache_ram_mib
+            if args.cache_ram_mib is not None
+            else app_settings.get_prompt_cache_ram_mib()
+        ),
+    )
 
 
 def _debug_print(*args, **kwargs) -> None:
@@ -74,51 +227,66 @@ def debug_cat(category: str, *args, **kwargs) -> None:
 
 def _print_banner() -> None:
     print()
-    print(_BAR)
-    print("  AutoTuner for llama.cpp  —  interactive launcher")
-    print(_BAR)
+    _RENDERER.heading(f"AutoTuner v{VERSION}  |  llama.cpp launcher")
+    print("  Hardware-aware model selection, memory planning, and server launch.")
 
 
 def _print_system(info: SystemInfo) -> None:
     print(format_system(info))
 
 
-def _capability_markers(entry: ModelEntry) -> str:
-    """Compact capability symbols mirroring the Qt GUI:
-    👁 vision · ⚡ draft · 🧠 thinking · 🛠 tool-use.
-    Returned with leading space so the menu still aligns when empty.
-    """
-    syms = []
+def _capability_markers(entry: ModelEntry, *, plain: Optional[bool] = None) -> str:
+    """Return GUI-parity capability markers, including embedded MTP drafts."""
+    use_plain = _RENDERER.plain if plain is None else plain
+    symbols = ("[V]", "[D]", "[T]", "[U]") if use_plain else ("👁", "⚡", "🧠", "🛠")
+    markers = []
     if entry.has_vision:
-        syms.append("👁")
-    if entry.has_draft:
-        syms.append("⚡")
+        markers.append(symbols[0])
+    if entry.has_speculative_draft:
+        markers.append(symbols[1])
     if entry.supports_thinking:
-        syms.append("🧠")
+        markers.append(symbols[2])
     if entry.supports_tool_use:
-        syms.append("🛠")
-    return ("  " + " ".join(syms)) if syms else "    "
+        markers.append(symbols[3])
+    return " ".join(markers) or "-"
 
 
 def _print_menu(groups: dict) -> List[ModelEntry]:
-    """Print grouped model menu and return a flat list in display order."""
+    """Render a responsive grouped model table and return its display order."""
     flat: List[ModelEntry] = []
-    print("\nAvailable models:")
-    print(_BAR)
-    print("  Symbols: 👁 vision · ⚡ draft · 🧠 thinking · 🛠 tool-use")
+    _RENDERER.section("Available models")
+    legend = (
+        "[V] vision / [D] draft/MTP / [T] thinking / [U] tools"
+        if _RENDERER.plain
+        else "👁 vision / ⚡ draft/MTP / 🧠 thinking / 🛠 tools"
+    )
+    for line in _RENDERER._lines(legend):
+        print("  " + line)
+    compact = _RENDERER.width < 60
+    name_width = max(12, _RENDERER.width - 34)
     idx = 1
-    for group_name in sorted(groups.keys()):
-        entries = sorted(groups[group_name], key=lambda e: e.name.lower())
+    for group_name in sorted(groups):
+        entries = sorted(groups[group_name], key=lambda entry: entry.name.lower())
         if not entries:
             continue
-        print(f"\n  [{group_name}]")
-        for e in entries:
-            size = f"{e.size_gb:>5.1f} GB"
-            ctx = ""
-            if e.native_context:
-                ctx = f"  ({e.native_context // 1024}k native)"
-            print(f"    {idx:>2}.{_capability_markers(e)} {e.name:<55} {size}{ctx}")
-            flat.append(e)
+        print(_RENDERER.style(f"\n  [{group_name}]", "1"))
+        for entry in entries:
+            context = (
+                f"{entry.native_context // 1024}k" if entry.native_context else "-"
+            )
+            markers = _capability_markers(entry)
+            if compact:
+                print(
+                    f"  {idx:>3}. {_RENDERER.truncate(entry.name, max(8, _RENDERER.width - 7))}"
+                )
+                print(f"       {entry.size_gb:.1f}G | ctx {context} | {markers}")
+            else:
+                name = _RENDERER.truncate(entry.name, name_width)
+                print(
+                    f"  {idx:>3}  {name:<{name_width}}  {entry.size_gb:>5.1f}G  "
+                    f"{context:>5}  {markers}"
+                )
+            flat.append(entry)
             idx += 1
     print()
     return flat
@@ -212,12 +380,35 @@ def _ask_interactive_features(
     draft_model: Optional[ModelEntry],
     settings_path: Path,
     force_ngram: bool = False,
+    non_interactive: bool = False,
+    draft_available: Optional[bool] = None,
+    thinking_available: Optional[bool] = None,
 ) -> tuple[bool, bool, bool, bool, Optional[ModelEntry]]:
     """Interaktive Fragen-Kette nach Modellauswahl.
 
     Returns:
         (use_vision, use_draft, use_thinking, use_ngram, effective_draft)
     """
+    # Embedded MTP is a draft capability even without an external model file.
+    draft_available = (
+        draft_model is not None or model.has_embedded_mtp
+        if draft_available is None
+        else draft_available
+    )
+    thinking_available = (
+        model.supports_thinking if thinking_available is None else thinking_available
+    )
+    # Non-interactive runs use the same availability defaults as the GUI:
+    # vision/draft/thinking on when available, n-gram only when explicit.
+    if non_interactive:
+        return (
+            model.mmproj is not None,
+            draft_available,
+            thinking_available,
+            force_ngram,
+            draft_model,
+        )
+
     # ── Vision ───────────────────────────────────────────────────────
     use_vision = False
     if model.mmproj is not None:
@@ -231,11 +422,9 @@ def _ask_interactive_features(
     # ── Draft Model ──────────────────────────────────────────────────
     use_draft = False
     effective_draft = draft_model
-    if effective_draft is not None:
-        use_draft = _confirm(
-            f"Draft-Modell aktivieren? ({effective_draft.name})",
-            default_yes=True,
-        )
+    if draft_available:
+        detail = effective_draft.name if effective_draft is not None else "embedded MTP"
+        use_draft = _confirm(f"Draft aktivieren? ({detail})", default_yes=True)
         if not use_draft:
             effective_draft = None
 
@@ -243,8 +432,7 @@ def _ask_interactive_features(
     # Read the chat template from GGUF metadata (the authoritative source);
     # fall back to filename heuristics only when no template is available.
     use_thinking = False
-    has_thinking_arch = model.supports_thinking
-    if has_thinking_arch:
+    if thinking_available:
         use_thinking = _confirm(
             "Thinking/Reasoning aktivieren? (<|think|> / <|reserved_special_token>)",
             default_yes=True,
@@ -333,6 +521,7 @@ def _pick_model(
 # ---------------------------------------------------------------------------
 # llama-server discovery
 
+
 def _native_binary_suffixes() -> Tuple[str, ...]:
     """Executable suffixes to auto-discover on this OS, preferred first."""
     if os.name == "nt":
@@ -391,7 +580,7 @@ def _is_runnable_binary(path: Path) -> bool:
 # found in the fork tree.
 _DIFFUSION_BINARIES = [
     "llama-diffusion-gemma-cli",  # DiffusionGemma fork (PR #24427)
-    "llama-diffusion-cli",       # mainline Dream/LLaDA/RND1
+    "llama-diffusion-cli",  # mainline Dream/LLaDA/RND1
 ]
 
 
@@ -411,7 +600,6 @@ def _diffusion_binary_for_arch(arch: Optional[str]) -> str:
 def _diffusion_subpaths_for(binary_name: str) -> List[str]:
     """Build native candidate subpaths for a given diffusion binary name."""
     return _binary_subpaths(binary_name)
-
 
 
 def _candidate_search_roots() -> List[Path]:
@@ -451,9 +639,7 @@ def _candidate_search_roots() -> List[Path]:
         # sees the container, not the forks inside it.
         try:
             for child in parent.iterdir():
-                if child.is_dir() and re.search(
-                    r"llama", child.name, re.IGNORECASE
-                ):
+                if child.is_dir() and re.search(r"llama", child.name, re.IGNORECASE):
                     add(child)
         except (OSError, PermissionError):
             pass
@@ -817,7 +1003,7 @@ def _discover_llama_forks() -> List[Tuple[str, Path]]:
 
 
 def _pick_fork(
-    forks: List[Tuple[str, Path]],
+    forks: List[Tuple[str, Path]], non_interactive: bool = False
 ) -> Optional[Path]:
     """Show the fork menu and return the chosen fork directory.
 
@@ -828,19 +1014,19 @@ def _pick_fork(
     if not forks:
         return None
 
-    if len(forks) == 1:
-        print(f"[AutoTuner] Found one llama.cpp fork: {forks[0][0]}")
+    if len(forks) == 1 or non_interactive:
+        print(f"[AutoTuner] Using default llama.cpp fork: {forks[0][0]}")
         return forks[0][1]
 
-    print("\n" + "═" * 64)
+    print("\n" + _BAR)
     print("  LLAMA.CPP FORK SELECTION")
-    print("═" * 64)
+    print(_BAR)
     print("  Found the following llama.cpp forks:\n")
     for i, (name, path) in enumerate(forks, 1):
         print(f"  {i}. {name:<30} {path}")
     print()
     print("  Enter a number to select, or press Enter for the default.")
-    print("═" * 64)
+    print(_BAR)
 
     try:
         raw = input(f"Select fork [1-{len(forks)}] (default 1): ").strip()
@@ -897,7 +1083,10 @@ def _print_client_settings(host: str, port: int, ctx: int, model: ModelEntry) ->
     print(f"    Base URL          : {base_url}")
     print("    API key           : sk-no-key   (any non-empty string works)")
     print(f"    Model name        : {model.name}")
-    print(f"    Context window    : {ctx:,} tokens   ← set this in your client")
+    hint = (
+        "<- set this in your client" if _RENDERER.plain else "← set this in your client"
+    )
+    print(f"    Context window    : {ctx:,} tokens   {hint}")
     print(_BAR)
 
 
@@ -905,11 +1094,39 @@ def _print_client_settings(host: str, port: int, ctx: int, model: ModelEntry) ->
 # Argument parsing
 
 
+def _server_was_explicit(argv: List[str]) -> bool:
+    """Recognize AutoTuner --server options before llama-server passthrough."""
+    try:
+        argv = argv[: argv.index("--")]
+    except ValueError:
+        pass
+    return any(
+        option == "--server" or option.startswith("--server=") for option in argv
+    )
+
+
 def _parse_args(argv: List[str]) -> argparse.Namespace:
+    """Parse AutoTuner options while preserving real llama-server passthrough."""
+    try:
+        separator_index = argv.index("--")
+    except ValueError:
+        before, separator, passthrough = argv, False, []
+    else:
+        before, separator, passthrough = (
+            argv[:separator_index],
+            True,
+            argv[separator_index + 1 :],
+        )
+    plain_help = "--plain" in before
+    target_help = describe_targets()
+    if plain_help:
+        target_help = _ascii_safe(target_help)
     p = argparse.ArgumentParser(
         prog="auto_tuner",
         description="Interactive launcher for llama-server with auto-tuned "
         "config based on free RAM/VRAM.",
+        epilog="Pass extra llama-server arguments after --, for example: "
+        "auto_tuner --model Qwen -- --threads 8",
     )
     p.add_argument(
         "--models-path",
@@ -994,9 +1211,9 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument(
         "--cache-ram-mib",
         type=int,
-        default=2048,
+        default=None,
         metavar="MIB",
-        help="Maximum host prompt-cache size in MiB (default: 2048; "
+        help="Maximum host prompt-cache size in MiB (default: saved GUI value; "
         "-1 unlimited, 0 disabled). --no-prompt-cache wins.",
     )
     p.add_argument(
@@ -1020,12 +1237,45 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "RAM/VRAM and OS privileges, and a b10151+ build on GPU systems",
     )
     p.add_argument(
+        "--mode",
+        choices=("chat", "coding"),
+        default=None,
+        help="Sampling mode (default: saved GUI preference or chat).",
+    )
+    p.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never prompt; requires an unambiguous --model and uses safe availability defaults.",
+    )
+    p.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use ASCII-only terminal output (safe for logs and legacy consoles).",
+    )
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color even in a supported terminal.",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable all debug output.",
+    )
+    p.add_argument(
+        "--debug-category",
+        action="append",
+        choices=("hardware", "scanner", "llama_cpp", "config"),
+        default=[],
+        help="Enable a debug category; may be repeated.",
+    )
+    p.add_argument(
         "--performance-target",
         choices=list_target_names(),
         default=None,
         metavar="{safe,balanced,throughput,low_vram}",
         help="VRAM utilisation preset. Overrides any 'performance_target:' "
-        "in the YAML profile. Tiers:\n" + describe_targets(),
+        "in the YAML profile. Tiers:\n" + target_help,
     )
     p.add_argument(
         "--gui",
@@ -1065,12 +1315,14 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--",
-        dest="passthrough",
-        nargs=argparse.REMAINDER,
-        help="Extra arguments after `--` are forwarded to llama-server",
+        "--version",
+        action="version",
+        version=f"AutoTuner v{VERSION}",
+        help="Show the AutoTuner version and exit.",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(before)
+    args.passthrough = passthrough if separator else []
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -1078,65 +1330,49 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but intentional)
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    raw_argv = argv if argv is not None else sys.argv[1:]
+    args = _parse_args(raw_argv)
+    _configure_renderer(args)
     if args.llama_cpp_dir:
         os.environ["LLAMA_CPP_DIR"] = args.llama_cpp_dir
 
-    _print_banner()
-
-    # ── Debug / verbose mode selection ─────────────────────────────────────
     global _DEBUG_MODE
-    print("\n" + "=" * 60)
-    print("  DEBUG / VERBOSE MODE SELECTION")
-    print("=" * 60)
-    print("  1. Debugging OFF (standard)")
-    print("  2. Debugging ON (alle Kategorien)")
-    print("-" * 60)
-    print("  Kategorie-Debugging (einzelne Bereiche):")
-    print("  3. Hardware-Erkennung (GPU/RAM/CPU)")
-    print("  4. Model-Scanning & Profil-Matching")
-    print("  5. Server-Pfad-Suche (llama.cpp)")
-    print("  6. Konfigurations-Berechnung (KV-Cache, Kontext)")
-    print("-" * 60)
+    _DEBUG_MODE = bool(args.debug)
+    _DEBUG_CATEGORIES.clear()
+    for category in args.debug_category:
+        enable_debug_category(category)
+    non_interactive = bool(
+        args.non_interactive
+        or not sys.stdin.isatty()
+        or (args.model is not None and (args.dry_run or args.yes))
+    )
+    if non_interactive and not args.model and args.diagnose is None:
+        print(
+            "[AutoTuner] --non-interactive requires --model so selection cannot block."
+        )
+        return 2
 
-    try:
-        debug_choice = input("Wahl [1-6] (default 1): ").strip()
-    except EOFError:
-        debug_choice = ""
-
-    if debug_choice == "2":
-        _DEBUG_MODE = True
-        print("[AutoTuner] Globaler Debug-Modus aktiviert.")
-    elif debug_choice == "3":
-        enable_debug_category("hardware")
-        print("[AutoTuner] Kategorie-Debugging: Hardware-Erkennung")
-    elif debug_choice == "4":
-        enable_debug_category("scanner")
-        print("[AutoTuner] Kategorie-Debugging: Model-Scanning & Profile")
-    elif debug_choice == "5":
-        enable_debug_category("llama_cpp")
-        print("[AutoTuner] Kategorie-Debugging: Server-Pfad-Suche")
-    elif debug_choice == "6":
-        enable_debug_category("config")
-        print("[AutoTuner] Kategorie-Debugging: Konfigurations-Berechnung")
-    else:
-        print("[AutoTuner] Debugging deaktiviert.")
-    print("=" * 60 + "\n")
+    _print_banner()
+    if _DEBUG_MODE or _DEBUG_CATEGORIES:
+        enabled = "all" if _DEBUG_MODE else ", ".join(sorted(_DEBUG_CATEGORIES))
+        print(f"  Debug: {enabled}")
 
     # ── llama.cpp fork discovery ────────────────────────────────────────────
     # Only show the fork menu when --server was NOT specified explicitly by the
     # user (i.e. it is still the default "llama-server" or from LLAMA_SERVER).
     # An explicit --server path overrides everything.
     user_specified_server = (
-        "--server" in (argv or sys.argv[1:]) or "LLAMA_SERVER" in os.environ
+        _server_was_explicit(raw_argv) or "LLAMA_SERVER" in os.environ
     )
 
     discovered_forks: List[Tuple[str, Path]] = []
     selected_fork_path: Optional[Path] = None
 
-    if not user_specified_server:
+    if not user_specified_server and args.diagnose is None:
         discovered_forks = _discover_llama_forks()
-        selected_fork_path = _pick_fork(discovered_forks)
+        selected_fork_path = _pick_fork(
+            discovered_forks, non_interactive=non_interactive
+        )
         if selected_fork_path is not None:
             # Point LLAMA_CPP_DIR at the chosen fork so that
             # _candidate_search_roots() finds binaries there (and siblings).
@@ -1147,6 +1383,10 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 "[AutoTuner] No llama.cpp forks found on disk — "
                 "set LLAMA_CPP_DIR or pass --server.\n"
             )
+
+    # Keep the user's/default fork as the per-selection baseline. A profile can
+    # temporarily select a specialized fork without leaking it to the next model.
+    default_fork_path = selected_fork_path
 
     # ── System detection ────────────────────────────────────────────────────
     system = detect_system()
@@ -1214,25 +1454,28 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
         if model is None:
             print("[AutoTuner] No model selected — exiting.")
+            if first_iteration and args.model is not None:
+                return 2
             return last_exit_code if first_iteration else 0
 
-        for flag in picked_flags:
-            if flag == "novision":
-                args.novision = True
-            elif flag == "nodraft":
-                args.nodraft = True
-            elif flag == "nothinking":
-                args.nothinking = True
-            elif flag == "ngram":
-                args.ngram = True
+        # Inline menu flags apply only to this selection; CLI flags stay global.
+        selection_flags = set(picked_flags)
+        use_novision = args.novision or "novision" in selection_flags
+        use_nodraft = args.nodraft or "nodraft" in selection_flags
+        use_nothinking = args.nothinking or "nothinking" in selection_flags
+        use_ngram_flag = args.ngram or "ngram" in selection_flags
+        model = __import__("copy").copy(model)
 
-        if args.novision and model.mmproj is not None:
+        if use_novision and model.mmproj is not None:
             print(
                 f"[AutoTuner] Vision disabled per --novision "
                 f"(ignoring {model.mmproj.name})"
             )
             model.mmproj = None
 
+        if default_fork_path is not None:
+            selected_fork_path = default_fork_path
+            os.environ["LLAMA_CPP_DIR"] = str(selected_fork_path)
         profile = match_profile(
             model.name, profiles, getattr(model, "architecture", "")
         )
@@ -1262,7 +1505,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                         if _fork_family(n) == _fork_family(req_lower)
                     ]
                     if matching:
-                        switch = _confirm(
+                        switch = non_interactive or _confirm(
                             f"Switch to {required_fork} for this model?",
                             default_yes=True,
                         )
@@ -1289,7 +1532,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         # draft sibling (when present). We just wrap that path in a
         # ModelEntry — `compute_config` only needs `.path` and `.size_gb`.
         draft_model = None
-        if profile.draft_max > 0 and not args.nodraft and model.draft is not None:
+        if profile.draft_max > 0 and not use_nodraft and model.draft is not None:
             try:
                 draft_size = model.draft.stat().st_size
                 draft_model = ModelEntry(
@@ -1308,11 +1551,20 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         # ── Interactive feature chain ────────────────────────────────────
         (use_vision, use_draft, use_thinking, use_ngram, effective_draft) = (
             _ask_interactive_features(
-                model, draft_model, args.settings_path, force_ngram=args.ngram
+                model,
+                draft_model,
+                args.settings_path,
+                force_ngram=use_ngram_flag,
+                non_interactive=non_interactive,
+                draft_available=(draft_model is not None or model.has_embedded_mtp)
+                and not use_nodraft,
+                thinking_available=model.supports_thinking and not use_nothinking,
             )
         )
         if not use_draft:
             effective_draft = None
+        if use_nothinking:
+            use_thinking = False
 
         # ── Config computation ───────────────────────────────────────────
         # Resolve performance target: CLI > YAML profile > "balanced".
@@ -1332,11 +1584,8 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             no_mmproj_offload=bool(
                 getattr(args, "no_mmproj_offload", False) and model.mmproj is not None
             ),
-            prompt_cache_ram_mib=(
-                0
-                if getattr(args, "no_prompt_cache", False)
-                else max(-1, int(getattr(args, "cache_ram_mib", 2048)))
-            ),
+            prompt_cache_ram_mib=_effective_prompt_cache_mib(args),
+            mode=_effective_mode(args),
             gpu_priorities=app_settings.get_gpu_priorities(),
             force_gpu=getattr(args, "gpu", None) or app_settings.get_forced_gpu(),
         )
@@ -1358,6 +1607,13 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             f"-> mlock={cfg.mlock}  no_mmap={cfg.no_mmap}"
         )
 
+        _RENDERER.section("Session")
+        selected_mode = _effective_mode(args)
+        gpu_choice = args.gpu or app_settings.get_forced_gpu() or "Auto"
+        print(
+            f"  Mode: {selected_mode}  |  Target: {perf_target.name}  |  GPU: {gpu_choice}  "
+            f"|  Prompt cache: {cfg.prompt_cache_ram_gb:.1f} GB"
+        )
         _print_config(model, profile, cfg, system)
 
         # ── Binary resolution ────────────────────────────────────────────
@@ -1508,7 +1764,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 # including embedded MTP (which has no external file and so
                 # isn't covered by effective_draft=None alone). n-gram is
                 # independent (--ngram).
-                enable_speculative=not args.nodraft,
+                enable_speculative=use_draft,
                 enable_ngram=use_ngram,
                 enable_prompt_cache=not getattr(args, "no_prompt_cache", False),
                 enable_metrics=not getattr(args, "no_metrics", False),
@@ -1519,8 +1775,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         if removed_args:
             print(
                 "[AutoTuner] Compatibility: selected llama.cpp binary does not "
-                "advertise these argument(s); removed them: "
-                + "; ".join(removed_args)
+                "advertise these argument(s); removed them: " + "; ".join(removed_args)
             )
 
         if args.dry_run:
@@ -1541,7 +1796,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 if is_diffusion_run
                 else "Launch llama-server now?"
             )
-            launch_now = args.yes or _confirm(prompt_label)
+            launch_now = non_interactive or args.yes or _confirm(prompt_label)
         except KeyboardInterrupt:
             print("\n[AutoTuner] Aborted by user.")
             return 0
@@ -1607,6 +1862,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                     "running in terminal mode."
                 )
             last_exit_code = launch(cmd, env_overrides=cfg.env_overrides)
+
+        if non_interactive:
+            return last_exit_code
 
         print()
         try:

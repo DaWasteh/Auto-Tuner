@@ -104,7 +104,7 @@ def main() -> int:
         if not themes.is_valid_builtin_set():
             raise ValueError(
                 "; ".join(themes.errors)
-                or "expected system, dark, dark-gray, light and high-contrast built-ins"
+                or "expected system, dark, dark-gray, light, high-contrast and midnight-rose built-ins"
             )
     except Exception as exc:
         print(f"[build] bundled themes are invalid: {exc}", file=sys.stderr)

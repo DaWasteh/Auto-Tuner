@@ -266,9 +266,7 @@ def test_favorite_star_click_selects_row_and_emits_both_states(tmp_path) -> None
 
     toggles = []
     delegate.favoriteToggled.connect(
-        lambda toggled_entry, favorite: toggles.append(
-            (toggled_entry.name, favorite)
-        )
+        lambda toggled_entry, favorite: toggles.append((toggled_entry.name, favorite))
     )
     rect = model_list.visualItemRect(target_item)
     star_position = qt_core.QPoint(rect.left() + 12, rect.center().y())
@@ -391,9 +389,7 @@ def test_dense_too_big_tier_context_is_monotonic(tmp_path) -> None:
 
     ctxs = {}
     for tier in ("safe", "balanced", "throughput"):
-        cfg = compute_config(
-            model, sys_info, profile, perf_target=get_target(tier)
-        )
+        cfg = compute_config(model, sys_info, profile, perf_target=get_target(tier))
         ctxs[tier] = cfg.ctx
         assert cfg.n_parallel == 1, f"{tier} should default to 1 slot"
 
@@ -592,8 +588,15 @@ def test_effective_load_mode_normalizes_legacy_and_garbage(tmp_path) -> None:
     from tuner import TunedConfig, effective_load_mode
 
     cfg = TunedConfig(
-        ctx=2048, ngl=99, threads=4, batch_threads=4, batch=2048, ubatch=512,
-        cache_k="f16", cache_v="f16", flash_attn=True,
+        ctx=2048,
+        ngl=99,
+        threads=4,
+        batch_threads=4,
+        batch=2048,
+        ubatch=512,
+        cache_k="f16",
+        cache_v="f16",
+        flash_attn=True,
     )
     # Explicit modes pass through and are case-normalized.
     for mode in ("none", "mmap", "mlock", "mmap+mlock", "dio"):
@@ -646,7 +649,10 @@ def test_build_command_metrics_and_slots_toggles(tmp_path) -> None:
 def test_parse_llama_build_number_ignores_compiler_versions() -> None:
     from tuner import _parse_llama_build_number
 
-    assert _parse_llama_build_number("version: 10058 (788e07dc9)\nbuilt with MSVC 19.51") == 10058
+    assert (
+        _parse_llama_build_number("version: 10058 (788e07dc9)\nbuilt with MSVC 19.51")
+        == 10058
+    )
     assert _parse_llama_build_number("  version: b10056 (b85833e)\n") == 10056
     assert _parse_llama_build_number("built with MSVC 19.51") is None
 
@@ -700,11 +706,17 @@ def test_mmproj_cpu_offload_moves_memory_and_emits_flag(tmp_path, monkeypatch) -
     profile = match_profile(model.name, profiles)
 
     gpu_cfg = compute_config(
-        model, _fake_system(), profile, no_mmproj_offload=False,
+        model,
+        _fake_system(),
+        profile,
+        no_mmproj_offload=False,
         prompt_cache_ram_mib=0,
     )
     cpu_cfg = compute_config(
-        model, _fake_system(), profile, no_mmproj_offload=True,
+        model,
+        _fake_system(),
+        profile,
+        no_mmproj_offload=True,
         prompt_cache_ram_mib=0,
     )
     expected_gb = mmproj.stat().st_size / 1024**3
@@ -719,8 +731,11 @@ def test_mmproj_cpu_offload_moves_memory_and_emits_flag(tmp_path, monkeypatch) -
 
     no_vision = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
     no_vision_cfg = compute_config(
-        no_vision, _fake_system(), match_profile(no_vision.name, profiles),
-        no_mmproj_offload=True, prompt_cache_ram_mib=0,
+        no_vision,
+        _fake_system(),
+        match_profile(no_vision.name, profiles),
+        no_mmproj_offload=True,
+        prompt_cache_ram_mib=0,
     )
     no_vision_cmd = build_command(
         no_vision, no_vision_cfg, match_profile(no_vision.name, profiles)
@@ -736,9 +751,7 @@ def test_prompt_cache_limit_reduces_ram_kv_budget(tmp_path) -> None:
     profiles = load_profiles(SETTINGS_DIR)
     model = _mistral_dense_md(tmp_path, size_gb=20.0)
     profile = match_profile(model.name, profiles)
-    system = _fake_system(
-        ram_total=40, ram_free=30, vram_total=8, vram_free=7.5
-    )
+    system = _fake_system(ram_total=40, ram_free=30, vram_total=8, vram_free=7.5)
     target = get_target("low_vram")
     assert target is not None
     uncached = compute_config(
@@ -877,6 +890,18 @@ def test_setting_tooltip_has_beginner_and_technical_layers() -> None:
     assert "--technical-flag<br>Second line" in tooltip
 
 
+def test_about_and_source_update_text_include_running_version_and_github():
+    qt_launcher = pytest.importorskip("qt_launcher")
+    from autotuner_version import GITHUB_REPO, VERSION
+
+    about = qt_launcher._about_text()
+    assert f"Version v{VERSION}" in about
+    assert f"https://github.com/{GITHUB_REPO}" in about
+    assert qt_launcher._source_update_message("Source update complete").startswith(
+        f"AutoTuner v{VERSION}:"
+    )
+
+
 def test_theme_replacement_is_only_authorized_for_selected_unchanged_user_id():
     qt_launcher = pytest.importorskip("qt_launcher")
     from theme_manager import ThemeDefinition
@@ -920,14 +945,41 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     )
 
     expert_names = (
-        "_btn_auto", "_btn_manual", "_btn_reset", "_btn_close", "_sp_ctx",
-        "_cb_cache_k", "_cb_cache_v", "_sp_ngl", "_sp_ncpumoe", "_sp_threads",
-        "_sp_batch_threads", "_sp_batch", "_sp_ubatch", "_chk_parallel",
-        "_sp_parallel", "_chk_fa", "_cb_load_mode", "_chk_jinja",
-        "_chk_verbose", "_chk_metrics", "_chk_slots_api", "_cb_numa", "_chk_rope",
-        "_sp_rope_factor", "_sp_temp", "_sp_top_k", "_sp_top_p", "_sp_min_p",
-        "_sp_rep", "_sp_presence", "_sp_draft_n_max", "_cb_reasoning",
-        "_sp_think_budget", "_chk_reasoning_preserve", "_le_extra",
+        "_btn_auto",
+        "_btn_manual",
+        "_btn_reset",
+        "_btn_close",
+        "_sp_ctx",
+        "_cb_cache_k",
+        "_cb_cache_v",
+        "_sp_ngl",
+        "_sp_ncpumoe",
+        "_sp_threads",
+        "_sp_batch_threads",
+        "_sp_batch",
+        "_sp_ubatch",
+        "_chk_parallel",
+        "_sp_parallel",
+        "_chk_fa",
+        "_cb_load_mode",
+        "_chk_jinja",
+        "_chk_verbose",
+        "_chk_metrics",
+        "_chk_slots_api",
+        "_cb_numa",
+        "_chk_rope",
+        "_sp_rope_factor",
+        "_sp_temp",
+        "_sp_top_k",
+        "_sp_top_p",
+        "_sp_min_p",
+        "_sp_rep",
+        "_sp_presence",
+        "_sp_draft_n_max",
+        "_cb_reasoning",
+        "_sp_think_budget",
+        "_chk_reasoning_preserve",
+        "_le_extra",
     )
     widgets = [getattr(expert, name) for name in expert_names]
     widgets.extend(
@@ -938,6 +990,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
             app_dialog.reload_themes_button,
             app_dialog.customize_theme_button,
             app_dialog.open_themes_button,
+            app_dialog.about_button,
         ]
     )
     widgets.extend(
@@ -952,30 +1005,91 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
 
     window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR)
     main_names = (
-        "_fork_combo", "_btn_fork_folder", "_perf_combo", "_mode_combo",
-        "_gpu_combo", "_search", "_btn_expert", "_btn_diagnose", "_cb_mmproj",
-        "_cb_draft", "_chk_vision", "_chk_mmproj_cpu", "_chk_draft",
-        "_chk_turbo_kv", "_chk_ngram", "_chk_prompt_cache",
-        "_sp_prompt_cache_mib", "_chk_thinking", "_host_edit", "_port_edit",
-        "_port_offset_combo", "_server_combo", "_btn_toggle_log", "_btn_launch",
-        "_btn_stop", "_btn_stop_all", "_btn_quit",
+        "_fork_combo",
+        "_btn_fork_folder",
+        "_perf_combo",
+        "_mode_combo",
+        "_gpu_combo",
+        "_search",
+        "_btn_expert",
+        "_btn_diagnose",
+        "_cb_mmproj",
+        "_cb_draft",
+        "_chk_vision",
+        "_chk_mmproj_cpu",
+        "_chk_draft",
+        "_chk_turbo_kv",
+        "_chk_ngram",
+        "_chk_prompt_cache",
+        "_sp_prompt_cache_mib",
+        "_chk_thinking",
+        "_host_edit",
+        "_port_edit",
+        "_port_offset_combo",
+        "_server_combo",
+        "_btn_toggle_log",
+        "_btn_launch",
+        "_btn_stop",
+        "_btn_stop_all",
+        "_btn_quit",
     )
     widgets.extend(getattr(window, name) for name in main_names)
-    toolbar_texts = {"📂 Models folder", "🔄 Refresh", "⬆ Update", "⚙ Settings", "A−", "A+"}
+    toolbar_texts = {
+        "📂 Models folder",
+        "🔄 Refresh",
+        "⬆ Update",
+        "⚙ Settings",
+        "A−",
+        "A+",
+    }
     widgets.extend(
         button
         for button in window.findChildren(qt_widgets.QPushButton)
         if button.text() in toolbar_texts
     )
     assert toolbar_texts <= {
-        button.text()
-        for button in window.findChildren(qt_widgets.QPushButton)
+        button.text() for button in window.findChildren(qt_widgets.QPushButton)
     }
 
     for widget in widgets:
         tooltip = widget.toolTip()
         assert "<b>In short:</b>" in tooltip, widget.objectName()
         assert "<b>Technical details:</b>" in tooltip, widget.objectName()
+
+    assert "<b>In short:</b>" in app_dialog.theme_combo.toolTip()
+    assert app_dialog.about_button.accessibleName() == "About AutoTuner"
+    assert (
+        app_dialog.theme_combo.itemData(
+            app_dialog.theme_combo.currentIndex(),
+            qt_launcher.Qt.ItemDataRole.ToolTipRole,
+        )
+        == app_dialog.theme_combo.currentText()
+    )
+
+    window.resize(1320, 840)
+    window.show()
+    _QT_TEST_APP.processEvents()
+    top_split, main_split = window._splitters
+    top_split.setSizes([333, 777])
+    main_split.setSizes([555, 222])
+    _QT_TEST_APP.processEvents()
+    expected_top = top_split.sizes()
+    expected_main = main_split.sizes()
+    window._apply_theme_definition(
+        window._theme_manager.get("builtin:dark"), _QT_TEST_APP, lambda: None
+    )
+    _QT_TEST_APP.processEvents()
+    assert all(
+        abs(actual - expected) <= 1
+        for actual, expected in zip(top_split.sizes(), expected_top)
+    )
+    assert all(
+        abs(actual - expected) <= 1
+        for actual, expected in zip(main_split.sizes(), expected_main)
+    )
+    assert window._launch_options_group.maximumHeight() >= (
+        window._launch_options_group.minimumSizeHint().height()
+    )
 
     window.close()
     paths_dialog.close()
@@ -1078,15 +1192,11 @@ def test_veto_unsafe_mlock_allows_b10151_gpu_build(tmp_path, monkeypatch) -> Non
     cfg.no_mmap = True
 
     monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10151)
-    assert tuner.veto_unsafe_mlock(
-        cfg, _fake_system(), binary="llama-server"
-    ) is False
+    assert tuner.veto_unsafe_mlock(cfg, _fake_system(), binary="llama-server") is False
     assert cfg.load_mode == "mlock"
 
     monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10114)
-    assert tuner.veto_unsafe_mlock(
-        cfg, _fake_system(), binary="llama-server"
-    ) is True
+    assert tuner.veto_unsafe_mlock(cfg, _fake_system(), binary="llama-server") is True
     assert cfg.load_mode == "auto"
 
 
@@ -3712,17 +3822,28 @@ def test_diffusiongemma_auto_memory_contract() -> None:
         free_ram_gb=40,
         gpus=[
             GPUInfo(
-                index=0, name="RX 9070 XT", vendor="amd",
-                total_vram_mb=16 * 1024, free_vram_mb=15 * 1024, hip_index=0,
+                index=0,
+                name="RX 9070 XT",
+                vendor="amd",
+                total_vram_mb=16 * 1024,
+                free_vram_mb=15 * 1024,
+                hip_index=0,
             ),
             GPUInfo(
-                index=1, name="Radeon AI PRO R9700", vendor="amd",
-                total_vram_mb=32 * 1024, free_vram_mb=31 * 1024, hip_index=1,
+                index=1,
+                name="Radeon AI PRO R9700",
+                vendor="amd",
+                total_vram_mb=32 * 1024,
+                free_vram_mb=31 * 1024,
+                hip_index=1,
             ),
         ],
     )
     cfg = compute_config(
-        model, system, profile, prompt_cache_ram_mib=0,
+        model,
+        system,
+        profile,
+        prompt_cache_ram_mib=0,
         gpu_priorities={"Radeon AI PRO R9700": 2, "RX 9070 XT": 1},
     )
     assert cfg.ctx == 4096
@@ -3731,8 +3852,10 @@ def test_diffusiongemma_auto_memory_contract() -> None:
     assert cfg.n_cpu_moe is None
     assert cfg.runtime_vram_overhead_gb == pytest.approx(1.5)
     total_gpu = (
-        cfg.estimated_model_vram_gb + cfg.kv_vram_gb
-        + cfg.vision_vram_gb + cfg.draft_vram_gb
+        cfg.estimated_model_vram_gb
+        + cfg.kv_vram_gb
+        + cfg.vision_vram_gb
+        + cfg.draft_vram_gb
         + cfg.runtime_vram_overhead_gb
     )
     assert total_gpu >= model.size_gb + 1.9
@@ -3742,7 +3865,11 @@ def test_diffusiongemma_auto_memory_contract() -> None:
     # cap: an explicit pin remains available for the HIP build and is still
     # clamped by the real F16 VRAM budget.
     pinned = compute_config(
-        model, system, profile, user_ctx=8192, prompt_cache_ram_mib=0,
+        model,
+        system,
+        profile,
+        user_ctx=8192,
+        prompt_cache_ram_mib=0,
         gpu_priorities={"Radeon AI PRO R9700": 2, "RX 9070 XT": 1},
     )
     assert pinned.ctx == 8192
@@ -3751,7 +3878,10 @@ def test_diffusiongemma_auto_memory_contract() -> None:
     from performance_target import get_target
 
     low_vram = compute_config(
-        model, system, profile, perf_target=get_target("low_vram"),
+        model,
+        system,
+        profile,
+        perf_target=get_target("low_vram"),
         prompt_cache_ram_mib=0,
     )
     assert low_vram.no_kv_offload is False
@@ -5077,12 +5207,7 @@ def test_gemma_draft_ik_fallback_only_for_pre_spec_type_builds(tmp_path) -> None
 
     modern = tmp_path / "llama-server"
     modern.write_text(
-        "#!/bin/sh\n"
-        "cat <<'EOF'\n"
-        "-m, --model\n"
-        "-md, --model-draft\n"
-        "--spec-type\n"
-        "EOF\n",
+        "#!/bin/sh\ncat <<'EOF'\n-m, --model\n-md, --model-draft\n--spec-type\nEOF\n",
         encoding="utf-8",
     )
     modern.chmod(0o755)
@@ -5090,11 +5215,7 @@ def test_gemma_draft_ik_fallback_only_for_pre_spec_type_builds(tmp_path) -> None
     legacy = tmp_path / "legacy" / "llama-server"
     legacy.parent.mkdir()
     legacy.write_text(
-        "#!/bin/sh\n"
-        "cat <<'EOF'\n"
-        "-m, --model\n"
-        "-md, --model-draft\n"
-        "EOF\n",
+        "#!/bin/sh\ncat <<'EOF'\n-m, --model\n-md, --model-draft\nEOF\n",
         encoding="utf-8",
     )
     legacy.chmod(0o755)
@@ -5136,12 +5257,7 @@ def test_vision_no_longer_suppresses_external_draft_on_spec_type_builds(
     legacy = tmp_path / "legacy" / "llama-server"
     legacy.parent.mkdir()
     legacy.write_text(
-        "#!/bin/sh\n"
-        "cat <<'EOF'\n"
-        "-m, --model\n"
-        "-md, --model-draft\n"
-        "--mmproj\n"
-        "EOF\n",
+        "#!/bin/sh\ncat <<'EOF'\n-m, --model\n-md, --model-draft\n--mmproj\nEOF\n",
         encoding="utf-8",
     )
     legacy.chmod(0o755)
@@ -5239,11 +5355,102 @@ def test_update_worker_archive_overlay_preserves_settings(
 
     assert finished and finished[0][0]
     assert "GitHub archive" in finished[0][1]
+    assert f"v{qt_launcher.VERSION}" in finished[0][1]
     assert (app / "qt_launcher.py").read_text(encoding="utf-8") == "NEW"
     assert (app / "settings" / "profile.yaml").read_text(encoding="utf-8") == "profile"
     assert (app / "autotuner_settings.json").read_text(encoding="utf-8") == "USER"
     assert (app / ".autotuner_update.json").exists()
     assert pip_calls, "requirements.txt change should reinstall dependencies"
+
+
+def test_close_refuses_while_an_update_thread_is_running(monkeypatch) -> None:
+    """Closing cannot destroy an updater that is still replacing files."""
+    import qt_launcher
+
+    class RunningThread:
+        def isRunning(self):  # noqa: N802
+            return True
+
+    class CloseEvent:
+        ignored = False
+
+        def ignore(self):
+            self.ignored = True
+
+    class Window:
+        _update_thread = RunningThread()
+        _update_worker = object()
+        _force_quit = True
+
+    messages = []
+    monkeypatch.setattr(
+        qt_launcher.QMessageBox,
+        "information",
+        lambda *_args: messages.append(_args[2]),
+    )
+    event = CloseEvent()
+    window = Window()
+    qt_launcher.MainWindow.closeEvent(window, event)
+
+    assert event.ignored
+    assert window._force_quit is False
+    assert messages and "still updating" in messages[0]
+
+
+def test_update_reference_cleanup_only_clears_the_finished_thread() -> None:
+    import qt_launcher
+
+    class Window:
+        def __init__(self):
+            self._update_thread = object()
+            self._update_worker = object()
+
+    window = Window()
+    other_thread = object()
+    qt_launcher.MainWindow._clear_update_references(window, other_thread)
+    assert window._update_thread is not None and window._update_worker is not None
+    qt_launcher.MainWindow._clear_update_references(window, window._update_thread)
+    assert window._update_thread is None and window._update_worker is None
+
+
+def test_git_update_rejects_ahead_only_branch(tmp_path, monkeypatch) -> None:
+    """An ahead-only checkout must not be described as matching upstream."""
+    import qt_launcher
+
+    worker = qt_launcher._UpdateWorker(tmp_path)
+    worker._repo_root = tmp_path
+    worker._git_bin = "git"
+    monkeypatch.setattr(worker, "_launcher_is_tracked_by_git", lambda: True)
+    monkeypatch.setattr(worker, "_backup_settings", lambda: {})
+
+    def run_git(*args, **_kwargs):
+        values = {
+            ("rev-parse", "--is-inside-work-tree"): "true",
+            ("rev-parse", "--abbrev-ref", "HEAD"): "main",
+            (
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{u}",
+            ): "origin/main",
+            ("status", "--porcelain", "--untracked-files=no"): "",
+            ("ls-files", "--error-unmatch", "autotuner_settings.json"): "",
+            ("fetch", "--prune", "origin"): "",
+            ("rev-list", "--left-right", "--count", "HEAD...origin/main"): "1 0",
+        }
+        return values[args]
+
+    monkeypatch.setattr(worker, "_run_git", run_git)
+    finished = []
+    worker.finished.connect(lambda ok, msg: finished.append((ok, msg)))
+    worker.run()
+
+    assert finished == [
+        (
+            False,
+            "Local branch has 1 commit(s) not on origin/main; refusing to auto-merge.",
+        )
+    ]
 
 
 def test_binary_update_worker_picks_macos_asset_not_linux(monkeypatch) -> None:

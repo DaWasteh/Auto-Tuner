@@ -6,9 +6,10 @@ import re
 from dataclasses import replace
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QSize
+from PyQt6.QtCore import QSize, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontDatabase
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QDialog,
@@ -97,13 +98,13 @@ class ThemeEditorDialog(QDialog):
         self.ui_font = QFontComboBox()
         self.mono_font = QFontComboBox()
         for combo in (self.ui_font, self.mono_font):
-            combo.setMinimumWidth(80)
+            combo.setMinimumWidth(160)
             combo.setMaximumWidth(500)
-            combo.setSizeAdjustPolicy(
-                QFontComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-            )
-            combo.setMinimumContentsLength(6)
+            combo.setSizeAdjustPolicy(QFontComboBox.SizeAdjustPolicy.AdjustToContents)
             combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo.currentFontChanged.connect(
+                lambda font, combo=combo: combo.setToolTip(font.family())
+            )
         self.mono_font.setFontFilters(QFontComboBox.FontFilter.MonospacedFonts)
         self.ui_default.setChecked(not theme.ui_family)
         self.mono_default.setChecked(not theme.mono_family)
@@ -115,6 +116,8 @@ class ThemeEditorDialog(QDialog):
             self.mono_font.setCurrentFont(
                 QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
             )
+        self.ui_font.setToolTip(self.ui_font.currentFont().family())
+        self.mono_font.setToolTip(self.mono_font.currentFont().family())
         self.ui_font.setEnabled(not self.ui_default.isChecked())
         self.mono_font.setEnabled(not self.mono_default.isChecked())
         form.addRow("Name", self.name_edit)
@@ -157,6 +160,16 @@ class ThemeEditorDialog(QDialog):
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        QTimer.singleShot(0, self._limit_height_to_screen)
+
+    def _limit_height_to_screen(self) -> None:
+        """Keep the editor usable on short displays while its colors scroll."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available_height = screen.availableGeometry().height()
+        if available_height > 0:
+            self.setMaximumHeight(max(240, available_height - 80))
 
     def sizeHint(self) -> QSize:  # noqa: N802
         """Keep the editor usable on an 800px-wide display; colors scroll."""

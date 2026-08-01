@@ -7,7 +7,7 @@ the RAM/VRAM you actually have free — without manual edits.
 
 # GUI-Design
 
-![v5.0.0](image.png)
+![AutoTuner GUI](image.png)
 
 ## Features
 
@@ -61,7 +61,7 @@ the RAM/VRAM you actually have free — without manual edits.
     decoding (smallest matching sibling wins). A leading `mtp-` explicitly
     marks an external draft head even when newer Qwen-based heads are several
     GiB; large infix `…-MTP-…` target models remain normal runnable models.
-- **Themes and appearance editor** — choose built-in System, Dark, Dark Gray, Light, or High Contrast themes in **⚙ Settings**, or copy one in the in-app color/font editor and save it as a safe JSON user theme. See the complete [theme guide](docs/themes.md).
+- **Themes and appearance editor** — choose built-in System, Dark, Dark Gray, Light, High Contrast, or the pink-accented Midnight Rose theme in **⚙ Settings**, or copy one in the in-app color/font editor and save it as a safe JSON user theme. See the complete [theme guide](docs/themes.md).
 - **Favorite models stay at the top** — click the star left of a model name
   to mark it. Active and inactive star colors follow the selected theme, and
   the choice is persisted across AutoTuner restarts.
@@ -135,11 +135,16 @@ the RAM/VRAM you actually have free — without manual edits.
   per-splitter persistence.
 - **Global font size** — persistent font size (clamped 7..22), applied
   immediately on app start (no flash of the default).
-- **Application settings** — the **⚙ Settings** toolbar button (also available
-  in the Windows title-bar system menu) controls per-user login autostart on
-  Windows, Linux, and macOS, plus optional **X → notification area/system
-  tray** behavior. Both options are disabled by default; the tray menu and the
-  dedicated **Quit** button always exit normally.
+- **Application settings & Info** — the **⚙ Settings** toolbar button and the
+  Windows title-bar system menu (click the top-left app symbol) provide
+  Settings plus **About AutoTuner** with the visible version and GitHub link.
+  The window title also always shows the running version. Settings controls
+  per-user login autostart on Windows, Linux, and macOS, plus optional **X →
+  notification area/system tray** behavior. Both options are disabled by
+  default; the tray menu and the dedicated **Quit** button always exit normally.
+- **Stable theme preview** — switching or previewing a theme preserves the
+  current window and pane/splitter arrangement; responsive Appearance controls
+  retain full theme/font names through sensible widths and tooltips.
 - **Reasoning effort** — selectable per model: `auto` / `off` /
   `minimal` / `low` / `medium` / `high` / `extra_high`. Think-budget
   (spin-box, -1 = off, 0 = stop immediately, N = token budget) and optional
@@ -183,8 +188,10 @@ You also need a working `llama-server` binary. The tuner automatically discovers
 
 ## Update (GUI-Button oder Terminal)
 
-In der Qt-GUI gibt es oben in der Toolbar den Button **⬆ Update**. Er
-prüft GitHub auf neue AutoTuner-Versionen. In einem echten `git clone` nutzt
+In der Qt-GUI gibt es oben in der Toolbar den Button **⬆ Update**. Die laufende
+Version steht im Fenstertitel sowie in den Update-Dialogen und -Meldungen. In einem
+Source-Start prüft er den Git-Branch beziehungsweise das GitHub-Source-ZIP, nicht
+Release-Assets. In einem echten `git clone` nutzt
 er `git pull --ff-only`; in einem heruntergeladenen ZIP/Release-Ordner ohne
 `.git` lädt er automatisch das aktuelle GitHub-Source-ZIP herunter und spielt
 es über die bestehende Installation. Bei geänderter `requirements.txt` führt
@@ -336,6 +343,25 @@ http://127.0.0.1:1234
 Works with the built-in **llama.cpp Web UI**, **VS Code** extensions
 like Continue / Cline, **Open WebUI**, or any OpenAI-API client.
 
+### Terminal TUI
+
+```bash
+python auto_tuner.py
+```
+
+The dependency-free terminal interface is designed for enthusiasts who prefer a
+fast keyboard workflow. It shows the shared **AutoTuner version**, responsive
+model cards, capability badges, the active performance target/GPU pin, and a
+compact memory/config summary. ANSI color is used only in compatible TTYs;
+logs, pipes, and `--plain` automatically use an ASCII-only, ANSI-free view.
+
+For repeatable scripts, use an unambiguous model with `--non-interactive` (or
+`--dry-run` / `--yes`). These paths do not read prompts: available vision,
+draft, and thinking features use their normal defaults, while n-gram remains
+opt-in via `--ngram`. The terminal UI shares the launch engine, but the GUI
+remains the place for persisted per-model Expert controls; advanced
+llama-server options can still be passed after `--`.
+
 ### Qt GUI
 
 ```bash
@@ -418,10 +444,14 @@ that only make sense with persistent state:
 | `--gpu NAME` | Hard-pin the server to a single GPU by name substring (e.g. `--gpu 9070`, `--gpu R9700`). Overrides the persisted `forced_gpu`; omit for free-VRAM-aware auto selection. The GUI exposes the same pin via the toolbar **GPU** dropdown |
 | `--ngram` | Enable n-gram (ngram-mod) self-speculative decoding |
 | `--no-mmproj-offload` | Keep an active vision projector in system RAM instead of VRAM; its size is moved into the RAM budget |
-| `--cache-ram-mib MIB` | Bound host prompt caching (default 2048 MiB; `-1` unlimited, `0` disabled) and reserve that amount in the RAM estimate |
+| `--cache-ram-mib MIB` | Bound host prompt caching (`-1` unlimited, `0` disabled); without this flag the saved GUI cache limit is used |
 | `--no-prompt-cache` | Disable host-memory prompt caching (`--cache-ram 0`). Caching is auto-on; Vision requires llama.cpp b10045+ and falls back to off on older/unprobeable builds |
-| `--dry-run` | Print the command, don't start the server |
-| `--yes / -y` | Skip the launch confirmation prompt |
+| `--dry-run` | Print the command, don't start the server; never opens TUI prompts when used with `--model` |
+| `--yes / -y` | Skip the launch confirmation prompt and use non-interactive defaults with `--model` |
+| `--non-interactive` | Require `--model` and never read prompts; intended for scripts/CI |
+| `--mode {chat,coding}` | Select profile sampling mode (default: saved GUI preference or `chat`) |
+| `--plain`, `--no-color` | Use ASCII-only output, or retain Unicode while disabling ANSI color |
+| `--debug`, `--debug-category NAME` | Enable all debug output or one of `hardware`, `scanner`, `llama_cpp`, `config` |
 | `--force-mlock` | Force the non-mmap locking path when resources/OS permissions allow it (Expert GUI exposes all `--load-mode` choices) |
 | `--performance-target {safe,balanced,throughput,low_vram}` | VRAM utilisation preset (see below) |
 | `-- <args...>` | Anything after `--` is forwarded to `llama-server` |
