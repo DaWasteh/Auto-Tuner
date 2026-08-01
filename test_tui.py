@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import types
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def test_plain_renderer_is_ascii_and_compact(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         auto_tuner.shutil,
         "get_terminal_size",
-        lambda fallback=(80, 24): types.SimpleNamespace(columns=30),
+        lambda fallback=(80, 24): os.terminal_size((30, 24)),
     )
     auto_tuner._configure_renderer(auto_tuner._parse_args(["--plain"]))
     entry = _entry(name="Long 模型 name with a very long suffix")
