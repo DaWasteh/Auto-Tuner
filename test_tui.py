@@ -54,6 +54,16 @@ def test_parser_supports_tui_options_and_real_passthrough() -> None:
             "4096",
             "--debug-category",
             "config",
+            "--ocr-input",
+            "document.pdf",
+            "--ocr-output",
+            "results",
+            "--ocr-pages",
+            "1-3,5",
+            "--ocr-dpi",
+            "300",
+            "--ocr-max-tokens",
+            "8192",
             "--plain",
             "--non-interactive",
             "--",
@@ -64,6 +74,11 @@ def test_parser_supports_tui_options_and_real_passthrough() -> None:
     assert args.mode == "coding"
     assert args.cache_ram_mib == 4096
     assert args.debug_category == ["config"]
+    assert args.ocr_input == ["document.pdf"]
+    assert args.ocr_output == "results"
+    assert args.ocr_pages == "1-3,5"
+    assert args.ocr_dpi == 300
+    assert args.ocr_max_tokens == 8192
     assert args.plain and args.non_interactive
     assert args.passthrough == ["--threads", "8"]
     assert auto_tuner._parse_args([]).cache_ram_mib is None

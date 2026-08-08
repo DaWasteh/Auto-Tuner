@@ -143,6 +143,10 @@ def main() -> int:
         "autotuner_version",
         "theme_manager",
         "theme_dialog",
+        "ocr_workflow",
+        "pymupdf",
+        "PIL.Image",
+        "PIL.ImageOps",
     ]
 
     cmd = [

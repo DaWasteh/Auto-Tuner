@@ -54,6 +54,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -73,6 +74,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -107,6 +109,7 @@ from tuner import (
     gemma_draft_needs_ik_fork,
     match_gpu_by_token,
     prepare_command_for_binary,
+    probe_binary_build_number,
     veto_unsafe_mlock,
     TunedConfig,
 )
@@ -118,6 +121,17 @@ from performance_target import (
 )
 import app_settings
 import startup_manager
+from ocr_workflow import (
+    OcrJobOptions,
+    OcrJobResult,
+    OcrJobRunner,
+    SUPPORTED_INPUT_EXTENSIONS,
+    client_base_url,
+    is_ocr_model,
+    ocr_model_preset,
+    ocr_projector_warning,
+    server_model_ids,
+)
 from autotuner_version import VERSION, GITHUB_REPO, USER_AGENT
 from theme_dialog import ThemeEditorDialog
 from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
@@ -784,6 +798,286 @@ class _ApplicationSettingsDialog(QDialog):
         """Allow layouts to compress to the same documented 800px bound."""
         hint = super().minimumSizeHint()
         return QSize(min(hint.width(), 800), hint.height())
+
+
+# ---------------------------------------------------------------------------
+# Shared OCR setup/progress UI
+
+
+class _OcrSetupDialog(QDialog):
+    """Collect document inputs and the shared OCR pipeline options."""
+
+    def __init__(self, model: ModelEntry, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.model = model
+        self.preset = ocr_model_preset(model)
+        self.setWindowTitle(f"OCR – {self.preset.label}")
+        self.setModal(True)
+        self.resize(760, 660)
+
+        layout = QVBoxLayout(self)
+        title = QLabel(
+            f"<b>{escape(model.name)}</b><br>"
+            "Images are normalized directly; PDF pages are rendered locally; "
+            "Word/Office files are converted through LibreOffice first."
+        )
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        if self.preset.notes:
+            note = QLabel(self.preset.notes)
+            note.setWordWrap(True)
+            note.setObjectName("mutedLabel")
+            layout.addWidget(note)
+
+        input_group = QGroupBox("Input files and folders")
+        input_layout = QVBoxLayout(input_group)
+        self.input_list = QListWidget()
+        self.input_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.input_list.setAccessibleName("OCR input files and folders")
+        input_layout.addWidget(self.input_list, 1)
+        input_buttons = QHBoxLayout()
+        add_files = QPushButton("Add files…")
+        add_folder = QPushButton("Add folder…")
+        remove = QPushButton("Remove selected")
+        clear = QPushButton("Clear")
+        add_files.clicked.connect(self._add_files)
+        add_folder.clicked.connect(self._add_folder)
+        remove.clicked.connect(self._remove_selected)
+        clear.clicked.connect(self.input_list.clear)
+        for button in (add_files, add_folder, remove, clear):
+            input_buttons.addWidget(button)
+        input_buttons.addStretch(1)
+        input_layout.addLayout(input_buttons)
+        layout.addWidget(input_group, 1)
+
+        options_group = QGroupBox("Output and OCR options")
+        grid = QGridLayout(options_group)
+        self.output_edit = QLineEdit(str(self._default_output_dir()))
+        self.output_edit.setAccessibleName("OCR output folder")
+        browse_output = QPushButton("Browse…")
+        browse_output.clicked.connect(self._browse_output)
+        grid.addWidget(QLabel("Output folder:"), 0, 0)
+        grid.addWidget(self.output_edit, 0, 1, 1, 3)
+        grid.addWidget(browse_output, 0, 4)
+
+        self.prompt_edit = QTextEdit()
+        self.prompt_edit.setPlainText(self.preset.prompt)
+        self.prompt_edit.setMaximumHeight(72)
+        self.prompt_edit.setAccessibleName("OCR prompt")
+        grid.addWidget(QLabel("Prompt:"), 1, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self.prompt_edit, 1, 1, 1, 4)
+
+        self.pages_edit = QLineEdit()
+        self.pages_edit.setPlaceholderText("all pages, or e.g. 1-3,5")
+        self.dpi_spin = QSpinBox()
+        self.dpi_spin.setRange(72, 600)
+        self.dpi_spin.setValue(220)
+        self.dpi_spin.setSuffix(" DPI")
+        self.tokens_spin = QSpinBox()
+        self.tokens_spin.setRange(1, 32768)
+        self.tokens_spin.setValue(self.preset.max_tokens)
+        self.tokens_spin.setSingleStep(512)
+        self.format_combo = QComboBox()
+        self.format_combo.addItem("Markdown (.md)", "markdown")
+        self.format_combo.addItem("Plain text (.txt)", "text")
+        grid.addWidget(QLabel("PDF pages:"), 2, 0)
+        grid.addWidget(self.pages_edit, 2, 1)
+        grid.addWidget(QLabel("Render:"), 2, 2)
+        grid.addWidget(self.dpi_spin, 2, 3)
+        grid.addWidget(QLabel("Max tokens/page:"), 3, 0)
+        grid.addWidget(self.tokens_spin, 3, 1)
+        grid.addWidget(QLabel("Format:"), 3, 2)
+        grid.addWidget(self.format_combo, 3, 3)
+
+        self.keep_rendered = QCheckBox("Keep rendered/normalized page PNG files")
+        self.keep_grounding = QCheckBox(
+            "Keep model grounding tags and bounding-box coordinates"
+        )
+        self.keep_grounding.setChecked(not self.preset.strip_grounding)
+        self.stop_server = QCheckBox("Stop the OCR server when the job finishes")
+        self.stop_server.setChecked(True)
+        grid.addWidget(self.keep_rendered, 4, 0, 1, 5)
+        grid.addWidget(self.keep_grounding, 5, 0, 1, 5)
+        grid.addWidget(self.stop_server, 6, 0, 1, 5)
+        layout.addWidget(options_group)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        start_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        start_button.setText("Start OCR")
+        self.buttons.accepted.connect(self._validate_and_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    @staticmethod
+    def _default_output_dir() -> Path:
+        documents = Path.home() / "Documents"
+        root = documents if documents.is_dir() else Path.home()
+        return root / "AutoTuner-OCR"
+
+    def _add_path(self, path: str) -> None:
+        normalized = os.path.normcase(str(Path(path).expanduser()))
+        for index in range(self.input_list.count()):
+            current = os.path.normcase(self.input_list.item(index).text())
+            if current == normalized:
+                return
+        self.input_list.addItem(str(Path(path).expanduser()))
+
+    def _add_files(self) -> None:
+        extensions = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_INPUT_EXTENSIONS))
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select OCR documents",
+            str(Path.home()),
+            f"OCR documents ({extensions});;All files (*)",
+        )
+        for path in files:
+            self._add_path(path)
+
+    def _add_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select OCR input folder", str(Path.home())
+        )
+        if path:
+            self._add_path(path)
+
+    def _remove_selected(self) -> None:
+        for item in self.input_list.selectedItems():
+            self.input_list.takeItem(self.input_list.row(item))
+
+    def _browse_output(self) -> None:
+        current = self.output_edit.text().strip() or str(self._default_output_dir())
+        path = QFileDialog.getExistingDirectory(self, "Select OCR output folder", current)
+        if path:
+            self.output_edit.setText(path)
+
+    def _validate_and_accept(self) -> None:
+        if self.input_list.count() == 0:
+            QMessageBox.warning(self, "OCR", "Add at least one input file or folder.")
+            return
+        if not self.output_edit.text().strip():
+            QMessageBox.warning(self, "OCR", "Choose an output folder.")
+            return
+        if not self.prompt_edit.toPlainText().strip() and self.preset.prompt:
+            answer = QMessageBox.question(
+                self,
+                "Empty OCR prompt",
+                "The prompt is empty. Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.accept()
+
+    def options(self) -> OcrJobOptions:
+        return OcrJobOptions(
+            inputs=[
+                Path(self.input_list.item(index).text())
+                for index in range(self.input_list.count())
+            ],
+            output_dir=Path(self.output_edit.text().strip()),
+            prompt=self.prompt_edit.toPlainText().strip(),
+            max_tokens=self.tokens_spin.value(),
+            dpi=self.dpi_spin.value(),
+            page_range=self.pages_edit.text().strip(),
+            output_format=str(self.format_combo.currentData()),
+            keep_rendered=self.keep_rendered.isChecked(),
+            strip_grounding=not self.keep_grounding.isChecked(),
+            stop_server_when_done=self.stop_server.isChecked(),
+        ).normalized()
+
+
+class _OcrProgressDialog(QDialog):
+    cancel_requested = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AutoTuner OCR")
+        self.setModal(False)
+        self.setMinimumWidth(560)
+        self._finished = False
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel("Starting llama-server and loading the OCR model…")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+        self.cancel_button = QPushButton("Cancel OCR")
+        self.cancel_button.clicked.connect(self._request_cancel)
+        layout.addWidget(self.cancel_button, 0, Qt.AlignmentFlag.AlignRight)
+
+    def _request_cancel(self) -> None:
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText("Cancelling OCR and releasing resources…")
+        self.cancel_requested.emit()
+
+    def update_progress(
+        self, _stage: str, current: int, total: int, message: str
+    ) -> None:
+        self.status_label.setText(message)
+        if total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(current)
+        else:
+            self.progress_bar.setRange(0, 0)
+
+    def mark_finished(self) -> None:
+        self._finished = True
+        self.cancel_button.setEnabled(False)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if not self._finished:
+            self._request_cancel()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+class _OcrPrepareWorker(QObject):
+    progress = pyqtSignal(str, int, int, str)
+    prepared = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, runner: OcrJobRunner) -> None:
+        super().__init__()
+        self.runner = runner
+
+    def run(self) -> None:
+        try:
+            self.runner.progress = self.progress.emit
+            self.runner.prepare()
+            self.prepared.emit(self.runner)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def cancel(self) -> None:
+        self.runner.cancel()
+
+
+class _OcrWorker(QObject):
+    progress = pyqtSignal(str, int, int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, runner: OcrJobRunner) -> None:
+        super().__init__()
+        self.runner = runner
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(self.runner.run())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def cancel(self) -> None:
+        self.runner.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -3557,6 +3851,13 @@ class MainWindow(QMainWindow):
         # binary-swap updater (frozen builds); both are QObjects moved to
         # ``_update_thread``.
         self._update_worker: Optional[QObject] = None
+        self._ocr_thread: Optional[QThread] = None
+        self._ocr_worker: Optional[_OcrWorker | _OcrPrepareWorker] = None
+        self._ocr_progress_dialog: Optional[_OcrProgressDialog] = None
+        self._ocr_server_record: Optional[dict] = None
+        self._ocr_prepared_runner: Optional[OcrJobRunner] = None
+        self._ocr_prepare_error: str = ""
+        self._ocr_locked_states: Dict[QWidget, bool] = {}
         self._sysinfo_busy = False
         # Persisted font size — falls back to 10pt on first launch.
         self._font_size = app_settings.get_font_size()
@@ -3647,10 +3948,14 @@ class MainWindow(QMainWindow):
             btn = QPushButton(label)
             btn.clicked.connect(slot)
             btn.setToolTip(tooltip)
-            if label.startswith("🔄"):
+            if label.startswith("📂"):
+                self._btn_models_folder = btn
+            elif label.startswith("🔄"):
                 self._btn_refresh = btn
             elif "Update" in label:
                 self._btn_update = btn
+            elif "Settings" in label:
+                self._btn_settings = btn
             tb.addWidget(btn)
 
         tb.addSeparator()
@@ -3814,6 +4119,7 @@ class MainWindow(QMainWindow):
         self._favorite_delegate.favoriteToggled.connect(self._set_model_favorite)
         self._model_list.setItemDelegate(self._favorite_delegate)
         self._model_list.currentItemChanged.connect(self._on_selection_changed)
+        self._model_list.itemDoubleClicked.connect(self._on_model_activated)
         self._model_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._model_list.customContextMenuRequested.connect(
             self._show_model_context_menu
@@ -4241,6 +4547,22 @@ class MainWindow(QMainWindow):
         )
         self._btn_toggle_log.clicked.connect(self._toggle_log_panel)
         bl.addWidget(self._btn_toggle_log)
+
+        self._btn_ocr = QPushButton("📄  OCR…")
+        self._btn_ocr.setFixedHeight(32)
+        self._btn_ocr.setEnabled(False)
+        self._btn_ocr.setVisible(False)
+        self._btn_ocr.setToolTip(
+            _setting_tooltip(
+                "Opens the document workflow for the selected OCR model.",
+                "Accepts images, PDF, Word, OpenDocument, presentation, and spreadsheet "
+                "inputs. Office files are converted with LibreOffice, PDF pages are "
+                "rendered with PyMuPDF, and normalized images are sent to the same "
+                "llama-server chat-completions API used by the terminal workflow.",
+            )
+        )
+        self._btn_ocr.clicked.connect(self._open_ocr_workflow)
+        bl.addWidget(self._btn_ocr)
 
         self._btn_launch = QPushButton("▶  Launch")
         self._btn_launch.setFixedHeight(32)
@@ -5576,7 +5898,7 @@ class MainWindow(QMainWindow):
             self._log("No models found in active folders.")
             return
         self._populate_list(entries)
-        self._btn_launch.setEnabled(True)
+        self._enable_launch_when_ocr_idle()
         roots = getattr(self, "_last_scan_roots", [])
         self._status.showMessage(
             f"{len(entries)} model(s) loaded from {len(roots)} folder(s)."
@@ -5853,6 +6175,11 @@ class MainWindow(QMainWindow):
             return
         self._show_config(entry)
 
+    def _on_model_activated(self, item: QListWidgetItem) -> None:
+        entry: Optional[ModelEntry] = item.data(Qt.ItemDataRole.UserRole)
+        if entry is not None and is_ocr_model(entry):
+            self._open_ocr_workflow()
+
     def _show_config(self, entry: ModelEntry) -> None:
         """Called on model selection — updates checkboxes, auto-selects fork, refreshes preview.
 
@@ -6033,6 +6360,15 @@ class MainWindow(QMainWindow):
         self._chk_prompt_cache.blockSignals(False)
         self._sp_prompt_cache_mib.setEnabled(pc_state)
 
+        ocr_selected = is_ocr_model(entry)
+        self._btn_ocr.setVisible(ocr_selected)
+        self._btn_ocr.setEnabled(
+            ocr_selected
+            and entry.mmproj is not None
+            and self._chk_vision.isChecked()
+            and self._ocr_thread is None
+        )
+
     def _populate_mmproj_combo(self, entry: ModelEntry, ov: dict) -> None:
         """Fill the always-on mmproj dropdown from ``entry.folder_mmprojs``.
 
@@ -6120,7 +6456,16 @@ class MainWindow(QMainWindow):
             compatible = is_draft_compatible(entry.path, c, md)
             arch = str(md.get("general.architecture", "") or "").lower().strip()
             kind = ""
-            if arch == "dflash":
+            is_dspark = arch == "dspark" or (
+                arch == "dflash"
+                and (
+                    md.get("__dspark_scan__") == "found"
+                    or bool(re.search(r"(?:^|[-_.])dspark(?:[-_.]|$)", c.name, re.I))
+                )
+            )
+            if is_dspark:
+                kind = "  [DSpark]"
+            elif arch == "dflash":
                 kind = "  [DFlash]"
             elif arch == "eagle3":
                 kind = "  [EAGLE-3]"
@@ -7051,11 +7396,25 @@ class MainWindow(QMainWindow):
         stopped/crashed server's port once it has been pruned from _servers.
         """
         live = []
-        for s in self._servers:
-            proc = s.get("proc")
+        dead = []
+        for server in self._servers:
+            proc = server.get("proc")
             if proc is not None and proc.is_running():
-                live.append(s)
+                live.append(server)
+            else:
+                dead.append(server)
         self._servers = live
+        for server in dead:
+            if server is not self._ocr_server_record:
+                continue
+            code = server.get("proc").returncode() if server.get("proc") else None
+            if server.get("ocr_started") and self._ocr_worker is not None:
+                self._ocr_worker.cancel()
+            else:
+                self._fail_pending_ocr(
+                    server,
+                    f"llama-server exited while loading the OCR model (code {code}).",
+                )
 
     def _requested_start_port(self, base_port: int, offset: int) -> int:
         """Return the user's requested first port before collision probing.
@@ -7260,9 +7619,400 @@ class MainWindow(QMainWindow):
         self._log(f"[Balance] Pinned to {name} (device {vis}).")
 
     # ------------------------------------------------------------------
+    # OCR workflow
+    # ------------------------------------------------------------------
+    def _set_ocr_controls_locked(self, locked: bool) -> None:
+        controls: List[QWidget] = [
+            self._model_list,
+            self._btn_models_folder,
+            self._btn_refresh,
+            self._btn_update,
+            self._btn_settings,
+            self._fork_combo,
+            self._btn_fork_folder,
+            self._perf_combo,
+            self._mode_combo,
+            self._gpu_combo,
+            self._chk_vision,
+            self._chk_mmproj_cpu,
+            self._chk_draft,
+            self._chk_turbo_kv,
+            self._chk_ngram,
+            self._chk_prompt_cache,
+            self._sp_prompt_cache_mib,
+            self._chk_thinking,
+            self._cb_mmproj,
+            self._cb_draft,
+            self._btn_expert,
+            self._btn_launch,
+            self._host_edit,
+            self._port_edit,
+            self._port_offset_combo,
+        ]
+        if locked:
+            if self._ocr_locked_states:
+                return
+            self._ocr_locked_states = {
+                widget: widget.isEnabled() for widget in controls
+            }
+            for widget in controls:
+                widget.setEnabled(False)
+            return
+        states = self._ocr_locked_states
+        self._ocr_locked_states = {}
+        for widget, enabled in states.items():
+            try:
+                widget.setEnabled(enabled)
+            except RuntimeError:
+                pass
+
+    def _enable_launch_when_ocr_idle(self) -> None:
+        active = bool(
+            self._ocr_thread is not None
+            or self._ocr_server_record is not None
+            or self._ocr_locked_states
+        )
+        self._btn_launch.setEnabled(not active)
+
+    def _open_ocr_workflow(self) -> None:
+        entry = self._current_entry
+        if entry is None or not is_ocr_model(entry):
+            QMessageBox.information(
+                self, "OCR", "Select an OCR/document model first."
+            )
+            return
+        if self._ocr_thread is not None or self._ocr_server_record is not None:
+            QMessageBox.information(
+                self, "OCR", "An OCR job is already starting or running."
+            )
+            return
+        if entry.mmproj is None or not self._chk_vision.isChecked():
+            QMessageBox.warning(
+                self,
+                "OCR projector required",
+                "OCR requires the matching mmproj and the Vision option. "
+                "Select the projector and enable Vision first.",
+            )
+            return
+
+        projector_warning = ocr_projector_warning(entry)
+        if projector_warning:
+            answer = QMessageBox.warning(
+                self,
+                "Legacy Unlimited-OCR projector",
+                projector_warning + "\n\nContinue with the reduced tile limit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        dialog = _OcrSetupDialog(entry, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        profile = match_profile(
+            entry.name, self._profiles, getattr(entry, "architecture", "")
+        )
+        preset = ocr_model_preset(entry)
+        binary = self._resolve_binary(profile, False, entry.name)
+        build = probe_binary_build_number(binary)
+        required_build = max(
+            int(getattr(profile, "min_llama_build", 0) or 0),
+            preset.min_llama_build,
+        )
+        if required_build and build is not None and build < required_build:
+            QMessageBox.critical(
+                self,
+                "llama.cpp build too old",
+                f"{preset.label} requires llama.cpp b{required_build}+ for the "
+                f"validated OCR path. The selected binary reports b{build}.\n\n"
+                "Select the b10329 (or newer) llama.cpp build and try again.",
+            )
+            return
+        if required_build and build is None:
+            answer = QMessageBox.warning(
+                self,
+                "Could not verify llama.cpp build",
+                f"AutoTuner could not read the selected binary's build number. "
+                f"{preset.label} is validated on b{required_build}+.\n\n"
+                "Continue with this unverified binary?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        runner = OcrJobRunner(
+            "",
+            _clean_model_name(entry.name),
+            options,
+            model_name=entry.name,
+            llama_build=build,
+            progress=None,
+        )
+        worker = _OcrPrepareWorker(runner)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_ocr_progress)
+        worker.prepared.connect(self._on_ocr_prepared)
+        worker.failed.connect(self._on_ocr_prepare_failed)
+        worker.prepared.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_ocr_prepare_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._ocr_worker = worker
+        self._ocr_thread = thread
+        self._ocr_prepared_runner = None
+        self._ocr_prepare_error = ""
+        self._ocr_progress_dialog = _OcrProgressDialog(self)
+        self._ocr_progress_dialog.cancel_requested.connect(self._cancel_ocr_job)
+        self._ocr_progress_dialog.update_progress(
+            "prepare", 0, 0, "Preparing documents before loading the OCR model…"
+        )
+        self._ocr_progress_dialog.show()
+        self._btn_ocr.setEnabled(False)
+        self._set_ocr_controls_locked(True)
+        self._log("[OCR] Preparing inputs before llama-server claims model memory.")
+        thread.start()
+
+    def _on_ocr_prepared(self, value: object) -> None:
+        self._ocr_prepared_runner = cast(OcrJobRunner, value)
+        job_dir, total = self._ocr_prepared_runner.prepare()
+        self._log(f"[OCR] Prepared {total} page(s) in {job_dir}.")
+
+    def _on_ocr_prepare_failed(self, message: str) -> None:
+        self._ocr_prepare_error = message
+
+    def _on_ocr_prepare_thread_finished(self) -> None:
+        worker = self._ocr_worker
+        cancelled = bool(worker and worker.runner.cancel_event.is_set())
+        self._ocr_worker = None
+        self._ocr_thread = None
+        if cancelled:
+            if self._ocr_prepared_runner is not None:
+                self._ocr_prepared_runner.finalize_prepared(
+                    "cancelled", "OCR cancelled before server launch"
+                )
+            self._ocr_prepared_runner = None
+            self._finish_ocr_ui()
+            self._set_ocr_controls_locked(False)
+            if self._current_entry is not None:
+                self._update_checkboxes(self._current_entry)
+            self._status.showMessage("OCR cancelled.")
+            return
+        if self._ocr_prepare_error or self._ocr_prepared_runner is None:
+            message = self._ocr_prepare_error or "OCR input preparation failed."
+            self._ocr_prepared_runner = None
+            self._finish_ocr_ui()
+            self._set_ocr_controls_locked(False)
+            if self._current_entry is not None:
+                self._update_checkboxes(self._current_entry)
+            self._log(f"[OCR] Preparation failed: {message}")
+            QMessageBox.critical(self, "OCR preparation failed", message)
+            return
+
+        # _launch_server reads checkbox enabled states. Temporarily restore
+        # the validated controls for this synchronous call, then lock the
+        # exact launched configuration until the OCR job ends.
+        self._set_ocr_controls_locked(False)
+        record = self._launch_server()
+        if record is None:
+            if self._ocr_prepared_runner is not None:
+                self._ocr_prepared_runner.finalize_prepared(
+                    "failed", "llama-server could not be launched"
+                )
+            self._ocr_prepared_runner = None
+            self._finish_ocr_ui()
+            if self._current_entry is not None:
+                self._update_checkboxes(self._current_entry)
+            return
+        self._set_ocr_controls_locked(True)
+        record["ocr_prepared_runner"] = self._ocr_prepared_runner
+        record["ocr_deadline"] = time.monotonic() + 300.0
+        record["ocr_started"] = False
+        self._ocr_prepared_runner = None
+        self._ocr_server_record = record
+        if self._ocr_progress_dialog is not None:
+            self._ocr_progress_dialog.update_progress(
+                "server", 0, 0, "Loading the OCR model in llama-server…"
+            )
+        self._log(
+            f"[OCR] Waiting for the OCR server on port {record.get('port')} "
+            "before page inference starts."
+        )
+
+    def _start_pending_ocr(self, record: dict) -> None:
+        if record is not self._ocr_server_record or record.get("ocr_started"):
+            return
+        runner = record.pop("ocr_prepared_runner", None)
+        if not isinstance(runner, OcrJobRunner):
+            return
+        record["ocr_started"] = True
+        runner.configure_server(
+            str(record.get("client_base_url") or record.get("base_url") or ""),
+            str(record.get("alias") or record.get("model") or "ocr-model"),
+            model_name=str(record.get("model") or "OCR model"),
+            llama_build=record.get("llama_build"),
+            server_command=record.get("command") or [],
+        )
+        worker = _OcrWorker(runner)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        runner.progress = worker.progress.emit
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_ocr_progress)
+        worker.finished.connect(self._on_ocr_finished)
+        worker.failed.connect(self._on_ocr_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_ocr_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._ocr_worker = worker
+        self._ocr_thread = thread
+        if self._ocr_progress_dialog is not None:
+            self._ocr_progress_dialog.update_progress(
+                "ocr", 0, 0, "OCR model ready. Processing prepared pages…"
+            )
+        self._log("[OCR] Server ready; document pipeline started.")
+        thread.start()
+
+    def _on_ocr_progress(
+        self, stage: str, current: int, total: int, message: str
+    ) -> None:
+        if self._ocr_progress_dialog is not None:
+            self._ocr_progress_dialog.update_progress(stage, current, total, message)
+        counter = f" [{current}/{total}]" if total else ""
+        self._status.showMessage(f"OCR {stage}{counter}: {message}")
+        self._log(f"[OCR:{stage}]{counter} {message}")
+
+    def _cancel_ocr_job(self) -> None:
+        if self._ocr_worker is not None:
+            self._ocr_worker.cancel()
+            # If inference is already waiting on HTTP response headers, closing
+            # the job-owned server immediately guarantees the socket unblocks.
+            record = self._ocr_server_record
+            if record is not None and record.get("ocr_started"):
+                self._stop_specific_server(record)
+            self._log("[OCR] Cancellation requested.")
+            return
+        # Still waiting for the model to load: there is no worker yet.
+        record = self._ocr_server_record
+        self._ocr_server_record = None
+        if record is not None:
+            pending_runner = record.pop("ocr_prepared_runner", None)
+            if isinstance(pending_runner, OcrJobRunner):
+                pending_runner.cancel()
+                pending_runner.finalize_prepared(
+                    "cancelled", "OCR cancelled while loading llama-server"
+                )
+            self._stop_specific_server(record)
+        self._finish_ocr_ui()
+        self._set_ocr_controls_locked(False)
+        if self._current_entry is not None:
+            self._update_checkboxes(self._current_entry)
+        self._status.showMessage("OCR cancelled.")
+
+    def _on_ocr_finished(self, value: object) -> None:
+        result = cast(OcrJobResult, value)
+        record = self._ocr_server_record
+        stop_server = False
+        # The pending options were popped when the worker started; read the
+        # authoritative normalized options from its runner instead.
+        if self._ocr_worker is not None:
+            stop_server = self._ocr_worker.runner.options.stop_server_when_done
+        self._ocr_server_record = None
+        if stop_server and record is not None:
+            self._stop_specific_server(record)
+        self._finish_ocr_ui()
+        if result.cancelled:
+            self._status.showMessage("OCR cancelled.")
+            self._log(f"[OCR] Cancelled. Manifest: {result.manifest_path}")
+            return
+        self._status.showMessage(
+            f"OCR complete: {result.completed_pages}/{result.total_pages} pages"
+        )
+        self._log(
+            f"[OCR] Complete: {result.completed_pages}/{result.total_pages} pages, "
+            f"{result.failed_pages} failed. Output: {result.job_dir}"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("OCR complete")
+        box.setIcon(
+            QMessageBox.Icon.Warning
+            if result.failed_pages
+            else QMessageBox.Icon.Information
+        )
+        box.setText(
+            f"Processed {result.completed_pages} of {result.total_pages} pages.\n"
+            f"Failed pages: {result.failed_pages}\n\n"
+            f"Output:\n{result.job_dir}"
+        )
+        open_button = box.addButton("Open output folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_button:
+            _open_local_folder(result.job_dir)
+
+    def _on_ocr_failed(self, message: str) -> None:
+        record = self._ocr_server_record
+        stop_server = True
+        if self._ocr_worker is not None:
+            stop_server = self._ocr_worker.runner.options.stop_server_when_done
+        self._ocr_server_record = None
+        if stop_server and record is not None:
+            self._stop_specific_server(record)
+        self._finish_ocr_ui()
+        self._status.showMessage("OCR failed.")
+        self._log(f"[OCR] Failed: {message}")
+        QMessageBox.critical(self, "OCR failed", message)
+
+    def _on_ocr_thread_finished(self) -> None:
+        self._ocr_worker = None
+        self._ocr_thread = None
+        self._ocr_server_record = None
+        self._set_ocr_controls_locked(False)
+        if self._current_entry is not None:
+            self._update_checkboxes(self._current_entry)
+
+    def _finish_ocr_ui(self) -> None:
+        dialog = self._ocr_progress_dialog
+        self._ocr_progress_dialog = None
+        if dialog is not None:
+            dialog.mark_finished()
+            dialog.close()
+            dialog.deleteLater()
+
+    def _fail_pending_ocr(self, record: dict, message: str) -> None:
+        if record is not self._ocr_server_record or record.get("ocr_started"):
+            return
+        pending_runner = record.pop("ocr_prepared_runner", None)
+        if isinstance(pending_runner, OcrJobRunner):
+            pending_runner.cancel()
+            pending_runner.finalize_prepared("failed", message)
+        self._finish_ocr_ui()
+        self._ocr_server_record = None
+        self._set_ocr_controls_locked(False)
+        if self._current_entry is not None:
+            self._update_checkboxes(self._current_entry)
+        self._log(f"[OCR] {message}")
+        QMessageBox.critical(self, "OCR could not start", message)
+
+    def _stop_specific_server(self, record: dict) -> None:
+        if record not in self._servers:
+            return
+        index = self._server_combo.findData(record.get("id"))
+        if index >= 0:
+            self._server_combo.setCurrentIndex(index)
+        self._stop_server()
+
+    # ------------------------------------------------------------------
     # Server control
     # ------------------------------------------------------------------
-    def _launch_server(self) -> None:
+    def _launch_server(self) -> Optional[dict]:
         # Multi-server: we no longer refuse when one is already running.
         # Prune any that have exited so the port counter and VRAM picture
         # are current before we plan this launch.
@@ -7619,8 +8369,12 @@ class MainWindow(QMainWindow):
             "id": self._next_server_id,
             "port": port,
             "base_url": base_url,
+            "client_base_url": client_base_url(host, port),
             "ready": False,
             "model": entry.name,
+            "alias": alias,
+            "command": list(cmd),
+            "llama_build": probe_binary_build_number(cmd[0]),
             "gpu": getattr(self, "_last_pinned_gpu", None),
             "vram_gb": (
                 float(cfg.estimated_model_vram_gb)
@@ -7641,9 +8395,9 @@ class MainWindow(QMainWindow):
         self._server_ready = False
         self._last_pinned_gpu = None
 
-        # Stop is enabled whenever ≥1 server runs; Launch stays enabled so the
-        # user can fire up another model on the next port.
-        self._btn_launch.setEnabled(True)
+        # Stop is enabled whenever ≥1 server runs. OCR holds Launch disabled
+        # until its worker and validated server handoff are fully finished.
+        self._enable_launch_when_ocr_idle()
         self._btn_stop.setEnabled(True)
         self._btn_stop_all.setEnabled(True)
         self._refresh_server_combo()
@@ -7651,6 +8405,7 @@ class MainWindow(QMainWindow):
             f"Loading model — PID {pid} — {base_url}  "
             f"({len(self._servers)} server(s) running)"
         )
+        return record
 
     def _launch_diffusion(
         self, entry: ModelEntry, cfg: TunedConfig, profile: ModelProfile
@@ -7799,7 +8554,7 @@ class MainWindow(QMainWindow):
             self._server_ready = False
             self._btn_stop.setEnabled(False)
             self._btn_stop_all.setEnabled(False)
-            self._btn_launch.setEnabled(True)
+            self._enable_launch_when_ocr_idle()
             self._refresh_server_combo()
             return
 
@@ -7814,6 +8569,11 @@ class MainWindow(QMainWindow):
                     break
         if record is None:
             record = self._servers[-1]
+        if record is self._ocr_server_record:
+            if self._ocr_worker is not None:
+                self._ocr_worker.cancel()
+            elif not record.get("ocr_started"):
+                self._fail_pending_ocr(record, "The OCR server was stopped before it became ready.")
         self._servers.remove(record)
 
         srv = record.get("proc")
@@ -7842,7 +8602,7 @@ class MainWindow(QMainWindow):
             self._btn_stop.setEnabled(False)
             self._btn_stop_all.setEnabled(False)
             self._status.showMessage("Server stopped.")
-        self._btn_launch.setEnabled(True)
+        self._enable_launch_when_ocr_idle()
         self._refresh_server_combo()
         self._log("[AutoTuner] Stop signal sent.")
 
@@ -7857,7 +8617,7 @@ class MainWindow(QMainWindow):
         self._stop_all_servers()
         self._btn_stop.setEnabled(False)
         self._btn_stop_all.setEnabled(False)
-        self._btn_launch.setEnabled(True)
+        self._enable_launch_when_ocr_idle()
         self._refresh_server_combo()
         self._status.showMessage(f"Stopped all {n} server(s).")
 
@@ -7914,6 +8674,18 @@ class MainWindow(QMainWindow):
 
     def _stop_all_servers(self) -> None:
         """Stop every running server (used on quit and by ‘Stop all’)."""
+        if self._ocr_worker is not None:
+            self._ocr_worker.cancel()
+        elif self._ocr_server_record is not None:
+            pending_runner = self._ocr_server_record.pop("ocr_prepared_runner", None)
+            if isinstance(pending_runner, OcrJobRunner):
+                pending_runner.cancel()
+                pending_runner.finalize_prepared(
+                    "cancelled", "OCR cancelled while stopping all servers"
+                )
+            self._ocr_server_record = None
+            self._finish_ocr_ui()
+            self._set_ocr_controls_locked(False)
         for record in self._servers:
             srv = record.get("proc")
             if srv is not None:
@@ -7948,6 +8720,10 @@ class MainWindow(QMainWindow):
                     f"[AutoTuner] Server on port {record.get('port')} "
                     f"({record.get('model')}) exited (code {code})."
                 )
+                self._fail_pending_ocr(
+                    record,
+                    f"llama-server exited while loading the OCR model (code {code}).",
+                )
         if len(still_live) != len(self._servers):
             self._servers = still_live
             if self._servers:
@@ -7965,7 +8741,7 @@ class MainWindow(QMainWindow):
                 self._btn_stop.setEnabled(False)
                 self._btn_stop_all.setEnabled(False)
                 self._status.showMessage("Server exited.")
-            self._btn_launch.setEnabled(True)
+            self._enable_launch_when_ocr_idle()
             self._refresh_server_combo()
 
         # Health-probe any not-yet-ready server so its status flips to Ready.
@@ -7973,15 +8749,47 @@ class MainWindow(QMainWindow):
             if record.get("ready"):
                 continue
             base_url = record.get("base_url")
-            if not base_url:
+            health_base_url = record.get("client_base_url") or base_url
+            if not health_base_url:
+                continue
+            deadline = float(record.get("ocr_deadline", 0.0) or 0.0)
+            if deadline and time.monotonic() >= deadline:
+                self._fail_pending_ocr(
+                    record,
+                    "llama-server did not become ready for OCR within 300 seconds.",
+                )
+                QTimer.singleShot(0, lambda r=record: self._stop_specific_server(r))
                 continue
             try:
                 import urllib.request
 
-                with urllib.request.urlopen(f"{base_url}/health", timeout=0.3) as resp:
+                with urllib.request.urlopen(
+                    f"{health_base_url}/health", timeout=0.3
+                ) as resp:
                     ready = resp.status == 200
             except Exception:
                 ready = False
+            if ready and record is self._ocr_server_record:
+                expected_alias = str(record.get("alias") or "")
+                served_ids = server_model_ids(
+                    str(health_base_url), timeout_seconds=0.3
+                )
+                if served_ids is None:
+                    # /health can turn green a fraction before /v1/models is
+                    # queryable. Retry on the next poll instead of calling a
+                    # transient verification failure a hostile endpoint.
+                    continue
+                if not expected_alias or expected_alias not in served_ids:
+                    shown = ", ".join(served_ids) if served_ids else "none"
+                    self._fail_pending_ocr(
+                        record,
+                        "A different service answered on the OCR port "
+                        f"(expected {expected_alias!r}; served models: {shown}).",
+                    )
+                    QTimer.singleShot(
+                        0, lambda r=record: self._stop_specific_server(r)
+                    )
+                    continue
             if ready:
                 record["ready"] = True
                 proc = record.get("proc")
@@ -8002,6 +8810,7 @@ class MainWindow(QMainWindow):
                         f"Ready — PID {pid} — {base_url}  "
                         f"({len(self._servers)} server(s) running)"
                     )
+                self._start_pending_ocr(record)
 
         # If enabled, poll /slots at a lower cadence than the 500 ms process
         # liveness check. This keeps the server switcher useful for continuous
@@ -8024,7 +8833,7 @@ class MainWindow(QMainWindow):
         if now < float(record.get("slots_next_probe", 0.0) or 0.0):
             return False
         record["slots_next_probe"] = now + 2.0
-        base_url = record.get("base_url")
+        base_url = record.get("client_base_url") or record.get("base_url")
         if not base_url:
             return False
         old = str(record.get("slots_summary", "") or "")
@@ -8130,6 +8939,51 @@ class MainWindow(QMainWindow):
             if a0 is not None:
                 a0.ignore()
             return
+
+        # Never destroy a QThread while document conversion or an HTTP OCR
+        # request is active. Give the user an explicit cancel-and-quit path,
+        # then wait for the shared runner to close LibreOffice/HTTP cleanly.
+        ocr_thread = self._ocr_thread
+        try:
+            ocr_running = ocr_thread is not None and ocr_thread.isRunning()
+        except RuntimeError:
+            ocr_running = False
+            self._ocr_thread = None
+            self._ocr_worker = None
+        if ocr_running:
+            reply = QMessageBox.question(
+                self,
+                "OCR still running",
+                "Cancel the active OCR job and quit AutoTuner?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._force_quit = False
+                if a0 is not None:
+                    a0.ignore()
+                return
+            if self._ocr_worker is not None:
+                self._ocr_worker.cancel()
+            if self._ocr_server_record is not None:
+                self._stop_specific_server(self._ocr_server_record)
+            assert ocr_thread is not None
+            ocr_thread.quit()
+            if not ocr_thread.wait(15000):
+                QMessageBox.warning(
+                    self,
+                    "OCR is still stopping",
+                    "The OCR worker has not released its resources yet. "
+                    "Please wait a moment and try Quit again.",
+                )
+                self._force_quit = False
+                if a0 is not None:
+                    a0.ignore()
+                return
+            self._ocr_thread = None
+            self._ocr_worker = None
+            self._finish_ocr_ui()
+            self._set_ocr_controls_locked(False)
 
         # Stop periodic timers first so no new background work is started
         # while we're tearing down.  Both timers are children of self so Qt

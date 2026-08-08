@@ -160,6 +160,7 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
             is_sharded = split_count > 1
 
             has_mtp_tensors = False
+            has_dspark_tensors = False
             scan_complete = False
             try:
                 for _ in range(n_tensors):
@@ -168,6 +169,19 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
                     n_dims = struct.unpack("<I", f.read(4))[0]
                     # skip: dims (u64 * n_dims) + type (u32) + offset (u64)
                     f.read(8 * n_dims + 4 + 8)
+                    tl = tname.lower()
+                    # DSpark uses the DFlash architecture plus an additional
+                    # Markov/confidence head, so ``general.architecture`` alone
+                    # cannot distinguish it. b10329 names those root tensors
+                    # markov_w1 / markov_w2 / conf_proj. Retain a synthetic
+                    # marker so command generation can select draft-dspark.
+                    if not has_dspark_tensors and (
+                        "markov_w1" in tl
+                        or "markov_w2" in tl
+                        or "conf_proj" in tl
+                        or "markov_head" in tl
+                    ):
+                        has_dspark_tensors = True
                     if not has_mtp_tensors:
                         # (a) Name-based: the canonical llama.cpp nextn tensors
                         #     are named "blk.{N}.nextn.*" (eh_proj, embed_tokens,
@@ -175,7 +189,6 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
                         #     independent of block_count, so it works even when
                         #     block_count is unreadable or the block is numbered
                         #     unexpectedly. Some forks emit "mtp" in the name.
-                        tl = tname.lower()
                         if "nextn" in tl or "mtp" in tl:
                             has_mtp_tensors = True
                         # (b) Index-based: a block index at/after block_count is
@@ -205,6 +218,8 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
                 md["__mtp_scan__"] = "absent"
             else:
                 md["__mtp_scan__"] = "inconclusive"
+            if has_dspark_tensors:
+                md["__dspark_scan__"] = "found"
 
             return md
     except (OSError, struct.error, EOFError, ValueError, UnicodeDecodeError):
@@ -255,7 +270,7 @@ def metadata_is_standalone_drafter(md: Dict[str, Any]) -> bool:
 # target. Used by the scan reclassification so such files are paired to a
 # target instead of appearing in the chooser. Covers the Gemma 4 MTP
 # assistant heads AND the EAGLE-3 / DFlash draft models (PR #18039 / #22105).
-_DRAFTER_ARCHS = frozenset({"eagle3", "dflash"})
+_DRAFTER_ARCHS = frozenset({"eagle3", "dflash", "dspark"})
 
 
 def metadata_is_drafter_file(md: Dict[str, Any]) -> bool:
@@ -1111,6 +1126,8 @@ class ModelEntry:
                      in PR #24593 since b9723).
         ``"dflash"``— DFlash block-diffusion draft model (arch ``dflash``),
                      ``-md`` + ``--spec-type draft-dflash`` (PR #22105).
+        ``"dspark"``— DSpark's DFlash-derived draft with Markov head,
+                     ``-md`` + ``--spec-type draft-dspark`` (b10164+).
         """
         if not self.metadata:
             return None
@@ -1119,6 +1136,20 @@ class ModelEntry:
             return "mtp"
         if arch == "eagle3":
             return "eagle3"
+        if arch == "dspark" or (
+            arch == "dflash"
+            and (
+                self.metadata.get("__dspark_scan__") == "found"
+                or bool(
+                    re.search(
+                        r"(?:^|[-_.])dspark(?:[-_.]|$)",
+                        self.name,
+                        re.IGNORECASE,
+                    )
+                )
+            )
+        ):
+            return "dspark"
         if arch == "dflash":
             return "dflash"
         return None
@@ -1325,12 +1356,13 @@ _DRAFT_FILENAME_TOKENS = (
     "assistant",
     "draft",
     "mtp",
-    # EAGLE-3 / DFlash draft models ship as separate GGUFs named
-    # ``…-eagle3`` / ``…-dflash``; treat them as drafts so they pair to a
-    # target via -md instead of showing up as choosable models.
+    # EAGLE-3 / DFlash / DSpark draft models ship as separate GGUFs named
+    # ``…-eagle3`` / ``…-dflash`` / ``dspark-…``; treat them as drafts so
+    # they pair to a target via -md instead of showing up as choosable models.
     "eagle3",
     "eagle",
     "dflash",
+    "dspark",
 )
 
 # Maximum size for an ambiguously named GGUF to be treated as a standalone
@@ -1365,7 +1397,8 @@ _QUANT_CORE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DRAFT_MARKER_RE = re.compile(
-    r"(?:^|[-_.])(?:assistant|draft|mtp|eagle3|eagle|dflash)(?=[-_.]|$)", re.IGNORECASE
+    r"(?:^|[-_.])(?:assistant|draft|mtp|eagle3|eagle|dflash|dspark)(?=[-_.]|$)",
+    re.IGNORECASE,
 )
 
 
@@ -1652,8 +1685,8 @@ def scan_models(
             continue
         md = read_gguf_metadata(m) if read_metadata else {}
         if md and metadata_is_drafter_file(md):
-            # Standalone drafter (Gemma 4 MTP assistant head, EAGLE-3, or
-            # DFlash) — reclassify into the draft pool so phase 2 pairs it
+            # Standalone drafter (Gemma 4 MTP assistant head, EAGLE-3,
+            # DFlash, or DSpark) — reclassify into the draft pool so phase 2 pairs it
             # to its target via -md instead of listing it as a model.
             if m not in drafts:
                 drafts.append(m)

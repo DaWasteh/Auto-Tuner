@@ -103,22 +103,37 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--cache-ram",
     "--cache-type-k",
     "--cache-type-v",
+    "--chat-template",
+    "--chat-template-file",
     "--chat-template-kwargs",
     "--ctx-size",
     "--diffusion-algorithm",
     "--diffusion-block-length",
     "--diffusion-eps",
     "--diffusion-steps",
+    "--dry-allowed-length",
+    "--dry-base",
+    "--dry-multiplier",
+    "--dry-penalty-last-n",
+    "--dry-sequence-breaker",
     "--fit",
     "--flash-attn",
+    "--frequency-penalty",
     "--gpu-layers",
     "--host",
+    "--image-max-tokens",
+    "--image-min-tokens",
     "--load-mode",
     "--main-gpu",
+    "--media-path",
     "--mcp-servers-config",
     "--mcp-servers-json",
     "--min-p",
     "--mmproj",
+    "--models-dir",
+    "--models-max",
+    "--models-preset",
+    "--mtmd-batch-max-tokens",
     "--model",
     "--model-draft",
     "--n-cpu-moe",
@@ -129,14 +144,18 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--predict",
     "--presence-penalty",
     "--prompt",
+    "--repeat-last-n",
     "--reasoning-budget",
     "--reasoning-budget-message",
     "--repeat-penalty",
     "--rope-scale",
     "--rope-scaling",
+    "--spec-draft-model",
     "--spec-draft-n-max",
+    "--spec-draft-n-min",
     "--spec-draft-ngl",
     "--spec-draft-p-min",
+    "--spec-draft-p-split",
     "--spec-ngram-map-k4v-min-hits",
     "--spec-ngram-map-k4v-size-m",
     "--spec-ngram-map-k4v-size-n",
@@ -149,6 +168,8 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--tensor-split",
     "--threads",
     "--threads-batch",
+    "--tools",
+    "--tools-runtime",
     "--top-k",
     "--top-p",
     "--ubatch-size",
@@ -314,6 +335,9 @@ _MIN_VISION_PROMPT_CACHE_BUILD = 10045
 # b10151 split the old mmap-backed ``mlock`` mode into two explicit choices:
 # ``mlock`` (normal reads + lock) and ``mmap+mlock`` (mapped + lock).
 _MIN_DISTINCT_MLOCK_BUILD = 10151
+# DSpark landed in b10164. Older binaries advertise --spec-type but reject
+# the new enum value, so ordinary flag-name probing cannot catch this case.
+_MIN_DSPARK_BUILD = 10164
 
 
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
@@ -356,6 +380,11 @@ def _probe_binary_build_number(binary: str) -> Optional[int]:
         return _probe_build_number_cached(resolved, st.st_mtime_ns, st.st_size)
     except OSError:
         return None
+
+
+def probe_binary_build_number(binary: str) -> Optional[int]:
+    """Public, cached build probe shared by GUI/TUI feature workflows."""
+    return _probe_binary_build_number(binary)
 
 
 def _memlock_limit_gb() -> Optional[float]:
@@ -432,6 +461,90 @@ def _adapt_load_mode_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     return adapted, notes
 
 
+def _adapt_spec_types_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
+    """Remove DSpark's whole external-draft path on pre-b10164 builds.
+
+    ``--help`` probing only discovers option *names*. A b10151 binary therefore
+    appears to support ``--spec-type`` even though it rejects the newer
+    ``draft-dspark`` enum value. Falling back to plain ``-md`` would be worse:
+    DSpark carries a Markov head and must not silently run as ordinary DFlash.
+    Keep any comma-separated n-gram method, but remove the DSpark model and its
+    draft-only tuning arguments with an explicit compatibility note.
+    """
+    if not cmd:
+        return [], []
+    build = _probe_binary_build_number(cmd[0])
+    if build is None or build >= _MIN_DSPARK_BUILD:
+        return list(cmd), []
+
+    adapted = list(cmd)
+    notes: List[str] = []
+    found_dspark = False
+    i = 1
+    while i < len(adapted):
+        token = adapted[i]
+        flag = _flag_name(token)
+        if flag != "--spec-type":
+            i += 1
+            continue
+        inline = "=" in token
+        if inline:
+            raw = token.split("=", 1)[1]
+        elif i + 1 < len(adapted):
+            raw = adapted[i + 1]
+        else:
+            i += 1
+            continue
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+        if "draft-dspark" not in values:
+            i += 1 if inline else 2
+            continue
+        found_dspark = True
+        kept = [v for v in values if v != "draft-dspark"]
+        if kept:
+            replacement = ",".join(kept)
+            if inline:
+                adapted[i] = f"--spec-type={replacement}"
+            else:
+                adapted[i + 1] = replacement
+            i += 1 if inline else 2
+        else:
+            del adapted[i : i + (1 if inline else 2)]
+
+    if not found_dspark:
+        return adapted, notes
+
+    # Remove the external DSpark model and draft-only parameters. Preserve any
+    # surviving n-gram method and its --spec-ngram-* tuning flags.
+    draft_value_flags = {
+        "-md",
+        "--model-draft",
+        "--spec-draft-model",
+        "--spec-draft-ngl",
+        "--spec-draft-n-max",
+        "--spec-draft-n-min",
+        "--spec-draft-p-min",
+        "--spec-draft-p-split",
+    }
+    cleaned: List[str] = [adapted[0]]
+    i = 1
+    while i < len(adapted):
+        token = adapted[i]
+        flag = _flag_name(token)
+        if flag in draft_value_flags:
+            i += 1
+            if "=" not in token and i < len(adapted):
+                i += 1
+            continue
+        cleaned.append(token)
+        i += 1
+    notes.append(
+        "draft-dspark and its external draft model disabled "
+        f"(requires llama.cpp b{_MIN_DSPARK_BUILD}+, selected b{build})"
+    )
+    return cleaned, notes
+
+
 def prepare_command_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     """Return ``cmd`` adapted/pruned for the selected binary plus changes.
 
@@ -446,8 +559,9 @@ def prepare_command_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     if not flags:
         return list(cmd), []
     adapted, mode_changes = _adapt_load_mode_for_binary(cmd)
+    adapted, spec_changes = _adapt_spec_types_for_binary(adapted)
     filtered, removed = _filter_command_for_supported_flags(adapted, flags)
-    return filtered, mode_changes + removed
+    return filtered, mode_changes + spec_changes + removed
 
 
 def gemma_draft_needs_ik_fork(
@@ -1355,6 +1469,7 @@ def _pick_kv_quant(
 
     Order tried (top → bottom = best → worst quality):
 
+        K=f16   V=f16      # reference quality (profiles that request F16)
         K=q8_0  V=q8_0     # symmetric high
         K=q8_0  V=q5_0     # asymmetric mid     (only if asymmetric=True)
         K=q5_0  V=q5_0     # symmetric mid
@@ -1386,10 +1501,13 @@ def _pick_kv_quant(
         ]
 
     # Honour profile_recommended as the starting *floor* — never go above
-    # what the model author tested. If the recommended quant is q5_0 we
-    # skip the q8_0 rows.
-    rec = profile_recommended.lower()
-    if rec in ("q8_0", "q5_0", "q4_0"):
+    # what the model author tested. F16 is opt-in only: unknown/empty profile
+    # values must preserve the historical Q8 starting point instead of
+    # unexpectedly doubling KV memory.
+    rec = profile_recommended.strip().lower()
+    if rec == "f16":
+        pairs.insert(0, ("f16", "f16"))
+    elif rec in ("q8_0", "q5_0", "q4_0"):
         # Drop pairs whose K-quant is strictly better than the recommended.
         order_rank = {"q4_0": 0, "q5_0": 1, "q8_0": 2}
         rec_rank = order_rank[rec]
@@ -2975,7 +3093,11 @@ def compute_config(
         ubatch=ubatch,
         cache_k=cache_k,
         cache_v=cache_v,
-        flash_attn=True,
+        flash_attn=(
+            bool(profile.flash_attn)
+            if getattr(profile, "flash_attn", None) is not None
+            else True
+        ),
         sampling=sampling,
         mlock=mlock,
         no_mmap=no_mmap,
@@ -3558,9 +3680,10 @@ def build_command(
     # The spec-type token an EXTERNAL drafter needs, if any. Plain sibling
     # drafters (auto-detected from -md) need no token. Standalone MTP heads
     # (Gemma 4 assistant) need "draft-mtp"; EAGLE-3 draft models need
-    # "draft-eagle3"; DFlash needs "draft-dflash" (PR #18039/#22105; Qwen3.5/
-    # 3.6 EAGLE-3 since PR #24593 / b9723). EAGLE-3 reads the target's hidden
-    # states for higher acceptance than a plain draft of the same size.
+    # "draft-eagle3"; DFlash needs "draft-dflash"; and b10164+ DSpark needs
+    # "draft-dspark" because its DFlash-derived graph carries an additional
+    # Markov head. EAGLE-3 reads the target's hidden states for higher
+    # acceptance than a plain draft of the same size.
     external_spec_type: Optional[str] = None
     if use_external:
         external_spec_type = getattr(draft_model, "drafter_spec_type", None)
@@ -3623,6 +3746,11 @@ def build_command(
     elif external_spec_type == "dflash":
         # DFlash block-diffusion draft model: emits a whole block per step.
         spec_types.append("draft-dflash")
+    elif external_spec_type == "dspark":
+        # DSpark extends DFlash with an anchor-first Markov proposal head.
+        # prepare_command_for_binary removes this whole path on pre-b10164
+        # binaries because flag-name probing cannot validate enum values.
+        spec_types.append("draft-dspark")
     if use_ngram:
         spec_types.append(ngram_method)
     if spec_types:
@@ -3697,8 +3825,10 @@ def build_command(
         # defaults — we deliberately don't guess sub-parameter flag names for
         # methods the AutoTuner hasn't explicitly calibrated.
 
-    if config.flash_attn:
-        cmd += ["-fa", "on"]
+    # Tri-state llama.cpp defaults to ``auto``. Emit both states explicitly so
+    # an OCR/reference profile (or an unchecked Expert toggle) can genuinely
+    # disable FA instead of silently inheriting auto=on from b10329.
+    cmd += ["-fa", "on" if config.flash_attn else "off"]
     if config.numa:
         cmd += ["--numa", config.numa]
     load_mode = effective_load_mode(config)

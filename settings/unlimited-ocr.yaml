@@ -1,0 +1,56 @@
+display_name: "Unlimited OCR (Baidu / DeepSeek-OCR runtime)"
+patterns:
+  - "unlimited-ocr"
+  - "unlimited ocr"
+# b10285 added multi-row DeepSeek-OCR batching; b10287 applies the model's
+# 32-tile preprocessing metadata. Older builds can load some variants but do
+# not reproduce Unlimited-OCR's intended page pipeline.
+min_llama_build: 10287
+max_context: 32768
+performance_target: "balanced"
+# OCR decoding is unusually sensitive to cache quantization; the official
+# b10329 quality recipe uses the default F16 cache. Keep it exact when memory
+# allows instead of trading document accuracy for a small VRAM reduction.
+recommended_kv_quant: "f16"
+flash_attn: false
+draft_max: 0
+
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+# Mirrors the b10329 llama.cpp Unlimited-OCR regression recipe. DRY is a
+# bounded substitute for the reference model's sliding no-repeat n-gram guard.
+extra_args:
+  - "--chat-template"
+  - "deepseek-ocr"
+  - "--no-jinja"
+  - "--no-warmup"
+  - "--dry-multiplier"
+  - "0.8"
+  - "--dry-base"
+  - "1.75"
+  - "--dry-allowed-length"
+  - "2"
+  - "--dry-penalty-last-n"
+  - "64"
+  - "--dry-sequence-breaker"
+  - "none"
+
+notes: >
+  OCR/document model. Use AutoTuner's OCR workflow so images are normalized,
+  PDFs are rendered page-by-page, and Word/Office files are converted through
+  LibreOffice before they are sent to llama-server. The verified prompt is
+  "document parsing."; "Free OCR." can return immediate EOS on Unlimited-OCR.

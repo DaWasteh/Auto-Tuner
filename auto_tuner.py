@@ -35,15 +35,17 @@ from autotuner_version import VERSION
 
 from hardware import detect_system, format_system, SystemInfo
 from launcher import launch
-from scanner import scan_models, group_entries, ModelEntry
+from scanner import scan_models, group_entries, read_gguf_metadata, ModelEntry
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import (
     build_command,
     build_diffusion_command,
     build_diffusion_server_command,
     compute_config,
+    effective_load_mode,
     gemma_draft_needs_ik_fork,
     prepare_command_for_binary,
+    probe_binary_build_number,
     TunedConfig,
 )
 from performance_target import (
@@ -52,6 +54,18 @@ from performance_target import (
     describe_targets,
 )
 import app_settings
+from ocr_workflow import (
+    OcrCancelled,
+    OcrJobOptions,
+    OcrJobRunner,
+    OcrWorkflowError,
+    client_base_url,
+    is_ocr_model,
+    ocr_model_preset,
+    ocr_projector_warning,
+    tcp_port_in_use,
+    wait_for_server,
+)
 
 # ---------------------------------------------------------------------------
 # Terminal presentation helpers
@@ -238,7 +252,11 @@ def _print_system(info: SystemInfo) -> None:
 def _capability_markers(entry: ModelEntry, *, plain: Optional[bool] = None) -> str:
     """Return GUI-parity capability markers, including embedded MTP drafts."""
     use_plain = _RENDERER.plain if plain is None else plain
-    symbols = ("[V]", "[D]", "[T]", "[U]") if use_plain else ("👁", "⚡", "🧠", "🛠")
+    symbols = (
+        ("[V]", "[D]", "[T]", "[U]", "[O]")
+        if use_plain
+        else ("👁", "⚡", "🧠", "🛠", "📄")
+    )
     markers = []
     if entry.has_vision:
         markers.append(symbols[0])
@@ -248,6 +266,8 @@ def _capability_markers(entry: ModelEntry, *, plain: Optional[bool] = None) -> s
         markers.append(symbols[2])
     if entry.supports_tool_use:
         markers.append(symbols[3])
+    if is_ocr_model(entry):
+        markers.append(symbols[4])
     return " ".join(markers) or "-"
 
 
@@ -256,9 +276,9 @@ def _print_menu(groups: dict) -> List[ModelEntry]:
     flat: List[ModelEntry] = []
     _RENDERER.section("Available models")
     legend = (
-        "[V] vision / [D] draft/MTP / [T] thinking / [U] tools"
+        "[V] vision / [D] draft/MTP / [T] thinking / [U] tools / [O] OCR"
         if _RENDERER.plain
-        else "👁 vision / ⚡ draft/MTP / 🧠 thinking / 🛠 tools"
+        else "👁 vision / ⚡ draft/MTP / 🧠 thinking / 🛠 tools / 📄 OCR"
     )
     for line in _RENDERER._lines(legend):
         print("  " + line)
@@ -320,10 +340,9 @@ def _print_config(
     print(f"  Threads         : {cfg.threads} (batch: {cfg.batch_threads})")
     print(f"  Batch / ubatch  : {cfg.batch} / {cfg.ubatch}")
     print(f"  Flash attention : {'on' if cfg.flash_attn else 'off'}")
-    if cfg.mlock:
-        print("  mlock           : on (model pinned in RAM/VRAM)")
-    if cfg.no_mmap:
-        print("  no-mmap         : on (prevent swapping)")
+    load_mode = effective_load_mode(cfg)
+    if load_mode is not None:
+        print(f"  Load mode       : {load_mode}")
     if cfg.numa:
         print(f"  NUMA            : {cfg.numa}")
     if cfg.no_context_shift:
@@ -450,6 +469,185 @@ def _ask_interactive_features(
         )
 
     return use_vision, use_draft, use_thinking, use_ngram, effective_draft
+
+
+def _ocr_options_for_selection(
+    model: ModelEntry,
+    args: argparse.Namespace,
+    *,
+    use_vision: bool,
+    non_interactive: bool,
+) -> Optional[OcrJobOptions]:
+    """Build the same OCR job options exposed by the Qt dialog."""
+    requested = bool(getattr(args, "ocr_input", None))
+    if not requested:
+        if non_interactive or not is_ocr_model(model):
+            return None
+        if not _confirm("OCR document workflow for this model?", default_yes=True):
+            return None
+
+    if not use_vision or model.mmproj is None:
+        raise OcrWorkflowError(
+            "OCR requires the model's matching mmproj; do not use --novision."
+        )
+
+    preset = ocr_model_preset(model)
+    projector_warning = ocr_projector_warning(model)
+    if projector_warning:
+        print(f"[AutoTuner] OCR projector warning: {projector_warning}")
+    raw_inputs = list(getattr(args, "ocr_input", None) or [])
+    if not raw_inputs:
+        try:
+            raw = input(
+                "OCR input file/folder (separate several paths with ';'): "
+            ).strip()
+        except EOFError as exc:
+            raise OcrWorkflowError("No OCR input was provided") from exc
+        raw_inputs = [part.strip() for part in raw.split(";") if part.strip()]
+    if not raw_inputs:
+        raise OcrWorkflowError("No OCR input was provided")
+
+    output_raw = getattr(args, "ocr_output", None)
+    if not output_raw and not non_interactive:
+        default_output = str(Path.cwd() / "ocr-output")
+        try:
+            entered = input(f"OCR output folder [{default_output}]: ").strip()
+        except EOFError:
+            entered = ""
+        output_raw = entered or default_output
+    output_dir = Path(output_raw or (Path.cwd() / "ocr-output"))
+
+    prompt = getattr(args, "ocr_prompt", None)
+    if prompt is None and not non_interactive:
+        try:
+            entered = input(f"OCR prompt [{preset.prompt}]: ").strip()
+        except EOFError:
+            entered = ""
+        prompt = entered or preset.prompt
+    prompt = preset.prompt if prompt is None else str(prompt)
+
+    return OcrJobOptions(
+        inputs=[Path(value) for value in raw_inputs],
+        output_dir=output_dir,
+        prompt=prompt,
+        max_tokens=int(getattr(args, "ocr_max_tokens", preset.max_tokens)),
+        dpi=int(getattr(args, "ocr_dpi", 220)),
+        page_range=str(getattr(args, "ocr_pages", "") or ""),
+        output_format=str(getattr(args, "ocr_format", "markdown")),
+        keep_rendered=bool(getattr(args, "ocr_keep_rendered", False)),
+        strip_grounding=(
+            False
+            if bool(getattr(args, "ocr_keep_grounding", False))
+            else preset.strip_grounding
+        ),
+        request_timeout_seconds=int(getattr(args, "ocr_timeout", 1200)),
+        stop_server_when_done=True,
+    ).normalized()
+
+
+def _run_ocr_terminal_job(
+    cmd: List[str],
+    cfg: TunedConfig,
+    model: ModelEntry,
+    profile: ModelProfile,
+    args: argparse.Namespace,
+    options: OcrJobOptions,
+) -> int:
+    """Start a job-owned server, process documents, then release VRAM."""
+    from server_process import ServerProcess
+
+    build = probe_binary_build_number(cmd[0])
+    preset = ocr_model_preset(model)
+    required_build = max(
+        int(getattr(profile, "min_llama_build", 0) or 0), preset.min_llama_build
+    )
+    if required_build and build is not None and build < required_build:
+        print(
+            f"[AutoTuner] OCR requires llama.cpp b{required_build}+ for "
+            f"{preset.label}; selected binary reports b{build}."
+        )
+        return 2
+    if required_build and build is None:
+        print(
+            f"[AutoTuner] Warning: could not verify the selected binary's build. "
+            f"{preset.label} is validated on b{required_build}+."
+        )
+
+    server = ServerProcess(cmd, env_overrides=cfg.env_overrides)
+
+    def progress(stage: str, current: int, total: int, message: str) -> None:
+        counter = f" [{current}/{total}]" if total else ""
+        print(f"[OCR:{stage}]{counter} {message}")
+
+    base_url = client_base_url(args.host, args.port)
+    runner = OcrJobRunner(
+        base_url,
+        model.name,
+        options,
+        model_name=model.name,
+        llama_build=build,
+        server_command=cmd,
+        progress=progress,
+    )
+    inference_started = False
+    try:
+        job_dir, total_pages = runner.prepare()
+        print(
+            f"[OCR:prepare] Prepared {total_pages} page(s); "
+            f"job directory: {job_dir}"
+        )
+        if tcp_port_in_use(args.host, args.port):
+            raise OcrWorkflowError(
+                f"Port {args.port} is already in use; refusing to send OCR "
+                "documents to an unverified endpoint."
+            )
+        server.start()
+        wait_for_server(
+            base_url,
+            timeout_seconds=300,
+            progress=progress,
+            process_is_running=lambda: (
+                server.proc is not None and server.proc.poll() is None
+            ),
+            expected_model_alias=model.name,
+        )
+        inference_started = True
+        result = runner.run()
+        print(_BAR)
+        print(f"  OCR output   : {result.job_dir}")
+        print(f"  Combined file: {result.combined_output}")
+        print(
+            f"  Pages        : {result.completed_pages}/{result.total_pages} complete, "
+            f"{result.failed_pages} failed"
+        )
+        print(f"  Manifest     : {result.manifest_path}")
+        print(_BAR)
+        if result.cancelled:
+            return 130
+        return 1 if result.failed_pages else 0
+    except OcrCancelled as exc:
+        if not inference_started:
+            runner.finalize_prepared("cancelled", str(exc))
+        print(f"[AutoTuner] OCR cancelled: {exc}")
+        return 130
+    except (OcrWorkflowError, OSError, ValueError) as exc:
+        if not inference_started:
+            runner.finalize_prepared("failed", str(exc))
+        print(f"[AutoTuner] OCR failed: {exc}")
+        logs = server.get_logs()
+        if logs:
+            print("[AutoTuner] Last llama-server output:")
+            for line in logs[-20:]:
+                print("  " + line.rstrip())
+        return 1
+    except KeyboardInterrupt:
+        runner.cancel()
+        if not inference_started:
+            runner.finalize_prepared("cancelled", "OCR cancelled by user")
+        print("\n[AutoTuner] OCR cancelled by user.")
+        return 130
+    finally:
+        server.stop()
 
 
 def _pick_model(
@@ -1201,6 +1399,68 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "The AutoTuner moves its estimated footprint to the RAM budget.",
     )
     p.add_argument(
+        "--ocr-input",
+        action="append",
+        metavar="PATH",
+        default=[],
+        help="Run the shared OCR workflow for a file or folder. May be repeated; "
+        "PDF pages are rendered and Office files are converted with LibreOffice.",
+    )
+    p.add_argument(
+        "--ocr-output",
+        metavar="DIR",
+        default=None,
+        help="OCR output parent directory (default: ./ocr-output).",
+    )
+    p.add_argument(
+        "--ocr-prompt",
+        default=None,
+        help="Override the detected OCR model family's verified task prompt.",
+    )
+    p.add_argument(
+        "--ocr-pages",
+        default="",
+        metavar="RANGE",
+        help="PDF page selection such as 1-3,5 (default: all pages).",
+    )
+    p.add_argument(
+        "--ocr-dpi",
+        type=int,
+        default=220,
+        metavar="N",
+        help="PDF render DPI, clamped to 72-600 (default: 220).",
+    )
+    p.add_argument(
+        "--ocr-max-tokens",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="Maximum generated tokens per page (default: 4096).",
+    )
+    p.add_argument(
+        "--ocr-format",
+        choices=("markdown", "text"),
+        default="markdown",
+        help="Combined/page output format (default: markdown).",
+    )
+    p.add_argument(
+        "--ocr-timeout",
+        type=int,
+        default=1200,
+        metavar="SECONDS",
+        help="llama-server request timeout per page (default: 1200).",
+    )
+    p.add_argument(
+        "--ocr-keep-rendered",
+        action="store_true",
+        help="Keep normalized/rendered page PNG files beside OCR results.",
+    )
+    p.add_argument(
+        "--ocr-keep-grounding",
+        action="store_true",
+        help="Keep <|ref|>/<|det|> coordinate markup instead of cleaning it.",
+    )
+    p.add_argument(
         "--no-prompt-cache",
         action="store_true",
         dest="no_prompt_cache",
@@ -1542,7 +1802,8 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                     size_bytes=draft_size,
                     mmproj=None,
                     draft=None,
-                    metadata={},
+                    metadata=read_gguf_metadata(model.draft),
+                    part_paths=[model.draft],
                 )
                 print(f"[AutoTuner] Found draft model: {draft_model.name}")
             except OSError as exc:
@@ -1565,6 +1826,17 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             effective_draft = None
         if use_nothinking:
             use_thinking = False
+
+        try:
+            ocr_options = _ocr_options_for_selection(
+                model,
+                args,
+                use_vision=use_vision,
+                non_interactive=non_interactive,
+            )
+        except OcrWorkflowError as exc:
+            print(f"[AutoTuner] OCR setup failed: {exc}")
+            return 2
 
         # ── Config computation ───────────────────────────────────────────
         # Resolve performance target: CLI > YAML profile > "balanced".
@@ -1662,7 +1934,11 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             model.is_diffusion or profile.runner == "llama-diffusion-cli"
         ) and profile.runner != "llama-diffusion-gemma-server"
 
-        extra = args.passthrough or []
+        extra = list(args.passthrough or [])
+        if ocr_options is not None:
+            # Make the request's model id deterministic across GUI/TUI and
+            # independent of llama-server's path-derived default alias.
+            extra = ["-a", model.name, *extra]
 
         if is_diffusion_run:
             # Resolve the diffusion binary. A profile's server_binary field
@@ -1779,7 +2055,16 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             )
 
         if args.dry_run:
-            if is_diffusion_run:
+            if ocr_options is not None:
+                print("[AutoTuner] --dry-run — not starting the OCR server/job.")
+                print("Server command:")
+                print("  " + " ".join(cmd))
+                print("OCR inputs:")
+                for input_path in ocr_options.inputs:
+                    print(f"  - {input_path}")
+                print(f"OCR output: {ocr_options.output_dir}")
+                print(f"OCR prompt: {ocr_options.prompt}")
+            elif is_diffusion_run:
                 print("[AutoTuner] --dry-run — not starting diffusion generation.")
                 print("Command:")
                 print("  " + " ".join(cmd))
@@ -1792,9 +2077,13 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
 
         try:
             prompt_label = (
-                "Run diffusion generation now?"
-                if is_diffusion_run
-                else "Launch llama-server now?"
+                "Run OCR document job now?"
+                if ocr_options is not None
+                else (
+                    "Run diffusion generation now?"
+                    if is_diffusion_run
+                    else "Launch llama-server now?"
+                )
             )
             launch_now = non_interactive or args.yes or _confirm(prompt_label)
         except KeyboardInterrupt:
@@ -1805,6 +2094,15 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             print("[AutoTuner] Launch skipped — back to the model menu.")
             first_iteration = False
             continue
+
+        if ocr_options is not None:
+            print(
+                "\n[AutoTuner] Starting the OCR model and processing documents "
+                "page-by-page. Ctrl+C cancels and releases the server.\n"
+            )
+            return _run_ocr_terminal_job(
+                cmd, cfg, model, profile, args, ocr_options
+            )
 
         if is_diffusion_run:
             print(

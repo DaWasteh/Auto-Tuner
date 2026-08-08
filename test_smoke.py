@@ -25,7 +25,12 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from hardware import GPUInfo, SystemInfo, detect_system, format_system  # noqa: E402
-from scanner import group_entries, scan_models, metadata_has_embedded_mtp  # noqa: E402
+from scanner import (  # noqa: E402
+    ModelEntry,
+    group_entries,
+    metadata_has_embedded_mtp,
+    scan_models,
+)
 from settings_loader import load_profiles, match_profile  # noqa: E402
 from tuner import (  # noqa: E402
     build_command,
@@ -1028,6 +1033,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_port_offset_combo",
         "_server_combo",
         "_btn_toggle_log",
+        "_btn_ocr",
         "_btn_launch",
         "_btn_stop",
         "_btn_stop_all",
@@ -1090,6 +1096,15 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     assert window._launch_options_group.maximumHeight() >= (
         window._launch_options_group.minimumSizeHint().height()
     )
+
+    launch_was_enabled = window._btn_launch.isEnabled()
+    fork_was_enabled = window._fork_combo.isEnabled()
+    window._set_ocr_controls_locked(True)
+    assert not window._btn_launch.isEnabled()
+    assert not window._fork_combo.isEnabled()
+    window._set_ocr_controls_locked(False)
+    assert window._btn_launch.isEnabled() == launch_was_enabled
+    assert window._fork_combo.isEnabled() == fork_was_enabled
 
     window.close()
     paths_dialog.close()
@@ -2045,13 +2060,12 @@ def test_resolver_matches_versioned_fork_dir(tmp_path, monkeypatch) -> None:
     assert Path(res1).resolve() == fork1b.resolve()
 
 
-def test_eagle3_and_dflash_drafter_detection() -> None:
-    """EAGLE-3 / DFlash drafter GGUFs are detected by architecture and
-    filename, classified as drafters (not choosable models), and expose the
-    spec-type token the launcher must emit."""
+def test_eagle3_dflash_and_dspark_drafter_detection(tmp_path) -> None:
+    """Current external draft families are classified and routed correctly."""
     from scanner import (
         metadata_is_drafter_file,
         metadata_is_standalone_drafter,
+        read_gguf_metadata,
         _is_draft_filename,
         _DRAFT_MARKER_RE,
     )
@@ -2059,6 +2073,7 @@ def test_eagle3_and_dflash_drafter_detection() -> None:
     # Architecture-based detection
     assert metadata_is_drafter_file({"general.architecture": "eagle3"})
     assert metadata_is_drafter_file({"general.architecture": "dflash"})
+    assert metadata_is_drafter_file({"general.architecture": "dspark"})
     assert metadata_is_drafter_file({"general.architecture": "gemma4-assistant"})
     assert not metadata_is_drafter_file({"general.architecture": "qwen3"})
     # eagle3/dflash are NOT 'standalone drafter' (that term is reserved for
@@ -2069,24 +2084,92 @@ def test_eagle3_and_dflash_drafter_detection() -> None:
     assert _is_draft_filename("Qwen3-4B-eagle3.gguf")
     assert _is_draft_filename("Qwen3-4B-eagle3-Q8_0.gguf")
     assert _is_draft_filename("Qwen3-4B-dflash.gguf")
+    assert _is_draft_filename("dspark-Qwen3-4B.gguf")
     assert _DRAFT_MARKER_RE.search("Qwen3-4B-eagle3.gguf")
     assert _DRAFT_MARKER_RE.search("Qwen3-4B-dflash.gguf")
+    assert _DRAFT_MARKER_RE.search("dspark-Qwen3-4B.gguf")
 
-    # drafter_spec_type maps arch -> spec-type token
-    def spec_type(arch: str) -> str | None:
-        a = arch.lower().strip()
-        if a.endswith("-assistant") or a.endswith("_assistant"):
-            return "mtp"
-        if a == "eagle3":
-            return "eagle3"
-        if a == "dflash":
-            return "dflash"
-        return None
+    def entry(arch: str, name: str, **metadata) -> ModelEntry:
+        return ModelEntry(
+            path=Path(name + ".gguf"),
+            name=name,
+            group=".",
+            size_bytes=1024,
+            metadata={"general.architecture": arch, **metadata},
+        )
 
-    assert spec_type("eagle3") == "eagle3"
-    assert spec_type("dflash") == "dflash"
-    assert spec_type("gemma4-assistant") == "mtp"
-    assert spec_type("qwen3") is None
+    assert entry("eagle3", "eagle").drafter_spec_type == "eagle3"
+    assert entry("dflash", "dflash").drafter_spec_type == "dflash"
+    assert entry("dflash", "dspark-model").drafter_spec_type == "dspark"
+    assert (
+        entry("dflash", "opaque", __dspark_scan__="found").drafter_spec_type
+        == "dspark"
+    )
+    assert entry("gemma4-assistant", "mtp").drafter_spec_type == "mtp"
+    assert entry("qwen3", "plain").drafter_spec_type is None
+
+    # Exercise the real tensor-table scan instead of only injecting the
+    # synthetic marker used by ModelEntry.
+    dspark_file = tmp_path / "opaque-sidecar.gguf"
+    key = b"general.architecture"
+    arch = b"dflash"
+    tensor = b"markov_w1.weight"
+    with dspark_file.open("wb") as stream:
+        stream.write(b"GGUF")
+        stream.write(struct.pack("<I", 3))
+        stream.write(struct.pack("<Q", 1))  # tensor count
+        stream.write(struct.pack("<Q", 1))  # KV count
+        stream.write(struct.pack("<Q", len(key)) + key)
+        stream.write(struct.pack("<I", 8))  # GGUF_TYPE_STRING
+        stream.write(struct.pack("<Q", len(arch)) + arch)
+        stream.write(struct.pack("<Q", len(tensor)) + tensor)
+        stream.write(struct.pack("<I", 1))  # n_dims
+        stream.write(struct.pack("<Q", 1))  # dim[0]
+        stream.write(struct.pack("<I", 0))  # tensor type
+        stream.write(struct.pack("<Q", 0))  # offset
+    metadata = read_gguf_metadata(dspark_file)
+    assert metadata["__dspark_scan__"] == "found"
+    assert entry("dflash", "opaque", **metadata).drafter_spec_type == "dspark"
+
+
+def test_dspark_command_and_pre_b10164_compatibility(tmp_path, monkeypatch) -> None:
+    import tuner
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Qwen3-4B", size_gb=4.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile)
+    draft = ModelEntry(
+        path=tmp_path / "dspark-Qwen3-4B.gguf",
+        name="dspark-Qwen3-4B",
+        group=".",
+        size_bytes=1024,
+        metadata={
+            "general.architecture": "dflash",
+            "__dspark_scan__": "found",
+        },
+    )
+    monkeypatch.setattr(
+        tuner,
+        "_probe_supported_flags",
+        lambda _binary: {"-m", "--model", "--spec-type"},
+    )
+    cmd = build_command(model, cfg, profile, draft_model=draft)
+    idx = cmd.index("--spec-type")
+    assert cmd[idx + 1] == "draft-dspark"
+    assert "-md" in cmd
+
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10163)
+    adapted, notes = tuner._adapt_spec_types_for_binary(cmd)
+    assert "draft-dspark" not in " ".join(adapted)
+    assert "-md" not in adapted
+    assert not any(token.startswith("--spec-draft-") for token in adapted)
+    assert "requires llama.cpp b10164+" in notes[0]
+
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10164)
+    current, notes = tuner._adapt_spec_types_for_binary(cmd)
+    assert current == cmd
+    assert notes == []
 
 
 def test_turbo_quant_mode_selection(tmp_path, monkeypatch) -> None:
@@ -5395,6 +5478,35 @@ def test_close_refuses_while_an_update_thread_is_running(monkeypatch) -> None:
     assert event.ignored
     assert window._force_quit is False
     assert messages and "still updating" in messages[0]
+
+
+def test_prune_dead_server_finalizes_pending_ocr() -> None:
+    import qt_launcher
+
+    class Process:
+        def is_running(self):
+            return False
+
+        def returncode(self):
+            return 9
+
+    record = {"proc": Process(), "ocr_started": False}
+
+    class Window:
+        _servers = [record]
+        _ocr_server_record = record
+        _ocr_worker = None
+        failures = []
+
+        def _fail_pending_ocr(self, failed_record, message):
+            self.failures.append((failed_record, message))
+
+    window = Window()
+    qt_launcher.MainWindow._prune_dead_servers(window)
+    assert window._servers == []
+    assert window.failures == [
+        (record, "llama-server exited while loading the OCR model (code 9).")
+    ]
 
 
 def test_update_reference_cleanup_only_clears_the_finished_thread() -> None:

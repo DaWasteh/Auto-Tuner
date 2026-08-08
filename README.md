@@ -13,6 +13,14 @@ the RAM/VRAM you actually have free — without manual edits.
 
 - **Interactive terminal menu** — pick from whatever GGUFs are in your
   models folder, no editing required.
+- **End-to-end OCR documents (GUI + TUI)** — OCR models get a 📄 action that
+  accepts images, multi-frame TIFF/GIF, PDF, Word/Office/OpenDocument,
+  presentation, spreadsheet, or whole-folder input. Office files are converted
+  with LibreOffice **before** the model claims RAM; PDFs are rendered with
+  PyMuPDF; pages are normalized with Pillow and sent through llama-server's
+  multimodal API. Per-page files, a combined Markdown/text result, and a hashed
+  JSON manifest go to the selected output folder. The source documents are
+  never modified.
 - **Visible throughput logs** — AutoTuner emits `--perf` on current
   llama.cpp builds so the separate terminal keeps showing prompt/eval
   timings and tokens/s; append `--no-perf` if you want quieter logs.
@@ -57,10 +65,12 @@ the RAM/VRAM you actually have free — without manual edits.
     between them. The auto pick prefers the **highest precision**
     (f32 > f16 > bf16) on an otherwise-equal name match; your manual
     choice is remembered per model.
-  - `*-assistant-*.gguf` / `*-draft-*.gguf` / `mtp-*.gguf` → speculative
-    decoding (smallest matching sibling wins). A leading `mtp-` explicitly
-    marks an external draft head even when newer Qwen-based heads are several
-    GiB; large infix `…-MTP-…` target models remain normal runnable models.
+  - `*-assistant-*.gguf` / `*-draft-*.gguf` / `mtp-*.gguf` / `dspark-*.gguf`
+    → speculative decoding (smallest matching sibling wins). A leading `mtp-`
+    explicitly marks an external draft head even when newer Qwen-based heads
+    are several GiB; large infix `…-MTP-…` target models remain normal runnable
+    models. EAGLE-3, DFlash, and b10329 DSpark sidecars are also classified from
+    GGUF architecture/tensor metadata and receive their required `--spec-type`.
 - **Themes and appearance editor** — choose built-in System, Dark, Dark Gray, Light, High Contrast, or the pink-accented Midnight Rose theme in **⚙ Settings**, or copy one in the in-app color/font editor and save it as a safe JSON user theme. See the complete [theme guide](docs/themes.md).
 - **Favorite models stay at the top** — click the star left of a model name
   to mark it. Active and inactive star colors follow the selected theme, and
@@ -71,6 +81,7 @@ the RAM/VRAM you actually have free — without manual edits.
   - ⚡ draft  (assistant sibling for speculative decoding)
   - 🧠 thinking (chat template emits `<think>` / `reasoning_content`)
   - 🛠 tool-use (chat template advertises `tool_calls` / `function_call`)
+  - 📄 OCR/document parsing (known OCR architecture/name)
 
   Detection reads the GGUF chat template directly — no name-based
   guessing — so `Qwen3-Coder` (no thinking) and `Qwen3-Embedding`
@@ -175,6 +186,39 @@ You can disable vision (mmproj) support in two ways:
 > unprobeable binaries safely fall back to `--cache-ram 0` while Vision is
 > active. This was runtime-verified on b10058 with a repeated Gemma 4 image
 > request (`cached_tokens`: 0 → 279).
+
+### OCR documents
+
+Select an OCR model with its matching mmproj (for example
+`Unlimited-OCR-BF16.gguf` + `mmproj-Unlimited-OCR-F16.gguf`). In the Qt GUI,
+click **📄 OCR…** or double-click the OCR model. Choose one or more files/folders,
+an output folder, PDF page range, DPI, output format, and token budget. The GUI
+converts/prepares documents first, loads the model, verifies the server's model
+alias, shows page progress, and optionally releases the server/VRAM afterward.
+
+Terminal equivalent:
+
+```bash
+python auto_tuner.py \
+  --model "Unlimited-OCR" \
+  --ocr-input document.pdf \
+  --ocr-input scans/ \
+  --ocr-output ocr-results \
+  --ocr-pages 1-5 \
+  --ocr-dpi 220 \
+  --ocr-max-tokens 4096 \
+  --non-interactive --yes
+```
+
+PDF rendering requires PyMuPDF and image normalization requires Pillow (both are
+installed by `requirements.txt`). Word/Office/OpenDocument input additionally
+requires a local LibreOffice installation; without it AutoTuner gives a clear
+error and leaves the source untouched. Unlimited-OCR uses its verified
+`document parsing.` prompt, F16 KV, deterministic sampling, explicit Flash
+Attention off, and requires llama.cpp b10287+ (b10329 recommended). For the
+full 32-tile Unlimited-OCR path, the mmproj must also contain
+`clip.vision.preproc_max_tiles=32`; AutoTuner warns when an older projector would
+silently fall back to 9 tiles.
 
 ## Installation
 
@@ -360,7 +404,9 @@ For repeatable scripts, use an unambiguous model with `--non-interactive` (or
 draft, and thinking features use their normal defaults, while n-gram remains
 opt-in via `--ngram`. The terminal UI shares the launch engine, but the GUI
 remains the place for persisted per-model Expert controls; advanced
-llama-server options can still be passed after `--`.
+llama-server options can still be passed after `--`. OCR models expose the same
+shared document pipeline through `--ocr-input` / `--ocr-output`; the job-owned
+server is stopped automatically when processing finishes.
 
 ### Qt GUI
 
@@ -371,6 +417,11 @@ python qt_launcher.py
 Same engine as the terminal launcher, plus a few quality-of-life bits
 that only make sense with persistent state:
 
+- **OCR dialog and progress.** OCR models show **📄 OCR…**; double-clicking one
+  opens the same workflow as the TUI. Inputs are prepared off the GUI thread,
+  mutable launch controls are locked until the validated server starts, Cancel
+  interrupts LibreOffice/HTTP/model loading, and successful output can be opened
+  directly from the completion dialog.
 - **Sticky per-model options.** Toggle vision / draft / thinking /
   n-gram / prompt-cache once, and pick an mmproj precision from the
   dropdown; the choices survive switching to another model and back,
@@ -446,7 +497,15 @@ that only make sense with persistent state:
 | `--no-mmproj-offload` | Keep an active vision projector in system RAM instead of VRAM; its size is moved into the RAM budget |
 | `--cache-ram-mib MIB` | Bound host prompt caching (`-1` unlimited, `0` disabled); without this flag the saved GUI cache limit is used |
 | `--no-prompt-cache` | Disable host-memory prompt caching (`--cache-ram 0`). Caching is auto-on; Vision requires llama.cpp b10045+ and falls back to off on older/unprobeable builds |
-| `--dry-run` | Print the command, don't start the server; never opens TUI prompts when used with `--model` |
+| `--ocr-input PATH` | Run OCR for a file or recursively for a folder; repeat for several inputs |
+| `--ocr-output DIR` | Parent folder for the timestamped OCR job/results |
+| `--ocr-pages RANGE` | PDF/multi-frame page selection such as `1-3,5` (default all) |
+| `--ocr-dpi N` | PDF render DPI, safely clamped to 72–600 (default 220) |
+| `--ocr-max-tokens N` | Maximum generated tokens per page (default 4096) |
+| `--ocr-format {markdown,text}` | Per-page and combined output format |
+| `--ocr-keep-rendered` | Keep normalized/rendered PNG pages for inspection |
+| `--ocr-keep-grounding` | Preserve OCR bounding-box/grounding markup instead of cleaning it |
+| `--dry-run` | Print the command and OCR plan, don't start the server; never opens TUI prompts when used with `--model` |
 | `--yes / -y` | Skip the launch confirmation prompt and use non-interactive defaults with `--model` |
 | `--non-interactive` | Require `--model` and never read prompts; intended for scripts/CI |
 | `--mode {chat,coding}` | Select profile sampling mode (default: saved GUI preference or `chat`) |
@@ -558,9 +617,9 @@ The tuner automatically searches for binaries in common local layouts.
 If you have a workspace like this, it "Just Works" without any flags:
 
 ```
-H:\GitHub\
+L:\GitHub\
 └── Auto Tuner\         ← clone of this repo
-H:\LAB\
+L:\LAB\
 └── ai-local\
     ├── llama.cpp\      ← standard build
     ├── tq_llama.cpp\   ← Turbo-Quant build
@@ -712,7 +771,8 @@ Notes on the new profiles:
 ```
 auto_tuner/
 ├── auto_tuner.py        # main entry: terminal menu + glue
-├── qt_launcher.py       # Qt GUI (model picker + sticky options + fork picker)
+├── qt_launcher.py       # Qt GUI (model picker + sticky options + OCR dialog)
+├── ocr_workflow.py      # shared GUI/TUI PDF/Office/image OCR pipeline
 ├── hardware.py          # CPU + multi-vendor GPU detection
 ├── scanner.py           # GGUF scanner: mmproj/draft pairing, capability detection
 ├── settings_loader.py   # YAML profile loader and matcher
@@ -740,16 +800,16 @@ repo keeps the build recipes in separate scripts so this README stays short:
 
 | File | Purpose |
 |------|---------|
-| [`llama_build.txt`](llama_build.txt) | Mainline llama.cpp Vulkan build (Windows/AMD-friendly; versioned `bXXXX_llama.cpp`). |
-| [`turboquant_llama_build.txt`](turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
-| [`ternary_bonsai_llama_build.txt`](ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
-| [`diffusion_llama_build.txt`](diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
-| [`diffusion_hip_llama_build.txt`](diffusion_hip_llama_build.txt) | DiffusionGemma HIP/ROCm build for AMD when Vulkan hits the ~1 GiB single-allocation limit. |
-| [`setup_llamacpp_cuda.ps1`](setup_llamacpp_cuda.ps1) | Windows NVIDIA/CUDA one-shot setup helper (PowerShell/Admin; freak288-style script). |
-| [`setup_llamacpp_turboquant_cuda.ps1`](setup_llamacpp_turboquant_cuda.ps1) | Windows NVIDIA/CUDA TurboQuant setup helper. |
+| [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline llama.cpp Vulkan build (Windows/AMD-friendly; versioned `bXXXX_llama.cpp`). |
+| [`turboquant_llama_build.txt`](building%20llama.cpp/turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
+| [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
+| [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
+| [`diffusion_hip_llama_build.txt`](building%20llama.cpp/diffusion_hip_llama_build.txt) | DiffusionGemma HIP/ROCm build for AMD when Vulkan hits the ~1 GiB single-allocation limit. |
+| [`setup_llamacpp_cuda.ps1`](building%20llama.cpp/setup_llamacpp_cuda.ps1) | Windows NVIDIA/CUDA one-shot setup helper (PowerShell/Admin; freak288-style script). |
+| [`setup_llamacpp_turboquant_cuda.ps1`](building%20llama.cpp/setup_llamacpp_turboquant_cuda.ps1) | Windows NVIDIA/CUDA TurboQuant setup helper. |
 
 The `*.txt` build recipes are PowerShell commands for the documented local
-workspace (`H:/LAB/ai-local` by default). They now handle both llama.cpp UI
+workspace (`L:/LAB/ai-local` on the documented Pandaking setup). They handle both llama.cpp UI
 layouts automatically (`tools/ui` since b9174, `tools/server/webui` on older
 forks) and fall back to the prebuilt UI if the fork does not ship UI sources.
 
@@ -758,17 +818,17 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (as of b10151)
+## Server features (as of b10329)
 
 The following `llama-server` features are supported (verified against `llama-server --help` / `tools/server/README.md`):
 
 | Flag | Support |
 |------|---------|
-| `-fa [on\|off\|auto]` | ✅ Emits the `-fa on` form |
+| `-fa [on\|off\|auto]` | ✅ Emits `-fa on` **or** `-fa off` explicitly; model profiles such as Unlimited-OCR can require the reference non-FA path |
 | `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ All in the dropdown |
 | `--fit off` | ✅ Always emitted so llama.cpp's own auto-fit pass (default `on`) doesn't silently re-adjust the computed values (AutoTuner is the authority) |
-| `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s. Current mainline already defaults timings on; users can append `--no-perf`. |
-| `--metrics` | ✅ Prometheus endpoint `GET /metrics` on the same host:port (see "Monitoring") |
+| `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s; users can append `--no-perf` |
+| `--metrics` | ✅ Prometheus endpoint `GET /metrics`, including b10282+ speculative draft/accept counters (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
 | `--cache-ram` / `-cram` | ✅ Host-memory prompt caching (PR #16391), auto-on with a 2048 MiB bounded default, adjustable in GUI/CLI and included in RAM planning. Vision caching is enabled for b10045+ and forced to `0` for older/unprobeable builds. |
 | `--reasoning on/off/auto` | ✅ Via dropdown |
@@ -778,7 +838,8 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--jinja` | ✅ Ticked visibly |
 | `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
 | `-md` external drafter | ✅ Without `--spec-type` — the presence of `-md` enables the draft path automatically in mainline (verified b9442) |
-| `--spec-type draft-mtp` | ✅ Integrated MTP (Qwen3.6-MTP etc.) — `draft-mtp` is the mainline name since PR #22673 merged (16 May 2026) |
+| `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.) |
+| `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. DSpark is emitted on b10164+; older binaries lose the entire DSpark path rather than mis-running it as DFlash |
 | `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Selectable via `ngram_method`; only the type token is emitted, sub-parameters are left to the llama.cpp defaults |
@@ -791,6 +852,30 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--rope-scaling yarn` | ✅ Already present |
 | `--numa` | ✅ Already present |
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
+| `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
+| Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+
+### Review b10151 → b10329
+
+Reviewed all **178 upstream commits** from exact tag **b10151**
+(`8e8681e0`) through **b10329** (`18f7ad7f`). The complete evidence and
+scope decisions are documented in
+[`docs/llama-b10329-audit.md`](docs/llama-b10329-audit.md).
+
+- **Integrated:** DSpark sidecar/tensor detection and `draft-dspark` build
+  gating; Unlimited-OCR's b10285 multi-row batching + b10287 32-tile fix;
+  deterministic OCR profile; complete GUI/TUI PDF/Office/image workflow;
+  b10329 value-bearing flag handling including `--tools-runtime`; explicit
+  Flash Attention off; F16 KV profile opt-in; selected-server alias/process
+  verification before any document upload.
+- **Automatic benefits:** new speculative counters appear in the already-enabled
+  `/metrics`; Qwen3-Next/DeepSeek V3.2/GLM MTP loaders, EAGLE-3 v3, model/router,
+  Vulkan/ROCm/Metal/CUDA/SYCL, tokenizer, and MTMD fixes require only a rebuilt
+  llama.cpp binary.
+- **Not automatic:** Docker tool isolation and MCP configs remain trusted Extra
+  CLI choices. The separate `llama-tts` breaking changes do not affect
+  AutoTuner's server runners. b10329 only announces a *future* upstream port
+  change; AutoTuner continues to pass explicit port 1234.
 
 ### Review b10107 → b10151
 
@@ -878,7 +963,7 @@ Changes this round are AutoTuner-side additions and fork-build fixes:
   2-bit/Ternary (`2b_`) Bonsai families stay distinct. Forks that match the
   name pattern but have no built `llama-server` binary are now reported in
   the `llama_cpp` debug category (instead of vanishing silently), and the
-  terminal launcher now finds `H:/LAB/ai-local` (the documented workspace)
+  terminal launcher now finds `L:/LAB/ai-local` (the documented workspace)
   even without `LLAMA_CPP_DIR` set.
 - **`bonsai-ternary.yaml`** corrected: `server_binary` now points to
   `2b_llama` (2-bit/Ternary fork), not `1b_llama` (1-bit Bonsai).

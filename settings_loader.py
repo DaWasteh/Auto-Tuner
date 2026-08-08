@@ -31,6 +31,12 @@ class ModelProfile:
     max_context: int = 8192
     sampling: Dict[str, Any] = field(default_factory=dict)
     recommended_kv_quant: str = "q5_0"
+    # Optional profile override for Flash Attention. None keeps AutoTuner's
+    # normal default; OCR/reference-sensitive models can require it off.
+    flash_attn: Optional[bool] = None
+    # Minimum numeric llama.cpp build needed by this model/runtime contract.
+    # Launchers surface this before model load; 0 means no build gate.
+    min_llama_build: int = 0
     extra_args: List[str] = field(default_factory=list)
     notes: str = ""
     source_file: Optional[str] = None  # which YAML this came from
@@ -150,6 +156,36 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         if not isinstance(extra, list):
             extra = []
 
+        flash_raw = data.get("flash_attn", None)
+        flash_attn: Optional[bool]
+        if isinstance(flash_raw, bool):
+            flash_attn = flash_raw
+        elif isinstance(flash_raw, int) and flash_raw in {0, 1}:
+            flash_attn = bool(flash_raw)
+        elif isinstance(flash_raw, str) and flash_raw.strip().lower() in {
+            "on",
+            "true",
+            "yes",
+            "1",
+        }:
+            flash_attn = True
+        elif isinstance(flash_raw, str) and flash_raw.strip().lower() in {
+            "off",
+            "false",
+            "no",
+            "0",
+        }:
+            flash_attn = False
+        else:
+            flash_attn = None
+        try:
+            min_llama_build = max(0, int(data.get("min_llama_build", 0) or 0))
+        except (TypeError, ValueError):
+            print(
+                f"[AutoTuner] {yml.name}: invalid min_llama_build; ignoring build gate."
+            )
+            min_llama_build = 0
+
         # RoPE-Scaling Konfiguration (optional)
         rope_scale_cfg = data.get("rope_scale") or {}
         if not isinstance(rope_scale_cfg, dict):
@@ -200,6 +236,8 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                 max_context=int(data.get("max_context", 8192)),
                 sampling=sampling,
                 recommended_kv_quant=str(data.get("recommended_kv_quant", "q5_0")),
+                flash_attn=flash_attn,
+                min_llama_build=min_llama_build,
                 extra_args=[str(x) for x in extra],
                 notes=str(data.get("notes", "") or ""),
                 source_file=yml.name,

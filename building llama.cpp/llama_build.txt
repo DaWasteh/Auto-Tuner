@@ -1,29 +1,60 @@
-cd L:\LAB\ai-local
-git clone https://github.com/KhronosGroup/SPIRV-Headers.git
-cmake -S .\SPIRV-Headers -B .\SPIRV-Headers\build `
+$ErrorActionPreference = "Stop"
+Set-Location "L:\LAB\ai-local"
+
+$version = "b10329"
+$expectedCommit = "18f7ad7fc912444acc0f51995a4b8e45fd9a0cd4"
+$dir = "${version}_llama.cpp"
+$repo = Join-Path (Get-Location) $dir
+$spirv = Join-Path (Get-Location) "SPIRV-Headers"
+
+# Install/update SPIR-V headers once. The Vulkan build consumes this prefix.
+if (-not (Test-Path $spirv)) {
+    git clone https://github.com/KhronosGroup/SPIRV-Headers.git $spirv
+    if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers clone failed" }
+} else {
+    git -C $spirv pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers update failed" }
+}
+cmake -S $spirv -B "$spirv\build" `
   -G "Visual Studio 18 2026" `
   -A x64 `
   -DCMAKE_INSTALL_PREFIX="L:/LAB/ai-local/SPIRV-Headers/install"
-cmake --build .\SPIRV-Headers\build --config Release
-cmake --install .\SPIRV-Headers\build --config Release
+if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers configure failed" }
+cmake --build "$spirv\build" --config Release --parallel 20
+if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers build failed" }
+cmake --install "$spirv\build" --config Release
+if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers install failed" }
 
-git clone https://github.com/ggml-org/llama.cpp.git _tmp_llama
-Push-Location .\_tmp_llama
-$desc = git describe --tags --always 2>$null
-$ver  = [regex]::Match($desc, 'b\d+').Value
-if (-not $ver) { $ver = "bUNKNOWN" }
-Pop-Location
-$dir = "${ver}_llama.cpp"
-if (Test-Path .\$dir) { Remove-Item .\$dir -Recurse -Force }
-Rename-Item .\_tmp_llama $dir
-Write-Host "==> Build-Verzeichnis: $dir"
+# Build the exact audited tag. Reusing the versioned checkout keeps the command
+# idempotent while reset --hard makes the source state reproducible.
+if (-not (Test-Path "$repo\.git")) {
+    git clone https://github.com/ggml-org/llama.cpp.git $repo
+    if ($LASTEXITCODE -ne 0) { throw "llama.cpp clone failed" }
+}
+git -C $repo fetch origin --tags --force
+if ($LASTEXITCODE -ne 0) { throw "Could not fetch llama.cpp tags" }
+git -C $repo checkout --detach $version
+if ($LASTEXITCODE -ne 0) { throw "Could not check out $version" }
+git -C $repo reset --hard $version
+if ($LASTEXITCODE -ne 0) { throw "Could not check out $version" }
+$actualCommit = (git -C $repo rev-parse HEAD).Trim()
+if ($actualCommit -ne $expectedCommit) {
+    throw "Tag $version resolved to $actualCommit, expected $expectedCommit"
+}
+Write-Host "==> Building llama.cpp $version ($actualCommit) in $repo"
 
-Push-Location .\$dir\tools\ui
-npm ci
-npm run build
-Pop-Location
+# b10329 stores the Web UI sources under tools/ui.
+Push-Location "$repo\tools\ui"
+try {
+    npm ci
+    if ($LASTEXITCODE -ne 0) { throw "Web UI dependency install failed" }
+    npm run build
+    if ($LASTEXITCODE -ne 0) { throw "Web UI build failed" }
+} finally {
+    Pop-Location
+}
 
-cmake -S .\$dir -B .\$dir\build `
+cmake -S $repo -B "$repo\build" `
   -G "Visual Studio 18 2026" `
   -A x64 `
   -DGGML_VULKAN=ON `
@@ -41,4 +72,9 @@ cmake -S .\$dir -B .\$dir\build `
   -DGGML_CCACHE=OFF `
   -DGGML_VULKAN_CHECK_RESULTS=OFF `
   -DCMAKE_PREFIX_PATH="L:/LAB/ai-local/SPIRV-Headers/install"
-cmake --build .\$dir\build --config Release --parallel 24
+if ($LASTEXITCODE -ne 0) { throw "llama.cpp configure failed" }
+cmake --build "$repo\build" --config Release --parallel 20
+if ($LASTEXITCODE -ne 0) { throw "llama.cpp build failed" }
+
+& "$repo\build\bin\Release\llama-server.exe" --version
+if ($LASTEXITCODE -ne 0) { throw "Built llama-server failed its version smoke test" }
