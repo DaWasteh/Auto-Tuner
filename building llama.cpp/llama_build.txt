@@ -1,80 +1,111 @@
 $ErrorActionPreference = "Stop"
 Set-Location "L:\LAB\ai-local"
 
-$version = "b10329"
-$expectedCommit = "18f7ad7fc912444acc0f51995a4b8e45fd9a0cd4"
-$dir = "${version}_llama.cpp"
-$repo = Join-Path (Get-Location) $dir
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][scriptblock]$Command
+    )
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+}
+
 $spirv = Join-Path (Get-Location) "SPIRV-Headers"
-
-# Install/update SPIR-V headers once. The Vulkan build consumes this prefix.
-if (-not (Test-Path $spirv)) {
-    git clone https://github.com/KhronosGroup/SPIRV-Headers.git $spirv
-    if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers clone failed" }
+if (-not (Test-Path "$spirv\.git")) {
+    Invoke-NativeChecked "SPIRV-Headers clone" {
+        git clone https://github.com/KhronosGroup/SPIRV-Headers.git $spirv
+    }
 } else {
-    git -C $spirv pull --ff-only
-    if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers update failed" }
+    Invoke-NativeChecked "SPIRV-Headers update" { git -C $spirv pull --ff-only }
 }
-cmake -S $spirv -B "$spirv\build" `
-  -G "Visual Studio 18 2026" `
-  -A x64 `
-  -DCMAKE_INSTALL_PREFIX="L:/LAB/ai-local/SPIRV-Headers/install"
-if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers configure failed" }
-cmake --build "$spirv\build" --config Release --parallel 20
-if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers build failed" }
-cmake --install "$spirv\build" --config Release
-if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers install failed" }
 
-# Build the exact audited tag. Reusing the versioned checkout keeps the command
-# idempotent while reset --hard makes the source state reproducible.
-if (-not (Test-Path "$repo\.git")) {
-    git clone https://github.com/ggml-org/llama.cpp.git $repo
-    if ($LASTEXITCODE -ne 0) { throw "llama.cpp clone failed" }
+Invoke-NativeChecked "SPIRV-Headers configure" {
+    cmake -S $spirv -B "$spirv\build" `
+        -G "Visual Studio 18 2026" `
+        -A x64 `
+        -DCMAKE_INSTALL_PREFIX="L:/LAB/ai-local/SPIRV-Headers/install"
 }
-git -C $repo fetch origin --tags --force
-if ($LASTEXITCODE -ne 0) { throw "Could not fetch llama.cpp tags" }
-git -C $repo checkout --detach $version
-if ($LASTEXITCODE -ne 0) { throw "Could not check out $version" }
-git -C $repo reset --hard $version
-if ($LASTEXITCODE -ne 0) { throw "Could not check out $version" }
-$actualCommit = (git -C $repo rev-parse HEAD).Trim()
-if ($actualCommit -ne $expectedCommit) {
-    throw "Tag $version resolved to $actualCommit, expected $expectedCommit"
+Invoke-NativeChecked "SPIRV-Headers build" {
+    cmake --build "$spirv\build" --config Release --parallel 20
 }
-Write-Host "==> Building llama.cpp $version ($actualCommit) in $repo"
+Invoke-NativeChecked "SPIRV-Headers install" {
+    cmake --install "$spirv\build" --config Release
+}
 
-# b10329 stores the Web UI sources under tools/ui.
-Push-Location "$repo\tools\ui"
+# Build a fresh checkout without deleting the last known-good build. The
+# process-specific staging name prevents two shells from clobbering each other.
+$tmp = Join-Path (Get-Location) "_tmp_llama_$PID"
+if (Test-Path $tmp) {
+    throw "Staging directory already exists: $tmp"
+}
+Invoke-NativeChecked "llama.cpp clone" {
+    git clone https://github.com/ggml-org/llama.cpp.git $tmp
+}
+
+Push-Location $tmp
 try {
-    npm ci
-    if ($LASTEXITCODE -ne 0) { throw "Web UI dependency install failed" }
-    npm run build
-    if ($LASTEXITCODE -ne 0) { throw "Web UI build failed" }
+    $description = (git describe --tags --always 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Could not determine llama.cpp build tag" }
+    $version = [regex]::Match($description, 'b\d+').Value
+    if (-not $version) { $version = "bUNKNOWN" }
+    $commit = (git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Could not determine llama.cpp commit" }
+    $shortCommit = $commit.Substring(0, 9)
 } finally {
     Pop-Location
 }
 
-cmake -S $repo -B "$repo\build" `
-  -G "Visual Studio 18 2026" `
-  -A x64 `
-  -DGGML_VULKAN=ON `
-  -DGGML_NATIVE=OFF `
-  -DGGML_AVX2=ON `
-  -DGGML_FMA=ON `
-  -DGGML_F16C=ON `
-  -DBUILD_SHARED_LIBS=OFF `
-  -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
-  -DCMAKE_ASM_COMPILER=cl `
-  -DLLAMA_BUILD_SERVER=ON `
-  -DLLAMA_BUILD_UI=ON `
-  -DLLAMA_USE_PREBUILT_UI=OFF `
-  -DLLAMA_CURL=OFF `
-  -DGGML_CCACHE=OFF `
-  -DGGML_VULKAN_CHECK_RESULTS=OFF `
-  -DCMAKE_PREFIX_PATH="L:/LAB/ai-local/SPIRV-Headers/install"
-if ($LASTEXITCODE -ne 0) { throw "llama.cpp configure failed" }
-cmake --build "$repo\build" --config Release --parallel 20
-if ($LASTEXITCODE -ne 0) { throw "llama.cpp build failed" }
+$dir = "${version}_llama.cpp"
+$repo = Join-Path (Get-Location) $dir
+if (Test-Path $repo) {
+    # Preserve the existing versioned build and publish this exact newer HEAD
+    # under a commit-qualified folder that AutoTuner also discovers.
+    $dir = "${version}_${shortCommit}_llama.cpp"
+    $repo = Join-Path (Get-Location) $dir
+}
+if (Test-Path $repo) {
+    throw "Build directory already exists; nothing was removed: $repo"
+}
+Rename-Item $tmp $dir
+Write-Host "==> Build directory: $repo ($description, commit $commit)"
 
-& "$repo\build\bin\Release\llama-server.exe" --version
-if ($LASTEXITCODE -ne 0) { throw "Built llama-server failed its version smoke test" }
+Push-Location "$repo\tools\ui"
+try {
+    Invoke-NativeChecked "Web UI dependency install" { npm ci }
+    Invoke-NativeChecked "Web UI build" { npm run build }
+} finally {
+    Pop-Location
+}
+
+Invoke-NativeChecked "llama.cpp configure" {
+    cmake -S $repo -B "$repo\build" `
+        -G "Visual Studio 18 2026" `
+        -A x64 `
+        -DGGML_VULKAN=ON `
+        -DGGML_NATIVE=OFF `
+        -DGGML_AVX2=ON `
+        -DGGML_FMA=ON `
+        -DGGML_F16C=ON `
+        -DBUILD_SHARED_LIBS=OFF `
+        -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
+        -DLLAMA_BUILD_SERVER=ON `
+        -DLLAMA_BUILD_UI=ON `
+        -DLLAMA_USE_PREBUILT_UI=OFF `
+        -DLLAMA_CURL=OFF `
+        -DGGML_CCACHE=OFF `
+        -DGGML_VULKAN_CHECK_RESULTS=OFF `
+        -DCMAKE_PREFIX_PATH="L:/LAB/ai-local/SPIRV-Headers/install"
+}
+Invoke-NativeChecked "llama.cpp build" {
+    cmake --build "$repo\build" --config Release --parallel 20
+}
+Invoke-NativeChecked "llama-server smoke test" {
+    & "$repo\build\bin\Release\llama-server.exe" --version
+}
+
+Write-Host ""
+Write-Host "OCR note: no CMake option controls Unlimited-OCR max_tiles."
+Write-Host "Use llama.cpp b10287+ and an mmproj whose GGUF metadata contains:"
+Write-Host "  clip.vision.preproc_max_tiles = 32"

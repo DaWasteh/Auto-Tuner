@@ -1972,6 +1972,48 @@ def test_resolver_finds_binary_in_sibling_llama_cpp(tmp_path, monkeypatch) -> No
     )
 
 
+def test_discovery_lists_ocr_fork_only_after_server_build(
+    tmp_path, monkeypatch
+) -> None:
+    """OCR forks are normal server builds to AutoTuner.
+
+    A source tree or llama-mtmd-cli-only build is intentionally skipped because
+    the OCR workflow uses /v1/chat/completions. Once llama-server exists in the
+    standard CMake output path, an ocr_b*_llama.cpp directory is discoverable.
+    """
+    from auto_tuner import _discover_llama_forks
+
+    container = tmp_path / "ai-local"
+    runnable_root = container / "ocr_b17400_llama.cpp"
+    _write_fake_server(_fake_llama_server_path(runnable_root))
+
+    cli_only_root = container / "ocr_cli_only_llama.cpp"
+    mtmd_name = "llama-mtmd-cli.exe" if os.name == "nt" else "llama-mtmd-cli"
+    mtmd = cli_only_root / "build" / "bin" / "Release" / mtmd_name
+    _write_fake_server(mtmd)
+
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(container))
+    monkeypatch.chdir(tmp_path)
+
+    found = _discover_llama_forks()
+    assert any(
+        name == "ocr_b17400_llama.cpp" and path.resolve() == runnable_root.resolve()
+        for name, path in found
+    )
+    assert all(name != "ocr_cli_only_llama.cpp" for name, _path in found)
+
+    # GUI has a separate container scanner; keep its server-only contract in
+    # lockstep with terminal discovery.
+    from qt_launcher import MainWindow
+
+    gui_found = MainWindow._expand_fork_container(container)
+    assert any(
+        name == "ocr_b17400_llama.cpp" and path.resolve() == runnable_root.resolve()
+        for name, path in gui_found
+    )
+    assert all(name != "ocr_cli_only_llama.cpp" for name, _path in gui_found)
+
+
 def test_resolver_distinguishes_between_llama_and_1b_llama(
     tmp_path, monkeypatch
 ) -> None:
@@ -2102,8 +2144,7 @@ def test_eagle3_dflash_and_dspark_drafter_detection(tmp_path) -> None:
     assert entry("dflash", "dflash").drafter_spec_type == "dflash"
     assert entry("dflash", "dspark-model").drafter_spec_type == "dspark"
     assert (
-        entry("dflash", "opaque", __dspark_scan__="found").drafter_spec_type
-        == "dspark"
+        entry("dflash", "opaque", __dspark_scan__="found").drafter_spec_type == "dspark"
     )
     assert entry("gemma4-assistant", "mtp").drafter_spec_type == "mtp"
     assert entry("qwen3", "plain").drafter_spec_type is None
@@ -4248,6 +4289,125 @@ def test_ling_2_0_mainline_vs_2_6_fork() -> None:
     assert "bailingmoe2" not in v26.arch_fallback
 
 
+def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
+    """New 2026 profiles match their own families without hijacking older ones."""
+    profiles = load_profiles(SETTINGS_DIR)
+
+    muse = match_profile("muse-glimmer-30B-kquant-17gb.gguf", profiles, "muse-glimmer")
+    assert muse.source_file == "muse-glimmer.yaml"
+    assert muse.max_context == 131072
+    assert muse.min_llama_build == 10353
+    assert muse.sampling["chat"]["top_k"] == 64
+    assert muse.draft_max == 15
+
+    ling3 = match_profile("Ling-3.0-flash-int4.gguf", profiles, "bailing_hybrid")
+    assert ling3.source_file == "ling-3.yaml"
+    assert ling3.max_context == 262144
+    assert ling3.sampling["coding"]["temperature"] == 0.6
+    assert "b10362" in ling3.notes
+    # Ling 2.6 keeps its separate filename profile despite the broad shared
+    # HF model_type; neither generation may steal the other's named GGUF.
+    ling26 = match_profile("Ling-2.6-flash-Q4_K_M.gguf", profiles, "bailing_hybrid")
+    assert ling26.source_file == "bailingmoe2-5.yaml"
+
+    shield = match_profile("Shieldstral-1.0-3B-Q8_0.gguf", profiles, "ministral3")
+    assert shield.source_file == "shieldstral.yaml"
+    assert shield.max_context == 32768
+    assert shield.sampling["chat"]["temperature"] == 0.0
+    assert shield.sampling["chat"]["top_k"] == 0
+
+    minimax = match_profile(
+        "MiniMax-M3-UD-IQ3_XXS-00001-of-00005.gguf", profiles, "minimax-m3"
+    )
+    assert minimax.source_file == "minimax-m3.yaml"
+    assert minimax.max_context == 1048576
+    assert minimax.min_llama_build == 10142
+    assert minimax.flash_attn is True
+    # M2 must remain on its older, smaller family profile.
+    assert (
+        match_profile("MiniMax-M2.7-Q4_K_M.gguf", profiles, "minimax-m2").source_file
+        == "minimax-m2.yaml"
+    )
+
+    kimi3 = match_profile("Kimi-K3-UD-Q2_K-00001-of-00034.gguf", profiles, "kimi-k3")
+    assert kimi3.source_file == "kimi-k3.yaml"
+    assert kimi3.max_context == 1048576
+    assert "not in a released mainline build" in kimi3.notes
+    assert (
+        match_profile("Kimi-K2.5-Q4_K_M.gguf", profiles, "deepseek2").source_file
+        == "kimi-k2.yaml"
+    )
+
+    glm52 = match_profile("GLM-5.2-UD-Q4_K_XL.gguf", profiles, "glm-dsa")
+    assert glm52.source_file == "glm-5_2.yaml"
+    assert glm52.max_context == 1048576
+    assert glm52.min_llama_build == 10174
+    assert glm52.ngram_method == "ngram-map-k4v"
+    assert match_profile("opaque-glm.gguf", profiles, "glm-dsa") is glm52
+    glm51 = match_profile("GLM-5.1-Q4_K_M.gguf", profiles, "glm5")
+    assert glm51.source_file == "glm-5.yaml"
+    assert glm51.min_llama_build == 0
+
+    dsv4 = match_profile("DeepSeek-V4-Flash-Q4_K_M.gguf", profiles, "deepseek4")
+    assert dsv4.source_file == "deepseek-v4.yaml"
+    assert dsv4.max_context == 1048576
+    assert dsv4.min_llama_build == 10254
+    assert dsv4.sampling["chat"]["top_p"] == 1.0
+    assert match_profile("opaque-deepseek.gguf", profiles, "deepseek4") is dsv4
+    assert (
+        match_profile("DeepSeek-V3.2-Q4_K_M.gguf", profiles, "deepseek2").source_file
+        == "deepseek-r1-v3.yaml"
+    )
+
+    switch = match_profile("opaque-adapter-model.gguf", profiles, "graniteswitch")
+    assert switch.source_file == "granite-switch-4_1.yaml"
+    assert switch.min_llama_build == 10342
+
+    # Every unique new architecture must work even when a community requant
+    # has an opaque filename, and no profile may claim the same exact fallback.
+    for opaque, arch, expected in (
+        ("opaque-a.gguf", "muse-glimmer", "muse-glimmer.yaml"),
+        ("opaque-b.gguf", "minimax-m3", "minimax-m3.yaml"),
+        ("opaque-c.gguf", "kimi-k3", "kimi-k3.yaml"),
+        ("opaque-d.gguf", "glm-dsa", "glm-5_2.yaml"),
+        ("opaque-e.gguf", "deepseek4", "deepseek-v4.yaml"),
+        ("opaque-f.gguf", "graniteswitch", "granite-switch-4_1.yaml"),
+    ):
+        assert match_profile(opaque, profiles, arch).source_file == expected
+
+    owners: dict[str, str] = {}
+    for candidate in profiles:
+        for arch in candidate.arch_fallback:
+            assert arch not in owners, (
+                f"duplicate arch_fallback {arch!r}: "
+                f"{owners[arch]} and {candidate.source_file}"
+            )
+            owners[arch] = str(candidate.source_file)
+
+
+def test_profile_minimum_build_gate(monkeypatch) -> None:
+    """Known-old builds are rejected; current and unprobeable shims are safe."""
+    import tuner
+    from settings_loader import ModelProfile
+
+    profile = ModelProfile(display_name="Future model", min_llama_build=12345)
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 12000)
+    allowed, message, detected = tuner.check_profile_build(profile, "server")
+    assert allowed is False
+    assert detected == 12000
+    assert "b12345+" in message and "b12000" in message
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 12345)
+    assert tuner.check_profile_build(profile, "server") == (True, "", 12345)
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: None)
+    allowed, message, detected = tuner.check_profile_build(profile, "wrapper")
+    assert allowed is True
+    assert detected is None
+    assert "Could not verify" in message
+
+
 def test_new_big_profiles_have_jinja_where_required() -> None:
     """Profiles for chat-template / tool-call / thinking models must emit
     --jinja (GLM-5, Seed-OSS, Qwen3-VL, Hunyuan-A13B, ERNIE, Ling/Ring,
@@ -4256,6 +4416,8 @@ def test_new_big_profiles_have_jinja_where_required() -> None:
     by_file = {p.source_file: p for p in profiles}
     for fname in (
         "glm-5.yaml",
+        "glm-5_2.yaml",
+        "granite-switch-4_1.yaml",
         "seed-oss.yaml",
         "qwen3-vl.yaml",
         "hunyuan-moe.yaml",
@@ -4264,6 +4426,12 @@ def test_new_big_profiles_have_jinja_where_required() -> None:
         "kimi-k2.yaml",
         "smollm3.yaml",
         "bailingmoe2-5.yaml",
+        "deepseek-v4.yaml",
+        "kimi-k3.yaml",
+        "ling-3.yaml",
+        "minimax-m3.yaml",
+        "muse-glimmer.yaml",
+        "shieldstral.yaml",
     ):
         assert fname in by_file, f"{fname} not loaded"
         assert "--jinja" in by_file[fname].extra_args, f"{fname} missing --jinja"

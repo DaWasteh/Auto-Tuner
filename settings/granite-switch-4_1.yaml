@@ -1,0 +1,37 @@
+display_name: "Granite Switch 4.1 (IBM adapters)"
+patterns:
+  - granite-switch-4.1
+  - granite-switch
+  - graniteswitch
+
+arch_fallback:
+  - graniteswitch
+
+max_context: 131072
+recommended_kv_quant: q8_0
+min_llama_build: 10342
+performance_target: balanced
+
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.0
+  coding:
+    temperature: 0.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  IBM Granite Switch 4.1 uses embedded adapters selected by control tokens
+  for RAG, safety, and explainability workloads. It has a dedicated
+  graniteswitch GGUF architecture and 128k context. Use llama.cpp b10342 or
+  newer. Chat keeps modest variation; coding/tool workflows use IBM-style
+  greedy decoding. Apache 2.0 license.

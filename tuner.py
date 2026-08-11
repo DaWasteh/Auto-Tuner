@@ -387,6 +387,38 @@ def probe_binary_build_number(binary: str) -> Optional[int]:
     return _probe_binary_build_number(binary)
 
 
+def check_profile_build(
+    profile: ModelProfile, binary: str
+) -> Tuple[bool, str, Optional[int]]:
+    """Validate a profile's minimum llama.cpp build against ``binary``.
+
+    Returns ``(allowed, message, detected_build)``. An unprobeable binary is
+    allowed with a warning so custom wrappers and remote launch shims keep
+    working; a positively identified older build is rejected before model
+    loading. This is shared by GUI, TUI, and OCR launch paths.
+    """
+    required = max(0, int(getattr(profile, "min_llama_build", 0) or 0))
+    if required == 0:
+        return True, "", None
+
+    detected = probe_binary_build_number(binary)
+    if detected is None:
+        return (
+            True,
+            f"Could not verify the selected binary's llama.cpp build; "
+            f"{profile.display_name} requires b{required}+.",
+            None,
+        )
+    if detected < required:
+        return (
+            False,
+            f"{profile.display_name} requires llama.cpp b{required}+; "
+            f"the selected binary reports b{detected}.",
+            detected,
+        )
+    return True, "", detected
+
+
 def _memlock_limit_gb() -> Optional[float]:
     """Soft RLIMIT_MEMLOCK in GB on POSIX; ``None`` = unlimited/not applicable.
 
@@ -588,9 +620,7 @@ def gemma_draft_needs_ik_fork(
     return flags is not None and "--spec-type" not in flags
 
 
-def match_gpu_by_token(
-    token: Optional[str], gpus: List[GPUInfo]
-) -> Optional[GPUInfo]:
+def match_gpu_by_token(token: Optional[str], gpus: List[GPUInfo]) -> Optional[GPUInfo]:
     """Resolve a user GPU pin token ("9070", "R9700", full driver string)
     to a detected card, robust across OS name styles.
 
@@ -1981,10 +2011,7 @@ def compute_config(
     # use this (experts spill to CPU, never to the secondary GPU). On
     # single-GPU systems this equals effective_free_vram.
     effective_primary_free_vram = (
-        primary_free_vram_gb
-        - vision_vram_gb
-        - draft_vram_gb
-        - runtime_vram_overhead_gb
+        primary_free_vram_gb - vision_vram_gb - draft_vram_gb - runtime_vram_overhead_gb
     )
     if effective_primary_free_vram < 0:
         effective_primary_free_vram = 0.0
@@ -2026,12 +2053,7 @@ def compute_config(
     # decisions are handled below via the disable_moe_placement flag.
     disable_moe_placement = is_diffusion_gemma
     n_cpu_moe: Optional[int] = None
-    if (
-        is_moe
-        and has_gpu
-        and n_layers > 0
-        and not disable_moe_placement
-    ):
+    if is_moe and has_gpu and n_layers > 0 and not disable_moe_placement:
         ngl, n_cpu_moe, model_vram, model_ram, full_off = _decide_moe_offload(
             model_size_gb=model.size_gb,
             free_vram_gb=effective_moe_vram,
@@ -2103,8 +2125,7 @@ def compute_config(
         # sense for a model too big for VRAM (the genuine hybrid case).
         dense_kv_reserve_gb = 0.0
         model_fits_vram = (
-            model.size_gb + FULL_OFF_HEADROOM_GB
-            <= effective_free_vram - vram_safety_gb
+            model.size_gb + FULL_OFF_HEADROOM_GB <= effective_free_vram - vram_safety_gb
         )
         if (
             not perf_target.kv_to_ram
@@ -2153,8 +2174,10 @@ def compute_config(
         full_off = new_cpu_moe == 0
         ngl = 999
 
-    if force_ngl is not None and n_layers > 0 and not (
-        is_moe and has_gpu and not disable_moe_placement
+    if (
+        force_ngl is not None
+        and n_layers > 0
+        and not (is_moe and has_gpu and not disable_moe_placement)
     ):
         new_ngl = max(0, min(n_layers, int(force_ngl)))
         per_layer_gb = model.size_gb / n_layers
@@ -2336,9 +2359,7 @@ def compute_config(
         # Qualitätspreis und darf nicht still für jedes Qwen-Modell
         # aktiviert werden, nur weil RAM vorhanden ist.
         if profile_rope_scale:
-            rope_target_ctx = (
-                user_ctx if user_ctx is not None else profile_rope_max
-            )
+            rope_target_ctx = user_ctx if user_ctx is not None else profile_rope_max
         elif user_ctx is not None and user_ctx > native_ctx:
             rope_target_ctx = user_ctx
         else:
@@ -2367,9 +2388,7 @@ def compute_config(
             # zurück, OHNE YaRN zu emittieren (der User bekam weniger
             # Context als bestellt und wusste nicht warum).
             if budget_ctx > native_ctx:
-                rope_scaled_ctx = min(
-                    budget_ctx, rope_target_ctx, profile_rope_max
-                )
+                rope_scaled_ctx = min(budget_ctx, rope_target_ctx, profile_rope_max)
                 rope_scaling_active = True
 
     # Expert override: force_rope_scale = True turns it on unconditionally;
@@ -2763,10 +2782,7 @@ def compute_config(
         # budget. This allows smaller models to be pinned to the primary GPU
         # even when their theoretical max-KV footprint exceeds the cap.
         model_footprint_gb = (
-            model_vram
-            + vision_vram_gb
-            + draft_vram_gb
-            + runtime_vram_overhead_gb
+            model_vram + vision_vram_gb + draft_vram_gb + runtime_vram_overhead_gb
         )
 
         # Pin the whole model to the primary GPU when its GPU-resident
@@ -3596,8 +3612,7 @@ def build_command(
     if vision_active:
         build_number = _probe_binary_build_number(server_binary)
         vision_cache_ok = bool(
-            build_number is not None
-            and build_number >= _MIN_VISION_PROMPT_CACHE_BUILD
+            build_number is not None and build_number >= _MIN_VISION_PROMPT_CACHE_BUILD
         )
 
     resolved_cache_ram_mib = (

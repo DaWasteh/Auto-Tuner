@@ -1,0 +1,49 @@
+display_name: "MiniMax-M3 (MiniMaxAI, MSA multimodal)"
+patterns:
+  - minimax-m3
+  - minimax_m3
+  - minimaxm3
+
+arch_fallback:
+  - minimax-m3
+
+max_context: 1048576
+recommended_kv_quant: q5_0
+flash_attn: true
+min_llama_build: 10142
+performance_target: throughput
+
+# Official card/generation config specifies temperature and top_p. Omitted
+# fields deliberately fall back to GGUF metadata instead of inventing values.
+sampling:
+  chat:
+    temperature: 1.0
+    top_p: 0.95
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_p: 0.95
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  MiniMax-M3 is a native multimodal 428B-A23B MoE with MiniMax Sparse
+  Attention (MSA) and 1M context. Use llama.cpp b10142 or newer for the text,
+  MSA, vision, and specialized tool-call path. Vision additionally requires
+  an M3 mmproj. Use an MSA-aware GGUF conversion that retains every
+  blk.N.index_q_proj/index_k_proj tensor; older dense-fallback GGUFs are not
+  equivalent. Flash Attention is required for the intended sparse path;
+  unsupported no-FA/unified-KV multi-sequence modes can fall back to dense
+  attention and lose the 1M-context efficiency. Released weights do not
+  contain the advertised MTP modules, so AutoTuner keeps conservative
+  draftless speculation. Official sampling is temp 1.0 / top_p 0.95; other
+  sampler fields are inherited from GGUF metadata.

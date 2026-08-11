@@ -1,0 +1,48 @@
+display_name: "DeepSeek-V4 Pro / Flash"
+patterns:
+  - deepseek-v4
+  - deepseek_v4
+  - deepseekv4
+
+arch_fallback:
+  - deepseek4
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+min_llama_build: 10254
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  DeepSeek-V4 Pro (1.6T-A49B) and Flash (284B-A13B) are 1M-context MoE
+  models with the dedicated deepseek4 GGUF architecture. Base architecture
+  support started earlier, but this combined Pro/Flash profile requires
+  llama.cpp b10254+ for the dedicated V4-Flash chat-template contract; a
+  current build is strongly preferred for later backend/indexer and KV fixes. Official decoding defaults are temp 1.0 / top_p 1.0.
+  Think-Max workflows should reserve at least a 384k context window. These
+  are datacenter-scale models; local workstation use needs very aggressive
+  quantization plus large system RAM and CPU expert offload. Keep preserved
+  reasoning for long agent/tool sessions.

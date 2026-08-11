@@ -1,0 +1,50 @@
+display_name: "Kimi-K3 (Moonshot AI, fork-only)"
+patterns:
+  - kimi-k3
+  - kimi_k3
+  - kimik3
+
+# Proposed/community GGUF architecture. Keep this isolated from Kimi-K2's
+# shared deepseek2 architecture and from the older kimi-linear loader.
+arch_fallback:
+  - kimi-k3
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+# Official evaluations use top_p 0.95 for single-step work and 1.0 for
+# agentic tasks. A compatible local GGUF may also embed recommendations;
+# unspecified truncation fields inherit metadata.
+sampling:
+  chat:
+    temperature: 1.0
+    top_p: 0.95
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_p: 1.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Moonshot Kimi-K3 is a native-multimodal 2.8T-A104B MoE with KDA,
+  Attention Residuals, 896 experts (16 active), and 1M context. Vision needs
+  the matching mmproj. IMPORTANT: as of llama.cpp b10362, Kimi-K3 is not in
+  a released mainline build; community GGUFs require the dedicated K3 PR or
+  a compatible fork. K3 cannot be routed through the existing kimi-linear
+  or Kimi-K2/deepseek2 loaders. Official settings use temp 1.0 with top_p
+  0.95 for single-step work and 1.0 for agentic tasks. Thinking stays enabled;
+  preserve the complete reasoning/tool-call history.
+  This profile is future/fork-ready matching and tuning, not a claim that
+  stock llama.cpp can load the model today. At this scale it is a cluster or
+  very-high-RAM model, not a practical 48 GB workstation checkpoint.

@@ -36,7 +36,6 @@ _MOE_FILENAME_RE: re.Pattern[str]
 # ---------------------------------------------------------------------------
 # Public helpers
 
-
 def extract_params_billion(name: str) -> float: ...
 def kv_per_token_mb_f16(params_billion: float) -> float: ...
 def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float: ...
@@ -44,6 +43,9 @@ def kv_quant_factor(quant: str) -> float: ...
 def _moe_expert_count(model: ModelEntry) -> int: ...
 def prepare_command_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]: ...
 def probe_binary_build_number(binary: str) -> Optional[int]: ...
+def check_profile_build(
+    profile: ModelProfile, binary: str
+) -> Tuple[bool, str, Optional[int]]: ...
 def gemma_draft_needs_ik_fork(
     model_name: str, use_draft: bool, resolved_binary: str
 ) -> bool: ...
@@ -60,7 +62,6 @@ def veto_unsafe_mlock(
 
 # ---------------------------------------------------------------------------
 # TunedConfig
-
 
 @dataclass
 class TunedConfig:
@@ -127,7 +128,6 @@ class TunedConfig:
 # ---------------------------------------------------------------------------
 # Main API
 
-
 def compute_config(
     model: ModelEntry,
     system: SystemInfo,
@@ -152,8 +152,6 @@ def compute_config(
     no_mmproj_offload: bool = ...,
     prompt_cache_ram_mib: int = ...,
 ) -> TunedConfig: ...
-
-
 def build_command(
     model: ModelEntry,
     config: TunedConfig,
@@ -171,8 +169,6 @@ def build_command(
     enable_metrics: Optional[bool] = ...,
     enable_slots_api: Optional[bool] = ...,
 ) -> List[str]: ...
-
-
 def build_diffusion_server_command(
     model: ModelEntry,
     config: TunedConfig,

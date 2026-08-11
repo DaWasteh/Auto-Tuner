@@ -1,0 +1,54 @@
+display_name: "Muse Glimmer 30B (Meta)"
+patterns:
+  - muse-glimmer
+  - muse_glimmer
+  - museglimmer
+
+# Native GGUF architecture added by llama.cpp PR #26841.
+arch_fallback:
+  - muse-glimmer
+
+# Official model card: 131,072+ context. The GGUF-native limit remains the
+# authoritative clamp if a future checkpoint exposes a larger value.
+max_context: 131072
+recommended_kv_quant: q8_0
+min_llama_build: 10353
+performance_target: balanced
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    # Meta recommends the same sampler for agentic work and coding.
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# The optional official DFlash drafter proposes blocks of 16 tokens. AutoTuner
+# detects its dflash architecture and pairs it through -md automatically.
+draft_max: 15
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Meta Muse Glimmer 30B is a dense multimodal local-agent model with a
+  separate perception mmproj, 131k context, interleaved reasoning/tool use,
+  and an optional DFlash block drafter. It requires llama.cpp b10353 or newer.
+  Official sampling is temp 1.0 / top_p 0.95 / top_k 64 in both chat and
+  agentic coding. Keep reasoning history for multi-turn tool workflows.
+  Reasoning strength is controlled in the system prompt with
+  "Reasoning strength: low|medium|high|xhigh". The Q4 model plus mmproj,
+  KV cache, and drafter targets a 24-32 GB device; on this dual-AMD system
+  benchmark the optional drafter because Vulkan overhead can offset gains.

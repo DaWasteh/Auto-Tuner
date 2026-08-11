@@ -41,6 +41,7 @@ from tuner import (
     build_command,
     build_diffusion_command,
     build_diffusion_server_command,
+    check_profile_build,
     compute_config,
     effective_load_mode,
     gemma_draft_needs_ik_fork,
@@ -592,10 +593,7 @@ def _run_ocr_terminal_job(
     inference_started = False
     try:
         job_dir, total_pages = runner.prepare()
-        print(
-            f"[OCR:prepare] Prepared {total_pages} page(s); "
-            f"job directory: {job_dir}"
-        )
+        print(f"[OCR:prepare] Prepared {total_pages} page(s); job directory: {job_dir}")
         if tcp_port_in_use(args.host, args.port):
             raise OcrWorkflowError(
                 f"Port {args.port} is already in use; refusing to send OCR "
@@ -2047,6 +2045,19 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 enable_slots_api=bool(getattr(args, "slots_api", False)),
             )
 
+        # Enforce profile-specific runtime gates before llama.cpp begins a
+        # potentially multi-minute model load. OCR performs the same check in
+        # its job-owned path because it also combines preset requirements.
+        if ocr_options is None:
+            build_allowed, build_message, _detected_build = check_profile_build(
+                profile, cmd[0]
+            )
+            if build_message:
+                level = "Warning" if build_allowed else "Error"
+                print(f"[AutoTuner] {level}: {build_message}")
+            if not build_allowed:
+                return 2
+
         cmd, removed_args = prepare_command_for_binary(cmd)
         if removed_args:
             print(
@@ -2100,9 +2111,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 "\n[AutoTuner] Starting the OCR model and processing documents "
                 "page-by-page. Ctrl+C cancels and releases the server.\n"
             )
-            return _run_ocr_terminal_job(
-                cmd, cfg, model, profile, args, ocr_options
-            )
+            return _run_ocr_terminal_job(cmd, cfg, model, profile, args, ocr_options)
 
         if is_diffusion_run:
             print(

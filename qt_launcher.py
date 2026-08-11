@@ -104,6 +104,7 @@ from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import (
     _probe_supported_flags,
     build_command,
+    check_profile_build,
     compute_config,
     effective_load_mode,
     gemma_draft_needs_ik_fork,
@@ -905,8 +906,7 @@ class _OcrSetupDialog(QDialog):
         layout.addWidget(options_group)
 
         self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         start_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         start_button.setText("Start OCR")
@@ -952,7 +952,9 @@ class _OcrSetupDialog(QDialog):
 
     def _browse_output(self) -> None:
         current = self.output_edit.text().strip() or str(self._default_output_dir())
-        path = QFileDialog.getExistingDirectory(self, "Select OCR output folder", current)
+        path = QFileDialog.getExistingDirectory(
+            self, "Select OCR output folder", current
+        )
         if path:
             self.output_edit.setText(path)
 
@@ -7677,9 +7679,7 @@ class MainWindow(QMainWindow):
     def _open_ocr_workflow(self) -> None:
         entry = self._current_entry
         if entry is None or not is_ocr_model(entry):
-            QMessageBox.information(
-                self, "OCR", "Select an OCR/document model first."
-            )
+            QMessageBox.information(self, "OCR", "Select an OCR/document model first.")
             return
         if self._ocr_thread is not None or self._ocr_server_record is not None:
             QMessageBox.information(
@@ -7951,7 +7951,9 @@ class MainWindow(QMainWindow):
             f"Failed pages: {result.failed_pages}\n\n"
             f"Output:\n{result.job_dir}"
         )
-        open_button = box.addButton("Open output folder", QMessageBox.ButtonRole.ActionRole)
+        open_button = box.addButton(
+            "Open output folder", QMessageBox.ButtonRole.ActionRole
+        )
         box.addButton(QMessageBox.StandardButton.Close)
         box.exec()
         if box.clickedButton() is open_button:
@@ -8272,6 +8274,19 @@ class MainWindow(QMainWindow):
                 enable_prompt_cache=use_prompt_cache,
             )
 
+        build_allowed, build_message, _detected_build = check_profile_build(
+            profile, cmd[0]
+        )
+        if build_message:
+            self._log(f"[Compat] {build_message}")
+        if not build_allowed:
+            QMessageBox.warning(
+                self,
+                "llama.cpp build too old",
+                build_message,
+            )
+            return
+
         cmd, removed_args = prepare_command_for_binary(cmd)
         for adjustment in removed_args:
             self._log(
@@ -8573,7 +8588,9 @@ class MainWindow(QMainWindow):
             if self._ocr_worker is not None:
                 self._ocr_worker.cancel()
             elif not record.get("ocr_started"):
-                self._fail_pending_ocr(record, "The OCR server was stopped before it became ready.")
+                self._fail_pending_ocr(
+                    record, "The OCR server was stopped before it became ready."
+                )
         self._servers.remove(record)
 
         srv = record.get("proc")
@@ -8771,9 +8788,7 @@ class MainWindow(QMainWindow):
                 ready = False
             if ready and record is self._ocr_server_record:
                 expected_alias = str(record.get("alias") or "")
-                served_ids = server_model_ids(
-                    str(health_base_url), timeout_seconds=0.3
-                )
+                served_ids = server_model_ids(str(health_base_url), timeout_seconds=0.3)
                 if served_ids is None:
                     # /health can turn green a fraction before /v1/models is
                     # queryable. Retry on the next poll instead of calling a
@@ -8786,9 +8801,7 @@ class MainWindow(QMainWindow):
                         "A different service answered on the OCR port "
                         f"(expected {expected_alias!r}; served models: {shown}).",
                     )
-                    QTimer.singleShot(
-                        0, lambda r=record: self._stop_specific_server(r)
-                    )
+                    QTimer.singleShot(0, lambda r=record: self._stop_specific_server(r))
                     continue
             if ready:
                 record["ready"] = True

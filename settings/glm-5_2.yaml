@@ -1,0 +1,47 @@
+display_name: "GLM-5.2 (Z.ai, 1M + IndexShare)"
+patterns:
+  - glm-5.2
+  - glm5.2
+  - glm-5_2
+
+arch_fallback:
+  - glm-dsa
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+min_llama_build: 10174
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.01
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.01
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  Z.ai GLM-5.2 is a 744B-A40B MoE with a solid 1M context, IndexShare
+  sparse attention, and one improved NextN/MTP layer. Use llama.cpp b10174
+  or newer for the complete MTP path; current builds are strongly preferred
+  for DSA indexer/backend fixes. Official generation config is temp 1.0 /
+  top_p 0.95; min_p 0.01 and top_k 40 retain the established local profile.
+  Datacenter scale: even low-bit quants need hundreds of GB, so a 48 GB
+  workstation requires substantial RAM/CPU expert offload and cannot exploit
+  a 1M cache.

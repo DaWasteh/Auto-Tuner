@@ -1,0 +1,41 @@
+display_name: "Shieldstral 1.0 3B (Mistral safety classifier)"
+patterns:
+  - shieldstral
+  - shield-stral
+
+# The checkpoint advertises 256k RoPE capacity, but Mistral trained and
+# recommends Shieldstral within 32k. Keep the classifier in-distribution.
+max_context: 32768
+recommended_kv_quant: q8_0
+performance_target: safe
+
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  Mistral Shieldstral 1.0 3B is a policy-adaptive multimodal safety
+  CLASSIFIER, not a conversational assistant. It is based on Ministral 3 and
+  runs in current llama.cpp after Mistral-format conversion. Text moderation
+  needs only the model GGUF; image moderation also needs the Pixtral mmproj.
+  Use a single yes/no policy question per request. The client should request
+  max_tokens=1 with logprobs/top_logprobs and derive the normalized yes/no
+  score; that response-side setting is not a llama-server launch flag and
+  therefore cannot be encoded in this YAML. Official inference uses greedy
+  temperature 0.0. Although the base architecture exposes 256k RoPE, the
+  model card recommends the 32k training range.

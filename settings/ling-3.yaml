@@ -1,0 +1,49 @@
+display_name: "Ling 3.0 Flash (InclusionAI, fork-only)"
+patterns:
+  - ling-3.0-flash
+  - ling3.0-flash
+  - ling-3-flash
+  - ling3-flash
+
+# Do not claim bailing_hybrid as an architecture fallback: older Ling 2.6
+# checkpoints use the same broad HF model_type, while no released mainline
+# llama.cpp GGUF architecture exists for Ling 3.0 yet. Filename matching keeps
+# the two generations deterministic.
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 3
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  InclusionAI Ling 3.0 Flash is a text-only 124B-A5.1B hybrid KDA/MLA MoE
+  trained to 256k context. Official sampling is temp 0.6 / top_p 0.95 /
+  top_k 20 with thinking enabled. The released model is trained with NEXTN
+  MTP, so a compatible runtime can use up to three speculative tokens.
+  IMPORTANT: as of llama.cpp b10362 there is no released mainline Ling 3.0
+  GGUF loader/runtime. This profile supplies correct matching and sampling
+  for a compatible future build or dedicated fork; it does not make an
+  unsupported GGUF load in stock llama.cpp. Do not reuse the older Ling 2.6
+  bailing_hybrid fork merely because the HF model_type looks related.

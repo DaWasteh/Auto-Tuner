@@ -215,10 +215,22 @@ installed by `requirements.txt`). Word/Office/OpenDocument input additionally
 requires a local LibreOffice installation; without it AutoTuner gives a clear
 error and leaves the source untouched. Unlimited-OCR uses its verified
 `document parsing.` prompt, F16 KV, deterministic sampling, explicit Flash
-Attention off, and requires llama.cpp b10287+ (b10329 recommended). For the
-full 32-tile Unlimited-OCR path, the mmproj must also contain
-`clip.vision.preproc_max_tiles=32`; AutoTuner warns when an older projector would
-silently fall back to 9 tiles.
+Attention off, and requires llama.cpp b10287+ (a current build such as b10362
+is recommended). **There is no CMake/build flag for `max_tiles=32`.** The value
+comes from the projector GGUF metadata. For the full 32-tile Unlimited-OCR
+path, the mmproj must contain `clip.vision.preproc_max_tiles=32`; AutoTuner
+warns when an older projector would silently fall back to 9 tiles. Reconvert
+Unlimited-OCR's mmproj with a current `convert_hf_to_gguf.py --mmproj` (the
+current converter writes 32 automatically), or download a newly converted
+projector. Rebuilding `llama-server` cannot repair an old mmproj.
+
+AutoTuner's OCR workflow uses the persistent OpenAI-compatible HTTP server, not
+`llama-mtmd-cli`. Therefore a llama.cpp directory is shown in the fork picker
+only after it contains `build/bin/Release/llama-server.exe` (or the native
+Linux/macOS binary). `building llama.cpp/ocr_llama_build.txt` fixes the legacy
+PR #17400 recipe by building both `llama-server` and `llama-mtmd-cli`; that old
+fork remains for DeepSeek-OCR v1. Unlimited-OCR should use the current mainline
+build from `building llama.cpp/llama_build.txt`.
 
 ## Installation
 
@@ -721,6 +733,15 @@ matches. See `settings/_default.yaml`.
 | `exaone-4_5.yaml` | LG EXAONE 4.5 33B VLM (dense, non-commercial license) | `exaone4` |
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
+| `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash | `muse-glimmer` |
+| `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
+| `glm-5.yaml` | GLM-5/5.1 | `glm5` |
+| `glm-5_2.yaml` | GLM-5.2, 1M + IndexShare/MTP | `glm-dsa` |
+| `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
+| `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
+| `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
+| `ling-3.yaml` | Ling 3.0 Flash (profile ready; compatible fork required) | not in mainline b10362 |
+| `kimi-k3.yaml` | Kimi-K3 (profile ready; compatible fork required) | proposed `kimi-k3` |
 
 Notes on the new profiles:
 
