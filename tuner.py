@@ -341,8 +341,18 @@ _MIN_DSPARK_BUILD = 10164
 
 
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
-    """Parse ``version: 10056 (...)`` output without matching compiler IDs."""
-    match = re.search(r"(?im)^\s*version:\s*b?(\d+)\b", version_output or "")
+    """Parse legacy and semantic-version llama.cpp build identifiers safely.
+
+    Current llama.cpp prints ``version: 0.1.0-dev (build 10423, commit ...)``;
+    older builds printed ``version: 10056 (...)``.  Prefer the explicit build
+    field so the semantic major version is never mistaken for build ``b0``.
+    Keeping both matches anchored to the version line also avoids compiler
+    versions such as ``MSVC 19.51``.
+    """
+    output = version_output or ""
+    match = re.search(r"(?im)^\s*version:[^\r\n]*?\(\s*build\s+b?(\d+)\b", output)
+    if match is None:
+        match = re.search(r"(?im)^\s*version:\s*b?(\d+)(?=\s|$)", output)
     return int(match.group(1)) if match else None
 
 
