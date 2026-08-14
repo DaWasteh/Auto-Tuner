@@ -470,11 +470,11 @@ def metadata_sampling(md: Dict[str, Any]) -> Dict[str, float]:
 # deckt das Prefix "qwen" ALLE Qwen-Arch-Strings ab: qwen2/qwen2moe/qwen2vl
 # UND qwen3/qwen3moe/qwen3next/qwen3vl/qwen3vlmoe/qwen35/qwen35moe. Vorher
 # stand hier "qwen2", was die neueren qwen3*/qwen35*-Strings NICHT traf —
-# die ganze Qwen3/3.5/3.6-Familie wäre so vom automatischen YaRN
+# die ganze Qwen3/3.5/3.6/3.8-Familie wäre so vom automatischen YaRN
 # ausgeschlossen gewesen (nur noch via rope_scale.enabled=true im Profil).
 _ROPE_SCALE_SUPPORTED_ARCHS = frozenset(
     {
-        "qwen",  # Qwen / Qwen2 / Qwen2.5 / Qwen3 / Qwen3.5 / Qwen3.6 Familie
+        "qwen",  # Qwen / Qwen2 / Qwen2.5 / Qwen3 / Qwen3.5–3.8 family
     }
 )
 
@@ -516,7 +516,7 @@ def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
 #   llama-arch.cpp:  JAMBA, FALCON_H1, PLAMO2, GRANITE_HYBRID, LFM2,
 #                    LFM2MOE, NEMOTRON_H, NEMOTRON_H_MOE, QWEN3NEXT,
 #                    KIMI_LINEAR, QWEN35, QWEN35MOE
-# Qwen3.5/3.6 use SSM-style metadata (ssm.conv_kernel / ssm.state_size /
+# Qwen3.5/3.6/3.8 use SSM-style metadata (ssm.conv_kernel / ssm.state_size /
 # ssm.group_count) so the generic ``.ssm.`` fallback in
 # ``metadata_is_hybrid_architecture`` already catches them — but listing
 # them explicitly is cheaper and survives GGUFs that name the recurrent
@@ -543,8 +543,8 @@ _HYBRID_ARCHS = frozenset(
         "qwen3next",  # Qwen3-Next: gated-delta-net + full attention
         "kimi-linear",  # Kimi-Linear hybrid
         "kimi_linear",
-        "qwen35",  # Qwen3.5: linear + full attention (b9672 hybrid)
-        "qwen35moe",  # Qwen3.6-A3B MoE: linear + full attention (b9672 hybrid)
+        "qwen35",  # Qwen3.5–3.8 dense: linear + full attention
+        "qwen35moe",  # Qwen3.5–3.8 MoE: linear + full attention
         "rwkv6",  # RWKV — pure SSM, but treated similarly for KV
         "rwkv7",
     }
@@ -726,7 +726,7 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
         # 1-in-4 minority (~25%).
         ratio = 0.25
     elif arch_l.startswith("qwen35"):
-        # Qwen3.5 / Qwen3.6(-A3B MoE): linear attention interleaved with a
+        # Qwen3.5–3.8 dense/MoE: linear attention interleaved with a
         # minority of full-attention layers. Published layouts put full
         # attention at roughly 1 in 4 (~25%); err high for KV safety.
         ratio = 0.25

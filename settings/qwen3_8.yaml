@@ -1,0 +1,74 @@
+display_name: "Qwen3.8 (Alibaba)"
+patterns:
+  - qwen3.8
+  - qwen3_8
+  - qwen38
+
+# Qwen3.8 reuses the Qwen3.5 dense/MoE architecture identifiers in its
+# official Transformers configs. Do not claim qwen35/qwen35moe as architecture
+# fallbacks here: GGUF metadata alone cannot distinguish a Qwen3.8 checkpoint
+# from Qwen3.5/3.6, and doing so would steal their community re-quants from the
+# existing qwen3_5-3_6 profile. The explicit filename patterns above win before
+# that older profile's architecture fallback is considered.
+
+# Both released checkpoints provide 262,144 native tokens. The 27B card states
+# extension to 1,000,000; the 2.4T-A95B card states 1,010,000. Use the lower
+# common limit so this shared profile remains valid for both variants.
+max_context: 262144
+recommended_kv_quant: q5_0
+
+rope_scale:
+  enabled: false
+  max_context: 1000000
+  scale_factor: 4.0
+
+# b10151 is the oldest locally verified build with --reasoning-preserve. The
+# underlying qwen35/qwen35moe loaders predate it, but preserved reasoning is an
+# explicit part of Qwen3.8's recommended agentic runtime contract.
+min_llama_build: 10151
+performance_target: throughput
+
+# Official thinking-mode decoding defaults. Qwen's published SWE-bench and
+# DeepSWE evaluations also use temp=1.0/top_p=0.95, so coding intentionally
+# keeps the same settings instead of inheriting Qwen3.6's older temp=0.6 setup.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# Both official cards describe multi-step MTP training. Keep the conservative
+# AMD/Vulkan two-token draft window used by the preceding Qwen hybrid models;
+# actual draft-mtp activation still depends on the converted GGUF metadata.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  Qwen3.8-27B is a dense native vision-language model with optional thinking;
+  Qwen3.8-2.4T-A95B is a text-only MoE (2.4T total, 95B active) whose thinking
+  mode cannot be disabled. Both use a 3:1 Gated DeltaNet/full-attention layout,
+  preserve historical reasoning by default, and support reasoning_effort values
+  xhigh (default), medium, and low. The profile therefore enables Jinja and
+  preserved reasoning and uses the official thinking defaults in both AutoTuner
+  modes. Only the 27B model supports non-thinking inference; when selecting it
+  manually, use enable_thinking=false together with temp 0.7, top_p 0.8,
+  top_k 20, min_p 0.0, presence_penalty 1.5, and repeat_penalty 1.0. Avoid that
+  high presence penalty for repetitive tool-call JSON if it causes loops. Vision
+  requires a matching 27B mmproj once a GGUF conversion publishes one. The
+  2.4T checkpoint is datacenter-scale and not realistically runnable on a
+  workstation, even with aggressive quantization and CPU expert offload.

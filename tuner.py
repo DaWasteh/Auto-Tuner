@@ -682,9 +682,16 @@ def match_gpu_by_token(token: Optional[str], gpus: List[GPUInfo]) -> Optional[GP
 
 def extract_params_billion(name: str) -> float:
     """Extract parameter count in billions from a model filename."""
-    matches = re.findall(r"(?<![A-Za-z])(\d+(?:\.\d+)?)\s*B(?![a-zA-Z0-9_])", name)
-    if matches:
-        return max(float(m) for m in matches)
+    counts = [
+        float(m)
+        for m in re.findall(r"(?<![A-Za-z])(\d+(?:\.\d+)?)\s*B(?![a-zA-Z0-9_])", name)
+    ]
+    counts.extend(
+        float(m) * 1000.0
+        for m in re.findall(r"(?<![A-Za-z])(\d+(?:\.\d+)?)\s*T(?![a-zA-Z0-9_])", name)
+    )
+    if counts:
+        return max(counts)
     m = re.search(r"E(\d+(?:\.\d+)?)B", name, re.IGNORECASE)
     if m:
         return float(m.group(1))

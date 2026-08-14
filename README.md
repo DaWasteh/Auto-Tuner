@@ -729,6 +729,7 @@ matches. See `settings/_default.yaml`.
 | Profile file | Models | llama.cpp arch |
 |--------------|--------|----------------|
 | `gemma-4.yaml` | Gemma 4 E2B/E4B/**12B**/26B-A4B/31B | `gemma4` |
+| `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
 | `mellum.yaml` | JetBrains Mellum2-12B-A2.5B (Base/Instruct/Thinking), MoE | `mellum` |
 | `exaone-4_5.yaml` | LG EXAONE 4.5 33B VLM (dense, non-commercial license) | `exaone4` |
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
@@ -745,6 +746,13 @@ matches. See `settings/_default.yaml`.
 
 Notes on the new profiles:
 
+- **Qwen3.8** keeps a separate profile from Qwen3.5/3.6 because its official
+  coding evaluations use the thinking defaults (`temp 1.0`, `top_p 0.95`,
+  `top_k 20`) instead of Qwen3.6's older coding temperature. The 27B variant
+  is multimodal and can disable thinking; the 2.4T-A95B variant is text-only
+  and always thinks. Both retain the existing `qwen35`/`qwen35moe` GGUF
+  architecture family, so filename patterns deliberately take precedence
+  without claiming those ambiguous architecture fallbacks.
 - **Mellum 2** is a code-focused MoE (64 experts, 8 active; 12B total /
   2.5B active; 128k ctx). `ngram_method` is deliberately set to
   `ngram-map-k4v` (MTP-compatible) so it survives whether or not llama.cpp's

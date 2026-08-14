@@ -82,6 +82,8 @@ def test_all_profiles_load() -> None:
         ("Qwen3.5-9B-Q8_0", "Qwen3.5 / Qwen3.6 (Alibaba)"),
         ("Qwen3.6-27B-UD-Q3_K_XL", "Qwen3.5 / Qwen3.6 (Alibaba)"),
         ("Qwen3.6-35B-A3B-UD-IQ3_S", "Qwen3.5 / Qwen3.6 (Alibaba)"),
+        ("Qwen3.8-27B-Q8_0", "Qwen3.8 (Alibaba)"),
+        ("Qwen3.8-2.4T-A95B-UD-IQ2_XXS", "Qwen3.8 (Alibaba)"),
         ("Gemma-4-26B-A4B-IQ3_M", "Gemma 4 (Google)"),
         ("gemma-4-E2B-it-BF16", "Gemma 4 (Google)"),
         ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
@@ -101,6 +103,26 @@ def test_pattern_matching(filename, expected_display) -> None:
     assert p.display_name == expected_display, (
         f"{filename!r} matched {p.display_name!r}, expected {expected_display!r}"
     )
+
+
+def test_qwen38_profile_contract_and_precedence() -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+    qwen38 = match_profile("Qwen3.8-2.4T-A95B-UD-IQ2_XXS", profiles, arch="qwen35moe")
+
+    assert qwen38.source_file == "qwen3_8.yaml"
+    assert qwen38.max_context == 262144
+    assert qwen38.rope_scale_max_ctx == 1000000
+    assert qwen38.sampling["chat"] == qwen38.sampling["coding"]
+    assert qwen38.ngram_method == "ngram-map-k4v"
+    assert "--jinja" in qwen38.extra_args
+    assert "--reasoning-preserve" in qwen38.extra_args
+
+    # The shared qwen35moe architecture cannot identify a 3.8 checkpoint by
+    # itself, so opaque older-family re-quants must keep the existing fallback.
+    older_fallback = match_profile(
+        "Opaque-Qwen-Community-Merge.gguf", profiles, arch="qwen35moe"
+    )
+    assert older_fallback.source_file == "qwen3_5-3_6.yaml"
 
 
 def test_ministral_does_not_collide_with_mistral_medium() -> None:
@@ -125,6 +147,8 @@ def test_ministral_does_not_collide_with_mistral_medium() -> None:
     [
         ("Qwen3.5-9B-Q8_0", 9.0),
         ("Qwen3.6-35B-A3B-UD-IQ3_S", 35.0),  # MoE: total params, not active
+        ("Qwen3.8-27B-Q8_0", 27.0),
+        ("Qwen3.8-2.4T-A95B-UD-IQ2_XXS", 2400.0),
         ("Mistral-Medium-3.5-128B-UD-IQ3_XXS", 128.0),
         ("gemma-4-E2B-it-BF16", 2.0),  # Gemma "effective" size
         ("gemma-4-E4B-it-Q8_0", 4.0),
