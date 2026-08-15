@@ -91,7 +91,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from hardware import detect_system, SystemInfo
+from hardware import detect_system, GPUInfo, SystemInfo
 from scanner import (
     scan_models,
     group_entries,
@@ -103,6 +103,7 @@ from scanner import (
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import (
     _probe_supported_flags,
+    _visibility_env_for_gpus,
     build_command,
     check_profile_build,
     compute_config,
@@ -1091,16 +1092,19 @@ class _HwDetectWorker(QObject):
 
     finished = pyqtSignal(object, str)  # SystemInfo|None, error_msg
 
-    def __init__(self, timeout: float = 30.0) -> None:
+    def __init__(
+        self, timeout: float = 30.0, llama_binary: Optional[str] = None
+    ) -> None:
         super().__init__()
         self._timeout = timeout
+        self._llama_binary = llama_binary
 
     def run(self) -> None:
         result: list = [None, ""]  # [SystemInfo|None, error_str]
 
         def _detect() -> None:
             try:
-                result[0] = detect_system()
+                result[0] = detect_system(self._llama_binary)
             except Exception as exc:
                 result[1] = str(exc)
 
@@ -1807,36 +1811,75 @@ class _BinaryUpdateWorker(QObject):
         Linux   → name contains ``linux`` (zip or raw ELF).
         macOS   → name contains ``macos``, ``darwin`` or ``osx``.
         """
-        # Decide by platform.system() alone (never os.name): the real OS is
-        # always reported correctly, and tests can monkeypatch it on any runner.
         system = platform.system().lower()
+        machine = platform.machine().strip().lower()
+        if machine in {"amd64", "x86_64", "x64"}:
+            arch = "x64"
+        elif machine in {"arm64", "aarch64"}:
+            arch = "arm64"
+        else:
+            arch = machine
+
+        def _asset_arch(name: str) -> str:
+            lower = name.lower()
+            if any(token in lower for token in ("arm64", "aarch64")):
+                return "arm64"
+            if any(token in lower for token in ("x86_64", "amd64", "x64")):
+                return "x64"
+            return ""  # legacy/generic asset
+
+        def _pick_arch(
+            candidates: List[Dict[str, object]],
+        ) -> Optional[Dict[str, object]]:
+            for asset in candidates:
+                if _asset_arch(str(asset.get("name", ""))) == arch:
+                    return asset
+            # Backward compatibility for old releases with one generic OS asset.
+            for asset in candidates:
+                if not _asset_arch(str(asset.get("name", ""))):
+                    return asset
+            return None
+
         if system == "windows":
-            for a in assets:
-                name = str(a.get("name", "")).lower()
-                if "windows" in name:
-                    return a
-            for a in assets:
-                name = str(a.get("name", "")).lower()
-                if name.endswith(".exe"):
-                    return a
-            return None
+            candidates = [
+                asset
+                for asset in assets
+                if "windows" in str(asset.get("name", "")).lower()
+            ]
+            picked = _pick_arch(candidates)
+            if picked is not None:
+                return picked
+            raw = [
+                asset
+                for asset in assets
+                if str(asset.get("name", "")).lower().endswith(".exe")
+            ]
+            return _pick_arch(raw)
         if system == "darwin":
-            for a in assets:
-                name = str(a.get("name", "")).lower()
-                if any(token in name for token in ("macos", "darwin", "osx")):
-                    return a
-            return None
-        # Linux / other POSIX: do NOT pick this branch on macOS, otherwise a
-        # frozen macOS build would download the Linux updater asset.
-        for a in assets:
-            name = str(a.get("name", "")).lower()
-            if "linux" in name:
-                return a
-        for a in assets:
-            name = str(a.get("name", "")).lower()
-            if not name.endswith(".exe") and "." not in name:
-                return a
-        return None
+            candidates = [
+                asset
+                for asset in assets
+                if any(
+                    token in str(asset.get("name", "")).lower()
+                    for token in ("macos", "darwin", "osx")
+                )
+            ]
+            return _pick_arch(candidates)
+
+        # Linux / other POSIX: never fall through here on macOS.
+        candidates = [
+            asset for asset in assets if "linux" in str(asset.get("name", "")).lower()
+        ]
+        picked = _pick_arch(candidates)
+        if picked is not None:
+            return picked
+        raw = [
+            asset
+            for asset in assets
+            if not str(asset.get("name", "")).lower().endswith(".exe")
+            and "." not in str(asset.get("name", ""))
+        ]
+        return _pick_arch(raw)
 
     def _extract_binary_from_zip(self, zip_path: Path) -> Path:
         """Pull the AutoTuner binary out of a downloaded release zip.
@@ -2802,7 +2845,7 @@ class ExpertPanel(QWidget):
         # Each slot gets its own KV-cache window, so Auto mode re-fits
         # the context length around the chosen slot count (same math the
         # performance target uses internally). Off = keep the
-        # performance-target default (1/2/4 for safe/balanced/throughput).
+        # performance-target default (one slot for desktop presets).
         _section("Parallelism")
         # Create the spinbox first so the checkbox's toggled signal can
         # safely reference it (it enables/disables the spinbox directly,
@@ -2827,7 +2870,7 @@ class ExpertPanel(QWidget):
                 "Enables a manual --parallel / -np override. llama-server uses "
                 "continuous batching and allocates a KV window per slot, so total KV "
                 "memory scales with slot count. Off delegates the count to the chosen "
-                "performance target and AutoTuner's hardware-aware default.",
+                "performance target (one slot by default).",
             ),
         )
         _add(
@@ -3080,12 +3123,15 @@ class ExpertPanel(QWidget):
             ),
         )
 
-        # Speculative decoding — non-cascading override; only takes effect
-        # when a draft path is active (external -md or embedded MTP).
+        # Speculative decoding — cascading because hybrid/recurrent targets
+        # allocate one rollback-state snapshot per proposed draft token.
         _section("Speculative decoding")
         self._sp_draft_n_max = QSpinBox()
         self._sp_draft_n_max.setRange(0, 64)
         self._sp_draft_n_max.setSpecialValueText("Profil (auto)")
+        self._sp_draft_n_max.valueChanged.connect(
+            lambda _: self._on_edit("force_draft_n_max")
+        )
         _add(
             "draft n-max",
             self._sp_draft_n_max,
@@ -3493,10 +3539,13 @@ class ExpertPanel(QWidget):
         elif kind == "force_n_cpu_moe":
             v = self._sp_ncpumoe.value()
             self._user_pins["force_n_cpu_moe"] = v if v > 0 else None
+        elif kind == "force_draft_n_max":
+            value = self._sp_draft_n_max.value()
+            self._user_pins["force_draft_n_max"] = value if value > 0 else None
         elif kind == "force_n_parallel":
             # Pinning the parallel-slot count makes Auto mode re-fit ctx
             # around N slots; unchecking releases the pin so the
-            # performance-target default (1/2/4) takes over again.
+            # performance-target default (one slot) takes over again.
             if self._chk_parallel.isChecked():
                 self._user_pins["force_n_parallel"] = max(1, self._sp_parallel.value())
             else:
@@ -3512,8 +3561,9 @@ class ExpertPanel(QWidget):
         """Ask the parent to rebuild the config with these overrides.
 
         ``overlay_widgets`` re-stamps the live non-cascading widget values
-        (threads / batch / flags / sampling / reasoning / extras / draft
-        n-max) onto the cascaded result so user edits survive a rebuild.
+        (threads / batch / flags / sampling / reasoning / extras) onto the
+        cascaded result so user edits survive a rebuild. Draft n-max is a
+        cascading pin because it changes recurrent-state memory.
         Reset passes ``False`` — there the whole point is to DROP those
         edits and repaint every widget from the pure Auto config.
         """
@@ -5283,13 +5333,25 @@ class MainWindow(QMainWindow):
         self._fork_combo.blockSignals(False)
         self._apply_fork(selected_idx)
 
+    def _active_llama_binary(self) -> Optional[str]:
+        """Resolve the selected fork's server for backend-aware detection."""
+        try:
+            _, resolve_server, _ = _get_fork_tools()
+            binary = resolve_server("llama-server")
+            return binary or None
+        except Exception:
+            return None
+
     def _start_hardware_detection(self) -> None:
         # Hardware detection (spawns PowerShell on Windows) → background thread
         # so it never blocks the UI and never flashes a window.
         # Use signal/slot pattern instead of QTimer.singleShot from bg thread
         # to avoid potential PyQt6 deadlocks when COM is involved.
         self._log("Detecting system hardware…")
-        self._hw_detect_worker = _HwDetectWorker(timeout=30.0)
+        self._hw_detect_worker = _HwDetectWorker(
+            timeout=30.0,
+            llama_binary=self._active_llama_binary(),
+        )
         self._hw_detect_thread = QThread(self)
         self._hw_detect_worker.moveToThread(self._hw_detect_thread)
         self._hw_detect_thread.started.connect(self._hw_detect_worker.run)
@@ -6986,12 +7048,15 @@ class MainWindow(QMainWindow):
             + cfg.vision_vram_gb
             + cfg.draft_vram_gb
             + cfg.kv_vram_gb
+            + cfg.recurrent_state_vram_gb
             + cfg.runtime_vram_overhead_gb
+            + cfg.batch_vram_overhead_gb
         )
         total_cpu = (
             cfg.estimated_model_ram_gb
             + cfg.vision_ram_gb
             + cfg.kv_ram_gb
+            + cfg.recurrent_state_ram_gb
             + cfg.prompt_cache_ram_gb
         )
         lines += [bar, "Memory estimate (with current options):"]
@@ -7013,16 +7078,31 @@ class MainWindow(QMainWindow):
             )
         else:
             lines.append(f"  KV cache  : ~{cfg.estimated_kv_gb:5.1f} GB")
+        recurrent_total = cfg.recurrent_state_vram_gb + cfg.recurrent_state_ram_gb
+        if recurrent_total > 0.005:
+            lines.append(
+                f"  Recurrent : ~{recurrent_total:5.2f} GB"
+                f" (GPU {cfg.recurrent_state_vram_gb:.2f} / "
+                f"RAM {cfg.recurrent_state_ram_gb:.2f})"
+            )
         if cfg.runtime_vram_overhead_gb > 0.05:
             lines.append(f"  Runtime GPU: ~{cfg.runtime_vram_overhead_gb:5.1f} GB")
-        lines.append(
-            f"  Total GPU : ~{total_gpu:5.1f} GB"
-            f"   of {self._system.free_vram_gb:.1f} GB free"
-        )
-        lines.append(
-            f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB"
-            f"   (free RAM:  {self._system.free_ram_gb:.1f} GB)"
-        )
+        if cfg.batch_vram_overhead_gb > 0.05:
+            lines.append(f"  Batch GPU : ~{cfg.batch_vram_overhead_gb:5.1f} GB")
+        lines.append(f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB")
+        if cfg.unified_memory:
+            lines.append(
+                f"  Unified total: ~{total_gpu + total_cpu:5.1f} GB"
+                f"   of {min(self._system.free_ram_gb, self._system.free_vram_gb):.1f} "
+                "GB accelerator-addressable"
+            )
+            lines.append("  (GPU and CPU allocations share this one physical pool.)")
+        else:
+            lines.append(
+                f"  Total GPU : ~{total_gpu:5.1f} GB"
+                f"   of {self._system.free_vram_gb:.1f} GB free"
+            )
+            lines.append(f"              (free RAM: {self._system.free_ram_gb:.1f} GB)")
         if cfg.prompt_cache_ram_gb > 0.05:
             lines.append(f"  Prompt RAM: ~{cfg.prompt_cache_ram_gb:5.1f} GB")
         if total_cpu > cfg.estimated_model_ram_gb + 0.05:
@@ -7267,7 +7347,7 @@ class MainWindow(QMainWindow):
 
         try:
             start = time.monotonic()
-            s = detect_system()
+            s = detect_system(self._active_llama_binary())
             elapsed = time.monotonic() - start
             self._sysinfo_ready.emit(s)
             self._bg_log.emit(f"[SysInfo] Refreshed ({elapsed:.1f}s)")
@@ -7284,18 +7364,26 @@ class MainWindow(QMainWindow):
         """
         self._system = s
 
-        # VRAM-Anzeige
-        if s.total_vram_gb > 0:
+        # Memory display. Unified-memory systems get one capacity, not a
+        # misleading RAM + VRAM double report.
+        if s.has_unified_memory:
+            self._vram_lbl.setText(
+                f"Unified: {min(s.free_ram_gb, s.free_vram_gb):.1f} / "
+                f"{s.total_ram_gb:.1f} GB accelerator-addressable"
+            )
+            self._ram_lbl.setText("RAM/VRAM: shared physical pool")
+        elif s.total_vram_gb > 0:
             self._vram_lbl.setText(
                 f"VRAM: {s.free_vram_gb:.1f} / {s.total_vram_gb:.1f} GB free"
             )
+            self._ram_lbl.setText(
+                f"RAM: {s.free_ram_gb:.1f} / {s.total_ram_gb:.1f} GB free"
+            )
         else:
             self._vram_lbl.setText("VRAM: keine GPU")
-
-        # RAM-Anzeige
-        self._ram_lbl.setText(
-            f"RAM: {s.free_ram_gb:.1f} / {s.total_ram_gb:.1f} GB free"
-        )
+            self._ram_lbl.setText(
+                f"RAM: {s.free_ram_gb:.1f} / {s.total_ram_gb:.1f} GB free"
+            )
 
         # CPU-Anzeige
         if s.cpu_name:
@@ -7460,8 +7548,11 @@ class MainWindow(QMainWindow):
         return base  # give up gracefully — caller still tries
 
     def _choose_gpu_for_launch(
-        self, cfg: TunedConfig, entry: ModelEntry
-    ) -> Tuple[Optional[object], Optional[str]]:
+        self,
+        cfg: TunedConfig,
+        entry: ModelEntry,
+        runtime_binary: Optional[str] = None,
+    ) -> Tuple[Optional[GPUInfo], Optional[str]]:
         """Pick which GPU a new server should target, given live VRAM use.
 
         Returns ``(gpu_or_None, refusal_message_or_None)``.
@@ -7481,7 +7572,7 @@ class MainWindow(QMainWindow):
         """
         # Re-detect so "free" reflects already-loaded servers.
         try:
-            fresh = detect_system()
+            fresh = detect_system(runtime_binary or self._active_llama_binary())
             if fresh is not None and fresh.gpus:
                 self._system = fresh
         except Exception as exc:
@@ -7502,6 +7593,8 @@ class MainWindow(QMainWindow):
             + float(cfg.vision_vram_gb)
             + float(cfg.draft_vram_gb)
             + float(cfg.runtime_vram_overhead_gb)
+            + float(cfg.batch_vram_overhead_gb)
+            + float(cfg.recurrent_state_vram_gb)
         )
         # A little breathing room so we don't fill a card to the last MB.
         SAFETY_GB = 1.0
@@ -7546,6 +7639,8 @@ class MainWindow(QMainWindow):
                     + float(cfg.vision_vram_gb)
                     + float(cfg.draft_vram_gb)
                     + float(cfg.runtime_vram_overhead_gb)
+                    + float(cfg.batch_vram_overhead_gb)
+                    + float(cfg.recurrent_state_vram_gb)
                 )
                 if g.free_vram_gb >= hard_footprint:
                     self._log(
@@ -7594,31 +7689,41 @@ class MainWindow(QMainWindow):
             "concurrent model still needs room on a single card.)"
         )
 
-    def _pin_cfg_to_gpu(self, cfg: TunedConfig, gpu: object) -> None:
-        """Force this server's tensors onto a specific GPU via env vars.
-
-        Sets HIP_VISIBLE_DEVICES / GGML_VK_VISIBLE_DEVICES to the chosen
-        card's device index so a second/third concurrent model lands on the
-        emptier GPU instead of defaulting back onto the (full) primary.
-        Clears any tensor_split the single-GPU pin would conflict with.
-        """
-        hip_index = getattr(gpu, "hip_index", None)
-        name = getattr(gpu, "name", "?")
-        if hip_index is None:
+    def _pin_cfg_to_gpu(self, cfg: TunedConfig, gpu: GPUInfo) -> None:
+        """Force one server onto a GPU with the selected backend's selector."""
+        device_index = gpu.hip_index
+        name = gpu.name
+        if device_index is None:
             self._log(
-                f"[Balance] {name} has no resolved device index; cannot hard-pin "
-                "— relying on tensor-split. Ensure vulkaninfo is reachable."
+                f"[Balance] {name} has no resolved runtime device index; "
+                "cannot hard-pin safely."
             )
             return
-        vis = str(hip_index)
+
+        selectors, remapped = _visibility_env_for_gpus([gpu], [int(device_index)])
+        if not remapped or not selectors:
+            self._log(
+                f"[Balance] {name} backend {gpu.runtime_backend or 'unknown'} "
+                "has no safe visibility remap; keeping computed placement."
+            )
+            return
+
         cfg.env_overrides = dict(cfg.env_overrides or {})
-        cfg.env_overrides["HIP_VISIBLE_DEVICES"] = vis
-        cfg.env_overrides["GGML_VK_VISIBLE_DEVICES"] = vis
-        # After remapping, the chosen card is the only visible device (idx 0).
-        cfg.main_gpu = 0
+        # Remove stale selectors from the previous auto-primary before applying
+        # the one selector namespace understood by the exact backend.
+        for key in (
+            "CUDA_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "GGML_VK_VISIBLE_DEVICES",
+            "ONEAPI_DEVICE_SELECTOR",
+        ):
+            cfg.env_overrides.pop(key, None)
+        cfg.env_overrides.update(selectors)
+        cfg.main_gpu = 0  # selected device is remapped to visible index zero
         cfg.tensor_split = None
         self._last_pinned_gpu = name
-        self._log(f"[Balance] Pinned to {name} (device {vis}).")
+        rendered = ", ".join(f"{key}={value}" for key, value in selectors.items())
+        self._log(f"[Balance] Pinned to {name} ({rendered}).")
 
     # ------------------------------------------------------------------
     # OCR workflow
@@ -7727,7 +7832,7 @@ class MainWindow(QMainWindow):
                 "llama.cpp build too old",
                 f"{preset.label} requires llama.cpp b{required_build}+ for the "
                 f"validated OCR path. The selected binary reports b{build}.\n\n"
-                "Select the b10329 (or newer) llama.cpp build and try again.",
+                f"Select llama.cpp b{required_build} or newer and try again.",
             )
             return
         if required_build and build is None:
@@ -8053,6 +8158,43 @@ class MainWindow(QMainWindow):
             entry.name, self._profiles, getattr(entry, "architecture", "")
         )
 
+        # Resolve and probe the EXACT binary this profile will launch before
+        # computing placement. Profiles can switch the selected fork to CUDA,
+        # SYCL, OpenVINO, or a dedicated diffusion runner; tuning against the
+        # toolbar's generic llama-server would reuse the wrong device table.
+        is_diffusion_cli = profile.runner == "llama-diffusion-cli" or (
+            entry.is_diffusion and profile.runner != "llama-diffusion-gemma-server"
+        )
+        try:
+            if is_diffusion_cli or profile.runner == "llama-diffusion-gemma-server":
+                _, _, resolve_diffusion = _get_fork_tools()
+                arch = (entry.metadata or {}).get("general.architecture")
+                request = (
+                    profile.server_binary or "llama-diffusion-cli"
+                    if is_diffusion_cli
+                    else "llama-diffusion-gemma-server"
+                )
+                runtime_binary = resolve_diffusion(request, arch=arch)
+            else:
+                runtime_binary = self._resolve_binary(profile, use_draft, entry.name)
+            fresh_system = detect_system(runtime_binary)
+            self._update_sysinfo_labels(fresh_system)
+            self._log(
+                f"[SysInfo] Launch runtime probe: {runtime_binary} → "
+                f"backends={fresh_system.runtime_backends or ('CPU',)}"
+            )
+        except Exception as exc:
+            self._log(
+                f"[Warning] Exact launch-runtime hardware probe failed ({exc}); "
+                "using the latest cached system information."
+            )
+            if is_diffusion_cli:
+                runtime_binary = profile.server_binary or "llama-diffusion-cli"
+            elif profile.runner == "llama-diffusion-gemma-server":
+                runtime_binary = "llama-diffusion-gemma-server"
+            else:
+                runtime_binary = self._resolve_binary(profile, use_draft, entry.name)
+
         # Resolve the launch config:
         #   • Expert panel open → the user is editing live; flush any
         #     pending autosave so the on-disk override matches what we
@@ -8061,14 +8203,11 @@ class MainWindow(QMainWindow):
         #     exists (so a hand-tuned setup is applied automatically),
         #     otherwise the AutoTuner's auto-tuned default.
         expert_open = self._config_stack.currentIndex() == 1
-        cfg: Optional[TunedConfig] = None
         if expert_open:
+            # Persist live widget state, then re-cascade it against the exact
+            # runtime's freshly detected capacity/backend inventory.
             self._expert_panel.flush_pending_save()
-            cfg = self._expert_panel.current_config()
-            if cfg is None:
-                self._log("[Warning] Expert panel had no config; falling back to auto.")
-        if cfg is None:
-            cfg = self._effective_config(entry, profile)
+        cfg: Optional[TunedConfig] = self._effective_config(entry, profile)
         # cfg is always non-None here: either the expert panel provided it
         # or compute_config just returned one.  The assert narrows the type
         # for static checkers (Pylance / mypy) that cannot prove this.
@@ -8082,9 +8221,7 @@ class MainWindow(QMainWindow):
         # diffusion (mainline Dream/LLaDA/RND1) is single-shot CLI: no port,
         # no /health, no registry. The binary is found in the SELECTED fork
         # (the fork dropdown points LLAMA_CPP_DIR at it).
-        if profile.runner == "llama-diffusion-cli" or (
-            entry.is_diffusion and profile.runner != "llama-diffusion-gemma-server"
-        ):
+        if is_diffusion_cli:
             self._launch_diffusion(entry, cfg, profile)
             return
 
@@ -8125,6 +8262,8 @@ class MainWindow(QMainWindow):
                 + float(cfg.vision_vram_gb)
                 + float(cfg.draft_vram_gb)
                 + float(cfg.runtime_vram_overhead_gb)
+                + float(cfg.batch_vram_overhead_gb)
+                + float(cfg.recurrent_state_vram_gb)
             )
             if forced_here.free_vram_gb < need:
                 self._log(
@@ -8139,7 +8278,9 @@ class MainWindow(QMainWindow):
                     "skipping auto-balance."
                 )
         elif self._servers:
-            chosen_gpu, refusal = self._choose_gpu_for_launch(cfg, entry)
+            chosen_gpu, refusal = self._choose_gpu_for_launch(
+                cfg, entry, runtime_binary
+            )
             if refusal is not None:
                 self._log(f"[Balance] Launch refused — {refusal.splitlines()[0]}")
                 QMessageBox.warning(self, "Not enough free VRAM", refusal)
@@ -8149,7 +8290,7 @@ class MainWindow(QMainWindow):
         else:
             # First model: still verify it actually fits somewhere so the
             # user gets a clear message instead of an opaque server crash.
-            _gpu, refusal = self._choose_gpu_for_launch(cfg, entry)
+            _gpu, refusal = self._choose_gpu_for_launch(cfg, entry, runtime_binary)
             if refusal is not None:
                 # For a single multi-GPU-splittable model the per-card check
                 # can be over-strict, so only hard-refuse on single-GPU /
@@ -8202,19 +8343,8 @@ class MainWindow(QMainWindow):
             # a normal server, so a queryable chat endpoint is exposed.
             from tuner import build_diffusion_server_command
 
-            try:
-                _, _, resolve_diff = _get_fork_tools()
-            except Exception as exc:
-                self._log(f"[Diffusion-Server] Resolver nicht ladbar: {exc}")
-                QMessageBox.warning(
-                    self,
-                    "DiffusionGemma-Server nicht verfügbar",
-                    f"Der llama-diffusion-gemma-server-Resolver konnte nicht "
-                    f"geladen werden:\n{exc}",
-                )
-                return
             arch = (entry.metadata or {}).get("general.architecture")
-            gemma_server_bin = resolve_diff("llama-diffusion-gemma-server", arch=arch)
+            gemma_server_bin = runtime_binary
             self._log(
                 f"[Diffusion-Server] binary: 'llama-diffusion-gemma-server' "
                 f"→ {gemma_server_bin} (arch={arch!r})"
@@ -8245,7 +8375,7 @@ class MainWindow(QMainWindow):
                 alias=alias,
             )
         else:
-            server_binary = self._resolve_binary(profile, use_draft, entry.name)
+            server_binary = runtime_binary
             # Locking is safe with the new split load-mode implementation, but
             # older/unprobeable GPU builds may still hit the historic Vulkan
             # host-buffer assertion. Resolve the exact binary before the veto.
@@ -8397,6 +8527,8 @@ class MainWindow(QMainWindow):
                 + float(cfg.vision_vram_gb)
                 + float(cfg.draft_vram_gb)
                 + float(cfg.runtime_vram_overhead_gb)
+                + float(cfg.batch_vram_overhead_gb)
+                + float(cfg.recurrent_state_vram_gb)
             ),
             "metrics_enabled": metrics_active,
             "slots_api_enabled": slots_active,
@@ -9094,7 +9226,27 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     p.add_argument("--models-path", default=str(_default_models_path()))
     p.add_argument("--settings-path", default=str(_default_settings_path()))
+    p.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.smoke_test:
+        # Frozen-release CI entry point: exercises the PyInstaller bootloader,
+        # imports, and bundled profile data without opening a GUI/event loop.
+        profiles = load_profiles(Path(args.settings_path))
+        if not profiles:
+            raise RuntimeError("frozen smoke test found no bundled profiles")
+        themes_dir = _bundled_resource("assets", "themes")
+        if not themes_dir.is_dir():
+            raise RuntimeError("frozen smoke test found no bundled themes")
+        print(
+            f"AutoTuner v{VERSION} frozen smoke test OK ({len(profiles)} profiles)",
+            flush=True,
+        )
+        return
 
     # Hide the parent console on Windows when launched via python.exe. A stable
     # AppUserModelID also makes Windows use our icon for the running taskbar app

@@ -524,6 +524,11 @@ def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
 # ``<arch>.attention.recurrent_layers`` key (b9672) in
 # ``metadata_attention_layer_count`` below; the names here are only the
 # hybrid *gate*, not the count.
+_RECURRENT_ARCHS = frozenset(
+    {"mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7"}
+)
+
+
 _HYBRID_ARCHS = frozenset(
     {
         "nemotron_h",
@@ -535,6 +540,9 @@ _HYBRID_ARCHS = frozenset(
         "granite_h",
         "jamba",
         "bamba",
+        "bailing_hybrid",  # Ling-2.6 fork: KDA/short-conv + attention
+        "bailingmoe2.5",
+        "bailingmoe2_5",
         "falcon_h1",
         "plamo2",  # Plamo-2 hybrid
         "zamba2",  # Zamba2 hybrid
@@ -545,6 +553,8 @@ _HYBRID_ARCHS = frozenset(
         "kimi_linear",
         "qwen35",  # Qwen3.5–3.8 dense: linear + full attention
         "qwen35moe",  # Qwen3.5–3.8 MoE: linear + full attention
+        "minimax-01",  # MiniMax-Text-01: lightning + full attention (b10441)
+        "minimax_01",
         "rwkv6",  # RWKV — pure SSM, but treated similarly for KV
         "rwkv7",
     }
@@ -563,7 +573,7 @@ def metadata_is_hybrid_architecture(md: Dict[str, Any]) -> bool:
     if not md:
         return False
     arch = str(md.get("general.architecture", "") or "").lower()
-    if arch in _HYBRID_ARCHS:
+    if arch in _RECURRENT_ARCHS or arch in _HYBRID_ARCHS:
         return True
     # Generic SSM-state detection — any *.ssm.* key signals hybrid.
     for k in md.keys():
@@ -687,13 +697,20 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
                 break
     if recurrent is not None:
         try:
-            n_rec = int(recurrent)
-            # 0 <= n_rec < total: a hybrid must keep at least one full-
-            # attention layer, and cannot have more recurrent layers than
-            # total blocks. Out-of-range values fall through to the keys
-            # and ratio below rather than producing a nonsensical count.
+            if isinstance(recurrent, (list, tuple)):
+                # Current llama.cpp may serialize this as one bool/int per
+                # layer (not only as a scalar count), notably MiniMax-Text-01.
+                n_rec = sum(1 for value in recurrent[:total] if bool(value))
+            else:
+                n_rec = int(recurrent)
+            # Pure recurrent/SSM models legitimately have n_rec == total and
+            # no context-growing attention KV. Return the existing one-layer
+            # sentinel so downstream sizing stays non-zero without inventing
+            # a 25%-of-layers KV cache.
             if 0 <= n_rec < total:
                 return max(1, total - n_rec)
+            if n_rec == total and arch.lower() in _RECURRENT_ARCHS:
+                return 1
         except (TypeError, ValueError):
             pass
 
@@ -721,6 +738,8 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
     # authoritative ``attention.recurrent_layers`` key (b9672) is absent —
     # i.e. older or community GGUFs predating that key.
     arch_l = arch.lower()
+    if arch_l in _RECURRENT_ARCHS:
+        return 1
     if "qwen3next" in arch_l:
         # Qwen3-Next: gated-delta-net on most layers, full attention on a
         # 1-in-4 minority (~25%).
@@ -744,6 +763,9 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
     elif "jamba" in arch_l:
         # Jamba: 1 attention per 7 Mamba (~14%).
         ratio = 0.15
+    elif "minimax-01" in arch_l or "minimax_01" in arch_l:
+        # Upstream fallback marks every eighth layer as full attention.
+        ratio = 0.125
     elif "granite" in arch_l and "hybrid" in arch_l:
         # Granite-Hybrid: ~25% attention.
         ratio = 0.25

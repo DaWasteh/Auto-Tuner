@@ -38,14 +38,21 @@ from scanner import (
     metadata_layer_count,
     metadata_attention_layer_count,
     metadata_is_hybrid_architecture,
+    _RECURRENT_ARCHS,
 )
 from tuner import (
     _moe_expert_count,
+    _KNOWN_MOE_ARCHS,
+    _MOE_ALT_KEY_SUFFIXES,
     _MOE_FILENAME_RE,
+    _KV_HEAD_COUNT_SUFFIXES,
+    _metadata_arch_int,
+    _resolve_kv_per_token_parts_mb,
     extract_params_billion,
     kv_per_token_mb_from_metadata,
     kv_per_token_mb_f16,
     kv_quant_factor,
+    recurrent_state_gb_from_metadata,
 )
 
 
@@ -70,6 +77,7 @@ class DiagnosticWarning:
 
 # ---------------------------------------------------------------------------
 # Internal: small typed metadata accessors
+
 
 def _md_int(md: dict, key: str) -> int:
     v = md.get(key, 0)
@@ -126,13 +134,14 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
     # it the tuner can't account for GQA (8x-32x KV reduction on modern
     # models) and will pessimistically reserve too much KV VRAM, leading
     # directly to fewer expert layers on GPU and lower t/s.
-    n_kv = _md_int(md, f"{arch}.attention.head_count_kv") if arch else 0
-    if n_kv <= 0:
+    n_kv = _metadata_arch_int(md, str(arch), *_KV_HEAD_COUNT_SUFFIXES) if arch else 0
+    if n_kv <= 0 and str(arch).lower() not in _RECURRENT_ARCHS:
         # Some quantizers write under non-canonical key names. Scan the
         # rest of the metadata for any *.head_count_kv variant before
         # raising the warning.
         alternates = [
-            k for k in md.keys()
+            k
+            for k in md.keys()
             if k.lower().endswith(".head_count_kv")
             or k.lower().endswith(".kv_head_count")
             or k.lower().endswith(".num_key_value_heads")
@@ -159,13 +168,25 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
             )
         )
 
-    # --- MOE-FILENAME-FALLBACK --------------------------------------------
+    # --- MOE-ARCH/FILENAME-FALLBACK ---------------------------------------
     expert_count = _moe_expert_count(model)
+    arch_l = str(arch or "").lower()
+    has_expert_key = any(str(key).lower().endswith(_MOE_ALT_KEY_SUFFIXES) for key in md)
+    if arch_l in _KNOWN_MOE_ARCHS and expert_count == 2 and not has_expert_key:
+        warnings.append(
+            DiagnosticWarning(
+                "MOE-ARCH-FALLBACK",
+                f"{model.name}: architecture '{arch_l}' is MoE but expert_count "
+                "is missing. Expert-aware placement is enabled with an unknown "
+                "count; re-quantize from authoritative metadata if possible.",
+            )
+        )
+
     is_moe_by_filename = bool(_MOE_FILENAME_RE.search(model.name))
     # _moe_expert_count returns the sentinel 2 when only the filename
     # tells us it's MoE. If we get 2 *and* the filename matches AND no
     # canonical expert_count key is present, flag it.
-    if is_moe_by_filename and expert_count == 2:
+    if is_moe_by_filename and expert_count == 2 and arch_l not in _KNOWN_MOE_ARCHS:
         canonical_keys = [k for k in md.keys() if k.endswith(".expert_count")]
         if not canonical_keys:
             warnings.append(
@@ -198,13 +219,17 @@ def format_diagnostic_report(model: ModelEntry) -> str:
     block_count = metadata_layer_count(md)
     att_layers = metadata_attention_layer_count(md)
     is_hybrid = metadata_is_hybrid_architecture(md)
-    n_heads = _md_int(md, f"{arch}.attention.head_count")
-    n_kv = _md_int(md, f"{arch}.attention.head_count_kv")
-    embd = _md_int(md, f"{arch}.embedding_length")
-    kl = _md_int(md, f"{arch}.attention.key_length")
-    vl = _md_int(md, f"{arch}.attention.value_length")
+    n_heads = _metadata_arch_int(md, str(arch), "attention.head_count")
+    n_kv = _metadata_arch_int(md, str(arch), *_KV_HEAD_COUNT_SUFFIXES)
+    embd = _metadata_arch_int(md, str(arch), "embedding_length")
+    kl = _metadata_arch_int(md, str(arch), "attention.key_length")
+    vl = _metadata_arch_int(md, str(arch), "attention.value_length")
     ctx_native = _md_int(md, f"{arch}.context_length")
-    expert_count_md = _md_int(md, f"{arch}.expert_count")
+    expert_count_md = _metadata_arch_int(
+        md,
+        str(arch),
+        *(suffix.lstrip(".") for suffix in _MOE_ALT_KEY_SUFFIXES),
+    )
     expert_count_eff = _moe_expert_count(model)
 
     # If head dims missing, scanner derives from embd / n_heads. We
@@ -220,8 +245,12 @@ def format_diagnostic_report(model: ModelEntry) -> str:
     params_b = extract_params_billion(model.name)
     f16_per_tok_md = kv_per_token_mb_from_metadata(md) if md else 0.0
     f16_per_tok_heur = kv_per_token_mb_f16(params_b)
-    f16_per_tok = f16_per_tok_md if f16_per_tok_md > 0 else f16_per_tok_heur
-    kv_source = "metadata" if f16_per_tok_md > 0 else "heuristic (no metadata)"
+    if str(arch).lower() in _RECURRENT_ARCHS:
+        f16_per_tok = sum(_resolve_kv_per_token_parts_mb(model, params_b))
+        kv_source = "pure recurrent (no context-growing attention KV)"
+    else:
+        f16_per_tok = f16_per_tok_md if f16_per_tok_md > 0 else f16_per_tok_heur
+        kv_source = "metadata" if f16_per_tok_md > 0 else "heuristic (no metadata)"
     q4_per_tok = f16_per_tok * kv_quant_factor("q4_0")
     q5_per_tok = f16_per_tok * kv_quant_factor("q5_0")
     q8_per_tok = f16_per_tok * kv_quant_factor("q8_0")
@@ -247,7 +276,10 @@ def format_diagnostic_report(model: ModelEntry) -> str:
     lines.append(f"  context_length        : {ctx_native:,}")
     line = f"  expert_count (md)     : {expert_count_md}"
     if expert_count_eff > 1 and expert_count_md == 0:
-        line += "   ← from filename fallback"
+        if str(arch).lower() in _KNOWN_MOE_ARCHS:
+            line += "   ← from architecture fallback"
+        else:
+            line += "   ← from filename fallback"
     lines.append(line)
 
     # KV capacity table
@@ -260,14 +292,16 @@ def format_diagnostic_report(model: ModelEntry) -> str:
     for ctx in (32768, 65536, 131072, 262144):
         gb = ctx * q5_per_tok / 1024.0
         lines.append(f"  → {ctx:>7,} ctx          : {gb:6.2f} GB KV cache")
+    recurrent_gb = recurrent_state_gb_from_metadata(md)
+    if recurrent_gb > 0:
+        lines.append(f"  recurrent state (1 slot): {recurrent_gb:6.2f} GB fixed F32")
 
     # Companions
     if model.mmproj is not None:
         try:
-            mmproj_gb = model.mmproj.stat().st_size / (1024 ** 3)
+            mmproj_gb = model.mmproj.stat().st_size / (1024**3)
             lines.append(
-                f"  vision projector      : {model.mmproj.name} "
-                f"({mmproj_gb:.2f} GB)"
+                f"  vision projector      : {model.mmproj.name} ({mmproj_gb:.2f} GB)"
             )
         except OSError:
             lines.append(f"  vision projector      : {model.mmproj.name}")
@@ -290,9 +324,7 @@ def format_diagnostic_report(model: ModelEntry) -> str:
     return "\n".join(lines)
 
 
-def find_model_by_substring(
-    models: List[ModelEntry], needle: str
-) -> List[ModelEntry]:
+def find_model_by_substring(models: List[ModelEntry], needle: str) -> List[ModelEntry]:
     """Helper for the ``--diagnose <substring>`` CLI path.
 
     Case-insensitive contains-match on ``model.name``. Returns all

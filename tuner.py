@@ -87,6 +87,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-cram",
     "-ctk",
     "-ctv",
+    "-dev",
     "-fa",
     "-m",
     "-md",
@@ -95,6 +96,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-ngl",
     "-np",
     "-p",
+    "-sm",
     "-t",
     "-tb",
     "-ub",
@@ -111,6 +113,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--diffusion-block-length",
     "--diffusion-eps",
     "--diffusion-steps",
+    "--device",
     "--dry-allowed-length",
     "--dry-base",
     "--dry-multiplier",
@@ -147,6 +150,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--repeat-last-n",
     "--reasoning-budget",
     "--reasoning-budget-message",
+    "--reasoning-effort",
     "--repeat-penalty",
     "--rope-scale",
     "--rope-scaling",
@@ -164,6 +168,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--spec-ngram-mod-n-min",
     "--spec-type",
     "--slot-prompt-similarity",
+    "--split-mode",
     "--temp",
     "--tensor-split",
     "--threads",
@@ -181,6 +186,7 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-c", "--ctx-size"},
     {"-ctk", "--cache-type-k"},
     {"-ctv", "--cache-type-v"},
+    {"-dev", "--device"},
     {"-fa", "--flash-attn"},
     {"-m", "--model"},
     {"-md", "--model-draft"},
@@ -189,6 +195,7 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-ngl", "--gpu-layers", "--n-gpu-layers"},
     {"-np", "--parallel"},
     {"-p", "--prompt"},
+    {"-sm", "--split-mode"},
     {"-t", "--threads"},
     {"-tb", "--threads-batch"},
     {"-ub", "--ubatch-size"},
@@ -724,6 +731,43 @@ def kv_per_token_mb_f16(params_billion: float) -> float:
     return 1.40
 
 
+_KV_HEAD_COUNT_SUFFIXES = (
+    "attention.head_count_kv",
+    "attention.kv_head_count",
+    "attention.num_key_value_heads",
+    "kv_head_count",
+    "num_key_value_heads",
+)
+
+
+def _metadata_arch_value(
+    md: Dict[str, Any], arch: str, suffixes: Tuple[str, ...]
+) -> Any:
+    """Return an architecture metadata value with suffix fallbacks.
+
+    Community converters sometimes preserve a valid value under a legacy
+    architecture prefix or HF-style key. Exact current-arch keys always win;
+    only then do we scan suffix-compatible alternatives.
+    """
+    for suffix in suffixes:
+        key = f"{arch}.{suffix}" if arch else suffix
+        if key in md:
+            return md[key]
+    lowered_suffixes = tuple(f".{suffix.lower()}" for suffix in suffixes)
+    for key, value in md.items():
+        if str(key).lower().endswith(lowered_suffixes):
+            return value
+    return None
+
+
+def _metadata_arch_int(md: Dict[str, Any], arch: str, *suffixes: str) -> int:
+    value = _metadata_arch_value(md, arch, tuple(suffixes))
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _kv_per_token_for_interleaved_attention(
     md: Dict[str, Any],
     arch: str,
@@ -769,19 +813,14 @@ def _kv_per_token_for_interleaved_attention(
     layer count before iterating.
     """
 
-    def _int_md(key: str) -> int:
-        v = md.get(f"{arch}.{key}", 0)
-        try:
-            return int(v) if v is not None else 0
-        except (TypeError, ValueError):
-            return 0
-
-    sliding_pattern = md.get(f"{arch}.attention.sliding_window_pattern")
-    kl = _int_md("attention.key_length")
-    vl = _int_md("attention.value_length")
-    n_heads = _int_md("attention.head_count")
-    embd = _int_md("embedding_length")
-    n_layers = _int_md("block_count")
+    sliding_pattern = _metadata_arch_value(
+        md, arch, ("attention.sliding_window_pattern",)
+    )
+    kl = _metadata_arch_int(md, arch, "attention.key_length")
+    vl = _metadata_arch_int(md, arch, "attention.value_length")
+    n_heads = _metadata_arch_int(md, arch, "attention.head_count")
+    embd = _metadata_arch_int(md, arch, "embedding_length")
+    n_layers = _metadata_arch_int(md, arch, "block_count")
 
     # Expand broadcast (single-element / short) per-layer arrays to the
     # full layer count. This is the DiffusionGemma case: head_count_kv=[2]
@@ -837,7 +876,7 @@ def _kv_per_token_for_interleaved_attention(
     return bytes_per_token / (1024.0 * 1024.0)
 
 
-def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
+def _kv_per_token_total_mb_from_metadata(md: Dict[str, Any]) -> float:
     """Compute exact f16 K+V cache size per token (MB) from GGUF metadata.
 
     Standard transformer formula:
@@ -874,17 +913,13 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
         return 0.0
 
     # ── Case 1: interleaved attention with per-layer KV-head array ─────
-    n_kv_raw = md.get(f"{arch}.attention.head_count_kv")
+    n_kv_raw = _metadata_arch_value(md, arch, _KV_HEAD_COUNT_SUFFIXES)
     if isinstance(n_kv_raw, list) and n_kv_raw:
         return _kv_per_token_for_interleaved_attention(md, arch, n_kv_raw)
 
     # ── Standard scalar path (existing behaviour) ─────────────────────
     def _int(key: str) -> int:
-        v = md.get(f"{arch}.{key}", 0)
-        try:
-            return int(v) if v is not None else 0
-        except (TypeError, ValueError):
-            return 0
+        return _metadata_arch_int(md, arch, key)
 
     # Use the attention-bearing layer count for hybrids; for pure
     # Transformer this equals block_count and behaves as before.
@@ -896,7 +931,7 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
         n_layers = _int("block_count")
 
     n_heads = _int("attention.head_count")
-    n_kv_heads = _int("attention.head_count_kv")
+    n_kv_heads = _metadata_arch_int(md, arch, *_KV_HEAD_COUNT_SUFFIXES)
     embd = _int("embedding_length")
     key_length = _int("attention.key_length")
     value_length = _int("attention.value_length")
@@ -923,17 +958,145 @@ def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
     return bytes_per_token / (1024.0 * 1024.0)
 
 
-def _resolve_kv_per_token_mb(model: ModelEntry, params_billion: float) -> float:
-    """Pick the best KV-per-token estimate available.
+def kv_per_token_parts_mb_from_metadata(
+    md: Dict[str, Any],
+) -> Tuple[float, float]:
+    """Return exact f16 ``(K, V)`` MB/token parts when metadata permits.
 
-    Preference: exact GGUF metadata first (precise; works for MoE),
-    falling back to params-based heuristic (for tests / metadata-less
-    models).
+    Keeping K and V separate matters for asymmetric cache quants on MLA and
+    other architectures where key/value head dimensions differ.
     """
+    total = _kv_per_token_total_mb_from_metadata(md)
+    if total <= 0:
+        return 0.0, 0.0
+    arch = str(md.get("general.architecture") or "")
+    key_length = _metadata_arch_int(md, arch, "attention.key_length")
+    value_length = _metadata_arch_int(md, arch, "attention.value_length")
+    if key_length <= 0 or value_length <= 0:
+        n_heads = _metadata_arch_int(md, arch, "attention.head_count")
+        embd = _metadata_arch_int(md, arch, "embedding_length")
+        if n_heads > 0 and embd > 0:
+            head_size = max(1, embd // n_heads)
+            key_length = key_length if key_length > 0 else head_size
+            value_length = value_length if value_length > 0 else head_size
+    denom = key_length + value_length
+    if denom <= 0:
+        return total / 2.0, total / 2.0
+    return total * key_length / denom, total * value_length / denom
+
+
+def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
+    """Compute f16 K+V cache size per token (MB) from GGUF metadata."""
+    key_mb, value_mb = kv_per_token_parts_mb_from_metadata(md)
+    return key_mb + value_mb
+
+
+def recurrent_state_gb_from_metadata(
+    md: Dict[str, Any],
+    n_parallel: int = 1,
+    snapshot_count: int = 0,
+) -> float:
+    """Estimate llama.cpp's fixed F32 recurrent-state buffers in GiB.
+
+    Unlike attention KV, this state does not grow with context length. It does
+    grow with recurrent layers, parallel sequences, and speculative rollback
+    snapshots. The formulas mirror ``llama_hparams::n_embd_r/n_embd_s`` and
+    ``llama_memory_recurrent`` in b10441.
+    """
+    if not md:
+        return 0.0
+    arch = str(md.get("general.architecture") or "").lower()
+    if not arch:
+        return 0.0
+
+    from scanner import (
+        _RECURRENT_ARCHS,
+        metadata_attention_layer_count,
+        metadata_is_hybrid_architecture,
+        metadata_layer_count,
+    )
+
+    total_layers = metadata_layer_count(md)
+    if total_layers <= 0 or not metadata_is_hybrid_architecture(md):
+        return 0.0
+    if arch in _RECURRENT_ARCHS:
+        recurrent_layers = total_layers
+    else:
+        recurrent_layers = max(0, total_layers - metadata_attention_layer_count(md))
+    if recurrent_layers <= 0:
+        return 0.0
+
+    n_embd = _metadata_arch_int(md, arch, "embedding_length")
+    n_heads = _metadata_arch_int(md, arch, "attention.head_count")
+    key_length = _metadata_arch_int(md, arch, "attention.key_length")
+    conv = _metadata_arch_int(md, arch, "ssm.conv_kernel")
+    inner = _metadata_arch_int(md, arch, "ssm.inner_size")
+    state = _metadata_arch_int(md, arch, "ssm.state_size")
+    groups = _metadata_arch_int(md, arch, "ssm.group_count")
+
+    r_elements = 0
+    s_elements = 0
+    wkv_head = _metadata_arch_int(md, arch, "wkv.head_size")
+    if wkv_head > 0 and n_embd > 0:
+        token_shifts = max(1, _metadata_arch_int(md, arch, "token_shift_count"))
+        r_elements = token_shifts * n_embd
+        s_elements = n_embd * wkv_head
+    else:
+        shortconv = _metadata_arch_int(md, arch, "shortconv.l_cache")
+        kda_head = _metadata_arch_int(md, arch, "kda.head_dim")
+        if shortconv > 0 and n_embd > 0:
+            r_elements = n_embd * max(0, shortconv - 1)
+        elif kda_head > 0 and n_heads > 0:
+            r_elements = 3 * max(0, conv - 1) * n_heads * kda_head
+            s_elements = kda_head * kda_head * n_heads
+        elif arch in {"minimax-01", "minimax_01"}:
+            # b10441 maps the full-attention key head dimension to the
+            # Lightning-Attention recurrent state dimension.
+            if key_length <= 0 and n_heads > 0 and n_embd > 0:
+                key_length = max(1, n_embd // n_heads)
+            if key_length > 0 and n_heads > 0:
+                s_elements = key_length * key_length * n_heads
+        else:
+            if conv > 0 and inner > 0:
+                r_elements = max(0, conv - 1) * (
+                    inner + 2 * max(0, groups) * max(0, state)
+                )
+            if state > 0 and inner > 0:
+                s_elements = state * inner
+
+    elements_per_layer = r_elements + s_elements
+    if elements_per_layer <= 0:
+        return 0.0
+    rows = max(1, int(n_parallel)) * (1 + max(0, int(snapshot_count)))
+    total_bytes = recurrent_layers * elements_per_layer * rows * 4  # F32
+    return total_bytes / (1024.0**3)
+
+
+def _resolve_kv_per_token_mb(model: ModelEntry, params_billion: float) -> float:
+    """Pick the best KV-per-token estimate available."""
     md_estimate = kv_per_token_mb_from_metadata(model.metadata)
     if md_estimate > 0:
         return md_estimate
     return kv_per_token_mb_f16(params_billion)
+
+
+def _resolve_kv_per_token_parts_mb(
+    model: ModelEntry, params_billion: float
+) -> Tuple[float, float]:
+    """Return f16 K/V parts, falling back to an even heuristic split."""
+    key_mb, value_mb = kv_per_token_parts_mb_from_metadata(model.metadata)
+    if key_mb + value_mb > 0:
+        return key_mb, value_mb
+    arch = str((model.metadata or {}).get("general.architecture") or "").lower()
+    from scanner import _RECURRENT_ARCHS
+
+    if arch in _RECURRENT_ARCHS:
+        # Pure recurrent architectures have no context-growing attention KV.
+        # Keep a tiny numerical sentinel so context math remains finite without
+        # falling back to the dense params-based heuristic.
+        return 1e-6, 1e-6
+    total = kv_per_token_mb_f16(params_billion)
+    return total / 2.0, total / 2.0
 
 
 def kv_quant_factor(quant: str) -> float:
@@ -998,6 +1161,59 @@ _MOE_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Architectures whose llama.cpp loaders are intrinsically MoE. This is a
+# safety fallback for malformed/community GGUFs that dropped expert_count;
+# the sentinel count 2 selects expert-aware placement without pretending the
+# exact number is known.
+_KNOWN_MOE_ARCHS = frozenset(
+    {
+        "afmoe",
+        "arctic",
+        "bailingmoe",
+        "bailingmoe2",
+        "bailingmoe2.5",
+        "bailingmoe2_5",
+        "bailing_hybrid",
+        "cohere2moe",
+        "dbrx",
+        "deepseek",
+        "deepseek2",
+        "deepseek32",
+        "deepseek4",
+        "dots1",
+        "ernie4_5-moe",
+        "ernie4_5_moe",
+        "exaone-moe",
+        "glm4moe",
+        "gpt-oss",
+        "granitemoe",
+        "granitemoehybrid",
+        "grok",
+        "grovemoe",
+        "hunyuan-moe",
+        "hunyuan_moe",
+        "jamba",
+        "kimi-linear",
+        "lfm2moe",
+        "llada-moe",
+        "llada_moe",
+        "mellum",
+        "minimax-01",
+        "minimax-m2",
+        "minimax-m3",
+        "nemotron_h_moe",
+        "nemotron-h-moe",
+        "nomic-bert-moe",
+        "olmoe",
+        "phimoe",
+        "qwen2moe",
+        "qwen3moe",
+        "qwen3vlmoe",
+        "qwen35moe",
+        "step35",
+    }
+)
+
 
 def _moe_expert_count(model: ModelEntry) -> int:
     """Return expert_count from GGUF metadata, or 0 if dense / unknown.
@@ -1036,10 +1252,14 @@ def _moe_expert_count(model: ModelEntry) -> int:
                 except (TypeError, ValueError):
                     continue
 
-    # Step 4: filename fallback. Returns 1 (sentinel) — caller treats
-    # any value > 1 as "definitely MoE". We bump the sentinel to 2 so
-    # `is_moe = expert_count > 1` triggers correctly without lying about
-    # the real count, which we don't know.
+    # Step 4: authoritative architecture fallback. The exact count is unknown,
+    # but the loader itself is MoE, so route through expert-aware placement.
+    arch = str((md or {}).get("general.architecture") or "").lower()
+    if arch in _KNOWN_MOE_ARCHS:
+        return 2
+
+    # Step 5: filename fallback. Sentinel 2 triggers ``is_moe`` without lying
+    # about the real expert count.
     if _MOE_FILENAME_RE.search(model.name):
         return 2
     return 0
@@ -1063,8 +1283,9 @@ class TunedConfig:
     sampling: Dict[str, Any] = field(default_factory=dict)
 
     # Explicit llama.cpp model-loading strategy. ``auto`` leaves the binary's
-    # default (currently mmap) untouched. The legacy booleans remain for saved
-    # settings/API compatibility and are normalized by ``effective_load_mode``.
+    # runtime policy untouched (b10364+ avoids mmap on iGPUs). Legacy booleans
+    # remain for settings/API compatibility and are normalized by
+    # ``effective_load_mode``.
     load_mode: str = "auto"
     mlock: bool = False
     no_mmap: bool = False
@@ -1080,6 +1301,10 @@ class TunedConfig:
     estimated_model_ram_gb: float = 0.0
     estimated_kv_gb: float = 0.0
     full_offload: bool = False
+    # CPU and accelerator allocations share one physical pool (Apple
+    # Silicon / confirmed integrated GPU). Display and preflight code must
+    # present one combined capacity instead of independent RAM + VRAM totals.
+    unified_memory: bool = False
 
     # ---- New (display fidelity) ---------------------------------------
     # VRAM that vision (mmproj) and draft model consume on the GPU.
@@ -1119,12 +1344,19 @@ class TunedConfig:
     # preflight / registry add it to the total GPU footprint so the
     # displayed picture matches the real on-device allocation.
     runtime_vram_overhead_gb: float = 0.0
+    # Additional MoE op-offload batch workspace beyond the generic KV/FA
+    # headroom. Included in GPU footprint/preflight reporting.
+    batch_vram_overhead_gb: float = 0.0
     # KV split between VRAM and RAM (set by compute_config). For
     # full-offload / MoE-on-GPU the entire KV cache lives in VRAM and
     # `kv_ram_gb == 0`. For dense-hybrid placement the small RAM share
     # is shown so the user can see why context is throttled.
     kv_vram_gb: float = 0.0
     kv_ram_gb: float = 0.0
+    # Fixed F32 recurrent state for Mamba/RWKV/linear-attention layers.
+    # This is separate from context-growing attention KV.
+    recurrent_state_vram_gb: float = 0.0
+    recurrent_state_ram_gb: float = 0.0
     # KV-quant labels actually applied (may differ from cache_k/cache_v
     # when an explicit Expert override was used — kept for diagnostics).
     kv_quant_strategy: str = (
@@ -1168,8 +1400,8 @@ class TunedConfig:
     # --parallel N for llama-server.  Controls how many inference slots
     # the server allocates simultaneously.  Always passed explicitly so
     # llama-server's "auto" heuristic cannot over-provision KV cache.
-    # Sized by the resolved PerformanceTarget (1 / 2 / 4 for throughput /
-    # balanced / safe).  The ctx calculation in compute_config divides
+    # Sized by the resolved PerformanceTarget (all desktop presets default to
+    # one slot). The ctx calculation in compute_config divides
     # kv_budget_gb by n_parallel so each slot gets a correctly-sized KV
     # window instead of the server silently multiplying KV by N slots.
     n_parallel: int = 1
@@ -1255,6 +1487,7 @@ def _decide_moe_offload(
     ram_safety_gb: float = DEFAULT_RAM_SAFETY_GB,
     moe_vram_safety_gb: float = MOE_VRAM_SAFETY_GB,
     moe_placement_ctx_target: int = MOE_PLACEMENT_CTX_TARGET,
+    batch_vram_reserve_gb: float = 0.0,
 ) -> Tuple[int, Optional[int], float, float, bool]:
     """Decide how to split an MoE model between GPU and CPU.
 
@@ -1287,15 +1520,26 @@ def _decide_moe_offload(
         kv_reservation_ctx * base_kv_per_token_mb * kv_quant_factor("q5_0")
     ) / 1024.0
 
-    # Layer placement uses VRAM left over AFTER KV + shared overhead.
+    # If even the estimated non-expert/shared tensors cannot fit, --n-cpu-moe
+    # cannot rescue the model: that flag moves experts only. Fall back to a
+    # fully CPU-resident load instead of reporting an impossible GPU footprint.
+    if free_vram_gb - moe_vram_safety_gb < shared_overhead_gb:
+        return 0, n_layers, 0.0, model_size_gb, False
+
+    # Layer placement uses VRAM left over AFTER KV, shared tensors, and the
+    # large MoE op-offload batch workspace selected by the performance tier.
     usable_for_experts = (
-        free_vram_gb - moe_vram_safety_gb - shared_overhead_gb - kv_reserve_gb
+        free_vram_gb
+        - moe_vram_safety_gb
+        - shared_overhead_gb
+        - kv_reserve_gb
+        - max(0.0, batch_vram_reserve_gb)
     )
 
     if usable_for_experts < 0:
-        # Not even the shared overhead + KV fits → everything via mmap/RAM.
-        if free_ram_gb - ram_safety_gb < model_size_gb - shared_overhead_gb:
-            return 999, n_layers, shared_overhead_gb, model_size_gb, False
+        # Shared tensors fit but the desired KV/batch reservation does not.
+        # Keep shared tensors on GPU, all experts in RAM, and let final context
+        # sizing use the actual residual capacity rather than double-counting.
         return (
             999,
             n_layers,
@@ -1349,6 +1593,63 @@ def _gpu_usable_cap_gb(gpu: "GPUInfo", is_primary: bool) -> float:
     cap_by_total = total_gb - headroom
     free_gb = gpu.free_vram_mb / 1024.0
     return max(0.0, min(cap_by_total, free_gb))
+
+
+def _visibility_env_for_gpus(
+    gpus: List[GPUInfo], indices: List[int]
+) -> Tuple[Dict[str, str], bool]:
+    """Return backend-correct visibility selectors and remap status.
+
+    ``indices`` are exact-runtime ordinals in the desired visible order. The
+    boolean tells the caller whether those selectors remap the chosen devices
+    to contiguous 0..N-1 indices (and therefore whether ``main_gpu`` may be
+    reset to a visible-list position).
+    """
+    if not gpus or len(gpus) != len(indices):
+        return {}, False
+    backends = {
+        str(g.runtime_backend or "").strip().lower() for g in gpus if g.runtime_backend
+    }
+    comma = ",".join(str(i) for i in indices)
+
+    if len(backends) == 1:
+        backend = next(iter(backends))
+        if backend.startswith("cuda"):
+            return {"CUDA_VISIBLE_DEVICES": comma}, True
+        if backend.startswith("hip") or backend.startswith("rocm"):
+            return {"HIP_VISIBLE_DEVICES": comma}, True
+        if backend.startswith("vulkan"):
+            return {"GGML_VK_VISIBLE_DEVICES": comma}, True
+        if backend.startswith("sycl"):
+            selector = ";".join(f"level_zero:{i}" for i in indices)
+            return {"ONEAPI_DEVICE_SELECTOR": selector}, True
+        # Metal/OpenVINO use different placement semantics; do not claim a
+        # visibility remap that the backend does not provide.
+        return {}, False
+
+    if backends:
+        # Mixed exact backends cannot share one ordinal namespace.
+        return {}, False
+
+    # Legacy/unprobeable build fallback. Emit every plausible selector for a
+    # homogeneous vendor; inactive backends ignore their variable.
+    vendors = {g.vendor.lower() for g in gpus}
+    if vendors == {"amd"}:
+        return {
+            "HIP_VISIBLE_DEVICES": comma,
+            "GGML_VK_VISIBLE_DEVICES": comma,
+        }, True
+    if vendors == {"nvidia"}:
+        return {
+            "CUDA_VISIBLE_DEVICES": comma,
+            "GGML_VK_VISIBLE_DEVICES": comma,
+        }, True
+    if vendors == {"intel"}:
+        return {
+            "ONEAPI_DEVICE_SELECTOR": ";".join(f"level_zero:{i}" for i in indices),
+            "GGML_VK_VISIBLE_DEVICES": comma,
+        }, True
+    return {}, False
 
 
 def _split_layers_by_bytes(layer_bytes: List[float], caps: List[float]) -> List[int]:
@@ -1499,6 +1800,8 @@ def _pick_kv_quant(
     *,
     turbo: bool = False,
     asymmetric: bool = True,  # Vulkan b9106+ supports asymmetric FA
+    base_k_per_token_mb: Optional[float] = None,
+    base_v_per_token_mb: Optional[float] = None,
 ) -> Tuple[str, str]:
     """Pick best (K, V) quants that fit target_ctx into kv_budget_gb.
 
@@ -1571,14 +1874,22 @@ def _pick_kv_quant(
     # budget check has to use the turbo factor or the AutoTuner will
     # leave a lot of context on the table (Basti's complaint: "the
     # token count doesn't change when switching to Turbo").
-    def _factor_for_pair(k_label: str, v_label: str) -> float:
+    def _per_token_for_pair(k_label: str, v_label: str) -> float:
         if turbo:
             k_label = _turbo_quant_for(k_label)
             v_label = _turbo_quant_for(v_label)
-        return (kv_quant_factor(k_label) + kv_quant_factor(v_label)) / 2
+        k_factor = kv_quant_factor(k_label)
+        v_factor = kv_quant_factor(v_label)
+        if (
+            base_k_per_token_mb is not None
+            and base_v_per_token_mb is not None
+            and base_k_per_token_mb + base_v_per_token_mb > 0
+        ):
+            return base_k_per_token_mb * k_factor + base_v_per_token_mb * v_factor
+        return base_kv_per_token_mb * (k_factor + v_factor) / 2
 
     for k, v in pairs:
-        per_tok = base_kv_per_token_mb * _factor_for_pair(k, v)
+        per_tok = _per_token_for_pair(k, v)
         if per_tok <= 0:
             continue
         max_fit = int(budget_mb / per_tok)
@@ -1723,6 +2034,7 @@ def compute_config(
     force_ngl: Optional[int] = None,  # Pin layer offload count
     force_n_cpu_moe: Optional[int] = None,  # Pin MoE CPU-layer count
     force_n_parallel: Optional[int] = None,  # Pin --parallel slot count
+    force_draft_n_max: Optional[int] = None,  # Pin speculative rollback depth
     force_rope_scale: Optional[bool] = None,  # Force YaRN on/off
     # ---- GPU priority overrides ----------------------------------------
     # Optional mapping of GPU name → user-assigned priority (≥1).
@@ -1812,6 +2124,7 @@ def compute_config(
     )
 
     has_gpu = bool(system.gpus) and system.total_vram_gb > 1
+    unified_memory = bool(getattr(system, "has_unified_memory", False))
     free_vram = max(0.0, system.free_vram_gb)
     n_layers = model.n_layers
 
@@ -1925,11 +2238,35 @@ def compute_config(
         if len(system.gpus) > 1 and primary_gpu is not None:
             primary_free_vram_gb = max(0.0, primary_gpu.free_vram_mb / 1024.0)
 
+    if forced_gpu is not None:
+        # A hard pin hides every peer device, so every placement/KV decision
+        # must use the selected card's capacity rather than aggregate VRAM.
+        free_vram = primary_free_vram_gb
+
     # ---- (0.1) KV per-token: MUST be defined before any branch uses it.
     # This is the bug that caused crashes on selection of any non-Qwen
     # model in v3.x — base_kv_mb was previously only set inside the
     # rope-scaling branch, but referenced unconditionally further below.
-    base_kv_mb = _resolve_kv_per_token_mb(model, params_b)
+    base_k_mb, base_v_mb = _resolve_kv_per_token_parts_mb(model, params_b)
+    base_kv_mb = base_k_mb + base_v_mb
+
+    # Context-independent recurrent state for Mamba/RWKV/hybrid layers.
+    # Model-based speculative methods retain rollback snapshots (draft_max;
+    # default 2), each of which duplicates state per parallel slot. b10441's
+    # common_params_speculative::need_n_rs_seq explicitly excludes n-gram
+    # methods, so draftless n-gram does not reserve snapshots here.
+    has_state_snapshots = bool(draft_model is not None or model.has_embedded_mtp)
+    resolved_draft_n_max = (
+        max(1, int(force_draft_n_max))
+        if force_draft_n_max is not None and int(force_draft_n_max) > 0
+        else max(1, int(getattr(profile, "draft_max", 0) or 2))
+    )
+    snapshot_count = resolved_draft_n_max if has_state_snapshots else 0
+    recurrent_state_total_gb = recurrent_state_gb_from_metadata(
+        model.metadata,
+        n_parallel=n_parallel,
+        snapshot_count=snapshot_count,
+    )
 
     native_ctx = model.native_context  # GGUF metadata: model's native ctx
 
@@ -2018,8 +2355,15 @@ def compute_config(
     # Effective VRAM available for main model placement. Vision/draft that
     # live on the GPU AND the runner's runtime overhead are subtracted up
     # front so placement + KV sizing see the real headroom.
+    shared_host_reserve_gb = (
+        vision_ram_gb + prompt_cache_ram_gb if unified_memory else 0.0
+    )
     effective_free_vram = (
-        free_vram - vision_vram_gb - draft_vram_gb - runtime_vram_overhead_gb
+        free_vram
+        - vision_vram_gb
+        - draft_vram_gb
+        - runtime_vram_overhead_gb
+        - shared_host_reserve_gb
     )
     if effective_free_vram < 0:
         effective_free_vram = 0.0
@@ -2028,7 +2372,11 @@ def compute_config(
     # use this (experts spill to CPU, never to the secondary GPU). On
     # single-GPU systems this equals effective_free_vram.
     effective_primary_free_vram = (
-        primary_free_vram_gb - vision_vram_gb - draft_vram_gb - runtime_vram_overhead_gb
+        primary_free_vram_gb
+        - vision_vram_gb
+        - draft_vram_gb
+        - runtime_vram_overhead_gb
+        - shared_host_reserve_gb
     )
     if effective_primary_free_vram < 0:
         effective_primary_free_vram = 0.0
@@ -2037,7 +2385,7 @@ def compute_config(
     # placement. This allows large MoE models like Qwen3.5-122B-A10B to
     # utilise both GPUs (R9700 + RX 9070 XT = 48 GB total) instead of
     # being restricted to the primary GPU only.
-    has_multiple_gpus = has_gpu and len(system.gpus) > 1
+    has_multiple_gpus = has_gpu and len(system.gpus) > 1 and forced_gpu is None
     combined_usable_vram_gb = 0.0
     if has_multiple_gpus:
         # Combined USABLE VRAM across all GPUs for MoE expert placement —
@@ -2069,6 +2417,17 @@ def compute_config(
     # placement branch entirely. is_moe stays True for display / split
     # decisions are handled below via the disable_moe_placement flag.
     disable_moe_placement = is_diffusion_gemma
+    state_vram_reserve_for_placement = (
+        0.0 if perf_target.kv_to_ram else recurrent_state_total_gb
+    )
+    dense_placement_safety_gb = (
+        max(vram_safety_gb, ram_safety_gb) if unified_memory else vram_safety_gb
+    )
+    moe_placement_safety_gb = (
+        max(perf_target.moe_vram_safety_gb, ram_safety_gb)
+        if unified_memory
+        else perf_target.moe_vram_safety_gb
+    )
     n_cpu_moe: Optional[int] = None
     if is_moe and has_gpu and n_layers > 0 and not disable_moe_placement:
         ngl, n_cpu_moe, model_vram, model_ram, full_off = _decide_moe_offload(
@@ -2081,8 +2440,11 @@ def compute_config(
             target_ctx=target_ctx_for_placement,
             base_kv_per_token_mb=base_kv_mb,
             ram_safety_gb=ram_safety_gb,
-            moe_vram_safety_gb=perf_target.moe_vram_safety_gb,
+            moe_vram_safety_gb=moe_placement_safety_gb,
             moe_placement_ctx_target=perf_target.moe_placement_ctx_target,
+            batch_vram_reserve_gb=(
+                perf_target.moe_batch_vram_reserve_gb + state_vram_reserve_for_placement
+            ),
         )
 
         # ---- Two-pass placement fallback ---------------------------------
@@ -2110,8 +2472,12 @@ def compute_config(
                 target_ctx=target_ctx_for_placement,
                 base_kv_per_token_mb=base_kv_mb,
                 ram_safety_gb=ram_safety_gb,
-                moe_vram_safety_gb=perf_target.moe_vram_safety_gb,
+                moe_vram_safety_gb=moe_placement_safety_gb,
                 moe_placement_ctx_target=shrunk_target,
+                batch_vram_reserve_gb=(
+                    perf_target.moe_batch_vram_reserve_gb
+                    + state_vram_reserve_for_placement
+                ),
             )
             # Only adopt the second pass if it actually placed layers on GPU.
             if cpu_moe_2 is not None and cpu_moe_2 < n_cpu_moe:
@@ -2123,7 +2489,11 @@ def compute_config(
                     full_2,
                 )
 
-        if n_cpu_moe == 0:
+        if ngl <= 0:
+            # Fully CPU-resident fallback: --n-cpu-moe is redundant and would
+            # incorrectly select the large MoE GPU-hybrid batch regime.
+            n_cpu_moe = None
+        elif n_cpu_moe == 0:
             n_cpu_moe = None
     else:
         # Reserve VRAM for the KV cache before placing dense weight layers,
@@ -2133,34 +2503,40 @@ def compute_config(
         # finally pick. Capped at the model's native context so we never
         # reserve for tokens the model can't address.
         #
-        # CRITICAL: only reserve when the model does NOT already fully fit in
-        # (combined) VRAM. A model that fits with room to spare should keep all
-        # its weights on GPU and draw KV from the leftover VRAM (the full_off
-        # branch below) — reserving there would needlessly spill weights to CPU
-        # AND, on multi-GPU, shrink model_vram enough that the model suddenly
-        # "fits" the primary card and stops spreading. The trade only makes
-        # sense for a model too big for VRAM (the genuine hybrid case).
-        dense_kv_reserve_gb = 0.0
-        model_fits_vram = (
-            model.size_gb + FULL_OFF_HEADROOM_GB <= effective_free_vram - vram_safety_gb
-        )
-        if (
-            not perf_target.kv_to_ram
-            and perf_target.dense_kv_reserve_ctx > 0
-            and not model_fits_vram
-        ):
+        # Reserve only when weights + the tier's desired KV target do not fit
+        # together. A roomy GPU remains full-offload; a near-full GPU spills a
+        # few weight layers to CPU so the VRAM-resident KV cache is real rather
+        # than being (incorrectly) supplemented with host RAM.
+        desired_dense_kv_reserve_gb = state_vram_reserve_for_placement
+        if not perf_target.kv_to_ram and perf_target.dense_kv_reserve_ctx > 0:
             reserve_ctx = perf_target.dense_kv_reserve_ctx
             if native_ctx > 0:
                 reserve_ctx = min(reserve_ctx, native_ctx)
-            dense_kv_reserve_gb = (
+            desired_dense_kv_reserve_gb += (
                 reserve_ctx * base_kv_mb * kv_quant_factor("q5_0")
             ) / 1024.0
+        model_weights_fit_vram = (
+            model.size_gb + FULL_OFF_HEADROOM_GB + state_vram_reserve_for_placement
+            <= effective_free_vram - dense_placement_safety_gb
+        )
+        model_and_kv_fit_vram = (
+            model.size_gb + FULL_OFF_HEADROOM_GB + desired_dense_kv_reserve_gb
+            <= effective_free_vram - dense_placement_safety_gb
+        )
+        # Preserve established multi-GPU full-offload behavior when the model
+        # weights fit across the pool. Context is then limited by the genuine
+        # post-weight VRAM remainder (never by a fictitious RAM supplement).
+        if has_multiple_gpus and model_weights_fit_vram:
+            model_and_kv_fit_vram = True
+        dense_kv_reserve_gb = (
+            0.0 if model_and_kv_fit_vram else desired_dense_kv_reserve_gb
+        )
         ngl, model_vram, model_ram, full_off = _decide_offload(
             model_size_gb=model.size_gb,
             free_vram_gb=effective_free_vram,
             n_layers=n_layers,
             has_gpu=has_gpu,
-            vram_headroom_gb=vram_safety_gb,
+            vram_headroom_gb=dense_placement_safety_gb,
             kv_reserve_gb=dense_kv_reserve_gb,
         )
 
@@ -2209,18 +2585,60 @@ def compute_config(
             model_ram = (n_layers - new_ngl) * per_layer_gb + residual_overhead
             full_off = False
 
-    # ---- (2) Remaining KV budget — include vision/draft VRAM in total
+    # Fixed recurrent state follows K/Q/V offload placement but does not grow
+    # with context. Account for it separately from attention KV.
+    if perf_target.kv_to_ram or not has_gpu or ngl <= 0:
+        recurrent_state_vram_gb = 0.0
+        recurrent_state_ram_gb = recurrent_state_total_gb
+    elif full_off or ngl == 999 or n_layers <= 0:
+        recurrent_state_vram_gb = recurrent_state_total_gb
+        recurrent_state_ram_gb = 0.0
+    else:
+        recurrent_gpu_fraction = min(1.0, max(0.0, ngl / n_layers))
+        recurrent_state_vram_gb = recurrent_state_total_gb * recurrent_gpu_fraction
+        recurrent_state_ram_gb = recurrent_state_total_gb - recurrent_state_vram_gb
+
+    # ---- (2) Remaining KV budget — include vision/draft/state in total
     effective_vram_safety = (
         perf_target.moe_vram_safety_gb if n_cpu_moe is not None else vram_safety_gb
     )
+    if unified_memory:
+        effective_vram_safety = max(effective_vram_safety, ram_safety_gb)
+    moe_batch_vram_reserve_gb = (
+        perf_target.moe_batch_vram_reserve_gb
+        if n_cpu_moe is not None and n_cpu_moe > 0 and ngl > 0
+        else 0.0
+    )
+
+    # If all fixed GPU allocations fit the preferred card, size KV from that
+    # card too. This preserves the "keep the secondary free" policy without
+    # approving context from aggregate VRAM and then hiding the peer GPU.
+    planned_single_gpu = forced_gpu is not None
+    gpu_budget_free_vram = free_vram
+    fixed_gpu_footprint = (
+        model_vram
+        + vision_vram_gb
+        + draft_vram_gb
+        + runtime_vram_overhead_gb
+        + moe_batch_vram_reserve_gb
+        + recurrent_state_vram_gb
+    )
+    if not planned_single_gpu and has_multiple_gpus and primary_gpu is not None:
+        primary_cap = _gpu_usable_cap_gb(primary_gpu, True)
+        if fixed_gpu_footprint <= primary_cap:
+            planned_single_gpu = True
+            gpu_budget_free_vram = primary_cap
+
     free_vram_after = max(
         0.0,
-        free_vram
+        gpu_budget_free_vram
         - effective_vram_safety
         - model_vram
         - vision_vram_gb
         - draft_vram_gb
-        - runtime_vram_overhead_gb,
+        - runtime_vram_overhead_gb
+        - moe_batch_vram_reserve_gb
+        - recurrent_state_vram_gb,
     )
     # The RAM budget must also account for the mmproj when it is forced
     # into host RAM (--no-mmproj-offload → vision_ram_gb) and for the
@@ -2232,8 +2650,32 @@ def compute_config(
         - ram_safety_gb
         - model_ram
         - vision_ram_gb
-        - prompt_cache_ram_gb,
+        - prompt_cache_ram_gb
+        - recurrent_state_ram_gb,
     )
+
+    if unified_memory:
+        # CPU and accelerator allocations consume one physical pool. Count all
+        # resident components once and expose the same remainder to either
+        # compute placement; never add RAM and VRAM capacities together.
+        shared_available = min(free_vram, max(0.0, system.free_ram_gb))
+        shared_remaining = max(
+            0.0,
+            shared_available
+            - max(effective_vram_safety, ram_safety_gb)
+            - model_vram
+            - model_ram
+            - vision_vram_gb
+            - vision_ram_gb
+            - draft_vram_gb
+            - runtime_vram_overhead_gb
+            - prompt_cache_ram_gb
+            - moe_batch_vram_reserve_gb
+            - recurrent_state_vram_gb
+            - recurrent_state_ram_gb,
+        )
+        free_vram_after = shared_remaining
+        free_ram_after = shared_remaining
 
     # KV-cache placement rules:
     #   - kv_to_ram (low_vram): the ENTIRE KV cache lives in system RAM via
@@ -2273,8 +2715,12 @@ def compute_config(
         ram_kv = min(free_ram_after, perf_target.kv_ram_cap_gb)
         kv_budget_gb = ram_kv
         no_kv_offload = True
-    elif is_moe and has_gpu and not disable_moe_placement:
-        if has_multiple_gpus:
+    elif unified_memory and has_gpu:
+        # Placement changes which processor owns the cache, not physical
+        # capacity. Both views point at the same deduplicated pool.
+        kv_budget_gb = min(free_vram_after, free_ram_after)
+    elif is_moe and has_gpu and ngl > 0 and not disable_moe_placement:
+        if has_multiple_gpus and not planned_single_gpu:
             # MoE KV lives in VRAM and follows the layer split, so it must
             # fit inside the SAME per-card caps the spread enforces. Using
             # the raw free-VRAM remainder here (free_vram_after) hands the
@@ -2288,22 +2734,18 @@ def compute_config(
                 - model_vram
                 - vision_vram_gb
                 - draft_vram_gb
-                - runtime_vram_overhead_gb,
+                - runtime_vram_overhead_gb
+                - moe_batch_vram_reserve_gb
+                - recurrent_state_vram_gb,
             )
         else:
             kv_budget_gb = free_vram_after
     elif full_off:
-        # Dense model fully on GPU, but the model may nearly fill VRAM
-        # (e.g. a 27B Q3 occupying 14 of 16 GB), leaving almost nothing
-        # for KV. Layer computation stays on GPU; allow the KV cache to
-        # use system RAM so the server reaches a useful context length.
-        # Cap prevents consuming all available RAM for KV alone.
-        # The VRAM share is always included — if VRAM has headroom, KV
-        # goes there first and is fast; the RAM portion only matters when
-        # VRAM is nearly full.
-        DENSE_FULL_KV_RAM_CAP_GB = 8.0
-        ram_supplement = min(free_ram_after, DENSE_FULL_KV_RAM_CAP_GB)
-        kv_budget_gb = free_vram_after + ram_supplement
+        # With KV offload enabled, every fully-offloaded layer allocates its
+        # KV buffer on the GPU device. llama.cpp does not transparently spill
+        # this cache into host RAM; only --no-kv-offload changes that. Budget
+        # strictly from post-weight VRAM so the promised context can allocate.
+        kv_budget_gb = free_vram_after
     elif ngl > 0 and n_layers > 0:
         # Dense hybrid: llama.cpp splits the KV cache BY LAYER — the KV of
         # GPU-resident layers lives in VRAM, the KV of CPU-resident layers in
@@ -2501,6 +2943,8 @@ def compute_config(
             model_ctx_limit,
             turbo=turbo_kv,
             asymmetric=auto_asymmetric_kv,
+            base_k_per_token_mb=base_k_mb,
+            base_v_per_token_mb=base_v_mb,
         )
         if force_cache_k is not None:
             cache_k = _turbo_quant_for(force_cache_k) if turbo_kv else force_cache_k
@@ -2515,9 +2959,9 @@ def compute_config(
                 else "turbo"
             )
 
-    actual_per_tok_mb = (
-        base_kv_mb * (kv_quant_factor(cache_k) + kv_quant_factor(cache_v)) / 2
-    )
+    actual_per_tok_mb = base_k_mb * kv_quant_factor(
+        cache_k
+    ) + base_v_mb * kv_quant_factor(cache_v)
 
     # Memory-safe ceiling — computed ONCE and used by both the auto and
     # the user-pin paths. Dividiere durch n_parallel, da llama-server N
@@ -2599,25 +3043,49 @@ def compute_config(
             f"Requested context {pin_clamped_to_budget:,} exceeds the "
             f"safe KV budget; clamped to {ctx:,} to avoid VRAM/RAM OOM."
         )
-    if n_cpu_moe is not None or full_off:
+    if unified_memory:
+        shared_total = (
+            model_vram
+            + model_ram
+            + estimated_kv_gb
+            + recurrent_state_total_gb
+            + vision_vram_gb
+            + vision_ram_gb
+            + draft_vram_gb
+            + runtime_vram_overhead_gb
+            + prompt_cache_ram_gb
+            + moe_batch_vram_reserve_gb
+            + max(effective_vram_safety, ram_safety_gb)
+        )
+        shared_free = min(free_vram, max(0.0, system.free_ram_gb))
+        if shared_total > shared_free * 0.98:
+            tight = (
+                f"Unified-memory budget tight: model {model_vram + model_ram:.1f} "
+                f"GB + KV {estimated_kv_gb:.1f} GB + overhead/reserves "
+                f"{shared_total - model_vram - model_ram - estimated_kv_gb:.1f} "
+                f"GB ≈ {shared_total:.1f} GB of {shared_free:.1f} GB available."
+            )
+            warning = f"{warning} {tight}" if warning else tight
+    elif n_cpu_moe is not None or full_off:
         # When --no-kv-offload is active the KV cache lives in system RAM,
-        # so it must NOT count toward the VRAM overcommit check (otherwise
-        # every low_vram run would false-positive a "VRAM budget tight"
-        # warning for KV that isn't even on the GPU).
+        # so it must NOT count toward the dedicated-VRAM overcommit check.
         vram_kv_component = 0.0 if no_kv_offload else estimated_kv_gb
         gpu_total = (
             model_vram
             + vram_kv_component
             + runtime_vram_overhead_gb
+            + moe_batch_vram_reserve_gb
+            + recurrent_state_vram_gb
             + effective_vram_safety
         )
-        if gpu_total > free_vram * 0.98:
+        if gpu_total > gpu_budget_free_vram * 0.98:
             tight = (
                 f"VRAM budget tight: model {model_vram:.1f} GB + KV "
-                f"{vram_kv_component:.1f} GB + runtime "
-                f"{runtime_vram_overhead_gb:.1f} GB + safety "
-                f"{effective_vram_safety:.1f} GB ≈ {gpu_total:.1f} GB of "
-                f"{free_vram:.1f} GB free."
+                f"{vram_kv_component:.1f} GB + runtime/batch "
+                f"{runtime_vram_overhead_gb + moe_batch_vram_reserve_gb:.1f} "
+                f"GB + recurrent state {recurrent_state_vram_gb:.1f} GB + "
+                f"safety {effective_vram_safety:.1f} GB ≈ "
+                f"{gpu_total:.1f} GB of {gpu_budget_free_vram:.1f} GB free."
             )
             warning = f"{warning} {tight}" if warning else tight
 
@@ -2773,9 +3241,9 @@ def compute_config(
     # hardware.py by PCI-device-id (vulkaninfo --summary) → --list-devices →
     # vulkaninfo name match.  We NEVER use the Windows registry/detection
     # position as a device index (it is the opposite order on this system).
-    # Both env vars are emitted so the config is backend-agnostic:
-    #   - HIP_VISIBLE_DEVICES        → ROCm/HIP builds
-    #   - GGML_VK_VISIBLE_DEVICES    → Vulkan builds (PR #5321+)
+    # The exact runtime backend selects the visibility mechanism: CUDA,
+    # HIP, Vulkan, or SYCL/oneAPI. Legacy unprobeable homogeneous systems
+    # receive conservative vendor-appropriate selectors.
     tensor_split: Optional[str] = None
     main_gpu: Optional[int] = None
     env_overrides: Dict[str, str] = {}
@@ -2789,28 +3257,27 @@ def compute_config(
         # the secondary card half-empty. Use the architectural is_moe flag
         # (combined with has_gpu) so EVERY MoE that spreads uses the
         # capacity-fill strategy, whether or not any experts spilled to CPU.
-        is_moe_cfg = is_moe and has_gpu and not disable_moe_placement
+        is_moe_cfg = is_moe and has_gpu and ngl > 0 and not disable_moe_placement
 
         primary_cap = _gpu_usable_cap_gb(primary_gpu, True)
 
-        # Full GPU footprint we need to place: weights + KV + vision + draft.
-        # For pinning decisions, we only consider model_vram (weights) because
-        # the KV cache is dynamically allocated and won't consume the entire
-        # budget. This allows smaller models to be pinned to the primary GPU
-        # even when their theoretical max-KV footprint exceeds the cap.
+        # Full GPU footprint we need to place. KV is included because a
+        # visibility pin hides every peer device; approving it from aggregate
+        # VRAM would otherwise create a deterministic single-card OOM.
         model_footprint_gb = (
-            model_vram + vision_vram_gb + draft_vram_gb + runtime_vram_overhead_gb
+            model_vram
+            + estimated_kv_gb
+            + vision_vram_gb
+            + draft_vram_gb
+            + runtime_vram_overhead_gb
+            + moe_batch_vram_reserve_gb
+            + recurrent_state_vram_gb
         )
 
         # Pin the whole model to the primary GPU when its GPU-resident
-        # weight footprint fits the primary's usable cap. This holds for
-        # both dense (all weights) and MoE (weights minus any CPU-spilled
-        # experts) — in both cases model_vram is exactly the portion that
-        # must live in GPU memory, so the single comparison is correct.
-        # KV is intentionally excluded here: it is allocated dynamically
-        # and capped downstream, so a model whose weights fit should pin to
-        # the primary even if its theoretical max-KV would not, keeping the
-        # secondary GPU free.
+        # complete footprint fits the primary's usable cap. Context sizing
+        # already used the same primary cap when fixed allocations fit there,
+        # preserving the secondary card without borrowing its KV capacity.
         #
         # A user-supplied force_gpu ALWAYS pins exclusively: the user has
         # explicitly chosen the card this server boots on, so we hide every
@@ -2822,19 +3289,28 @@ def compute_config(
 
         if pin_to_primary:
             if hip_known:
-                # Expose ONLY the primary GPU. After this remap the primary is
-                # the sole visible device (index 0), so EVERY allocation —
-                # including the draft/MTP context that was crashing on Vulkan0 —
-                # lands on the intended card (the R9700).
-                vis = str(primary_gpu.hip_index)
-                env_overrides["HIP_VISIBLE_DEVICES"] = vis
-                env_overrides["GGML_VK_VISIBLE_DEVICES"] = vis
-                main_gpu = 0  # only one device visible after remapping
+                primary_index = int(primary_gpu.hip_index)  # type: ignore[arg-type]
+                selectors, remapped = _visibility_env_for_gpus(
+                    [primary_gpu], [primary_index]
+                )
+                env_overrides.update(selectors)
+                if remapped:
+                    # The selected physical device is now visible as index 0.
+                    main_gpu = 0
+                else:
+                    # Backend has no supported visibility remap. Steer weights
+                    # with a runtime-order one-hot split and keep the original
+                    # backend index for --main-gpu.
+                    idx_order = sorted(
+                        range(len(system.gpus)),
+                        key=lambda i: int(system.gpus[i].hip_index),  # type: ignore[arg-type]
+                    )
+                    parts = ["0.000"] * len(system.gpus)
+                    parts[idx_order.index(primary_pos)] = "1.000"
+                    tensor_split = ",".join(parts)
+                    main_gpu = primary_index
             else:
-                # Index unknown — pin weights via a position-based split. This
-                # steers the main model to the primary but cannot HIDE the
-                # secondary GPU. Ensure the llama binary / Vulkan SDK is
-                # reachable so hardware.py can resolve hip_index next time.
+                # Index unknown — position-based steering cannot hide peers.
                 parts = ["0.000"] * len(system.gpus)
                 parts[primary_pos] = "1.000"
                 tensor_split = ",".join(parts)
@@ -2899,9 +3375,11 @@ def compute_config(
                 kv_layer_gb = (
                     0.0 if no_kv_offload else max(0.0, estimated_kv_gb) / n_layers
                 )
+                recurrent_layer_gb = max(0.0, recurrent_state_vram_gb) / n_layers
                 layer_gpu_bytes = [
                     light_gb
                     + kv_layer_gb
+                    + recurrent_layer_gb
                     + (0.0 if li < cpu_moe_layers else per_layer_expert)
                     for li in range(n_layers)
                 ]
@@ -2947,9 +3425,15 @@ def compute_config(
                     range(len(ordered)),
                     key=lambda i: int(ordered[i].hip_index),  # type: ignore[arg-type]
                 )
-                vis_str = ",".join(str(ordered[i].hip_index) for i in idx_order)
-                env_overrides["HIP_VISIBLE_DEVICES"] = vis_str
-                env_overrides["GGML_VK_VISIBLE_DEVICES"] = vis_str
+                visible_gpus = [ordered[i] for i in idx_order]
+                visible_indices = [
+                    int(ordered[i].hip_index)  # type: ignore[arg-type]
+                    for i in idx_order
+                ]
+                selectors, remapped = _visibility_env_for_gpus(
+                    visible_gpus, visible_indices
+                )
+                env_overrides.update(selectors)
                 if layer_gpu_bytes:
                     # MoE → byte-aware LAYER-COUNT split (see comment above).
                     # Caps in visible-device order; the primary's cap is
@@ -2959,7 +3443,14 @@ def compute_config(
                     for i in idx_order:
                         c = caps[i]
                         if ordered[i] is primary_gpu:
-                            c = max(0.0, c - vision_vram_gb - draft_vram_gb)
+                            c = max(
+                                0.0,
+                                c
+                                - vision_vram_gb
+                                - draft_vram_gb
+                                - runtime_vram_overhead_gb
+                                - moe_batch_vram_reserve_gb,
+                            )
                         caps_vis.append(c)
                     counts_vis = _split_layers_by_bytes(layer_gpu_bytes, caps_vis)
                     tensor_split = ",".join(f"{c:.3f}" for c in counts_vis)
@@ -2967,9 +3458,12 @@ def compute_config(
                     tensor_split = ",".join(
                         f"{alloc[i] / denom:.3f}" for i in idx_order
                     )
-                # main_gpu is the index (within the visible/sorted list) of the
-                # primary card — where llama.cpp keeps the small shared tensors.
-                main_gpu = idx_order.index(ordered.index(primary_gpu))
+                primary_visible_pos = idx_order.index(ordered.index(primary_gpu))
+                # Visibility selectors remap devices to 0..N-1; otherwise
+                # retain the runtime's original ordinal.
+                main_gpu = (
+                    primary_visible_pos if remapped else int(primary_gpu.hip_index)  # type: ignore[arg-type]
+                )
             else:
                 # Indices unknown — position-based split in the system.gpus
                 # order (may be wrong on Windows AMD; keep the llama binary /
@@ -2980,7 +3474,14 @@ def compute_config(
                     for g in system.gpus:
                         c = _gpu_usable_cap_gb(g, g is primary_gpu)
                         if g is primary_gpu:
-                            c = max(0.0, c - vision_vram_gb - draft_vram_gb)
+                            c = max(
+                                0.0,
+                                c
+                                - vision_vram_gb
+                                - draft_vram_gb
+                                - runtime_vram_overhead_gb
+                                - moe_batch_vram_reserve_gb,
+                            )
                         caps_pos.append(c)
                     counts_pos = _split_layers_by_bytes(layer_gpu_bytes, caps_pos)
                     tensor_split = ",".join(f"{c:.3f}" for c in counts_pos)
@@ -3092,7 +3593,7 @@ def compute_config(
     if no_kv_offload:
         kv_vram_gb = 0.0
         kv_ram_gb = estimated_kv_gb
-    elif is_moe and has_gpu and not disable_moe_placement:
+    elif is_moe and has_gpu and ngl > 0 and not disable_moe_placement:
         kv_vram_gb = estimated_kv_gb
         kv_ram_gb = 0.0
     elif full_off:
@@ -3144,6 +3645,7 @@ def compute_config(
         estimated_model_ram_gb=model_ram,
         estimated_kv_gb=estimated_kv_gb,
         full_offload=full_off,
+        unified_memory=unified_memory,
         vision_vram_gb=vision_vram_gb,
         vision_ram_gb=vision_ram_gb,
         draft_vram_gb=draft_vram_gb,
@@ -3151,8 +3653,11 @@ def compute_config(
         prompt_cache_ram_mib=prompt_cache_ram_mib,
         prompt_cache_ram_gb=prompt_cache_ram_gb,
         runtime_vram_overhead_gb=runtime_vram_overhead_gb,
+        batch_vram_overhead_gb=moe_batch_vram_reserve_gb,
         kv_vram_gb=kv_vram_gb,
         kv_ram_gb=kv_ram_gb,
+        recurrent_state_vram_gb=recurrent_state_vram_gb,
+        recurrent_state_ram_gb=recurrent_state_ram_gb,
         kv_quant_strategy=kv_quant_strategy,
         no_context_shift=no_context_shift,
         no_kv_offload=no_kv_offload,
@@ -3180,6 +3685,11 @@ def compute_config(
         performance_target=perf_target.name,
         n_parallel=n_parallel,
         n_parallel_forced=n_parallel_forced,
+        draft_n_max=(
+            max(1, int(force_draft_n_max))
+            if force_draft_n_max is not None and int(force_draft_n_max) > 0
+            else 0
+        ),
         warning=warning,
         extra_cli_flags=seed_extras,
         env_overrides=env_overrides,

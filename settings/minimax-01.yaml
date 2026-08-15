@@ -1,0 +1,46 @@
+display_name: "MiniMax-Text-01 / MiniMax-M1 (hybrid MoE)"
+patterns:
+  - minimax-text-01
+  - minimax_text_01
+  - minimax-m1
+  - minimax_m1
+
+arch_fallback:
+  - minimax-01
+
+# The original model was trained to 1M and advertised 4M extrapolation.
+# Keep the automatic profile at the trained window; GGUF native metadata is
+# still authoritative and may clamp this lower.
+max_context: 1048576
+recommended_kv_quant: q5_0
+min_llama_build: 10437
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 0.9
+    top_k: 40
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 0.9
+    top_k: 40
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  - --jinja
+
+draft_max: 0
+ngram_method: ngram-mod
+
+notes: >
+  MiniMax-Text-01 is a 456B-A45.9B MoE hybrid with Lightning Attention
+  recurrent layers and one full-attention layer per eight blocks; MiniMax-M1
+  uses the same llama.cpp minimax-01 architecture. Native support landed in
+  llama.cpp b10437. AutoTuner counts recurrent-layer boolean arrays, sizes KV
+  only for full-attention layers, and uses expert-aware placement. The model
+  is far larger than ordinary laptop memory even when quantized; small local
+  systems require a heavily quantized split and substantial system RAM.

@@ -190,7 +190,7 @@ def test_diagnose_skips_irrelevant_fork_discovery(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(
         auto_tuner,
         "detect_system",
-        lambda: SystemInfo(
+        lambda *_: SystemInfo(
             os_name="Test",
             cpu_name="CPU",
             cpu_cores_physical=1,
@@ -225,7 +225,7 @@ def test_noninteractive_and_yes_never_call_confirm(monkeypatch, tmp_path) -> Non
         free_ram_gb=8,
     )
     monkeypatch.setattr(auto_tuner, "_discover_llama_forks", lambda: [])
-    monkeypatch.setattr(auto_tuner, "detect_system", lambda: system)
+    monkeypatch.setattr(auto_tuner, "detect_system", lambda *_: system)
     monkeypatch.setattr(auto_tuner, "scan_models", lambda _: [entry])
     monkeypatch.setattr(auto_tuner, "load_profiles", lambda _: [profile])
     monkeypatch.setattr(auto_tuner, "match_profile", lambda *_: profile)
@@ -255,7 +255,12 @@ def test_noninteractive_and_yes_never_call_confirm(monkeypatch, tmp_path) -> Non
             estimated_model_ram_gb=0,
             vision_vram_gb=0,
             vision_ram_gb=0,
+            draft_vram_gb=0,
+            unified_memory=False,
             runtime_vram_overhead_gb=0,
+            batch_vram_overhead_gb=0,
+            recurrent_state_vram_gb=0,
+            recurrent_state_ram_gb=0,
             estimated_kv_gb=0,
             prompt_cache_ram_gb=0,
             env_overrides={},

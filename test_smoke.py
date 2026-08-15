@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -327,6 +328,9 @@ def _fake_system(
     vram_total: float = 24,
     vram_free: float = 22,
     vendor: str = "amd",
+    unified: bool = False,
+    runtime_backend: str | None = None,
+    runtime_index: int | None = None,
 ):
     """Build a synthetic SystemInfo for tuner tests."""
     return SystemInfo(
@@ -343,6 +347,15 @@ def _fake_system(
                 vendor=vendor,
                 total_vram_mb=int(vram_total * 1024),
                 free_vram_mb=int(vram_free * 1024),
+                unified_memory=unified,
+                is_integrated=True if unified else False,
+                runtime_backend=runtime_backend,
+                runtime_device=(
+                    f"{runtime_backend}{runtime_index}"
+                    if runtime_backend is not None and runtime_index is not None
+                    else None
+                ),
+                hip_index=runtime_index,
             )
         ]
         if vram_total > 0
@@ -495,7 +508,10 @@ def test_nvidia_auto_kv_stays_symmetric_for_cuda_flash_attention(tmp_path) -> No
         profile,
     )
 
-    assert amd_cfg.cache_k != amd_cfg.cache_v
+    # AMD may choose an asymmetric pair when it fits, but must fall back to a
+    # safe symmetric pair rather than overcommitting a tight real VRAM budget.
+    assert amd_cfg.cache_k in {"q8_0", "q5_0", "q4_0"}
+    assert amd_cfg.cache_v in {"q8_0", "q5_0", "q4_0"}
     assert nvidia_cfg.cache_k == nvidia_cfg.cache_v
 
 
@@ -1874,14 +1890,19 @@ def test_priority_weighted_tensor_split(tmp_path) -> None:
     # Vulkan order: device 0 = 9070 XT (small_vk_idx=0), device 1 = R9700 (large_vk_idx=1)
     xt_share = parts[0]  # 9070 XT
     r97_share = parts[1]  # R9700
-    # R9700 must get the lion's share — at least 75% (it has 2× priority
-    # AND 2× the free VRAM). Pure VRAM-proportional would give only 67%.
-    assert r97_share > 0.75, (
-        f"R9700 should dominate with priority=2; got share={r97_share:.3f}"
+    # R9700 receives the lion's share, but the split must not exceed its
+    # physical usable cap once KV is included. A hard >75% requirement is
+    # impossible for a 40 GB model when the card's safe cap is ~29 GB.
+    assert r97_share > xt_share
+    footprint = (
+        cfg.estimated_model_vram_gb
+        + cfg.kv_vram_gb
+        + cfg.recurrent_state_vram_gb
+        + cfg.runtime_vram_overhead_gb
+        + cfg.batch_vram_overhead_gb
     )
-    assert xt_share < 0.25, (
-        f"9070 XT should be ≤25% with priority=1; got share={xt_share:.3f}"
-    )
+    assert footprint * r97_share <= 31.0
+    assert footprint * xt_share <= 14.0
 
 
 def test_second_server_avoids_full_primary(tmp_path) -> None:
@@ -1937,6 +1958,14 @@ def test_force_gpu_pins_to_named_card(tmp_path) -> None:
     # visible device, hiding the R9700 the auto-logic would have chosen.
     assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "0"
     assert cfg.env_overrides.get("HIP_VISIBLE_DEVICES") == "0"
+    forced_footprint = (
+        cfg.estimated_model_vram_gb
+        + cfg.kv_vram_gb
+        + cfg.recurrent_state_vram_gb
+        + cfg.runtime_vram_overhead_gb
+        + cfg.batch_vram_overhead_gb
+    )
+    assert forced_footprint <= sys_info.gpus[1].free_vram_gb
 
 
 def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
@@ -3209,6 +3238,384 @@ def test_dense_spread_stays_priority_weighted(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# v5.1.3 architecture/backend memory regressions
+
+
+def test_full_offload_kv_never_uses_unflagged_host_ram(tmp_path) -> None:
+    """Full-offload + default KV offload must fit model and KV in real VRAM."""
+    from performance_target import PERFORMANCE_TARGETS
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _mistral_dense_md(tmp_path, size_gb=5.0)
+    profile = match_profile(model.name, profiles)
+    system = _fake_system(
+        ram_total=128,
+        ram_free=100,
+        vram_total=16,
+        vram_free=14,
+    )
+    target = PERFORMANCE_TARGETS["balanced"]
+    cfg = compute_config(model, system, profile, perf_target=target)
+
+    assert cfg.full_offload is True
+    assert cfg.no_kv_offload is False
+    assert cfg.kv_ram_gb == pytest.approx(0.0)
+    assert (
+        cfg.estimated_model_vram_gb
+        + cfg.kv_vram_gb
+        + cfg.runtime_vram_overhead_gb
+        + cfg.batch_vram_overhead_gb
+        + cfg.recurrent_state_vram_gb
+        + target.dense_vram_safety_gb
+        <= system.free_vram_gb + 1e-6
+    )
+
+
+def test_unified_memory_is_budgeted_once(tmp_path) -> None:
+    """Apple/iGPU shared RAM must not become independent RAM + VRAM pools."""
+    from performance_target import PERFORMANCE_TARGETS
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _mistral_dense_md(tmp_path, size_gb=20.0)
+    profile = match_profile(model.name, profiles)
+    system = _fake_system(
+        ram_total=64,
+        ram_free=40,
+        vram_total=64,
+        vram_free=40,
+        vendor="apple",
+        unified=True,
+        runtime_backend="Metal",
+        runtime_index=0,
+    )
+    target = PERFORMANCE_TARGETS["balanced"]
+    cfg = compute_config(model, system, profile, perf_target=target)
+    total = (
+        cfg.estimated_model_vram_gb
+        + cfg.estimated_model_ram_gb
+        + cfg.estimated_kv_gb
+        + cfg.recurrent_state_vram_gb
+        + cfg.recurrent_state_ram_gb
+        + cfg.vision_vram_gb
+        + cfg.vision_ram_gb
+        + cfg.draft_vram_gb
+        + cfg.runtime_vram_overhead_gb
+        + cfg.batch_vram_overhead_gb
+        + cfg.prompt_cache_ram_gb
+        + max(target.dense_vram_safety_gb, target.ram_safety_gb)
+    )
+    assert cfg.unified_memory is True
+    assert total <= system.free_ram_gb + 1e-6
+
+
+def test_alternate_kv_head_key_is_used_by_sizing() -> None:
+    from diagnostics import audit_model_metadata
+    from scanner import ModelEntry
+    from tuner import kv_per_token_mb_from_metadata
+
+    md = {
+        "general.architecture": "future",
+        "future.block_count": 32,
+        "future.embedding_length": 4096,
+        "future.attention.head_count": 32,
+        "future.attention.kv_head_count": 8,
+        "future.attention.key_length": 128,
+        "future.attention.value_length": 128,
+    }
+    expected = 32 * 8 * (128 + 128) * 2 / (1024 * 1024)
+    assert kv_per_token_mb_from_metadata(md) == pytest.approx(expected)
+    model = ModelEntry(
+        path=Path("future.gguf"),
+        name="future",
+        group=".",
+        size_bytes=1,
+        metadata=md,
+    )
+    assert not any(w.id == "KV-HEAD-COUNT-MISSING" for w in audit_model_metadata(model))
+
+
+def test_asymmetric_kv_quant_weights_unequal_kv_dimensions() -> None:
+    from tuner import (
+        _pick_kv_quant,
+        kv_per_token_mb_from_metadata,
+        kv_per_token_parts_mb_from_metadata,
+    )
+
+    md = {
+        "general.architecture": "future",
+        "future.block_count": 10,
+        "future.attention.head_count": 16,
+        "future.attention.head_count_kv": 2,
+        "future.embedding_length": 2048,
+        "future.attention.key_length": 256,
+        "future.attention.value_length": 64,
+    }
+    k_mb, v_mb = kv_per_token_parts_mb_from_metadata(md)
+    assert k_mb / v_mb == pytest.approx(4.0)
+    pair = _pick_kv_quant(
+        "q8_0",
+        32768,
+        kv_per_token_mb_from_metadata(md),
+        0.20,
+        32768,
+        asymmetric=True,
+        base_k_per_token_mb=k_mb,
+        base_v_per_token_mb=v_mb,
+    )
+    assert pair == ("q5_0", "q5_0")
+
+
+def test_pure_mamba_recurrent_layers_use_minimal_kv_sentinel(tmp_path) -> None:
+    from diagnostics import audit_model_metadata, format_diagnostic_report
+    from scanner import ModelEntry, metadata_attention_layer_count
+    from tuner import (
+        _resolve_kv_per_token_parts_mb,
+        recurrent_state_gb_from_metadata,
+    )
+
+    md = {
+        "general.architecture": "mamba",
+        "mamba.block_count": 64,
+        "mamba.ssm.state_size": 16,
+        "mamba.ssm.inner_size": 4096,
+        "mamba.ssm.conv_kernel": 4,
+        "mamba.ssm.group_count": 1,
+        "mamba.attention.recurrent_layers": 64,
+    }
+    assert metadata_attention_layer_count(md) == 1
+    assert recurrent_state_gb_from_metadata(md) > 0.01
+    model = ModelEntry(
+        path=tmp_path / "Mamba-7B.gguf",
+        name="Mamba-7B",
+        group=".",
+        size_bytes=7 * 1024**3,
+        metadata=md,
+    )
+    assert sum(_resolve_kv_per_token_parts_mb(model, 7.0)) < 0.00001
+    assert not any(
+        warning.id == "KV-HEAD-COUNT-MISSING" for warning in audit_model_metadata(model)
+    )
+    assert "pure recurrent" in format_diagnostic_report(model)
+
+
+def test_minimax_01_bool_recurrent_array_is_counted() -> None:
+    from scanner import metadata_attention_layer_count
+    from tuner import recurrent_state_gb_from_metadata
+
+    recurrent = [((i + 1) % 8 != 0) for i in range(80)]
+    md = {
+        "general.architecture": "minimax-01",
+        "minimax-01.block_count": 80,
+        "minimax-01.embedding_length": 8192,
+        "minimax-01.attention.head_count": 64,
+        "minimax-01.attention.key_length": 128,
+        "minimax-01.attention.recurrent_layers": recurrent,
+    }
+    assert metadata_attention_layer_count(md) == 10
+    state_gb = recurrent_state_gb_from_metadata(md)
+    assert 0.25 < state_gb < 0.30
+    assert recurrent_state_gb_from_metadata(md, snapshot_count=2) == pytest.approx(
+        state_gb * 3
+    )
+
+
+def test_draft_n_max_resizes_hybrid_recurrent_snapshots(tmp_path) -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model_md(
+        tmp_path,
+        "Qwen3.5-9B-MTP-Q4_K_M",
+        8.0,
+        {
+            "general.architecture": "qwen35",
+            "qwen35.block_count": 40,
+            "qwen35.context_length": 131072,
+            "qwen35.embedding_length": 4096,
+            "qwen35.attention.head_count": 32,
+            "qwen35.attention.head_count_kv": 4,
+            "qwen35.attention.key_length": 128,
+            "qwen35.attention.value_length": 128,
+            "qwen35.attention.recurrent_layers": 30,
+            "qwen35.nextn_predict_layers": 1,
+            "qwen35.ssm.inner_size": 2048,
+            "qwen35.ssm.state_size": 128,
+            "qwen35.ssm.conv_kernel": 4,
+            "qwen35.ssm.group_count": 8,
+        },
+    )
+    profile = match_profile(model.name, profiles, model.architecture)
+    system = _fake_system(vram_total=24, vram_free=22)
+    auto = compute_config(model, system, profile)
+    pinned = compute_config(model, system, profile, force_draft_n_max=8)
+    auto_state = auto.recurrent_state_vram_gb + auto.recurrent_state_ram_gb
+    pinned_state = pinned.recurrent_state_vram_gb + pinned.recurrent_state_ram_gb
+    assert pinned.draft_n_max == 8
+    assert pinned_state == pytest.approx(auto_state * 3)
+
+
+def test_known_moe_architecture_survives_missing_expert_count(tmp_path) -> None:
+    from diagnostics import audit_model_metadata
+    from scanner import (
+        ModelEntry,
+        metadata_attention_layer_count,
+        metadata_is_hybrid_architecture,
+    )
+    from tuner import _moe_expert_count
+
+    path = tmp_path / "opaque.gguf"
+    _write_minimal_gguf(path)
+    model = ModelEntry(
+        path=path,
+        name="opaque-checkpoint",
+        group=".",
+        size_bytes=1024,
+        metadata={
+            "general.architecture": "qwen35moe",
+            "qwen35moe.block_count": 32,
+            "qwen35moe.attention.head_count_kv": 8,
+        },
+    )
+    assert _moe_expert_count(model) == 2
+    assert any(w.id == "MOE-ARCH-FALLBACK" for w in audit_model_metadata(model))
+
+    for arch in (
+        "bailingmoe2.5",
+        "bailingmoe2_5",
+        "bailing_hybrid",
+        "ernie4_5_moe",
+        "hunyuan_moe",
+        "llada_moe",
+        "nemotron-h-moe",
+        "granitemoehybrid",
+    ):
+        alias_model = ModelEntry(
+            path=path,
+            name="opaque-checkpoint",
+            group=".",
+            size_bytes=1024,
+            metadata={"general.architecture": arch, f"{arch}.block_count": 32},
+        )
+        assert _moe_expert_count(alias_model) == 2, arch
+    bailing_md = {
+        "general.architecture": "bailing_hybrid",
+        "bailing_hybrid.block_count": 32,
+    }
+    assert metadata_is_hybrid_architecture(bailing_md)
+    assert metadata_attention_layer_count(bailing_md) == 8
+
+
+def test_moe_alias_diagnostic_is_not_called_filename_fallback(tmp_path) -> None:
+    from diagnostics import format_diagnostic_report
+    from scanner import ModelEntry
+
+    model = ModelEntry(
+        path=tmp_path / "opaque.gguf",
+        name="opaque",
+        group=".",
+        size_bytes=1024,
+        metadata={
+            "general.architecture": "futuremoe",
+            "futuremoe.block_count": 16,
+            "futuremoe.attention.head_count": 16,
+            "futuremoe.attention.head_count_kv": 4,
+            "futuremoe.embedding_length": 2048,
+            "futuremoe.num_local_experts": 8,
+        },
+    )
+    report = format_diagnostic_report(model)
+    assert "expert_count (md)     : 8" in report
+    assert "from filename fallback" not in report
+
+
+def test_moe_shared_tensors_that_do_not_fit_fall_back_to_cpu() -> None:
+    from tuner import _decide_moe_offload
+
+    ngl, n_cpu, model_vram, model_ram, full = _decide_moe_offload(
+        model_size_gb=100.0,
+        free_vram_gb=4.0,
+        free_ram_gb=128.0,
+        n_layers=40,
+        expert_count=128,
+        params_billion=100.0,
+        target_ctx=32768,
+        base_kv_per_token_mb=0.05,
+    )
+    assert ngl == 0
+    assert n_cpu == 40
+    assert model_vram == 0.0
+    assert model_ram == pytest.approx(100.0)
+    assert full is False
+
+
+def test_backend_specific_visibility_selectors() -> None:
+    from tuner import _visibility_env_for_gpus
+
+    cuda = GPUInfo(
+        0,
+        "RTX 5090",
+        "nvidia",
+        32768,
+        32000,
+        hip_index=1,
+        runtime_backend="CUDA",
+    )
+    sycl = GPUInfo(
+        0,
+        "Intel Arc A770",
+        "intel",
+        16384,
+        15000,
+        hip_index=1,
+        runtime_backend="SYCL",
+    )
+    cuda_env, cuda_remap = _visibility_env_for_gpus([cuda], [1])
+    sycl_env, sycl_remap = _visibility_env_for_gpus([sycl], [1])
+    assert cuda_env == {"CUDA_VISIBLE_DEVICES": "1"}
+    assert sycl_env == {"ONEAPI_DEVICE_SELECTOR": "level_zero:1"}
+    assert cuda_remap and sycl_remap
+
+
+def test_qt_balance_pin_replaces_stale_backend_selector() -> None:
+    import qt_launcher
+
+    logs = []
+    window = types.SimpleNamespace(
+        _log=logs.append,
+        _last_pinned_gpu=None,
+    )
+    cfg = _fake_diffusion_config()
+    cfg.env_overrides = {
+        "HIP_VISIBLE_DEVICES": "0",
+        "GGML_VK_VISIBLE_DEVICES": "0",
+    }
+    gpu = GPUInfo(
+        0,
+        "RTX 5090",
+        "nvidia",
+        32768,
+        30000,
+        hip_index=1,
+        runtime_backend="CUDA",
+    )
+    qt_launcher.MainWindow._pin_cfg_to_gpu(window, cfg, gpu)
+    assert cfg.env_overrides == {"CUDA_VISIBLE_DEVICES": "1"}
+    assert cfg.main_gpu == 0
+    assert cfg.tensor_split is None
+
+
+def test_multi_gpu_cuda_pinning_does_not_emit_hip_or_vulkan(tmp_path) -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
+    profile = match_profile(model.name, profiles)
+    system = _fake_dual_gpu_system_with_vk_order()
+    for gpu in system.gpus:
+        gpu.vendor = "nvidia"
+        gpu.runtime_backend = "CUDA"
+    cfg = compute_config(model, system, profile)
+    assert cfg.env_overrides == {"CUDA_VISIBLE_DEVICES": "1"}
+    assert cfg.main_gpu == 0
+
+
+# ---------------------------------------------------------------------------
 # Qt launcher helpers
 
 
@@ -3291,6 +3698,210 @@ def test_manual_next_port_not_shifted_by_running_server_count() -> None:
 # RX 9070 XT as empty (15.9/15.9 "free") and the empty R9700 as half-full,
 # so a second model was refused. llama-server --list-devices gives the
 # correct, per-card, live numbers — these tests pin its parsing.
+
+
+def test_llama_device_probe_preserves_backend_without_memory(monkeypatch) -> None:
+    import hardware
+
+    out = """Available devices:
+  Metal0: Apple M5 Max
+  SYCL1: Intel(R) Arc(TM) A770 Graphics
+"""
+    monkeypatch.setattr(hardware, "_run", lambda *a, **k: out)
+    authoritative, records = hardware._probe_llama_devices("llama-server")
+    assert authoritative is True
+    assert [(r.backend, r.index, r.identifier) for r in records] == [
+        ("Metal", 0, "Metal0"),
+        ("SYCL", 1, "SYCL1"),
+    ]
+
+
+def test_exact_runtime_order_beats_vulkan_fallback(monkeypatch) -> None:
+    import hardware
+
+    runtime = """Available devices:
+  CUDA0: GPU-B (16000 MiB, 15000 MiB free)
+  CUDA1: GPU-A (24000 MiB, 23000 MiB free)
+"""
+
+    def fake_run(cmd, *args, **kwargs):
+        if "--list-devices" in cmd:
+            return runtime
+        return """Devices:
+GPU0:\n deviceName = GPU-A\n deviceID = 0x1000
+GPU1:\n deviceName = GPU-B\n deviceID = 0x1001
+"""
+
+    monkeypatch.setattr(hardware, "_run", fake_run)
+    gpus = [
+        GPUInfo(0, "GPU-A", "nvidia", 24000, 23000, pci_device_id=0x1000),
+        GPUInfo(1, "GPU-B", "nvidia", 16000, 15000, pci_device_id=0x1001),
+    ]
+    hardware._assign_hip_indices(gpus, "llama-server")
+    assert [(g.hip_index, g.runtime_backend) for g in gpus] == [
+        (1, "CUDA"),
+        (0, "CUDA"),
+    ]
+
+
+def test_apple_detection_uses_live_available_unified_memory(monkeypatch) -> None:
+    import hardware
+
+    class VM:
+        total = 64 * 1024**3
+        available = 40 * 1024**3
+
+    def fake_run(cmd, *args, **kwargs):
+        if "hw.memsize" in cmd:
+            return str(64 * 1024**3)
+        return "Apple M5 Max"
+
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(hardware.psutil, "virtual_memory", lambda: VM())
+    monkeypatch.setattr(hardware, "_run", fake_run)
+    gpu = hardware._detect_apple()[0]
+    assert gpu.total_vram_mb == 64 * 1024
+    assert gpu.free_vram_mb == 40 * 1024
+    assert gpu.unified_memory is True
+
+    monkeypatch.setattr(hardware.platform, "machine", lambda: "x86_64")
+    assert hardware._detect_apple() == []
+
+
+def test_integrated_amd_apu_is_unified_and_filtered_beside_dgpu() -> None:
+    import hardware
+
+    assert (
+        hardware._infer_integrated_gpu("AMD Radeon 780M Graphics", "amd", 16384) is True
+    )
+    for name in (
+        "AMD Radeon(TM) 840M Graphics",
+        "AMD Radeon(TM) 860M Graphics",
+        "AMD Radeon(TM) 880M Graphics",
+    ):
+        assert hardware._infer_integrated_gpu(name, "amd", 16384) is True
+    apu = GPUInfo(
+        0,
+        "AMD Radeon 780M Graphics",
+        "amd",
+        16384,
+        12000,
+        unified_memory=True,
+        is_integrated=True,
+    )
+    dgpu = GPUInfo(1, "AMD Radeon RX 9070 XT", "amd", 16384, 15000, is_integrated=False)
+    used, ignored = hardware._filter_inference_gpus([apu, dgpu])
+    assert used == [dgpu]
+    assert apu in ignored
+
+
+def test_discrete_intel_arc_is_not_blanket_filtered() -> None:
+    import hardware
+
+    arc = GPUInfo(
+        0,
+        "Intel Arc A770",
+        "intel",
+        16384,
+        15000,
+        is_integrated=False,
+    )
+    amd = GPUInfo(1, "AMD Radeon", "amd", 24576, 23000, is_integrated=False)
+    used, ignored = hardware._filter_inference_gpus([arc, amd])
+    assert arc in used
+    assert arc not in ignored
+    assert (
+        hardware._infer_integrated_gpu("Intel(R) Arc(TM) Pro A60 Graphics", "intel", 0)
+        is False
+    )
+
+
+def test_windows_registry_gpu_scan_survives_sparse_subkeys(monkeypatch) -> None:
+    import hardware
+
+    subkeys = ["0000", "0002"]
+    desc = {"0000": "GPU Zero", "0002": "GPU Two"}
+
+    def open_key(_root, path, *_args):
+        return path.rsplit("\\", 1)[-1] if path.endswith(tuple(subkeys)) else "base"
+
+    def enum_key(_base, index):
+        if index >= len(subkeys):
+            raise OSError
+        return subkeys[index]
+
+    def query_value(key, value):
+        if value == "DriverDesc":
+            return desc[key], 1
+        if value == "HardwareInformation.qwMemorySize":
+            return (8 if key == "0000" else 16) * 1024**3, 1
+        raise FileNotFoundError
+
+    fake = types.SimpleNamespace(
+        HKEY_LOCAL_MACHINE=object(),
+        KEY_READ=1,
+        OpenKey=open_key,
+        EnumKey=enum_key,
+        QueryValueEx=query_value,
+        CloseKey=lambda _key: None,
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    result = hardware._get_vram_from_registry()
+    assert result == {"GPU Zero": 8 * 1024**3, "GPU Two": 16 * 1024**3}
+
+
+def test_rocm_text_fallback_subtracts_used_memory(monkeypatch) -> None:
+    import hardware
+
+    text = """GPU[0] : VRAM Total Memory (B): 17179869184
+GPU[0] : VRAM Total Used Memory (B): 4294967296
+"""
+    monkeypatch.setattr(hardware.shutil, "which", lambda _name: "rocm-smi")
+    monkeypatch.setattr(hardware, "_run", lambda *args, **kwargs: text)
+    gpu = hardware._detect_amd_rocm()[0]
+    assert gpu.total_vram_mb == 16384
+    assert gpu.free_vram_mb == 12288
+
+
+def test_openvino_runtime_is_preserved_as_unified_accelerator(monkeypatch) -> None:
+    import hardware
+
+    monkeypatch.setattr(hardware, "_detect_nvidia", lambda: [])
+    monkeypatch.setattr(hardware, "_detect_amd_rocm", lambda: [])
+    monkeypatch.setattr(hardware, "_detect_apple", lambda: [])
+    monkeypatch.setattr(hardware, "_detect_windows_gpus", lambda **kwargs: [])
+    monkeypatch.setattr(hardware, "_detect_linux_drm_gpus", lambda **kwargs: [])
+    monkeypatch.setattr(hardware, "_detect_linux_other_gpus", lambda **kwargs: [])
+    monkeypatch.setattr(hardware, "_get_pci_device_ids", lambda: {})
+    record = hardware._LlamaDeviceRecord(
+        "OPENVINO", 0, "openvino runtime", 48000, 27000
+    )
+    monkeypatch.setattr(
+        hardware, "_probe_llama_devices", lambda _binary: (True, [record])
+    )
+    system = hardware.detect_system("openvino-llama-server")
+    assert len(system.gpus) == 1
+    assert system.gpus[0].runtime_backend == "OPENVINO"
+    assert system.gpus[0].unified_memory is True
+
+
+def test_cpu_only_binary_intersects_out_os_visible_gpu(monkeypatch) -> None:
+    import hardware
+
+    gpu = GPUInfo(0, "RTX 5090", "nvidia", 32768, 32000, is_integrated=False)
+    monkeypatch.setattr(hardware, "_detect_nvidia", lambda: [gpu])
+    monkeypatch.setattr(hardware, "_detect_amd_rocm", lambda: [])
+    monkeypatch.setattr(hardware, "_detect_apple", lambda: [])
+    monkeypatch.setattr(hardware, "_detect_windows_gpus", lambda **kwargs: [])
+    monkeypatch.setattr(hardware, "_detect_linux_drm_gpus", lambda **kwargs: [])
+    monkeypatch.setattr(hardware, "_detect_linux_other_gpus", lambda **kwargs: [])
+    monkeypatch.setattr(hardware, "_get_pci_device_ids", lambda: {})
+    monkeypatch.setattr(hardware, "_probe_llama_devices", lambda _binary: (True, []))
+    system = hardware.detect_system("cpu-only-llama-server")
+    assert system.gpus == []
+    assert system.ignored_gpus == [gpu]
+
 
 _LIST_DEVICES_REAL = """Available devices:
   Vulkan0: AMD Radeon RX 9070 XT (16304 MiB, 15416 MiB free)
@@ -5763,6 +6374,25 @@ def test_git_update_rejects_ahead_only_branch(tmp_path, monkeypatch) -> None:
     ]
 
 
+def test_qt_frozen_smoke_entrypoint_returns_without_gui() -> None:
+    import qt_launcher
+
+    assert (
+        qt_launcher.main(["--smoke-test", "--settings-path", str(SETTINGS_DIR)]) is None
+    )
+
+
+def test_release_workflow_publishes_arm64_macos_asset() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "runner: macos-15" in workflow
+    assert "artifact: AutoTuner-macOS-arm64.zip" in workflow
+    assert "assets/AutoTuner-macOS-arm64.zip" in workflow
+    assert 'expected = "${{ matrix.arch }}"' in workflow
+    assert "assets/AutoTuner-macOS.zip" not in workflow
+
+
 def test_binary_update_worker_picks_macos_asset_not_linux(monkeypatch) -> None:
     """A frozen macOS build must not download the Linux release asset."""
     import qt_launcher
@@ -5771,11 +6401,13 @@ def test_binary_update_worker_picks_macos_asset_not_linux(monkeypatch) -> None:
     assets = [
         {"name": "AutoTuner-Windows-x64.zip"},
         {"name": "AutoTuner-Linux-x64.zip"},
-        {"name": "AutoTuner-macOS.zip"},
+        {"name": "AutoTuner-macOS-arm64.zip"},
+        {"name": "AutoTuner-macOS-x64.zip"},
     ]
     monkeypatch.setattr(qt_launcher.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(qt_launcher.platform, "machine", lambda: "arm64")
 
-    assert worker._pick_asset(assets) == {"name": "AutoTuner-macOS.zip"}
+    assert worker._pick_asset(assets) == {"name": "AutoTuner-macOS-arm64.zip"}
 
 
 def test_binary_update_worker_macos_missing_asset_returns_none(monkeypatch) -> None:
@@ -5783,5 +6415,7 @@ def test_binary_update_worker_macos_missing_asset_returns_none(monkeypatch) -> N
 
     worker = qt_launcher._BinaryUpdateWorker()
     monkeypatch.setattr(qt_launcher.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(qt_launcher.platform, "machine", lambda: "arm64")
 
     assert worker._pick_asset([{"name": "AutoTuner-Linux-x64.zip"}]) is None
+    assert worker._pick_asset([{"name": "AutoTuner-macOS-x64.zip"}]) is None

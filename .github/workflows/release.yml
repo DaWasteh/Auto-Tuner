@@ -35,13 +35,17 @@ jobs:
         include:
           - runner: windows-latest
             os-label: Windows
+            arch: x64
             artifact: AutoTuner-Windows-x64.zip
           - runner: ubuntu-latest
             os-label: Linux
+            arch: x64
             artifact: AutoTuner-Linux-x64.zip
-          - runner: macos-latest
+          # GitHub's standard macos-15 label is Apple Silicon arm64.
+          - runner: macos-15
             os-label: macOS
-            artifact: AutoTuner-macOS.zip
+            arch: arm64
+            artifact: AutoTuner-macOS-arm64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +79,45 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Verify build architecture
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform
+          machine = platform.machine().lower()
+          actual = "arm64" if machine in {"arm64", "aarch64"} else "x64" if machine in {"x86_64", "amd64", "x64"} else machine
+          expected = "${{ matrix.arch }}"
+          print(f"runner architecture: {machine} -> {actual}; expected: {expected}")
+          if actual != expected:
+              raise SystemExit(f"architecture mismatch: expected {expected}, got {actual}")
+          PY
+
       - name: Build binary
         run: python build_exe.py
+
+      - name: Smoke-test frozen binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "dist/AutoTuner.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Frozen smoke test failed with exit code $($proc.ExitCode)" }
+
+      - name: Smoke-test frozen binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x dist/AutoTuner-Linux
+          QT_QPA_PLATFORM=offscreen dist/AutoTuner-Linux --smoke-test
+
+      - name: Smoke-test frozen binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          if [ -x "dist/AutoTuner-macOS.app/Contents/MacOS/AutoTuner-macOS" ]; then
+            binary="dist/AutoTuner-macOS.app/Contents/MacOS/AutoTuner-macOS"
+          else
+            binary="dist/AutoTuner-macOS"
+            chmod +x "$binary"
+          fi
+          "$binary" --smoke-test
 
       - name: Stage zip contents (Windows)
         if: runner.os == 'Windows'
@@ -127,11 +168,15 @@ jobs:
             launch_hint='./AutoTuner-macOS'
           fi
           cat > "stage/AutoTuner/ReadMe - AutoTuner.txt" <<EOF
-          AutoTuner v${{ steps.ver.outputs.version }}  (macOS)
+          AutoTuner v${{ steps.ver.outputs.version }}  (macOS Apple Silicon arm64)
 
           1. Entpacke diese ZIP an einen beliebigen Ort.
           2. Starte AutoTuner mit: $launch_hint
-          3. Updates holst du später einfach oben in der Toolbar ueber den
+          3. Falls Gatekeeper warnt: im Finder Rechtsklick auf die App, dann
+             "Oeffnen"; falls noetig unter Datenschutz & Sicherheit "Dennoch
+             oeffnen" bestaetigen. Dieser Community-Build ist nicht mit einer
+             Apple Developer ID notarisiert.
+          4. Updates holst du später einfach oben in der Toolbar ueber den
              Update-Button. Deine Einstellungen bleiben erhalten.
           EOF
           (cd stage && zip -r ../${{ matrix.artifact }} AutoTuner)
@@ -236,17 +281,19 @@ jobs:
           files: |
             assets/AutoTuner-Windows-x64.zip
             assets/AutoTuner-Linux-x64.zip
-            assets/AutoTuner-macOS.zip
+            assets/AutoTuner-macOS-arm64.zip
           body: |
             ## AutoTuner v${{ steps.ver.outputs.version }}
 
-            **Download für Einsteiger:** die passende ZIP holen, entpacken, Doppelklick.
+            **Download:** passende ZIP holen und entpacken. Windows per Doppelklick;
+            Linux nach `chmod +x`; macOS beim ersten Start per Rechtsklick → Öffnen
+            (Community-Build ohne Apple-Notarisierung).
 
             | OS | Datei |
             | -- | ----- |
             | Windows 10/11 | `AutoTuner-Windows-x64.zip` (→ `AutoTuner.exe`) |
             | Linux (Ubuntu, Fedora, Arch, Mint, CachyOS, Kali, Debian) | `AutoTuner-Linux-x64.zip` (→ `AutoTuner-Linux`) |
-            | macOS | `AutoTuner-macOS.zip` (→ `AutoTuner-macOS.app` or `AutoTuner-macOS`) |
+            | macOS (Apple Silicon arm64) | `AutoTuner-macOS-arm64.zip` (→ `AutoTuner-macOS.app` or `AutoTuner-macOS`) |
 
             In der kompilierten Version funktioniert der **Update-Button**:
             er lädt automatisch das zum OS passende Release-ZIP und tauscht

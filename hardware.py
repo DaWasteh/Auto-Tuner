@@ -43,8 +43,34 @@ def _get_vram_from_registry() -> Dict[str, int]:
         r"\{4d36e968-e325-11ce-bfc1-08002be10318}"
     )
 
-    for i in range(100):
-        key_name = f"{i:04d}"  # "0000", "0001", ..., "0099" — old f"000{i}" was wrong for i≥10
+    try:
+        base_key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            reg_path_base,
+            0,
+            winreg.KEY_READ,
+        )
+    except OSError:
+        return result
+
+    try:
+        subkeys: List[str] = []
+        i = 0
+        while True:
+            try:
+                key_name = winreg.EnumKey(base_key, i)
+            except OSError:
+                break
+            i += 1
+            if re.fullmatch(r"\d{4}", key_name):
+                subkeys.append(key_name)
+    finally:
+        try:
+            winreg.CloseKey(base_key)
+        except Exception:
+            pass
+
+    for key_name in subkeys:
         try:
             key = winreg.OpenKey(
                 winreg.HKEY_LOCAL_MACHINE,
@@ -52,8 +78,6 @@ def _get_vram_from_registry() -> Dict[str, int]:
                 0,
                 winreg.KEY_READ,
             )
-        except FileNotFoundError:
-            break
         except OSError:
             continue
 
@@ -88,8 +112,14 @@ def _get_vram_from_registry() -> Dict[str, int]:
         ):
             continue
 
-        # AMD RX 9000 Series (RDNA 5) und andere echte GPUs nicht filtern
-        result[driver_desc] = vram_qw
+        # Keep identical adapters instead of collapsing them by DriverDesc.
+        # The first keeps the clean display name; later duplicates carry the
+        # registry subkey as a stable disambiguator and still fuzzy-match the
+        # runtime's shorter --list-devices name.
+        unique_name = driver_desc
+        if unique_name in result:
+            unique_name = f"{driver_desc} [{key_name}]"
+        result[unique_name] = vram_qw
 
     return result
 
@@ -482,9 +512,9 @@ class GPUInfo:
     total_vram_mb: int
     free_vram_mb: int
     gpu_util_percent: float = 0.0  # GPU-Auslastung in %
-    # HIP/ROCm device index as seen by llama.cpp (Vulkan enumeration order).
-    # None = unknown (Windows registry order may differ from HIP order).
-    # Set by detect_system() via _assign_hip_indices() when possible.
+    # Device index reported by the selected llama.cpp runtime. The historical
+    # field name is retained for settings/tests, but this may be a Vulkan,
+    # HIP, CUDA, SYCL, Metal, or OpenVINO index. None means unresolved.
     hip_index: Optional[int] = None
     # PCI device ID (e.g. 0x7550 for RX 9070 XT, 0x7551 for R9700). This is
     # the *stable physical identity* of the card — it appears identically in
@@ -494,6 +524,16 @@ class GPUInfo:
     # map a Windows-enumerated GPU onto its llama.cpp/Vulkan device index,
     # independent of the (differing) registry vs Vulkan ordering.
     pci_device_id: Optional[int] = None
+    # Backend/device identity from the exact binary's --list-devices output,
+    # e.g. runtime_backend="CUDA", runtime_device="CUDA1".
+    runtime_backend: Optional[str] = None
+    runtime_device: Optional[str] = None
+    # True when CPU and accelerator draw from the same physical memory pool
+    # (Apple Silicon and confirmed integrated GPUs). Capacity planning must
+    # count this pool once, never independently as RAM plus VRAM.
+    unified_memory: bool = False
+    # None = unknown, True = integrated/shared-memory, False = discrete.
+    is_integrated: Optional[bool] = None
 
     @property
     def total_vram_gb(self) -> float:
@@ -535,6 +575,22 @@ class SystemInfo:
     @property
     def is_multi_gpu(self) -> bool:
         return len(self.gpus) > 1
+
+    @property
+    def has_unified_memory(self) -> bool:
+        """Whether inference devices share the host's physical RAM pool."""
+        return bool(self.gpus) and all(g.unified_memory for g in self.gpus)
+
+    @property
+    def runtime_backends(self) -> Tuple[str, ...]:
+        """Distinct selected-runtime backends represented by usable GPUs."""
+        return tuple(
+            dict.fromkeys(
+                g.runtime_backend
+                for g in self.gpus
+                if isinstance(g.runtime_backend, str) and g.runtime_backend
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -735,9 +791,11 @@ def _detect_linux_drm_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         except OSError:
             slot = ""
         try:
-            for line in (dev / "uevent").read_text(
-                encoding="utf-8", errors="ignore"
-            ).splitlines():
+            for line in (
+                (dev / "uevent")
+                .read_text(encoding="utf-8", errors="ignore")
+                .splitlines()
+            ):
                 if line.startswith("PCI_SLOT_NAME="):
                     slot = line.split("=", 1)[1].strip()
                     break
@@ -775,6 +833,21 @@ def _detect_linux_drm_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
                 free_vram_mb=free_b // (1024 * 1024),
                 gpu_util_percent=float(busy if busy is not None else 0.0),
                 pci_device_id=pci_id,
+                is_integrated=_infer_integrated_gpu(
+                    name,
+                    _vendor_from_name(name),
+                    total_b // (1024 * 1024),
+                    slot,
+                ),
+                unified_memory=(
+                    _infer_integrated_gpu(
+                        name,
+                        _vendor_from_name(name),
+                        total_b // (1024 * 1024),
+                        slot,
+                    )
+                    is True
+                ),
             )
         )
     return gpus
@@ -809,6 +882,7 @@ def _detect_nvidia() -> List[GPUInfo]:
                         total_vram_mb=int(parts[2]),
                         free_vram_mb=int(parts[3]),
                         gpu_util_percent=gpu_util,
+                        is_integrated=False,
                     )
                 )
             except ValueError:
@@ -884,7 +958,7 @@ def _detect_amd_rocm() -> List[GPUInfo]:
                     elif (
                         "GPU Item" in k
                         or "System Total" in k
-                        or "GPU utilization" in k.lower()
+                        or "gpu utilization" in k.lower()
                     ):
                         try:
                             val_str = str(v).strip().replace("%", "")
@@ -914,19 +988,37 @@ def _detect_amd_rocm() -> List[GPUInfo]:
         return []
     by_idx: dict = {}
     for line in out.splitlines():
-        m = re.match(r"GPU\[(\d+)\].*?Total\s+Memory.*?(\d+)\s*$", line, re.IGNORECASE)
-        if m:
-            by_idx.setdefault(int(m.group(1)), {})["total"] = int(m.group(2))
+        total = re.match(
+            r"GPU\[(\d+)\].*?VRAM\s+Total\s+Memory.*?(\d+)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        used = re.match(
+            r"GPU\[(\d+)\].*?VRAM\s+Total\s+Used\s+Memory.*?(\d+)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if total:
+            by_idx.setdefault(int(total.group(1)), {})["total"] = int(total.group(2))
+        if used:
+            by_idx.setdefault(int(used.group(1)), {})["used"] = int(used.group(2))
     return [
         GPUInfo(
             index=i,
             name=f"AMD GPU {i}",
             vendor="amd",
             total_vram_mb=info.get("total", 0) // (1024 * 1024),
-            free_vram_mb=info.get("total", 0) // (1024 * 1024),
+            # Unknown usage is not equivalent to empty VRAM. Report zero free
+            # conservatively so a second server is never overcommitted.
+            free_vram_mb=(
+                max(0, info.get("total", 0) - info["used"]) // (1024 * 1024)
+                if "used" in info
+                else 0
+            ),
             gpu_util_percent=0.0,
         )
         for i, info in by_idx.items()
+        if info.get("total", 0) > 0
     ]
 
 
@@ -939,7 +1031,76 @@ def _vendor_from_name(name: str) -> str:
         return "amd"
     if "intel" in n or "arc" in n:
         return "intel"
+    if "qualcomm" in n or "adreno" in n:
+        return "qualcomm"
     return "unknown"
+
+
+def _infer_integrated_gpu(
+    name: str,
+    vendor: str,
+    total_vram_mb: int = 0,
+    pci_slot: str = "",
+) -> Optional[bool]:
+    """Best-effort integrated/discrete classification.
+
+    The distinction matters because integrated GPUs report shared system RAM
+    as device memory. A blanket ``vendor == 'intel'`` test incorrectly drops
+    discrete Arc cards, while trusting the runtime total lets an iGPU look
+    larger than a real dGPU. Prefer strong PCI/name/dedicated-memory signals
+    and return ``None`` when the evidence is ambiguous.
+    """
+    n = name.lower()
+    if vendor == "apple":
+        return True
+    if vendor == "qualcomm" or "adreno" in n or "tegra" in n:
+        return True
+
+    slot = pci_slot.lower()
+    if vendor == "amd":
+        # Strong discrete product families first.
+        if re.search(
+            r"\b(?:radeon\s+)?(?:rx\s+\d{3,4}|pro\s+w\d+|ai\s+pro|instinct)\b",
+            n,
+        ):
+            return False
+        # AMD APUs normally expose one of these stable marketing forms while
+        # drawing all accelerator memory from host RAM.
+        if (
+            "radeon(tm) graphics" in n
+            or re.search(r"\bradeon(?:\(tm\))?\s+(?:\d{3,4}[ms]|80[56]0s)\b", n)
+            or re.search(r"\bradeon\s+(?:rx\s+)?vega\s+\d+\b", n)
+            or n.strip() in {"amd radeon graphics", "radeon graphics"}
+        ):
+            return True
+        return None
+
+    if vendor != "intel":
+        return None
+    if re.search(r"(?:^|:)00:02\.0$", slot):
+        return True
+    if re.search(r"\barc(?:\(tm\))?\s+(?:pro\s+)?[ab]\d{2,4}m?\b", n):
+        return False
+    if "arc" in n and "graphics" in n and not re.search(r"\b[ab]\d{2,4}m?\b", n):
+        return True
+    if any(
+        token in n
+        for token in (
+            "uhd graphics",
+            "hd graphics",
+            "iris",
+            "integrated",
+            "built-in",
+            "intel(r) graphics",
+            "intel graphics",
+        )
+    ):
+        return True
+    if total_vram_mb >= 2048:
+        return False
+    if 0 < total_vram_mb <= 1024:
+        return True
+    return None
 
 
 # PowerShell snippet: enumerates every PCI video adapter, reads VRAM from the
@@ -1150,6 +1311,13 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
                     total_vram_mb=total_mb,
                     free_vram_mb=free_mb,
                     gpu_util_percent=gpu_util,
+                    is_integrated=_infer_integrated_gpu(
+                        name, _vendor_from_name(name), total_mb
+                    ),
+                    unified_memory=(
+                        _infer_integrated_gpu(name, _vendor_from_name(name), total_mb)
+                        is True
+                    ),
                 )
             )
         return gpus
@@ -1215,6 +1383,13 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
                 total_vram_mb=total_mb,
                 free_vram_mb=free_mb,
                 gpu_util_percent=0.0,
+                is_integrated=_infer_integrated_gpu(
+                    name, _vendor_from_name(name), total_mb
+                ),
+                unified_memory=(
+                    _infer_integrated_gpu(name, _vendor_from_name(name), total_mb)
+                    is True
+                ),
             )
         )
     return gpus
@@ -1232,7 +1407,7 @@ def _detect_linux_other_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
     skip = {n.lower() for n in (skip_names or set())}
     gpus: List[GPUInfo] = []
     seen_names: set = set()
-    for name, dev_id in _linux_lspci_gpu_map().values():
+    for slot, (name, dev_id) in _linux_lspci_gpu_map().items():
         lname = name.lower()
         if lname in skip or lname in seen_names:
             continue
@@ -1246,6 +1421,13 @@ def _detect_linux_other_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
                 free_vram_mb=0,
                 gpu_util_percent=0.0,
                 pci_device_id=dev_id,
+                is_integrated=_infer_integrated_gpu(
+                    name, _vendor_from_name(name), 0, slot
+                ),
+                unified_memory=(
+                    _infer_integrated_gpu(name, _vendor_from_name(name), 0, slot)
+                    is True
+                ),
             )
         )
     return gpus
@@ -1254,7 +1436,12 @@ def _detect_linux_other_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
 def _detect_apple() -> List[GPUInfo]:
     if platform.system() != "Darwin":
         return []
-    # Apple Silicon = unified memory; treat the whole RAM as addressable VRAM
+    # Intel Macs also report hw.memsize, but do not have Apple-Silicon Metal
+    # unified memory. Avoid fabricating an Apple GPU under Rosetta/Intel.
+    machine = platform.machine().strip().lower()
+    if machine not in {"arm64", "aarch64"}:
+        return []
+
     out = _run(["sysctl", "-n", "hw.memsize"])
     if not out:
         return []
@@ -1262,7 +1449,17 @@ def _detect_apple() -> List[GPUInfo]:
         mem_b = int(out.strip())
     except ValueError:
         return []
+
+    # The CPU and Metal GPU share one physical pool. Total addressable memory
+    # is hw.memsize, but free capacity is the live OS-available amount — never
+    # the full installed memory. The exact Metal runtime report may tighten
+    # this further later in detect_system().
+    try:
+        available_b = int(psutil.virtual_memory().available)
+    except Exception:
+        available_b = 0
     mem_mb = mem_b // (1024 * 1024)
+    free_mb = max(0, min(mem_mb, available_b // (1024 * 1024)))
     name_out = _run(["sysctl", "-n", "machdep.cpu.brand_string"]) or ""
     label = f"Apple Silicon ({name_out.strip()})" if name_out else "Apple Silicon"
     return [
@@ -1271,8 +1468,10 @@ def _detect_apple() -> List[GPUInfo]:
             name=label,
             vendor="apple",
             total_vram_mb=mem_mb,
-            free_vram_mb=mem_mb,
+            free_vram_mb=free_mb,
             gpu_util_percent=0.0,
+            unified_memory=True,
+            is_integrated=True,
         )
     ]
 
@@ -1328,12 +1527,11 @@ def _filter_inference_gpus(
 
     Two-stage filter:
 
-    Stage 1 — vendor gate:
-      Intel iGPUs are moved to ignored whenever at least one non-Intel GPU
-      exists. Intel iGPUs on Windows can report large shared-memory VRAM
-      values (e.g. 27 GB on a system with 32 GB RAM) that would fool the
-      VRAM-ratio check below and cause real discrete GPUs (e.g. a 16 GB
-      RX 9070 XT next to a 32 GB R9700) to be wrongly excluded.
+    Stage 1 — integrated-device gate:
+      Confirmed shared-memory iGPUs/APUs are moved to ignored whenever at
+      least one discrete peer exists. Integrated devices can report large
+      shared-RAM totals, but discrete Intel Arc/AMD cards remain eligible;
+      vendor alone is never used as the integrated-device test.
 
     Stage 2 — VRAM-ratio gate:
       Among the remaining (non-Intel) GPUs drop any that have less than
@@ -1361,14 +1559,14 @@ def _filter_inference_gpus(
         kept_pool = list(gpus)
         ignored = []
 
-    # Stage 1: always ignore Intel iGPUs when real discrete GPUs exist.
-    # Must happen before the VRAM-ratio sort, because iGPUs report shared
-    # system-RAM as "VRAM" and can appear larger than actual dGPUs.
-    non_intel = [g for g in kept_pool if g.vendor != "intel"]
-    intel_igpus = [g for g in kept_pool if g.vendor == "intel"]
-    if non_intel:
-        ignored.extend(intel_igpus)
-        kept_pool = non_intel
+    # Stage 1: ignore only CONFIRMED shared-memory integrated devices when a
+    # discrete peer exists. The previous blanket Intel gate discarded Arc;
+    # limiting this to Intel would still double-count AMD APU memory.
+    discrete_peers = [g for g in kept_pool if g.is_integrated is not True]
+    integrated_devices = [g for g in kept_pool if g.is_integrated is True]
+    if discrete_peers and integrated_devices:
+        ignored.extend(integrated_devices)
+        kept_pool = [g for g in kept_pool if g not in integrated_devices]
 
     if len(kept_pool) < 2:
         return kept_pool, ignored
@@ -1438,76 +1636,97 @@ def _detect_llama_device_order(binary: Optional[str]) -> List[str]:
     Thin ordered-names view over :func:`_detect_llama_devices` (which is
     the full table including per-device VRAM).
     """
-    return [name for (_idx, name, _t, _f) in _detect_llama_devices(binary)]
+    _authoritative, records = _probe_llama_devices(binary)
+    return [record.name for record in records]
+
+
+@dataclass(frozen=True)
+class _LlamaDeviceRecord:
+    """One backend-qualified row from ``llama-server --list-devices``."""
+
+    backend: str
+    index: int
+    name: str
+    total_mb: int = 0
+    free_mb: int = 0
+
+    @property
+    def identifier(self) -> str:
+        return f"{self.backend}{self.index}"
+
+    def legacy_tuple(self) -> Tuple[int, str, int, int]:
+        return (self.index, self.name, self.total_mb, self.free_mb)
+
+
+def _probe_llama_devices(
+    binary: Optional[str],
+) -> Tuple[bool, List[_LlamaDeviceRecord]]:
+    """Probe backend-qualified devices from the exact inference binary.
+
+    The boolean is true only when the output is authoritative: at least one
+    device row parsed, or the binary explicitly printed an empty ``Available
+    devices`` table (the normal CPU-only result). Rows without a memory suffix
+    are retained so Metal/SYCL/OpenVINO backend identity is not discarded.
+    """
+    if not binary:
+        return False, []
+    out = _run([binary, "--list-devices"], timeout=15)
+    if out is None:
+        return False, []
+
+    line_pat = re.compile(
+        r"^\s*([A-Za-z][A-Za-z0-9]*?)(\d+):\s*(.+?)\s*$",
+        re.MULTILINE,
+    )
+    mem_pat = re.compile(
+        r"\s*\(\s*(\d+)\s*(MiB|MB|GiB|GB)\s*,\s*"
+        r"(\d+)\s*(MiB|MB|GiB|GB)\s*free\s*\)\s*$"
+    )
+
+    def _to_mb(value: int, unit: str) -> int:
+        return value * 1024 if unit in ("GiB", "GB") else value
+
+    records: List[_LlamaDeviceRecord] = []
+    for match in line_pat.finditer(out):
+        backend = match.group(1)
+        try:
+            idx = int(match.group(2))
+        except ValueError:
+            continue
+        raw_name = match.group(3).strip()
+        total_mb = 0
+        free_mb = 0
+        mem = mem_pat.search(raw_name)
+        if mem:
+            raw_name = raw_name[: mem.start()].strip()
+            total_mb = _to_mb(int(mem.group(1)), mem.group(2))
+            free_mb = min(total_mb, _to_mb(int(mem.group(3)), mem.group(4)))
+        name = raw_name.lower()
+        if name:
+            records.append(
+                _LlamaDeviceRecord(
+                    backend=backend,
+                    index=idx,
+                    name=name,
+                    total_mb=total_mb,
+                    free_mb=free_mb,
+                )
+            )
+
+    authoritative = bool(records) or "available devices" in out.lower()
+    return authoritative, records
 
 
 def _detect_llama_devices(
     binary: Optional[str],
 ) -> List[Tuple[int, str, int, int]]:
-    """Return ``[(device_index, name_lower, total_mb, free_mb), …]`` from
-    ``<binary> --list-devices``, sorted by device index.
+    """Return the legacy memory-bearing device table from ``--list-devices``.
 
-    This is the AUTHORITATIVE device table: the exact enumeration order,
-    names and VRAM numbers the inference binary itself will use for
-    ``--main-gpu`` / ``--tensor-split`` / the visibility env vars. The free
-    figure reflects live residency of anything already loaded (other
-    servers, the desktop, OBS, games).
-
-    Using this sidesteps every Windows WMI problem at once — missing
-    DedicatedUsage counters on RDNA 5, the LUID-vs-PCI-id mismatch, and the
-    registry/Vulkan enumeration-order difference that made the old WMI path
-    swap the two AMD cards (reporting the full RX 9070 XT as empty and the
-    empty R9700 as half-full).
-
-    IMPORTANT (Linux/Mesa RADV): two cards can carry the SAME device name
-    (e.g. both "AMD Radeon Graphics (RADV NAVI48)" when Mesa doesn't know a
-    card's marketing name yet). A name-keyed dict would silently collapse
-    them into one entry — this indexed LIST keeps every device distinct so
-    callers can disambiguate by total VRAM instead.
-
-    Output line shape (Vulkan build):
-
-        Vulkan0: AMD Radeon RX 9070 XT (16304 MiB, 15416 MiB free)
-
-    Units are normalised to MB (MiB/MB treated as ~MB; GiB/GB ×1024).
-    Returns ``[]`` when the binary is missing, errors, or the table can't
-    be parsed.
+    Backend-qualified parsing lives in :func:`_probe_llama_devices`; this view
+    remains tuple-compatible for existing callers and diagnostics.
     """
-    if not binary:
-        return []
-    out = _run([binary, "--list-devices"], timeout=15)
-    if not out:
-        return []
-
-    # "<Backend><idx>: <name> (<TOTAL UNIT>, <FREE UNIT> free)"
-    # Name may contain parentheses (e.g. "Intel(R) Graphics" or Mesa's
-    # "(RADV NAVI48)" suffix), so anchor the capture on the
-    # " (NNNN <unit>, NNNN <unit> free)" memory annotation.
-    pat = re.compile(
-        r"^\s*[A-Za-z][A-Za-z0-9]*?(\d+):\s*(.+?)\s*\(\s*"
-        r"(\d+)\s*(MiB|MB|GiB|GB)\s*,\s*"
-        r"(\d+)\s*(MiB|MB|GiB|GB)\s*free\s*\)",
-        re.MULTILINE,
-    )
-
-    def _to_mb(value: int, unit: str) -> int:
-        if unit in ("GiB", "GB"):
-            return value * 1024
-        return value  # MiB ≈ MB for our purposes
-
-    devices: List[Tuple[int, str, int, int]] = []
-    for m in pat.finditer(out):
-        try:
-            idx = int(m.group(1))
-        except ValueError:
-            continue
-        name = m.group(2).strip().lower()
-        if not name:
-            continue
-        total_mb = _to_mb(int(m.group(3)), m.group(4))
-        free_mb = _to_mb(int(m.group(5)), m.group(6))
-        if total_mb > 0:
-            devices.append((idx, name, total_mb, min(free_mb, total_mb)))
+    _authoritative, records = _probe_llama_devices(binary)
+    devices = [r.legacy_tuple() for r in records if r.total_mb > 0]
     devices.sort(key=lambda t: t[0])
     return devices
 
@@ -1715,7 +1934,11 @@ def _best_gpu_name_match(gpu_name: str, candidate_names: List[str]) -> Optional[
         if not overlap:
             continue
         cand_digit_tokens = {t for t in cand_tokens if any(ch.isdigit() for ch in t)}
-        if gpu_digit_tokens and cand_digit_tokens and not (gpu_digit_tokens & cand_digit_tokens):
+        if (
+            gpu_digit_tokens
+            and cand_digit_tokens
+            and not (gpu_digit_tokens & cand_digit_tokens)
+        ):
             continue
         score = len(overlap) * 2 + len(gpu_digit_tokens & cand_digit_tokens)
         if score > best_score:
@@ -1773,7 +1996,7 @@ def _get_pci_device_ids() -> Dict[str, int]:
                     dev_id = None
             # Fallback: parse DEV_7550 out of the PNPDeviceID.
             if dev_id is None:
-                pnp = (getattr(vc, "PNPDeviceID", "") or "")
+                pnp = getattr(vc, "PNPDeviceID", "") or ""
                 m = re.search(r"DEV_([0-9A-Fa-f]{4})", pnp)
                 if m:
                     try:
@@ -1857,73 +2080,57 @@ def _detect_vulkan_summary() -> List[Tuple[int, str, Optional[int]]]:
     return devices
 
 
-def _assign_hip_indices(
-    gpus: List[GPUInfo], llama_binary: Optional[str]
-) -> None:
-    """Resolve and set ``gpu.hip_index`` for every GPU (mutates in place).
+def _assign_hip_indices(gpus: List[GPUInfo], llama_binary: Optional[str]) -> None:
+    """Resolve selected-runtime device identities (mutates ``gpus``).
 
-    This is the single source of truth for "which llama.cpp/Vulkan device
-    index does this Windows-enumerated GPU correspond to". It deliberately
-    does **not** trust the Windows registry/detection order, which differs
-    from the Vulkan order on multi-AMD-GPU systems and was the root cause of
-    the model loading onto the 16 GB RX 9070 XT instead of the 32 GB R9700.
-
-    Resolution, most → least authoritative:
-
-      1. **PCI device ID match** (the Rosetta Stone). vulkaninfo --summary
-         gives each Vulkan index its ``deviceID``; we match that against the
-         GPU's ``pci_device_id`` (WMI on Windows, DRM sysfs/lspci on Linux).
-         Order- and name-independent, so it is correct even for two
-         identically *named* cards. Requires vulkaninfo (Vulkan SDK /
-         ``vulkan-tools``) — often NOT installed on a fresh Ubuntu.
-      2. **Name + VRAM match against ``--list-devices``** — the
-         authoritative table reported by the very binary that will run
-         inference. Names are matched first; cards whose names don't match
-         (Mesa RADV can report a generic "AMD Radeon Graphics (RADV …)"
-         for very new cards like the R9700) are matched by their UNIQUE
-         total VRAM instead, and a single leftover pair is resolved by
-         elimination. Each device index is claimed at most once.
-      3. **Name match against vulkaninfo** (summary, then legacy) as a final
-         fallback when the llama binary can't be located.
-
-    Whatever resolves first wins per GPU; unresolved GPUs keep hip_index=None
-    and the caller (tuner.py) must NOT fall back to registry position.
+    ``hip_index`` is a legacy field name; the authoritative source is now the
+    exact binary's backend-qualified ``--list-devices`` table. Vulkan PCI/name
+    probing is used only when that runtime probe is unavailable, never ahead
+    of CUDA/HIP/SYCL/Metal/OpenVINO enumeration.
     """
     if not gpus:
         return
 
-    # --- Source A: vulkaninfo --summary → ordered (idx, name, device_id) ---
+    authoritative, records = _probe_llama_devices(llama_binary)
+    if records:
+        devices = [record.legacy_tuple() for record in records]
+        mapped = _map_gpus_to_llama_devices(gpus, devices)
+        by_key = {(record.index, record.name): record for record in records}
+        for gpu in gpus:
+            dev = mapped.get(id(gpu))
+            if dev is None:
+                continue
+            record = by_key.get((dev[0], dev[1]))
+            gpu.hip_index = dev[0]
+            if record is not None:
+                gpu.runtime_backend = record.backend
+                gpu.runtime_device = record.identifier
+        # A successful exact-runtime table is authoritative even when it lists
+        # only a subset of OS-visible accelerators. Do not assign unrelated
+        # Vulkan indices to devices this binary cannot use.
+        if authoritative:
+            return
+    elif authoritative:
+        # Explicitly empty table = CPU-only runtime.
+        return
+
+    # Fallback for old/unprobeable Vulkan/HIP builds. PCI device ID is the
+    # strongest physical identity; name order is the final resort. Backend is
+    # intentionally left unknown so tuner.py emits conservative selectors for
+    # every plausible vendor backend rather than assuming Vulkan.
     vk_summary = _detect_vulkan_summary()
     devid_to_idx: Dict[int, int] = {
         devid: idx for (idx, _name, devid) in vk_summary if devid is not None
     }
     summary_names: List[str] = [name for (_idx, name, _d) in vk_summary]
 
-    # 1. PCI device-id match — strongest, order/name independent.
     for gpu in gpus:
         if gpu.hip_index is not None:
             continue
         if gpu.pci_device_id is not None and gpu.pci_device_id in devid_to_idx:
             gpu.hip_index = devid_to_idx[gpu.pci_device_id]
 
-    # --- Source B: llama-server --list-devices → indexed device table
-    #     (preferred over vulkaninfo names since it is the runtime's own
-    #     enumeration AND carries per-device VRAM for name-free matching). ---
-    llama_devices = _detect_llama_devices(llama_binary)
-    pending = [g for g in gpus if g.hip_index is None]
-    if pending and llama_devices:
-        # Devices already claimed via PCI-id must not be re-assigned.
-        claimed_idx = {g.hip_index for g in gpus if g.hip_index is not None}
-        free_devices = [d for d in llama_devices if d[0] not in claimed_idx]
-        for gid, dev in _map_gpus_to_llama_devices(pending, free_devices).items():
-            for g in pending:
-                if id(g) == gid:
-                    g.hip_index = dev[0]
-                    break
-
-    # --- Source C: legacy vulkaninfo name probe (last resort). ------------
-    llama_names = [d[1] for d in llama_devices]
-    legacy_names = llama_names or summary_names or _detect_vulkan_device_order()
+    legacy_names = summary_names or _detect_vulkan_device_order()
     taken = {g.hip_index for g in gpus if g.hip_index is not None}
     for gpu in gpus:
         if gpu.hip_index is not None:
@@ -1963,7 +2170,11 @@ def detect_system(llama_binary: Optional[str] = None) -> SystemInfo:
     # ones missed (Windows: AMD without ROCm, Intel Arc; Linux: DRM/sysfs for
     # new AMD cards plus lspci names for devices without measurable VRAM).
     found_names = {g.name.lower() for g in raw}
-    for detector in (_detect_windows_gpus, _detect_linux_drm_gpus, _detect_linux_other_gpus):
+    for detector in (
+        _detect_windows_gpus,
+        _detect_linux_drm_gpus,
+        _detect_linux_other_gpus,
+    ):
         try:
             raw.extend(detector(skip_names=found_names))
             found_names = {g.name.lower() for g in raw}
@@ -1999,6 +2210,9 @@ def detect_system(llama_binary: Optional[str] = None) -> SystemInfo:
             old.pci_device_id = g.pci_device_id
         if old.vendor == "unknown" and g.vendor != "unknown":
             old.vendor = g.vendor
+        if old.is_integrated is None:
+            old.is_integrated = g.is_integrated
+        old.unified_memory = old.unified_memory or g.unified_memory
     raw = merged
 
     # Re-index in detection order for stable display. NOTE: g.index is the
@@ -2021,56 +2235,104 @@ def detect_system(llama_binary: Optional[str] = None) -> SystemInfo:
     except Exception:
         pass
 
-    # --- Authoritative VRAM from llama-server --list-devices ---------------
-    # The WMI/registry path above can mis-attribute used VRAM on multi-AMD-GPU
-    # Windows systems (RDNA 5 has no usable DedicatedUsage counters, and the
-    # perf-counter LUIDs map to neither PCI id nor Vulkan UUID). llama-server
-    # reports total + free per device directly, correctly per card, and live —
-    # so when it's available we overwrite total/free with its numbers. This is
-    # the same binary that runs inference, so the free figure is exactly what
-    # the next model must fit into. Name-keyed (lowercased), unique per card.
+    # --- Exact selected-runtime device table -------------------------------
+    # Preserve backend identity and use the binary's own enumeration BEFORE
+    # any Vulkan fallback. This makes CUDA/HIP/SYCL/Metal indices authoritative
+    # and intersects OS-visible GPUs with what the chosen executable can use.
     llama_bin = _resolve_llama_binary(llama_binary)
+    runtime_authoritative = False
+    runtime_mapped_ids: set[int] = set()
     try:
-        llama_devices = _detect_llama_devices(llama_bin)
-        if llama_devices:
-            # One device per GPU, never double-assigned — critical on Linux
-            # where Mesa RADV can give two cards the SAME device name (which
-            # used to collapse them into one dict entry and overwrite both
-            # cards with the same total/free figures).
-            mapped = _map_gpus_to_llama_devices(raw, llama_devices)
+        runtime_authoritative, records = _probe_llama_devices(llama_bin)
+        if records:
+            devices = [record.legacy_tuple() for record in records]
+            mapped = _map_gpus_to_llama_devices(raw, devices)
+            by_key = {(record.index, record.name): record for record in records}
+            shared_available_mb = (
+                int(vm.available // (1024 * 1024)) if vm is not None else 0
+            )
+            mapped_record_keys: set[Tuple[int, str]] = set()
             for g in raw:
                 dev = mapped.get(id(g))
-                if dev is not None:
-                    _idx, _name, total_mb, free_mb = dev
-                    g.total_vram_mb = total_mb
-                    g.free_vram_mb = free_mb
-    except Exception:
-        pass
+                if dev is None:
+                    continue
+                runtime_mapped_ids.add(id(g))
+                mapped_record_keys.add((dev[0], dev[1]))
+                record = by_key.get((dev[0], dev[1]))
+                g.hip_index = dev[0]
+                if record is not None:
+                    g.runtime_backend = record.backend
+                    g.runtime_device = record.identifier
+                if dev[2] > 0:
+                    g.total_vram_mb = dev[2]
+                    g.free_vram_mb = dev[3]
+                if g.unified_memory and shared_available_mb > 0:
+                    # Runtime "free" can be a Metal recommended working-set
+                    # limit rather than live host availability. The shared
+                    # pool cannot exceed what the OS currently has available.
+                    g.free_vram_mb = min(g.free_vram_mb, shared_available_mb)
 
-    used, ignored = _filter_inference_gpus(raw)
-
-    # --- HIP / Vulkan device index resolution (multi-GPU) ------------------
-    # The Windows registry/detection order in which GPUs appear does NOT match
-    # the Vulkan/HIP device order llama.cpp uses. Concretely on this system:
-    #   registry order : [0] R9700 (32 GB), [1] RX 9070 XT (16 GB), [2] Intel
-    #   Vulkan  order  : [0] RX 9070 XT,    [1] R9700,              [2] Intel
-    # Feeding the registry position to --main-gpu / GGML_VK_VISIBLE_DEVICES
-    # therefore selects the WRONG physical card — the 16 GB gaming GPU instead
-    # of the 32 GB R9700 — and the model OOMs / lands on the wrong device.
-    #
-    # _assign_hip_indices() resolves the correct Vulkan index per GPU using,
-    # in order: (1) PCI-device-id match via vulkaninfo --summary, (2) name
-    # match via `llama-server --list-devices`, (3) name match via vulkaninfo.
-    # Anything still unresolved keeps hip_index=None and tuner.py must NOT
-    # fall back to registry position.
-    try:
-        if (len(used) + len(ignored)) > 1:
-            _assign_hip_indices(
-                list(used) + list(ignored),
-                llama_bin,
-            )
+            # Some whole-graph backends do not expose a physical adapter name.
+            # b10441 OpenVINO, for example, reports "OPENVINO0: OpenVINO
+            # Runtime" with host-memory capacity. Preserve such authoritative
+            # accelerator records as synthetic unified-memory devices instead
+            # of intersecting them away and forcing -ngl 0 (which would disable
+            # the backend AutoTuner is meant to launch).
+            for record in records:
+                key = (record.index, record.name)
+                if key in mapped_record_keys or record.total_mb <= 0:
+                    continue
+                backend_l = record.backend.lower()
+                if backend_l.startswith(("cpu", "rpc")):
+                    continue
+                vendor = _vendor_from_name(record.name)
+                if vendor == "unknown":
+                    if backend_l.startswith("cuda"):
+                        vendor = "nvidia"
+                    elif backend_l.startswith(("sycl", "openvino")):
+                        vendor = "intel"
+                integrated = _infer_integrated_gpu(record.name, vendor, record.total_mb)
+                unified = (
+                    backend_l.startswith(("metal", "openvino")) or integrated is True
+                )
+                free_mb = record.free_mb
+                if unified and shared_available_mb > 0:
+                    free_mb = min(free_mb, shared_available_mb)
+                synthetic_name = (
+                    "OpenVINO Runtime"
+                    if backend_l.startswith("openvino")
+                    else record.name
+                )
+                synthetic = GPUInfo(
+                    index=record.index,
+                    name=synthetic_name,
+                    vendor=vendor,
+                    total_vram_mb=record.total_mb,
+                    free_vram_mb=free_mb,
+                    hip_index=record.index,
+                    runtime_backend=record.backend,
+                    runtime_device=record.identifier,
+                    unified_memory=unified,
+                    is_integrated=integrated,
+                )
+                raw.append(synthetic)
+                runtime_mapped_ids.add(id(synthetic))
     except Exception:
-        pass  # non-fatal — hip_index stays None, tuner handles that safely
+        runtime_authoritative = False
+        runtime_mapped_ids.clear()
+
+    if runtime_authoritative:
+        supported = [g for g in raw if id(g) in runtime_mapped_ids]
+        unsupported = [g for g in raw if id(g) not in runtime_mapped_ids]
+        used, ignored = _filter_inference_gpus(supported)
+        ignored.extend(unsupported)
+    else:
+        used, ignored = _filter_inference_gpus(raw)
+        try:
+            if (len(used) + len(ignored)) > 1:
+                _assign_hip_indices(list(used) + list(ignored), llama_bin)
+        except Exception:
+            pass  # non-fatal — index remains unknown, tuner stays conservative
     os_name = f"{platform.system()} {platform.release()}"
 
     try:
@@ -2112,17 +2374,33 @@ def format_system(info: SystemInfo) -> str:
     lines = [
         f"OS:   {info.os_name}",
         f"CPU:  {info.cpu_name} ({info.cpu_cores_physical}C/{info.cpu_cores_logical}T)",
-        f"RAM:  {info.total_ram_gb:.1f} GB total, {info.free_ram_gb:.1f} GB free",
     ]
+    if info.has_unified_memory:
+        shared_free_gb = min(info.free_ram_gb, info.free_vram_gb)
+        lines.append(
+            f"MEM:  {info.total_ram_gb:.1f} GB unified, "
+            f"{shared_free_gb:.1f} GB accelerator-addressable/available "
+            "(CPU + GPU shared)"
+        )
+    else:
+        lines.append(
+            f"RAM:  {info.total_ram_gb:.1f} GB total, {info.free_ram_gb:.1f} GB free"
+        )
     if info.gpus:
         for g in info.gpus:
             tag = f"[{g.vendor}]"
             if g.total_vram_mb > 0:
-                lines.append(
-                    f"GPU{g.index}: {tag} {g.name} "
-                    f"({g.total_vram_gb:.1f} GB total, "
-                    f"{g.free_vram_gb:.1f} GB free)"
-                )
+                backend = f", {g.runtime_backend}" if g.runtime_backend else ""
+                if g.unified_memory:
+                    lines.append(
+                        f"GPU{g.index}: {tag} {g.name} (unified/shared memory{backend})"
+                    )
+                else:
+                    lines.append(
+                        f"GPU{g.index}: {tag} {g.name} "
+                        f"({g.total_vram_gb:.1f} GB total, "
+                        f"{g.free_vram_gb:.1f} GB free{backend})"
+                    )
             else:
                 lines.append(f"GPU{g.index}: {tag} {g.name} (VRAM unknown)")
     else:
@@ -2131,6 +2409,6 @@ def format_system(info: SystemInfo) -> str:
     for g in info.ignored_gpus:
         size = f"{g.total_vram_gb:.1f} GB" if g.total_vram_mb > 0 else "VRAM unknown"
         lines.append(
-            f"      (ignored: [{g.vendor}] {g.name}, {size} — too small or auxiliary)"
+            f"      (not used by selected runtime: [{g.vendor}] {g.name}, {size})"
         )
     return "\n".join(lines)

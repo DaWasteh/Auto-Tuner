@@ -362,21 +362,48 @@ def _print_config(
 
     print()
     print("  Memory estimate (with current options):")
-    print(
-        f"    Model GPU : ~ {cfg.estimated_model_vram_gb:5.1f} GB   (free VRAM: {system.free_vram_gb:5.1f} GB)"
-    )
-    print(
-        f"    Model CPU : ~ {cfg.estimated_model_ram_gb:5.1f} GB   (free RAM:  {system.free_ram_gb:5.1f} GB)"
-    )
+    gpu_label = "accelerator" if cfg.unified_memory else "GPU"
+    cpu_label = "host" if cfg.unified_memory else "CPU"
+    print(f"    Model {gpu_label:<11}: ~ {cfg.estimated_model_vram_gb:5.1f} GB")
+    print(f"    Model {cpu_label:<11}: ~ {cfg.estimated_model_ram_gb:5.1f} GB")
     if cfg.vision_vram_gb:
-        print(f"    Vision GPU: ~ {cfg.vision_vram_gb:5.1f} GB")
+        print(f"    Vision GPU       : ~ {cfg.vision_vram_gb:5.1f} GB")
     if cfg.vision_ram_gb:
-        print(f"    Vision RAM: ~ {cfg.vision_ram_gb:5.1f} GB")
+        print(f"    Vision RAM       : ~ {cfg.vision_ram_gb:5.1f} GB")
     if cfg.runtime_vram_overhead_gb:
-        print(f"    Runtime GPU:~ {cfg.runtime_vram_overhead_gb:5.1f} GB")
-    print(f"    KV cache  : ~ {cfg.estimated_kv_gb:5.1f} GB")
+        print(f"    Runtime GPU      : ~ {cfg.runtime_vram_overhead_gb:5.1f} GB")
+    if cfg.batch_vram_overhead_gb:
+        print(f"    Batch workspace  : ~ {cfg.batch_vram_overhead_gb:5.1f} GB")
+    print(f"    KV cache         : ~ {cfg.estimated_kv_gb:5.1f} GB")
+    recurrent_total = cfg.recurrent_state_vram_gb + cfg.recurrent_state_ram_gb
+    if recurrent_total:
+        print(f"    Recurrent state  : ~ {recurrent_total:5.1f} GB")
     if cfg.prompt_cache_ram_gb:
-        print(f"    Prompt RAM: ~ {cfg.prompt_cache_ram_gb:5.1f} GB")
+        print(f"    Prompt RAM       : ~ {cfg.prompt_cache_ram_gb:5.1f} GB")
+    if cfg.unified_memory:
+        total_unified = (
+            cfg.estimated_model_vram_gb
+            + cfg.estimated_model_ram_gb
+            + cfg.vision_vram_gb
+            + cfg.vision_ram_gb
+            + cfg.draft_vram_gb
+            + cfg.estimated_kv_gb
+            + cfg.recurrent_state_vram_gb
+            + cfg.recurrent_state_ram_gb
+            + cfg.runtime_vram_overhead_gb
+            + cfg.batch_vram_overhead_gb
+            + cfg.prompt_cache_ram_gb
+        )
+        print(
+            f"    Unified total    : ~ {total_unified:5.1f} GB   "
+            f"({min(system.free_ram_gb, system.free_vram_gb):.1f} GB "
+            "accelerator-addressable before launch)"
+        )
+    else:
+        print(
+            f"    Capacity         : {system.free_vram_gb:.1f} GB VRAM / "
+            f"{system.free_ram_gb:.1f} GB RAM free before launch"
+        )
     print(_BAR)
 
 
@@ -1647,7 +1674,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
     default_fork_path = selected_fork_path
 
     # ── System detection ────────────────────────────────────────────────────
-    system = detect_system()
+    # Probe the selected/exact binary so CUDA/HIP/Vulkan/SYCL/Metal device
+    # identities, memory, and supported-device intersection are authoritative.
+    system = detect_system(_resolve_server_binary(args.server))
     _print_system(system)
 
     models_path = Path(args.models_path).expanduser()
@@ -1696,7 +1725,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
     while True:
         if not first_iteration:
             print()
-            system = detect_system()
+            system = detect_system(_resolve_server_binary(args.server))
             _print_system(system)
             args.model = None
             args.ctx = None
@@ -1836,7 +1865,49 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             print(f"[AutoTuner] OCR setup failed: {exc}")
             return 2
 
+        def resolve_specialized_binary(
+            profile: ModelProfile,
+            use_draft_flag: bool,
+            model_name: str,
+        ) -> str:
+            """Choose the exact server/fork before hardware tuning."""
+            if profile.server_binary:
+                return profile.server_binary
+            if gemma_draft_needs_ik_fork(
+                model_name, use_draft_flag, _resolve_server_binary(args.server)
+            ):
+                print(
+                    "[AutoTuner] Selected build advertises no --spec-type "
+                    "(pre-b9190) — Gemma-4 drafter falls back to ik_llama.cpp."
+                )
+                return "ik_llama.cpp/llama-server"
+            return args.server
+
         # ── Config computation ───────────────────────────────────────────
+        # Re-probe after model/profile fork selection. A profile may have
+        # switched from the menu's default build to CUDA, SYCL, OpenVINO, or a
+        # specialized fork; tuning against the old OS-visible GPU set would
+        # produce invalid indices and memory assumptions.
+        tuning_is_diffusion = (
+            model.is_diffusion or profile.runner == "llama-diffusion-cli"
+        ) and profile.runner != "llama-diffusion-gemma-server"
+        if tuning_is_diffusion:
+            tuning_request = profile.server_binary or "llama-diffusion-cli"
+            tuning_binary = _resolve_diffusion_binary(
+                tuning_request,
+                arch=(model.metadata or {}).get("general.architecture"),
+            )
+        elif profile.runner == "llama-diffusion-gemma-server":
+            tuning_binary = _resolve_diffusion_binary(
+                "llama-diffusion-gemma-server",
+                arch=(model.metadata or {}).get("general.architecture"),
+            )
+        else:
+            tuning_binary = _resolve_server_binary(
+                resolve_specialized_binary(profile, use_draft, model.name)
+            )
+        system = detect_system(tuning_binary)
+
         # Resolve performance target: CLI > YAML profile > "balanced".
         perf_target = resolve_performance_target(
             cli_choice=getattr(args, "performance_target", None),
@@ -1886,51 +1957,13 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         )
         _print_config(model, profile, cfg, system)
 
-        # ── Binary resolution ────────────────────────────────────────────
-        def resolve_specialized_binary(
-            profile: ModelProfile,
-            use_draft_flag: bool,
-            model_name: str,
-        ) -> str:
-            """Choose the llama-server binary for this model.
-
-            Priority:
-              1. server_binary from YAML profile
-              2. Whatever the user selected / args.server — for Gemma 4 WITH
-                 external draft this is probed for --spec-type first: mainline
-                 runs the drafter natively since PR #23398 (b9190+), so only a
-                 build too old to advertise --spec-type still falls back to
-                 the legacy ik_llama.cpp fork.
-            """
-            # Explicit server_binary in YAML always wins
-            if profile.server_binary:
-                return profile.server_binary
-
-            # Gemma 4 + external drafter: use the selected build when it
-            # advertises --spec-type (mainline b9190+ handles the
-            # gemma4-assistant head via --spec-type draft-mtp); redirect to
-            # ik_llama.cpp only for genuinely old builds.
-            if gemma_draft_needs_ik_fork(
-                model_name, use_draft_flag, _resolve_server_binary(args.server)
-            ):
-                print(
-                    "[AutoTuner] Selected build advertises no --spec-type "
-                    "(pre-b9190) — Gemma-4 drafter falls back to ik_llama.cpp."
-                )
-                return "ik_llama.cpp/llama-server"
-
-            # Default: let _resolve_server_binary find it in LLAMA_CPP_DIR
-            return args.server
-
         # ── Runner selection: diffusion vs server ────────────────────────
         # Diffusion text models (Dream/LLaDA/RND1 mainline; DiffusionGemma
         # fork) are NOT served by llama-server — they run single-shot via
         # llama-diffusion-cli with --diffusion-* flags and no /health/API.
         # The scanner detects this from general.architecture; a profile may
         # also force it with `runner: llama-diffusion-cli`.
-        is_diffusion_run = (
-            model.is_diffusion or profile.runner == "llama-diffusion-cli"
-        ) and profile.runner != "llama-diffusion-gemma-server"
+        is_diffusion_run = tuning_is_diffusion
 
         extra = list(args.passthrough or [])
         if ocr_options is not None:
@@ -2008,10 +2041,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         else:
             # ── Binary resolution (server path) ──────────────────────────
             raw_server = profile.server_binary or args.server
-            effective_server = resolve_specialized_binary(
-                profile, use_draft, model.name
-            )
-            server = _resolve_server_binary(effective_server)
+            server = tuning_binary
 
             if server != raw_server:
                 print(f"[AutoTuner] Found server binary: {server}")

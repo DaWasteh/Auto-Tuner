@@ -64,18 +64,20 @@ class PerformanceTarget:
     moe_hybrid_batch: int = 2048
     moe_hybrid_ubatch: int = 2048
 
+    # Additional VRAM withheld for large MoE op-offload batches, on top of
+    # tuner.py's generic 0.6 GB/slot attention workspace reserve. 4096-token
+    # throughput batches need about 1.5 GB total, so throughput adds 0.9 GB.
+    moe_batch_vram_reserve_gb: float = 0.3
+
     # --parallel N passed to llama-server.
     #
     # llama-server's default is "auto": it infers N from the total KV
     # budget divided by the per-slot cost at the requested context.  On a
     # dual-GPU system (e.g. R9700 32 GB + RX 9070 XT 16 GB) with a large
-    # dense model (e.g. Qwen3.6-27B-Q8, ~33 GB) the free VRAM after
-    # weights is ~13 GB plus the 8 GB RAM supplement = ~21 GB.  With a
-    # 262k context at Q8 KV (~0.060 MB/token) that budget fits ~354k
-    # tokens, so "auto" happily sets n_parallel = 4 (354k / 262k ≈ 1.35
-    # rounded up to 4 by llama-server's heuristic).  The result: 4 slots
-    # × 15.4 GB KV/slot = 61.6 GB reserved, filling ALL 47 GB of RAM and
-    # part of VRAM even though the model barely fits.
+    # dense model (e.g. Qwen3.6-27B-Q8, ~33 GB), implicit slot selection can
+    # multiply a large KV allocation beyond the planned budget. At 262k
+    # context and ~0.060 MB/token, one slot already needs ~15.4 GB; four
+    # auto-selected slots would reserve ~61.6 GB and exhaust a desktop box.
     #
     # Fix: always pass --parallel N explicitly so the server cannot
     # over-provision KV cache.  The value must also feed into the ctx
@@ -149,11 +151,12 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # different tier anyway.
         moe_hybrid_batch=1024,
         moe_hybrid_ubatch=1024,
+        moe_batch_vram_reserve_gb=0.0,
         n_parallel=1,
         dense_kv_reserve_ctx=65536,  # reserve most VRAM for KV → max context
         dense_kv_ram_cap_gb=24.0,
         description=(
-            "Conservative. KV reserved for 128k (MoE) / 32k (dense) context, "
+            "Conservative. KV reserved for 128k (MoE) / 64k (dense) context, "
             "generous safety bands. Single slot with the full context. Pick "
             "this for long-context sessions."
         ),
@@ -168,11 +171,12 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # 16 GB-class GPUs on Qwen3.6-A3B / Gemma-4-26B-A4B / GLM-4.7-MoE.
         moe_hybrid_batch=2048,
         moe_hybrid_ubatch=2048,
+        moe_batch_vram_reserve_gb=0.3,
         n_parallel=1,
         dense_kv_reserve_ctx=32768,  # balanced VRAM split weights ↔ KV
         dense_kv_ram_cap_gb=16.0,
         description=(
-            "Default. KV reserved for 64k (MoE) / 16k (dense) context — "
+            "Default. KV reserved for 64k (MoE) / 32k (dense) context — "
             "enough headroom for most chats while letting more weight/expert "
             "layers fit on GPU. Single slot."
         ),
@@ -189,11 +193,12 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # smallest KV budget (32k) so there's room.
         moe_hybrid_batch=4096,
         moe_hybrid_ubatch=4096,
+        moe_batch_vram_reserve_gb=0.9,
         n_parallel=1,
         dense_kv_reserve_ctx=16384,  # reserve least → max weight layers on GPU
         dense_kv_ram_cap_gb=8.0,
         description=(
-            "Aggressive. KV reserved for only 32k (MoE) / 8k (dense) — every "
+            "Aggressive. KV reserved for only 32k (MoE) / 16k (dense) — every "
             "spare GB of VRAM goes to weight/expert layers for max tokens/s. "
             "Single slot. Not recommended for very long context."
         ),
@@ -214,6 +219,7 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
         # limited by CPU-resident experts + CPU attention.
         moe_hybrid_batch=1024,
         moe_hybrid_ubatch=1024,
+        moe_batch_vram_reserve_gb=0.0,
         # Single slot: the whole point is maximising per-slot context,
         # so the KV budget is not divided across slots.
         n_parallel=1,

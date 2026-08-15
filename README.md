@@ -329,12 +329,21 @@ git pull && python qt_launcher.py
 
 ## Compiled build (.exe / Linux binary)
 
-Für Einsteiger gibt es eine kompilierte **noconsole**-Version — keine
-Python-Installation, kein Terminalfenster, einfach Doppelklick. Sie läuft auf
-**Windows 10/11** (`.exe`), **macOS** und Linux. Der Linux-Build wird bei jedem
-Release automatisiert auf **Ubuntu, Fedora, Arch Linux, Linux Mint, CachyOS,
-Kali Linux und Debian** gestartet und lässt sich wie die anderen Builds über
-denselben **⬆ Update**-Button self-updaten.
+Für Einsteiger gibt es kompilierte **noconsole**-Versionen ohne separate
+Python-Installation: **Windows 10/11 x64** (`.exe`), **Linux x64** und
+**macOS Apple Silicon arm64**. Der Linux-Build wird bei jedem Release
+automatisiert auf **Ubuntu, Fedora, Arch Linux, Linux Mint, CachyOS, Kali
+Linux und Debian** gestartet; Windows und macOS erhalten zusätzlich einen
+nativen Frozen-Binary-Smoke-Test. Alle drei Builds verwenden denselben
+**⬆ Update**-Button.
+
+Der macOS-Build ist derzeit nicht mit einer kostenpflichtigen Apple Developer
+ID signiert/notarisiert. Gatekeeper kann deshalb beim ersten Start warnen:
+App im Finder mit **Rechtsklick → Öffnen** starten und die Rückfrage bestätigen;
+falls nötig unter **Systemeinstellungen → Datenschutz & Sicherheit → Dennoch
+öffnen** freigeben. Nur das Asset aus dem offiziellen AutoTuner-GitHub-Release
+verwenden. Intel-Macs und ARM-Linux sind derzeit Source-Installationen, keine
+bereitgestellten Frozen-Assets.
 
 ### Bauen
 
@@ -534,12 +543,12 @@ VRAM. It changes both the safety bands and the KV-cache budget that
 gets reserved up front during MoE layer placement, so picking the right
 tier can move several expert layers between GPU and CPU.
 
-| Tier | KV reservation | VRAM safety | When to use |
+| Tier | KV reservation (MoE / dense) | VRAM safety | When to use |
 |---|---|---|---|
-| `safe` | 128 k tokens | 0.30 GB | Long-context sessions (>64 k), maximum stability |
-| `balanced` *(default)* | 64 k tokens | 0.25 GB | General use — moderate optimisation that helps everyone |
-| `throughput` | 32 k tokens | 0.15 GB | Short-context inference (chat, reasoning ≤32 k); pushes more expert layers onto the GPU for higher tokens/s |
-| `low_vram` | KV → system RAM | 0.15 GB | **LOW-VRAM / high-RAM boxes** (e.g. 8 GB VRAM, 64 GB RAM). Forces the KV cache into system RAM via `--no-kv-offload`, so context is drawn from abundant RAM instead of scarce VRAM — the only way to reach 90 k+ on a 20 GB MoE that barely fits the GPU. Trades generation speed for context (attention compute follows the KV onto the CPU). |
+| `safe` | 128 k / 64 k tokens | 0.30 GB | Long-context sessions (>64 k), maximum stability |
+| `balanced` *(default)* | 64 k / 32 k tokens | 0.25 GB | General use — moderate optimisation that helps everyone |
+| `throughput` | 32 k / 16 k tokens | 0.15 GB | Short-context inference (chat, reasoning ≤32 k); pushes more expert layers onto the GPU for higher tokens/s |
+| `low_vram` | KV → system RAM | 0.15 GB | **Dedicated low-VRAM / high-RAM boxes** (e.g. 8 GB VRAM, 64 GB RAM). Emits `--no-kv-offload`; attention follows the KV to the CPU. On Apple/iGPU unified memory this changes compute placement but does not increase physical capacity. |
 
 #### Why `low_vram` exists
 
@@ -573,7 +582,8 @@ The user choice (CLI / GUI) always wins over the profile recommendation.
 ### Model loading and memory locking (`--load-mode`)
 
 The Expert panel exposes llama.cpp's complete model-loading strategy: `auto`
-(default mmap), `none`, `mmap`, `mlock`, `mmap+mlock`, and `dio`. Starting with
+(upstream policy; b10364 avoids mmap on iGPUs), `none`, `mmap`, `mlock`,
+`mmap+mlock`, and `dio`. Starting with
 **b10151**, `mlock` means lock normally-read model memory **without mmap**, while
 `mmap+mlock` explicitly combines mapping and locking. AutoTuner emits the
 non-deprecated `--load-mode MODE` form and migrates old per-model
@@ -847,7 +857,7 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (as of b10329)
+## Server features (as of b10441)
 
 The following `llama-server` features are supported (verified against `llama-server --help` / `tools/server/README.md`):
 
@@ -883,6 +893,31 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+
+### Review b10329 → b10441
+
+Reviewed all **112 upstream commits** from exact tag **b10329**
+(`18f7ad7f`) through **b10441** (`0177dcc7`). The source, official-package,
+backend, architecture, and memory-accounting evidence is documented in
+[`docs/llama-b10441-audit.md`](docs/llama-b10441-audit.md).
+
+- **No emitted flag broke:** the complete AutoTuner server surface remains in
+  b10441. `--load-mode auto` is now the upstream default; the new
+  value-bearing `--reasoning-effort` is safe through Extra CLI flags.
+- **Backend identity is now exact:** `CUDA`, `HIP`, `Vulkan`, `SYCL`, `Metal`,
+  and `OPENVINO` device prefixes from the selected binary are retained.
+  CUDA/SYCL no longer inherit Vulkan indices or selectors.
+- **Unified memory is one pool:** Apple Silicon and confirmed integrated GPUs
+  use live available memory, with CPU/GPU allocations counted once. Full-GPU
+  KV no longer receives an impossible host-RAM supplement.
+- **Architecture updates:** existing Muse Glimmer and Granite Switch profiles
+  cover their new native loaders; MiniMax-Text-01/MiniMax-M1 gains a
+  `minimax-01` hybrid-MoE profile; PocketTTS remains a dedicated TTS workflow,
+  not a normal text-chat claim.
+- **Official packages expanded:** b10441 publishes Windows x64 Vulkan, ROCm,
+  SYCL, OpenVINO, CUDA 12.4 and CUDA 13.3 builds, plus native macOS arm64 and
+  Ubuntu backend packages. AutoTuner launches these external binaries rather
+  than linking to one backend.
 
 ### Review b10151 → b10329
 
@@ -1265,27 +1300,48 @@ in `autotuner_settings.json` (`mmproj_selection`). The automatic pre-pick
 now prefers the **highest** precision (f32 > f16 > bf16) instead of, as
 before, always taking bf16 purely alphabetically.
 
-On an Arrow Lake system (Core Ultra 285K) the integrated Intel GPU and the
-NPU deliberately appear only as *ignored* in the GPU list, not in the
-inference pool. b9334 does bring an **OpenVINO** backend (Intel CPU/GPU/NPU)
-and **SYCL** (Intel GPU), but:
+### Intel CPU, SYCL, and OpenVINO
 
-1. OpenVINO is a **standalone whole-model backend** that completely
-   replaces the GGML graph — it **cannot** be mixed with the Vulkan/ROCm
-   AMD pool in one process (either/or).
-2. Official Windows binaries exist only as CPU / CUDA / Vulkan / HIP —
-   there is **no** Windows OpenVINO build (Ubuntu only). Since b9371
-   (#23705) **no official SYCL releases** are built either, so SYCL would
-   be a self-build.
-3. The desktop iGPU (~4 Xe cores) and the ~13-TOPS NPU share DDR5
-   bandwidth with the CPU, which is already computing the MoE experts, and
-   in a layer split the slowest device paces the pipeline — next to two
-   strong AMD cards that would be a net loss.
+AutoTuner selects capabilities from the **exact llama-server binary**, not from
+an OS-vendor guess. This matters on Intel laptops and mixed workstations:
 
-The iGPU/NPU would only make sense as a **separate, standalone**
-`llama-server` instance (SYCL on Windows, OpenVINO on Linux) for a small
-background model — not in the main inference path. This separation is
-intentional.
+1. An x64 CPU build always remains the safe baseline. On a ThinkPad, thread
+   count and RAM/KV sizing are derived normally even when the iGPU is too old
+   or too small.
+2. The b10441 **SYCL** backend supports Intel GPU families from 11th-generation
+   Core onward, including Iris Xe, built-in Arc, and discrete Arc. Official
+   b10441 Windows x64 and Ubuntu FP16/FP32 packages exist. AutoTuner retains
+   `SYCL0`, uses `ONEAPI_DEVICE_SELECTOR`, and counts confirmed iGPU memory as
+   shared system RAM. A 10th-generation or older iGPU is not promised; use CPU
+   or a separately validated OpenCL path there.
+3. The b10441 **OpenVINO** backend is available officially on Windows and
+   Ubuntu and can target Intel CPU, GPU, or NPU. It is a whole-graph backend,
+   represented as one host/unified-memory accelerator. Set the upstream
+   environment variable before starting AutoTuner when a target is required:
+   `GGML_OPENVINO_DEVICE=CPU`, `GPU`, `GPU.0`, or `NPU`. Model, quantization,
+   stateful-execution, and NPU coverage remain experimental upstream.
+4. OpenVINO cannot be mixed with a Vulkan/ROCm pool in one process. On a
+   workstation with strong discrete cards, use a separate server process for
+   an Intel iGPU/NPU background model. When the selected binary is SYCL or
+   OpenVINO, unrelated OS-visible AMD/NVIDIA devices are excluded from that
+   process's tuning calculation.
+
+Discrete Intel Arc cards are no longer blanket-filtered when AMD/NVIDIA peers
+exist; only confirmed integrated/shared-memory Intel devices are treated as
+auxiliary in a mixed generic GPU pool.
+
+### Apple Silicon / M5 unified memory
+
+The macOS release is built natively on GitHub's Apple-Silicon arm64 runner and
+published as `AutoTuner-macOS-arm64.zip`. Metal is enabled by default in the
+official llama.cpp macOS arm64 package. M1 through M5-family names require no
+hard-coded chip table.
+
+RAM and VRAM are **not separate on Apple Silicon**. AutoTuner uses live
+available memory, caps it by the selected Metal runtime report, subtracts model,
+KV, projector/draft, prompt-cache, and workspace allocations once, and displays
+one unified total. `low_vram` may move KV compute to the CPU, but it cannot
+create extra physical memory on a unified-memory Mac.
 
 ### Monitoring (`/health` + `/metrics` + optional `/slots`)
 
