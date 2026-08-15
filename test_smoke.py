@@ -60,7 +60,8 @@ def test_detect_system_does_not_raise() -> None:
 def test_format_system_produces_text() -> None:
     info = detect_system()
     out = format_system(info)
-    assert "CPU:" in out and "RAM:" in out
+    expected_memory_label = "MEM:" if info.has_unified_memory else "RAM:"
+    assert "CPU:" in out and expected_memory_label in out
 
 
 # ---------------------------------------------------------------------------
@@ -3306,6 +3307,7 @@ def test_unified_memory_is_budgeted_once(tmp_path) -> None:
     )
     assert cfg.unified_memory is True
     assert total <= system.free_ram_gb + 1e-6
+    assert "MEM:" in format_system(system)
 
 
 def test_alternate_kv_head_key_is_used_by_sizing() -> None:
