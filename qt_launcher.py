@@ -38,6 +38,7 @@ from PyQt6.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QPointF,
     QRect,
     QThread,
     QTimer,
@@ -51,6 +52,7 @@ from PyQt6.QtGui import (
     QColor,
     QDesktopServices,
     QIcon,
+    QMouseEvent,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -3900,7 +3902,13 @@ class MainWindow(QMainWindow):
     _WIN_SETTINGS_COMMAND_ID = 0x1FFE
     _WIN_ABOUT_COMMAND_ID = 0x1FFD
 
-    def __init__(self, models_path: Path, settings_path: Path) -> None:
+    def __init__(
+        self,
+        models_path: Path,
+        settings_path: Path,
+        *,
+        start_background: bool = True,
+    ) -> None:
         super().__init__()
         self.setWindowTitle(f"AutoTuner v{VERSION}")
         # Hard-coded default size — only kicks in when no persisted
@@ -3966,11 +3974,15 @@ class MainWindow(QMainWindow):
         self._option_overrides: dict = {}
         self._favorite_models = app_settings.get_favorite_models()
         self._model_view_mode = app_settings.get_model_view_mode()
-        # Folder expansion survives filtering, rescans, and favorite changes.
-        # The dedicated favorites section starts open on first use.
-        self._tree_expanded_paths: set[str] = {"favorites"}
+        # New folders start expanded. Explicit collapses survive filtering,
+        # rescans, and favorite changes for the rest of the session.
+        self._tree_collapsed_paths: set[str] = set()
         self._tree_native_toggle_item: Optional[QTreeWidgetItem] = None
         self._tree_manual_toggle = False
+        # Rebuilding a QTreeWidget synchronously inside its item delegate's
+        # mouse event can invalidate Qt's active QModelIndex and crash the
+        # process. Favorite changes therefore coalesce into a zero-delay refresh.
+        self._favorite_refresh_pending = False
 
         # Track whether the user has manually overridden the fork selection
         self._fork_manual_override = False
@@ -4015,17 +4027,20 @@ class MainWindow(QMainWindow):
         # that hasn't been connected yet (one of the crash patterns).
         self._sysinfo_ready.connect(self._update_sysinfo_labels)
         self._bg_log.connect(self._log)
-        QTimer.singleShot(0, self._startup_load)
+        if start_background:
+            QTimer.singleShot(0, self._startup_load)
 
         # Server crash-detection (lightweight poll — no stdout read)
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_server)
-        self._poll_timer.start(500)
+        if start_background:
+            self._poll_timer.start(500)
 
         # Sysinfo refresh (non-blocking — daemon thread)
         self._sysinfo_timer = QTimer(self)
         self._sysinfo_timer.timeout.connect(self._sysinfo_async)
-        self._sysinfo_timer.start(6000)
+        if start_background:
+            self._sysinfo_timer.start(6000)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -6282,9 +6297,9 @@ class MainWindow(QMainWindow):
         if not isinstance(key, str) or not key:
             return
         if expanded:
-            self._tree_expanded_paths.add(key)
+            self._tree_collapsed_paths.discard(key)
         else:
-            self._tree_expanded_paths.discard(key)
+            self._tree_collapsed_paths.add(key)
 
     def _on_tree_expansion_changed(self, item: QTreeWidgetItem, expanded: bool) -> None:
         """Remember expansion and distinguish native arrow clicks from labels."""
@@ -6358,7 +6373,9 @@ class MainWindow(QMainWindow):
             item = self._add_tree_model_item(favorite_root, entry)
             if selected_path is not None and entry.path == selected_path:
                 selected_item = item
-        favorite_root.setExpanded(filtering or "favorites" in self._tree_expanded_paths)
+        favorite_root.setExpanded(
+            filtering or "favorites" not in self._tree_collapsed_paths
+        )
 
         roots = getattr(self, "_last_scan_roots", self._active_model_paths())
         folder_items: Dict[Tuple[str, ...], QTreeWidgetItem] = {}
@@ -6389,7 +6406,7 @@ class MainWindow(QMainWindow):
                     )
                     folder_item.setToolTip(0, str(entry.path.parent))
                     folder_item.setExpanded(
-                        filtering or state_key in self._tree_expanded_paths
+                        filtering or state_key not in self._tree_collapsed_paths
                     )
                     folder_items[folder_key] = folder_item
                 parent = folder_item
@@ -6456,13 +6473,21 @@ class MainWindow(QMainWindow):
             self._model_tree.blockSignals(False)
 
     def _set_model_favorite(self, entry: ModelEntry, favorite: bool) -> None:
-        """Persist a star click and rebuild both views in favorite order."""
+        """Persist a star click, then safely rebuild after the delegate event."""
         key = app_settings.favorite_model_key(entry.path)
         if favorite:
             self._favorite_models.add(key)
         else:
             self._favorite_models.discard(key)
         app_settings.set_model_favorite(entry.path, favorite)
+        if self._favorite_refresh_pending:
+            return
+        self._favorite_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_after_favorite_change)
+
+    def _refresh_after_favorite_change(self) -> None:
+        """Rebuild views only after Qt has finished the star-click event."""
+        self._favorite_refresh_pending = False
         self._apply_filter(self._search.text())
 
     def _apply_filter(self, text: str) -> None:
@@ -9498,6 +9523,71 @@ class MainWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
+def _run_model_tree_interaction_smoke(app: QApplication, settings_path: Path) -> None:
+    """Exercise the crash-prone tree favorite event through production slots."""
+    root = Path(tempfile.gettempdir()) / "autotuner-model-tree-smoke"
+    entry = ModelEntry(
+        path=root / "Alibaba" / "Qwen3.6" / "Qwen3.6-27B-Q4_K_M.gguf",
+        name="Qwen3.6-27B-Q4_K_M",
+        group="Alibaba/Qwen3.6",
+        size_bytes=1 * 1024**3,
+    )
+    window = MainWindow(root, settings_path, start_background=False)
+    original_set_favorite = app_settings.set_model_favorite
+    persisted: List[Tuple[Path, bool]] = []
+    try:
+        # The smoke test must never modify a user's portable settings file.
+        app_settings.set_model_favorite = lambda path, favorite: persisted.append(
+            (path, favorite)
+        )
+        window._favorite_models = set()
+        window._all_entries = [entry]
+        window._last_scan_roots = [root]
+        window._populate_list(window._all_entries)
+        window._set_model_view("tree", persist=False)
+
+        favorite_root = window._model_tree.topLevelItem(0)
+        vendor_folder = window._model_tree.topLevelItem(1)
+        family_folder = vendor_folder.child(0)
+        model_item = family_folder.child(0)
+        if not (
+            favorite_root.isExpanded()
+            and vendor_folder.isExpanded()
+            and family_folder.isExpanded()
+        ):
+            raise RuntimeError("model tree did not start fully expanded")
+
+        index = window._model_tree.indexFromItem(model_item)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 500, 26)
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(12, 13),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        handled = window._tree_favorite_delegate.editorEvent(
+            event, window._model_tree.model(), option, index
+        )
+        key = app_settings.favorite_model_key(entry.path)
+        if not handled or key not in window._favorite_models:
+            raise RuntimeError("tree favorite click was not handled")
+        if favorite_root.childCount() != 0 or not window._favorite_refresh_pending:
+            raise RuntimeError("tree rebuilt synchronously inside the delegate event")
+
+        app.processEvents()
+        refreshed_favorites = window._model_tree.topLevelItem(0)
+        if window._favorite_refresh_pending or refreshed_favorites.childCount() != 1:
+            raise RuntimeError("deferred tree favorite refresh did not complete")
+        if persisted != [(entry.path, True)]:
+            raise RuntimeError("tree favorite state was not persisted exactly once")
+    finally:
+        app_settings.set_model_favorite = original_set_favorite
+        window.deleteLater()
+        app.processEvents()
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     import argparse
 
@@ -9538,7 +9628,22 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        "--model-tree-smoke-test",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.model_tree_smoke_test:
+        app = QApplication(sys.argv)
+        _application_theme_manager(app, _bundled_resource("assets", "themes"))
+        _run_model_tree_interaction_smoke(app, Path(args.settings_path))
+        print(
+            f"AutoTuner v{VERSION} model tree interaction smoke test OK",
+            flush=True,
+        )
+        return
 
     if args.smoke_test:
         # Frozen-release CI entry point: exercises the PyInstaller bootloader,

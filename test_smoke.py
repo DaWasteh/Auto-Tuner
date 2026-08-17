@@ -337,6 +337,23 @@ def test_favorite_star_click_selects_row_and_emits_both_states(tmp_path) -> None
     model_list.close()
 
 
+def test_model_tree_favorite_interaction_is_deferred_and_crash_safe(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+
+    qt_launcher._run_model_tree_interaction_smoke(_QT_TEST_APP, SETTINGS_DIR)
+
+
 # ---------------------------------------------------------------------------
 # Tuner
 
@@ -991,8 +1008,6 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     global _QT_TEST_APP
 
     qt_launcher = pytest.importorskip("qt_launcher")
-    qt_core = pytest.importorskip("PyQt6.QtCore")
-    qt_test = pytest.importorskip("PyQt6.QtTest")
     qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
     _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
     parent = qt_widgets.QWidget()
@@ -1075,7 +1090,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         ]
     )
 
-    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR)
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
     main_names = (
         "_fork_combo",
         "_btn_fork_folder",
@@ -1161,24 +1176,27 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         window._model_tree.topLevelItem(index).text(0)
         for index in range(1, window._model_tree.topLevelItemCount())
     ] == ["Alibaba", "Google"]
+    assert all(
+        window._model_tree.topLevelItem(index).isExpanded()
+        for index in range(window._model_tree.topLevelItemCount())
+    )
     assert window._model_tree.topLevelItem(1).child(0).text(0) == "Qwen3.6"
+    assert window._model_tree.topLevelItem(1).child(0).isExpanded()
     window._set_model_view("tree")
     assert window._model_view_stack.currentWidget() is window._model_tree
     assert qt_launcher.app_settings.get_model_view_mode() == "tree"
     window._apply_filter("Alibaba")
     assert window._model_tree.topLevelItemCount() == 2  # favorites + matching folder
+    window._apply_filter("")
 
     window.resize(1320, 840)
     window.show()
     _QT_TEST_APP.processEvents()
     alibaba_folder = window._model_tree.topLevelItem(1)
     alibaba_folder.setExpanded(False)
-    folder_rect = window._model_tree.visualItemRect(alibaba_folder)
-    qt_test.QTest.mouseClick(
-        window._model_tree.viewport(),
-        qt_core.Qt.MouseButton.LeftButton,
-        pos=qt_core.QPoint(folder_rect.left() + 80, folder_rect.center().y()),
-    )
+    _QT_TEST_APP.processEvents()
+    assert window._tree_native_toggle_item is None
+    window._on_tree_item_clicked(alibaba_folder, 0)
     assert alibaba_folder.isExpanded()  # clicking the folder name toggles it
 
     top_split, main_split = window._splitters
