@@ -87,6 +87,8 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon,
     QTextEdit,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -2158,6 +2160,7 @@ def _capability_markers(entry: ModelEntry) -> str:
 
 
 _FAVORITE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+_TREE_PATH_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 
 
 class _FavoriteStarDelegate(QStyledItemDelegate):
@@ -2181,6 +2184,11 @@ class _FavoriteStarDelegate(QStyledItemDelegate):
         return option.rect.adjusted(31, 0, 0, 0)
 
     def paint(self, painter, option, index) -> None:
+        # Folder/header rows in the tree carry no ModelEntry. Render those with
+        # the native Qt delegate so indentation and expand arrows remain intact.
+        if index.data(Qt.ItemDataRole.UserRole) is None:
+            super().paint(painter, option, index)
+            return
         text_option = QStyleOptionViewItem(option)
         text_option.rect = self._text_rect(option)
         if option.state & QStyle.StateFlag.State_Selected:
@@ -2236,6 +2244,76 @@ def _sort_model_entries(
         key=lambda entry: (
             app_settings.favorite_model_key(entry.path) not in favorite_models
         ),
+    )
+
+
+def _model_display_text(entry: ModelEntry) -> str:
+    """Return the shared model-row label used by list and folder views."""
+    marks = _capability_markers(entry)
+    tail = f"  ({entry.size_gb:.1f} GB)"
+    return f"{entry.name}  {marks}{tail}" if marks else f"{entry.name}{tail}"
+
+
+def _model_tooltip(entry: ModelEntry, favorite: bool) -> str:
+    """Describe favorite state and paired capabilities for one model row."""
+    state = (
+        "Favorit — anklicken zum Entfernen"
+        if favorite
+        else "Kein Favorit — Stern anklicken zum Markieren"
+    )
+    lines = [entry.name, str(entry.path), "", f"★  {state}"]
+    if entry.mmproj is not None:
+        lines.append(f"👁  Vision      {entry.mmproj.name}")
+    if entry.draft is not None:
+        lines.append(f"⚡  Draft       {entry.draft.name}")
+    if entry.supports_thinking:
+        lines.append("🧠  Thinking    chat template emits <think>")
+    if entry.supports_tool_use:
+        lines.append("🛠  Tool use    chat template supports tool_calls")
+    return "\n".join(lines)
+
+
+def _model_folder_parts(entry: ModelEntry, roots: List[Path]) -> Tuple[str, ...]:
+    """Return stable display folders for an entry under one or more scan roots.
+
+    A single configured model root is omitted because its children are already
+    the useful vendor/family hierarchy. With multiple roots, a unique root
+    label is prepended so equally named folders on different drives never merge.
+    """
+    try:
+        parent = entry.path.parent.resolve(strict=False)
+    except (OSError, RuntimeError):
+        parent = entry.path.parent
+
+    normalized_roots: List[Path] = []
+    for root in roots:
+        try:
+            normalized_roots.append(root.resolve(strict=False))
+        except (OSError, RuntimeError):
+            normalized_roots.append(root)
+
+    for root in normalized_roots:
+        try:
+            relative = parent.relative_to(root)
+        except ValueError:
+            continue
+        parts = list(relative.parts)
+        if len(normalized_roots) > 1:
+            label = root.name or str(root)
+            duplicate = (
+                sum(
+                    1
+                    for candidate in normalized_roots
+                    if (candidate.name or str(candidate)) == label
+                )
+                > 1
+            )
+            parts.insert(0, str(root) if duplicate else label)
+        return tuple(part for part in parts if part not in ("", "."))
+
+    # Defensive fallback for synthetic entries and paths moved after scanning.
+    return tuple(
+        part for part in re.split(r"[\\/]", entry.group) if part not in ("", ".")
     )
 
 
@@ -3887,6 +3965,12 @@ class MainWindow(QMainWindow):
         # Shape:  { "<model_name>": {"vision": bool, "draft": bool, "thinking": bool} }
         self._option_overrides: dict = {}
         self._favorite_models = app_settings.get_favorite_models()
+        self._model_view_mode = app_settings.get_model_view_mode()
+        # Folder expansion survives filtering, rescans, and favorite changes.
+        # The dedicated favorites section starts open on first use.
+        self._tree_expanded_paths: set[str] = {"favorites"}
+        self._tree_native_toggle_item: Optional[QTreeWidgetItem] = None
+        self._tree_manual_toggle = False
 
         # Track whether the user has manually overridden the fork selection
         self._fork_manual_override = False
@@ -4164,7 +4248,36 @@ class MainWindow(QMainWindow):
             )
         )
         self._search.textChanged.connect(self._apply_filter)
-        frl.addWidget(self._search)
+        frl.addWidget(self._search, 1)
+
+        self._btn_list_view = QPushButton("☷ Liste")
+        self._btn_list_view.setCheckable(True)
+        self._btn_list_view.setToolTip(
+            _setting_tooltip(
+                "Shows every model in the familiar flat list.",
+                "Favorites stay sorted first. Switching views keeps the active filter "
+                "and selected model and does not rescan or move any files.",
+            )
+        )
+        self._btn_list_view.clicked.connect(
+            lambda _checked=False: self._set_model_view("list")
+        )
+        frl.addWidget(self._btn_list_view)
+
+        self._btn_tree_view = QPushButton("🌳 Ordner")
+        self._btn_tree_view.setCheckable(True)
+        self._btn_tree_view.setToolTip(
+            _setting_tooltip(
+                "Groups models by their real folder and subfolder hierarchy.",
+                "Click folder rows to expand or collapse them. Favorites are also "
+                "shown in a separate section at the top while remaining visible in "
+                "their original folders.",
+            )
+        )
+        self._btn_tree_view.clicked.connect(
+            lambda _checked=False: self._set_model_view("tree")
+        )
+        frl.addWidget(self._btn_tree_view)
 
         self._model_list = QListWidget()
         self._favorite_delegate = _FavoriteStarDelegate(self._model_list)
@@ -4174,15 +4287,43 @@ class MainWindow(QMainWindow):
         self._model_list.itemDoubleClicked.connect(self._on_model_activated)
         self._model_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._model_list.customContextMenuRequested.connect(
-            self._show_model_context_menu
+            lambda position: self._show_model_context_menu(position, self._model_list)
         )
+
+        self._model_tree = QTreeWidget()
+        self._model_tree.setHeaderHidden(True)
+        self._model_tree.setUniformRowHeights(True)
+        self._model_tree.setAnimated(True)
+        self._tree_favorite_delegate = _FavoriteStarDelegate(self._model_tree)
+        self._tree_favorite_delegate.favoriteToggled.connect(self._set_model_favorite)
+        self._model_tree.setItemDelegate(self._tree_favorite_delegate)
+        self._model_tree.currentItemChanged.connect(self._on_selection_changed)
+        self._model_tree.itemClicked.connect(self._on_tree_item_clicked)
+        self._model_tree.itemDoubleClicked.connect(
+            lambda item, _column: self._on_model_activated(item)
+        )
+        self._model_tree.itemExpanded.connect(
+            lambda item: self._on_tree_expansion_changed(item, True)
+        )
+        self._model_tree.itemCollapsed.connect(
+            lambda item: self._on_tree_expansion_changed(item, False)
+        )
+        self._model_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._model_tree.customContextMenuRequested.connect(
+            lambda position: self._show_model_context_menu(position, self._model_tree)
+        )
+
+        self._model_view_stack = QStackedWidget()
+        self._model_view_stack.addWidget(self._model_list)
+        self._model_view_stack.addWidget(self._model_tree)
+        self._set_model_view(self._model_view_mode, persist=False, repopulate=False)
 
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(2)
         ll.addWidget(fr)
-        ll.addWidget(self._model_list)
+        ll.addWidget(self._model_view_stack)
 
         # ── Config preview / Expert panel (stacked) ────────────────────
         self._config_preview = QTextEdit()
@@ -4704,9 +4845,10 @@ class MainWindow(QMainWindow):
         def refresh_widgets() -> None:
             self._apply_mono_font(self._config_preview)
             self._apply_mono_font(self._log_panel)
-            viewport = self._model_list.viewport()
-            if viewport is not None:
-                viewport.update()
+            for view in (self._model_list, self._model_tree):
+                viewport = view.viewport()
+                if viewport is not None:
+                    viewport.update()
 
         def apply_definition(theme) -> None:
             self._apply_theme_definition(theme, app, refresh_widgets)
@@ -5909,6 +6051,7 @@ class MainWindow(QMainWindow):
         self._btn_refresh.setEnabled(False)
         self._btn_launch.setEnabled(False)
         self._model_list.clear()
+        self._model_tree.clear()
         roots = self._active_model_paths()
         self._last_scan_roots = roots
         label = self._models_label(roots)
@@ -6100,60 +6243,220 @@ class MainWindow(QMainWindow):
             self._log(f"[Update] ERROR: {msg}")
             QMessageBox.warning(self, "AutoTuner update failed", msg)
 
-    def _populate_list(self, entries: List[ModelEntry]) -> None:
-        selected_path: Optional[Path] = None
-        current = self._model_list.currentItem()
-        if current is not None:
-            selected: Optional[ModelEntry] = current.data(Qt.ItemDataRole.UserRole)
-            if selected is not None:
-                selected_path = selected.path
+    @staticmethod
+    def _entry_from_model_item(
+        item: Optional[QListWidgetItem | QTreeWidgetItem],
+    ) -> Optional[ModelEntry]:
+        if item is None:
+            return None
+        if isinstance(item, QTreeWidgetItem):
+            return item.data(0, Qt.ItemDataRole.UserRole)
+        return item.data(Qt.ItemDataRole.UserRole)
 
-        self._model_list.clear()
-        selected_item: Optional[QListWidgetItem] = None
-        for entry in _sort_model_entries(entries, self._favorite_models):
-            marks = _capability_markers(entry)
-            # Right-align the size so capabilities stay readable when
-            # filenames vary in length. The delegate geometrically reserves
-            # and paints the favorite-star area left of this text.
-            tail = f"  ({entry.size_gb:.1f} GB)"
-            if marks:
-                text = f"{entry.name}  {marks}{tail}"
-            else:
-                text = f"{entry.name}{tail}"
-            item = QListWidgetItem(text)
-            favorite = (
-                app_settings.favorite_model_key(entry.path) in self._favorite_models
-            )
-            item.setData(Qt.ItemDataRole.UserRole, entry)
-            item.setData(_FAVORITE_ROLE, favorite)
-            # Tooltip lists what each symbol means and which assets
-            # are paired. Use explicit `is not None` checks instead of
-            # the convenience `has_*` properties so Pylance/Mypy can
-            # narrow Optional[Path] → Path on the next line.
-            state = (
-                "Favorit — anklicken zum Entfernen"
-                if favorite
-                else "Kein Favorit — Stern anklicken zum Markieren"
-            )
-            lines = [entry.name, "", f"★  {state}"]
-            if entry.mmproj is not None:
-                lines.append(f"👁  Vision      {entry.mmproj.name}")
-            if entry.draft is not None:
-                lines.append(f"⚡  Draft       {entry.draft.name}")
-            if entry.supports_thinking:
-                lines.append("🧠  Thinking    chat template emits <think>")
-            if entry.supports_tool_use:
-                lines.append("🛠  Tool use    chat template supports tool_calls")
-            item.setToolTip("\n".join(lines))
-            self._model_list.addItem(item)
+    def _active_model_view(self) -> QListWidget | QTreeWidget:
+        return self._model_tree if self._model_view_mode == "tree" else self._model_list
+
+    def _selected_model_path(self) -> Optional[Path]:
+        entry = self._entry_from_model_item(self._active_model_view().currentItem())
+        if entry is not None:
+            return entry.path
+        return self._current_entry.path if self._current_entry is not None else None
+
+    def _set_model_view(
+        self, mode: str, *, persist: bool = True, repopulate: bool = True
+    ) -> None:
+        """Switch between flat and folder views without rescanning models."""
+        normalized = mode if mode in ("list", "tree") else "list"
+        selected_path = self._selected_model_path() if repopulate else None
+        self._model_view_mode = normalized
+        self._model_view_stack.setCurrentIndex(1 if normalized == "tree" else 0)
+        self._btn_list_view.setChecked(normalized == "list")
+        self._btn_tree_view.setChecked(normalized == "tree")
+        if persist:
+            app_settings.set_model_view_mode(normalized)
+        if selected_path is not None:
+            self._select_model_path(selected_path, self._active_model_view())
+
+    def _remember_tree_expansion(self, item: QTreeWidgetItem, expanded: bool) -> None:
+        key = item.data(0, _TREE_PATH_ROLE)
+        if not isinstance(key, str) or not key:
+            return
+        if expanded:
+            self._tree_expanded_paths.add(key)
+        else:
+            self._tree_expanded_paths.discard(key)
+
+    def _on_tree_expansion_changed(self, item: QTreeWidgetItem, expanded: bool) -> None:
+        """Remember expansion and distinguish native arrow clicks from labels."""
+        self._remember_tree_expansion(item, expanded)
+        if self._tree_manual_toggle:
+            return
+        self._tree_native_toggle_item = item
+
+        def clear_native_marker() -> None:
+            if self._tree_native_toggle_item is item:
+                self._tree_native_toggle_item = None
+
+        # itemClicked follows the native branch-indicator toggle in the same
+        # event turn. Clear afterward so keyboard expansion never suppresses a
+        # later label click.
+        QTimer.singleShot(0, clear_native_marker)
+
+    def _on_tree_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        """Toggle a folder when its row/name is clicked, not only its arrow."""
+        if self._entry_from_model_item(item) is not None:
+            return
+        key = item.data(0, _TREE_PATH_ROLE)
+        if not isinstance(key, str) or not key:
+            return
+        if self._tree_native_toggle_item is item:
+            # Qt already toggled because the user clicked the disclosure arrow.
+            self._tree_native_toggle_item = None
+            return
+        self._tree_manual_toggle = True
+        try:
+            item.setExpanded(not item.isExpanded())
+        finally:
+            self._tree_manual_toggle = False
+
+    def _add_tree_model_item(
+        self, parent: Optional[QTreeWidgetItem], entry: ModelEntry
+    ) -> QTreeWidgetItem:
+        item = (
+            QTreeWidgetItem(parent, [_model_display_text(entry)])
+            if parent is not None
+            else QTreeWidgetItem(self._model_tree, [_model_display_text(entry)])
+        )
+        favorite = app_settings.favorite_model_key(entry.path) in self._favorite_models
+        item.setData(0, Qt.ItemDataRole.UserRole, entry)
+        item.setData(0, _FAVORITE_ROLE, favorite)
+        item.setToolTip(0, _model_tooltip(entry, favorite))
+        return item
+
+    def _populate_tree(
+        self, entries: List[ModelEntry], selected_path: Optional[Path], filtering: bool
+    ) -> Optional[QTreeWidgetItem]:
+        selected_item: Optional[QTreeWidgetItem] = None
+        favorites = [
+            entry
+            for entry in entries
+            if app_settings.favorite_model_key(entry.path) in self._favorite_models
+        ]
+        favorite_root = QTreeWidgetItem(
+            self._model_tree, [f"★ Favoriten ({len(favorites)})"]
+        )
+        favorite_root.setData(0, _TREE_PATH_ROLE, "favorites")
+        favorite_font = favorite_root.font(0)
+        favorite_font.setBold(True)
+        favorite_root.setFont(0, favorite_font)
+        favorite_root.setToolTip(
+            0,
+            "Favorisierte Modelle bleiben hier unabhängig von ihrer Ordnerposition "
+            "direkt erreichbar.",
+        )
+        for entry in _sort_model_entries(favorites, self._favorite_models):
+            item = self._add_tree_model_item(favorite_root, entry)
             if selected_path is not None and entry.path == selected_path:
                 selected_item = item
+        favorite_root.setExpanded(filtering or "favorites" in self._tree_expanded_paths)
 
-        if selected_item is not None:
-            self._model_list.setCurrentItem(selected_item)
+        roots = getattr(self, "_last_scan_roots", self._active_model_paths())
+        folder_items: Dict[Tuple[str, ...], QTreeWidgetItem] = {}
+        ordered = sorted(
+            entries,
+            key=lambda entry: (
+                tuple(part.casefold() for part in _model_folder_parts(entry, roots)),
+                entry.name.casefold(),
+            ),
+        )
+        for entry in ordered:
+            parent: Optional[QTreeWidgetItem] = None
+            cumulative: List[str] = []
+            for folder in _model_folder_parts(entry, roots):
+                cumulative.append(folder)
+                folder_key = tuple(cumulative)
+                folder_item = folder_items.get(folder_key)
+                if folder_item is None:
+                    folder_item = (
+                        QTreeWidgetItem(parent, [folder])
+                        if parent is not None
+                        else QTreeWidgetItem(self._model_tree, [folder])
+                    )
+                    state_key = "folder:" + "\x1f".join(folder_key)
+                    folder_item.setData(0, _TREE_PATH_ROLE, state_key)
+                    folder_item.setIcon(
+                        0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+                    )
+                    folder_item.setToolTip(0, str(entry.path.parent))
+                    folder_item.setExpanded(
+                        filtering or state_key in self._tree_expanded_paths
+                    )
+                    folder_items[folder_key] = folder_item
+                parent = folder_item
+            item = self._add_tree_model_item(parent, entry)
+            if selected_item is None and selected_path is not None:
+                if entry.path == selected_path:
+                    selected_item = item
+        return selected_item
+
+    def _select_model_path(self, path: Path, view: QListWidget | QTreeWidget) -> None:
+        if isinstance(view, QListWidget):
+            for row in range(view.count()):
+                item = view.item(row)
+                entry = self._entry_from_model_item(item)
+                if entry is not None and entry.path == path:
+                    view.setCurrentItem(item)
+                    return
+            return
+
+        def visit(parent: QTreeWidgetItem) -> Optional[QTreeWidgetItem]:
+            entry = self._entry_from_model_item(parent)
+            if entry is not None and entry.path == path:
+                return parent
+            for child_index in range(parent.childCount()):
+                found = visit(parent.child(child_index))
+                if found is not None:
+                    return found
+            return None
+
+        for top_index in range(view.topLevelItemCount()):
+            found = visit(view.topLevelItem(top_index))
+            if found is not None:
+                view.setCurrentItem(found)
+                return
+
+    def _populate_list(self, entries: List[ModelEntry]) -> None:
+        selected_path = self._selected_model_path()
+        filtering = bool(self._search.text().strip())
+        self._model_list.blockSignals(True)
+        self._model_tree.blockSignals(True)
+        try:
+            self._model_list.clear()
+            selected_list_item: Optional[QListWidgetItem] = None
+            for entry in _sort_model_entries(entries, self._favorite_models):
+                item = QListWidgetItem(_model_display_text(entry))
+                favorite = (
+                    app_settings.favorite_model_key(entry.path) in self._favorite_models
+                )
+                item.setData(Qt.ItemDataRole.UserRole, entry)
+                item.setData(_FAVORITE_ROLE, favorite)
+                item.setToolTip(_model_tooltip(entry, favorite))
+                self._model_list.addItem(item)
+                if selected_path is not None and entry.path == selected_path:
+                    selected_list_item = item
+            if selected_list_item is not None:
+                self._model_list.setCurrentItem(selected_list_item)
+
+            self._model_tree.clear()
+            selected_tree_item = self._populate_tree(entries, selected_path, filtering)
+            if selected_tree_item is not None:
+                self._model_tree.setCurrentItem(selected_tree_item)
+        finally:
+            self._model_list.blockSignals(False)
+            self._model_tree.blockSignals(False)
 
     def _set_model_favorite(self, entry: ModelEntry, favorite: bool) -> None:
-        """Persist a star click and rebuild the filtered list in favorite order."""
+        """Persist a star click and rebuild both views in favorite order."""
         key = app_settings.favorite_model_key(entry.path)
         if favorite:
             self._favorite_models.add(key)
@@ -6163,28 +6466,32 @@ class MainWindow(QMainWindow):
         self._apply_filter(self._search.text())
 
     def _apply_filter(self, text: str) -> None:
-        q = text.strip().lower()
+        q = text.strip().casefold()
         self._populate_list(
             self._all_entries
             if not q
-            else [e for e in self._all_entries if q in e.name.lower()]
+            else [
+                entry
+                for entry in self._all_entries
+                if q in entry.name.casefold() or q in str(entry.path.parent).casefold()
+            ]
         )
 
-    def _show_model_context_menu(self, position: QPoint) -> None:
+    def _show_model_context_menu(
+        self, position: QPoint, view: QListWidget | QTreeWidget
+    ) -> None:
         """Offer model-specific actions for the item under the pointer."""
-        item = self._model_list.itemAt(position)
-        if item is None:
-            return
-        entry: Optional[ModelEntry] = item.data(Qt.ItemDataRole.UserRole)
-        if entry is None:
+        item = view.itemAt(position)
+        entry = self._entry_from_model_item(item)
+        if item is None or entry is None:
             return
 
         # Make the right-clicked model the active one as users expect, while
         # keeping the menu action tied to this exact item.
-        self._model_list.setCurrentItem(item)
-        menu = QMenu(self._model_list)
+        view.setCurrentItem(item)
+        menu = QMenu(view)
         open_folder = menu.addAction("📂 GGUF-Ordner öffnen")
-        viewport = self._model_list.viewport()
+        viewport = view.viewport()
         if viewport is None:  # defensive for incomplete Qt teardown states
             return
         chosen = menu.exec(viewport.mapToGlobal(position))
@@ -6229,18 +6536,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _on_selection_changed(
         self,
-        current: Optional[QListWidgetItem],
-        _prev: Optional[QListWidgetItem],
+        current: Optional[QListWidgetItem | QTreeWidgetItem],
+        _prev: Optional[QListWidgetItem | QTreeWidgetItem],
     ) -> None:
-        if current is None:
-            return
-        entry: ModelEntry = current.data(Qt.ItemDataRole.UserRole)
-        if entry is None:
-            return
-        self._show_config(entry)
+        entry = self._entry_from_model_item(current)
+        if entry is not None:
+            self._show_config(entry)
 
-    def _on_model_activated(self, item: QListWidgetItem) -> None:
-        entry: Optional[ModelEntry] = item.data(Qt.ItemDataRole.UserRole)
+    def _on_model_activated(self, item: QListWidgetItem | QTreeWidgetItem) -> None:
+        entry = self._entry_from_model_item(item)
         if entry is not None and is_ocr_model(entry):
             self._open_ocr_workflow()
 
@@ -7731,6 +8035,9 @@ class MainWindow(QMainWindow):
     def _set_ocr_controls_locked(self, locked: bool) -> None:
         controls: List[QWidget] = [
             self._model_list,
+            self._model_tree,
+            self._btn_list_view,
+            self._btn_tree_view,
             self._btn_models_folder,
             self._btn_refresh,
             self._btn_update,

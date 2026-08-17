@@ -249,6 +249,24 @@ def test_group_entries_buckets_by_folder(tmp_path) -> None:
     assert "Vendor2" in groups
 
 
+def test_model_folder_parts_preserve_nested_storage_and_separate_roots(
+    tmp_path,
+) -> None:
+    from qt_launcher import _model_folder_parts
+
+    root_a = tmp_path / "models-a"
+    root_b = tmp_path / "models-b"
+    entry = _fake_model(root_a / "Alibaba" / "Qwen3.6", "Qwen3.6-27B", 1.0)
+    entry.group = "Alibaba/Qwen3.6"
+
+    assert _model_folder_parts(entry, [root_a]) == ("Alibaba", "Qwen3.6")
+    assert _model_folder_parts(entry, [root_a, root_b]) == (
+        "models-a",
+        "Alibaba",
+        "Qwen3.6",
+    )
+
+
 def test_model_list_sorts_favorites_first_without_losing_group_order(tmp_path) -> None:
     import app_settings
     from qt_launcher import _sort_model_entries
@@ -973,6 +991,8 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     global _QT_TEST_APP
 
     qt_launcher = pytest.importorskip("qt_launcher")
+    qt_core = pytest.importorskip("PyQt6.QtCore")
+    qt_test = pytest.importorskip("PyQt6.QtTest")
     qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
     _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
     parent = qt_widgets.QWidget()
@@ -1063,6 +1083,8 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_mode_combo",
         "_gpu_combo",
         "_search",
+        "_btn_list_view",
+        "_btn_tree_view",
         "_btn_expert",
         "_btn_diagnose",
         "_cb_mmproj",
@@ -1119,9 +1141,46 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         == app_dialog.theme_combo.currentText()
     )
 
+    alibaba = _fake_model(tmp_path / "Alibaba" / "Qwen3.6", "Qwen3.6-27B-Q4_K_M", 1.0)
+    google = _fake_model(tmp_path / "Google" / "Gemma", "Gemma-3-12B-Q4", 1.0)
+    window._last_scan_roots = [tmp_path]
+    window._all_entries = [google, alibaba]
+    window._favorite_models = {
+        qt_launcher.app_settings.favorite_model_key(alibaba.path)
+    }
+    window._populate_list(window._all_entries)
+    assert window._model_tree.topLevelItem(0).text(0) == "★ Favoriten (1)"
+    assert (
+        window._model_tree.topLevelItem(0)
+        .child(0)
+        .data(0, qt_launcher.Qt.ItemDataRole.UserRole)
+        .path
+        == alibaba.path
+    )
+    assert [
+        window._model_tree.topLevelItem(index).text(0)
+        for index in range(1, window._model_tree.topLevelItemCount())
+    ] == ["Alibaba", "Google"]
+    assert window._model_tree.topLevelItem(1).child(0).text(0) == "Qwen3.6"
+    window._set_model_view("tree")
+    assert window._model_view_stack.currentWidget() is window._model_tree
+    assert qt_launcher.app_settings.get_model_view_mode() == "tree"
+    window._apply_filter("Alibaba")
+    assert window._model_tree.topLevelItemCount() == 2  # favorites + matching folder
+
     window.resize(1320, 840)
     window.show()
     _QT_TEST_APP.processEvents()
+    alibaba_folder = window._model_tree.topLevelItem(1)
+    alibaba_folder.setExpanded(False)
+    folder_rect = window._model_tree.visualItemRect(alibaba_folder)
+    qt_test.QTest.mouseClick(
+        window._model_tree.viewport(),
+        qt_core.Qt.MouseButton.LeftButton,
+        pos=qt_core.QPoint(folder_rect.left() + 80, folder_rect.center().y()),
+    )
+    assert alibaba_folder.isExpanded()  # clicking the folder name toggles it
+
     top_split, main_split = window._splitters
     top_split.setSizes([333, 777])
     main_split.setSizes([555, 222])
@@ -5194,6 +5253,23 @@ def test_path_settings_are_os_namespaced(_isolated_settings, tmp_path) -> None:
         json.dumps(legacy_only, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     assert app_settings.get_models_path() == models.resolve()
+
+
+def test_model_view_mode_defaults_validates_and_persists(_isolated_settings) -> None:
+    import json
+
+    import app_settings
+
+    assert app_settings.get_model_view_mode() == "list"
+    app_settings.set_model_view_mode("tree")
+    assert app_settings.get_model_view_mode() == "tree"
+    app_settings.set_model_view_mode("invalid")
+    assert app_settings.get_model_view_mode() == "tree"
+
+    _isolated_settings.write_text(
+        json.dumps({"model_view_mode": "corrupt"}), encoding="utf-8"
+    )
+    assert app_settings.get_model_view_mode() == "list"
 
 
 def test_application_close_preference_is_opt_in(_isolated_settings) -> None:

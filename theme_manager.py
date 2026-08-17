@@ -276,14 +276,14 @@ QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
 QToolBar, QStatusBar, QMenuBar, QMenu {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; }}
 QGroupBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; margin-top: 0.8em; padding-top: 0.35em; }}
 QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 8px; padding: 0 4px; color: {c["text"]}; }}
-QTextEdit, QListWidget, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; }}
+QTextEdit, QListWidget, QTreeWidget, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {c["panel_bg"]}; border: 1px solid {c["border"]}; border-radius: 3px; }}
 QPushButton {{ background: {c["control_bg"]}; border: 1px solid {c["border"]}; padding: 4px; border-radius: 3px; }}
 QPushButton:hover {{ background: {c["control_hover"]}; }}
 QPushButton:pressed {{ background: {c["control_pressed"]}; }}
 QPushButton:checked, QPushButton:default {{ background: {c["accent"]}; color: {c["accent_text"]}; }}
 QWidget:disabled {{ color: {c["disabled_text"]}; }}
-QListWidget::item:selected, QComboBox QAbstractItemView::item:selected, QMenu::item:selected {{ background: {c["selection_bg"]}; color: {c["selection_text"]}; }}
-QPushButton:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QListWidget:focus, QTextEdit:focus {{ border: 2px solid {c["accent"]}; }}
+QListWidget::item:selected, QTreeWidget::item:selected, QComboBox QAbstractItemView::item:selected, QMenu::item:selected {{ background: {c["selection_bg"]}; color: {c["selection_text"]}; }}
+QPushButton:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QListWidget:focus, QTreeWidget:focus, QTextEdit:focus {{ border: 2px solid {c["accent"]}; }}
 QToolTip {{ background: {c["panel_bg"]}; color: {c["text"]}; border: 1px solid {c["border"]}; }}
 QScrollBar:vertical {{ background: {c["panel_bg"]}; width: 12px; }}
 QScrollBar::handle:vertical {{ background: {c["control_hover"]}; min-height: 20px; border: 1px solid {c["border"]}; }}

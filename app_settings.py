@@ -25,6 +25,8 @@ Public API:
     set_mmproj_selection(model_name, filename)
     get_font_size()        -> Optional[int]
     set_font_size(int)
+    get_model_view_mode()  -> str
+    set_model_view_mode(str)
     get_theme_id()         -> str
     set_theme_id(str)
     get_minimize_on_close() -> bool
@@ -491,6 +493,7 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 #
 # Reset (the new button next to Auto/Manual) simply clears the entry.
 
+
 def get_expert_override(model_name: str) -> Optional[Dict[str, Any]]:
     """Return the saved Expert-panel snapshot for ``model_name``, or None.
 
@@ -521,7 +524,11 @@ def set_expert_override(model_name: str, snapshot: Dict[str, Any]) -> None:
     """
     if not model_name:
         return
-    if not isinstance(snapshot, dict) or "mode" not in snapshot or "values" not in snapshot:
+    if (
+        not isinstance(snapshot, dict)
+        or "mode" not in snapshot
+        or "values" not in snapshot
+    ):
         return
     s = load_settings()
     overrides = s.get("expert_overrides")
@@ -595,6 +602,25 @@ def set_mode(name: str) -> None:
     name = (name or "").lower().strip()
     if name in _VALID_MODES + ("",):
         _update("mode", name)
+
+
+# ---------------------------------------------------------------------------
+# Model browser view (flat list / folder tree)
+
+_VALID_MODEL_VIEW_MODES = ("list", "tree")
+
+
+def get_model_view_mode() -> str:
+    """Return the persisted model-browser mode, defaulting safely to list."""
+    value = str(load_settings().get("model_view_mode", "list")).lower().strip()
+    return value if value in _VALID_MODEL_VIEW_MODES else "list"
+
+
+def set_model_view_mode(mode: str) -> None:
+    """Persist the model-browser mode when it is one of the supported values."""
+    value = str(mode or "").lower().strip()
+    if value in _VALID_MODEL_VIEW_MODES:
+        _update("model_view_mode", value)
 
 
 # ---------------------------------------------------------------------------
