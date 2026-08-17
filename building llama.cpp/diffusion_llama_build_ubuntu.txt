@@ -3,6 +3,47 @@ BASE_DIR="/home/dawasteh/local_ai"
 mkdir -p "$BASE_DIR"
 cd "$BASE_DIR" || exit 1
 
+
+get_llama_build_tag() {
+    commit="${1:-HEAD}"
+    remote="${2:-origin}"
+
+    sha=$(git rev-parse "$commit" 2>/dev/null || true)
+    if [ -n "$sha" ]; then
+        # llama.cpp b10470+ pushes lightweight b-tags explicitly from CI. Ask
+        # the remote tag namespace directly first so just-created tags are seen.
+        remote_tag=$(git ls-remote --tags "$remote" 'refs/tags/b*' 2>/dev/null |
+            awk -v sha="$sha" '$1 == sha { sub("refs/tags/", "", $2); print $2 }' |
+            grep -E '^b[0-9]+$' |
+            sort -t b -k 2,2nr |
+            head -n 1)
+        if [ -n "$remote_tag" ]; then
+            printf '%s\n' "$remote_tag"
+            return 0
+        fi
+    fi
+
+    git fetch "$remote" --tags --force 2>/dev/null || true
+
+    tag=$(git tag --points-at "$commit" --list 'b[0-9]*' 2>/dev/null |
+        grep -E '^b[0-9]+$' |
+        sort -t b -k 2,2nr |
+        head -n 1)
+    if [ -n "$tag" ]; then
+        printf '%s\n' "$tag"
+        return 0
+    fi
+
+    tag=$(git describe --tags --abbrev=0 --match 'b[0-9]*' "$commit" 2>/dev/null || true)
+    if printf '%s' "$tag" | grep -Eq '^b[0-9]+$'; then
+        printf '%s\n' "$tag"
+        return 0
+    fi
+
+    printf '%s\n' 'bUNKNOWN'
+}
+
+
 # SPIRV-Headers nur bauen, falls noch nicht vorhanden (liegt dort schon
 # vom Mainline-Build)
 if [ ! -d "SPIRV-Headers/install" ]; then
@@ -25,9 +66,7 @@ git checkout pr-diffusiongemma
 git fetch origin --tags
 base=$(git merge-base HEAD origin/master 2>/dev/null)
 [ -z "$base" ] && base="HEAD"
-desc=$(git describe --tags --abbrev=0 --match "b[0-9]*" "$base" 2>/dev/null)
-ver=$(echo "$desc" | grep -oE 'b[0-9]+' | head -n 1)
-[ -z "$ver" ] && ver="bUNKNOWN"
+ver=$(get_llama_build_tag "$base" origin)
 popd > /dev/null
 
 dir="d_${ver}_ubuntu_llama.cpp"

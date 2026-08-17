@@ -79,7 +79,7 @@ try {
             -DGGML_CCACHE=OFF `
             -DGGML_VULKAN_CHECK_RESULTS=OFF `
             -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
-            -DCMAKE_PREFIX_PATH="L:/LAB/ai-local/SPIRV-Headers/install"
+            "-DCMAKE_PREFIX_PATH=L:/LAB/ai-local/SPIRV-Headers/install"
     }
     Invoke-NativeChecked "OCR fork build" {
         cmake --build $buildDir --config Release `

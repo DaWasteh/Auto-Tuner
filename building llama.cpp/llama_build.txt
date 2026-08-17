@@ -12,6 +12,39 @@ function Invoke-NativeChecked {
     }
 }
 
+
+function Get-LlamaBuildTag {
+    param(
+        [string]$Commit = "HEAD",
+        [string]$Remote = "origin"
+    )
+
+    $sha = (git rev-parse $Commit 2>$null).Trim()
+    if ($LASTEXITCODE -eq 0 -and $sha) {
+        # llama.cpp b10470+ creates/pushes the lightweight release tag explicitly
+        # in CI, before the GitHub Release is created. Ask the remote tag
+        # namespace directly first, so even a just-created tag is recognized.
+        $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
+        foreach ($row in $remoteTags) {
+            if ($row -match "^$sha\s+refs/tags/(b\d+)$") { return $Matches[1] }
+        }
+    }
+
+    git fetch $Remote --tags --force 2>$null
+
+    $pointingTags = @(
+        git tag --points-at $Commit --list "b[0-9]*" 2>$null |
+            Where-Object { $_ -match '^b\d+$' } |
+            Sort-Object { [int]($_ -replace '^b', '') } -Descending
+    )
+    if ($pointingTags.Count -gt 0) { return $pointingTags[0] }
+
+    $desc = (git describe --tags --abbrev=0 --match "b[0-9]*" $Commit 2>$null).Trim()
+    if ($LASTEXITCODE -eq 0 -and $desc -match 'b\d+') { return $Matches[0] }
+
+    return "bUNKNOWN"
+}
+
 $spirv = Join-Path (Get-Location) "SPIRV-Headers"
 if (-not (Test-Path "$spirv\.git")) {
     Invoke-NativeChecked "SPIRV-Headers clone" {
@@ -46,10 +79,9 @@ Invoke-NativeChecked "llama.cpp clone" {
 
 Push-Location $tmp
 try {
-    $description = (git describe --tags --always 2>$null).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "Could not determine llama.cpp build tag" }
-    $version = [regex]::Match($description, 'b\d+').Value
-    if (-not $version) { $version = "bUNKNOWN" }
+    $version = Get-LlamaBuildTag -Commit HEAD -Remote origin
+    $description = (git describe --tags --always --match "b[0-9]*" 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $description) { $description = $version }
     $commit = (git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw "Could not determine llama.cpp commit" }
     $shortCommit = $commit.Substring(0, 9)
@@ -96,7 +128,7 @@ Invoke-NativeChecked "llama.cpp configure" {
         -DLLAMA_CURL=OFF `
         -DGGML_CCACHE=OFF `
         -DGGML_VULKAN_CHECK_RESULTS=OFF `
-        -DCMAKE_PREFIX_PATH="L:/LAB/ai-local/SPIRV-Headers/install"
+        "-DCMAKE_PREFIX_PATH=L:/LAB/ai-local/SPIRV-Headers/install"
 }
 Invoke-NativeChecked "llama.cpp build" {
     cmake --build "$repo\build" --config Release --parallel 20

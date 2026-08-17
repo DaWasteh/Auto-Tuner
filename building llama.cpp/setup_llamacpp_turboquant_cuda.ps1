@@ -36,6 +36,39 @@ function Is-Available($cmd) {
     return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
+function Get-LlamaBuildTag {
+    param(
+        [string]$Commit = "HEAD",
+        [string]$Remote = "origin"
+    )
+
+    $sha = (git rev-parse $Commit 2>$null).Trim()
+    if ($LASTEXITCODE -eq 0 -and $sha) {
+        # llama.cpp b10470+ creates/pushes the lightweight release tag explicitly
+        # in CI, before the GitHub Release is created. Ask the remote tag
+        # namespace directly first, so even a just-created tag is recognized.
+        $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
+        foreach ($row in $remoteTags) {
+            if ($row -match "^$sha\s+refs/tags/(b\d+)$") { return $Matches[1] }
+        }
+    }
+
+    git fetch $Remote --tags --force 2>$null
+
+    $pointingTags = @(
+        git tag --points-at $Commit --list "b[0-9]*" 2>$null |
+            Where-Object { $_ -match '^b\d+$' } |
+            Sort-Object { [int]($_ -replace '^b', '') } -Descending
+    )
+    if ($pointingTags.Count -gt 0) { return $pointingTags[0] }
+
+    $desc = (git describe --tags --abbrev=0 --match "b[0-9]*" $Commit 2>$null).Trim()
+    if ($LASTEXITCODE -eq 0 -and $desc -match 'b\d+') { return $Matches[0] }
+
+    return "bUNKNOWN"
+}
+
+
 
 function Get-WingetPackageState {
     param(
@@ -451,9 +484,11 @@ if ($existingDir) {
     if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
     git clone --branch $REPO_BRANCH $REPO_URL $tmpDir
     Push-Location $tmpDir
-    $desc = git describe --tags --always 2>$null
-    $ver  = [regex]::Match($desc, 'b\d+').Value
-    if (-not $ver) { $ver = "bUNKNOWN" }
+    git remote add upstream https://github.com/ggml-org/llama.cpp.git 2>$null
+    git fetch upstream --tags 2>$null
+    $base = git merge-base HEAD upstream/master 2>$null
+    if (-not $base) { $base = "HEAD" }
+    $ver = Get-LlamaBuildTag -Commit $base -Remote upstream
     Pop-Location
     $dir = Join-Path $INSTALL_DIR "${ver}_$DIR_SUFFIX"
     if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
