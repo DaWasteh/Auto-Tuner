@@ -37,6 +37,8 @@ Public API:
     set_port_offset(int)
     get_prompt_cache_ram_mib() -> int
     set_prompt_cache_ram_mib(int)
+    get_turbo_kv_warning_suppressed() -> bool
+    set_turbo_kv_warning_suppressed(bool)
     get_reasoning_effort(model_name) -> Optional[str]
     set_reasoning_effort(model_name, value)
     favorite_model_key(model_path) -> str
@@ -921,6 +923,16 @@ def set_prompt_cache_ram_mib(value: int) -> None:
         "prompt_cache_ram_mib",
         max(_PROMPT_CACHE_RAM_MIB_MIN, min(_PROMPT_CACHE_RAM_MIB_MAX, n)),
     )
+
+
+def get_turbo_kv_warning_suppressed() -> bool:
+    """Return whether the user chose ``Never Show Again`` for Turbo KV."""
+    return load_settings().get("turbo_kv_warning_suppressed") is True
+
+
+def set_turbo_kv_warning_suppressed(suppressed: bool) -> None:
+    """Persist the global TurboQuant special-fork warning preference."""
+    _update("turbo_kv_warning_suppressed", bool(suppressed))
 
 
 def get_font_size() -> int:

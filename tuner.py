@@ -1592,7 +1592,15 @@ def _gpu_usable_cap_gb(gpu: "GPUInfo", is_primary: bool) -> float:
     headroom = min(cap_flat, max(floor, total_gb * frac))
     cap_by_total = total_gb - headroom
     free_gb = gpu.free_vram_mb / 1024.0
-    return max(0.0, min(cap_by_total, free_gb))
+    usable = max(0.0, min(cap_by_total, free_gb))
+    # A nearly-full peer should not be pulled into a new server for a token
+    # amount of memory: doing so can OOM the already-running workload and makes
+    # device visibility span both cards for no practical gain. The selected
+    # primary is still allowed below this threshold because it may be an
+    # explicit pin or the only viable device.
+    if not is_primary and usable < 2.0:
+        return 0.0
+    return usable
 
 
 def _visibility_env_for_gpus(
@@ -1803,40 +1811,44 @@ def _pick_kv_quant(
     base_k_per_token_mb: Optional[float] = None,
     base_v_per_token_mb: Optional[float] = None,
 ) -> Tuple[str, str]:
-    """Pick best (K, V) quants that fit target_ctx into kv_budget_gb.
+    """Pick the highest-quality K/V pair that preserves ``target_ctx``.
 
-    With ``asymmetric=True`` (default — Vulkan ≥ b9106, ROCm, CUDA all
-    support it) K and V may use *different* quants. The strategy is to
-    keep K at the highest quality that still fits, and step V down one
-    bucket — because K-quantisation hurts attention recall more than
-    V-quantisation hurts output quality. When K and V cannot live at
-    different levels (e.g. an older fork without asymmetric FA), pass
-    ``asymmetric=False`` for the legacy K=V behaviour.
+    Context is the primary objective. Once the requested/model maximum fits,
+    unused memory is reinvested in KV precision instead of leaving a q4/q5
+    cache selected merely because a profile named that conservative default.
+    ``profile_recommended`` remains a compatibility hint: an explicit
+    ``bf16`` chooses BF16 as the full-precision tier; every other profile uses
+    llama.cpp's reference F16 tier. It is deliberately *not* a quality ceiling.
+
+    With ``asymmetric=True`` (default — Vulkan ≥ b9106 and ROCm support it),
+    K and V may use different types. K is kept one tier above V where useful
+    because K quantisation generally hurts attention recall more than V
+    quantisation hurts output quality. Backends that require K == V pass
+    ``asymmetric=False``.
 
     With ``turbo=True`` the chosen labels are mapped via
-    :data:`_TURBO_QUANT_MAP` to the TurboQuant equivalents. Practical
-    effect: ~10 % smaller KV at the same nominal precision.
+    :data:`_TURBO_QUANT_MAP` to fork-only TurboQuant equivalents.
 
     Order tried (top → bottom = best → worst quality):
 
-        K=f16   V=f16      # reference quality (profiles that request F16)
+        K=f16   V=f16      # reference/full precision (bf16 if requested)
+        K=f16   V=q8_0     # asymmetric high     (only if asymmetric=True)
         K=q8_0  V=q8_0     # symmetric high
-        K=q8_0  V=q5_0     # asymmetric mid     (only if asymmetric=True)
+        K=q8_0  V=q5_0     # asymmetric mid      (only if asymmetric=True)
         K=q5_0  V=q5_0     # symmetric mid
-        K=q5_0  V=q4_0     # asymmetric low     (only if asymmetric=True)
+        K=q5_0  V=q4_0     # asymmetric low      (only if asymmetric=True)
         K=q4_0  V=q4_0     # symmetric low
     """
     # Beschränke target_ctx auf Modell-Maximum wenn nötig.
     if model_max_ctx > 0 and target_ctx > model_max_ctx:
         target_ctx = model_max_ctx
 
-    # Quality-ranked pairs. The list is *static*; the profile-recommended
-    # quant only nudges the starting index forward when its symmetric
-    # variant is in the list (so e.g. recommended_kv_quant=q8_0 still
-    # tries q8_0/q8_0 first even though it's the default top-of-list).
-    pairs: List[Tuple[str, str]] = []
+    rec = profile_recommended.strip().lower()
+    full_precision = "bf16" if rec == "bf16" else "f16"
     if asymmetric:
-        pairs = [
+        pairs: List[Tuple[str, str]] = [
+            (full_precision, full_precision),
+            (full_precision, "q8_0"),
             ("q8_0", "q8_0"),
             ("q8_0", "q5_0"),
             ("q5_0", "q5_0"),
@@ -1845,25 +1857,11 @@ def _pick_kv_quant(
         ]
     else:
         pairs = [
+            (full_precision, full_precision),
             ("q8_0", "q8_0"),
             ("q5_0", "q5_0"),
             ("q4_0", "q4_0"),
         ]
-
-    # Honour profile_recommended as the starting *floor* — never go above
-    # what the model author tested. F16 is opt-in only: unknown/empty profile
-    # values must preserve the historical Q8 starting point instead of
-    # unexpectedly doubling KV memory.
-    rec = profile_recommended.strip().lower()
-    if rec == "f16":
-        pairs.insert(0, ("f16", "f16"))
-    elif rec in ("q8_0", "q5_0", "q4_0"):
-        # Drop pairs whose K-quant is strictly better than the recommended.
-        order_rank = {"q4_0": 0, "q5_0": 1, "q8_0": 2}
-        rec_rank = order_rank[rec]
-        pairs = [p for p in pairs if order_rank[p[0]] <= rec_rank]
-        if not pairs:
-            pairs = [(rec, rec)]  # defensive — should never happen
 
     budget_mb = kv_budget_gb * 1024 * 0.98
 
@@ -1951,6 +1949,18 @@ def _kv_headroom_reserve(
         fractional = min(fractional * 1.35, 0.20)
 
     return round(absolute_gb, 2), round(fractional, 3)
+
+
+def _usable_kv_budget_after_headroom(
+    raw_budget_gb: float,
+    target_ctx: int,
+    n_parallel: int,
+    rope_scaling: bool,
+) -> float:
+    """Apply the same compute/scratch reserve to any candidate KV budget."""
+    absolute_gb, fractional = _kv_headroom_reserve(target_ctx, n_parallel, rope_scaling)
+    raw_budget_gb = max(0.0, raw_budget_gb)
+    return max(0.0, raw_budget_gb - absolute_gb - fractional * raw_budget_gb)
 
 
 # ---------------------------------------------------------------------------
@@ -2381,24 +2391,36 @@ def compute_config(
     if effective_primary_free_vram < 0:
         effective_primary_free_vram = 0.0
 
-    # For MoE models with multiple GPUs, use the combined VRAM for expert
-    # placement. This allows large MoE models like Qwen3.5-122B-A10B to
-    # utilise both GPUs (R9700 + RX 9070 XT = 48 GB total) instead of
-    # being restricted to the primary GPU only.
-    has_multiple_gpus = has_gpu and len(system.gpus) > 1 and forced_gpu is None
+    # Use a multi-GPU pool only when at least one peer has a meaningful usable
+    # contribution. A nearly-full peer (<2 GiB usable) is intentionally ignored
+    # by _gpu_usable_cap_gb; treating the raw device count as a pool would place
+    # weights against aggregate VRAM and later pin that oversized placement to
+    # the sole viable card. When no peer remains, recompute every placement
+    # budget from the primary's safe cap so excess dense layers/experts spill to
+    # CPU before context and device visibility are decided.
+    multi_gpu_candidate = (
+        has_gpu
+        and len(system.gpus) > 1
+        and forced_gpu is None
+        and primary_gpu is not None
+    )
+    gpu_usable_caps: Dict[int, float] = {}
+    if multi_gpu_candidate:
+        gpu_usable_caps = {
+            id(g): _gpu_usable_cap_gb(g, g is primary_gpu) for g in system.gpus
+        }
+    has_multiple_gpus = bool(
+        multi_gpu_candidate
+        and any(
+            g is not primary_gpu and gpu_usable_caps.get(id(g), 0.0) > 0
+            for g in system.gpus
+        )
+    )
     combined_usable_vram_gb = 0.0
     if has_multiple_gpus:
-        # Combined USABLE VRAM across all GPUs for MoE expert placement —
-        # the sum of the per-card caps the spread (section 4d) enforces,
-        # NOT the raw combined free VRAM. The spread reserves per-card
-        # headroom (≈1.9 GB primary + ≈1.6 GB secondary here); budgeting
-        # the expert placement against raw free VRAM overcommits by
-        # exactly that headroom, so the split had to push the primary
-        # card to its physical limit (30.9/32 GB on the step-3.7 run)
-        # no matter how the layers were distributed.
-        combined_usable_vram_gb = sum(
-            _gpu_usable_cap_gb(g, g is primary_gpu) for g in system.gpus
-        )
+        # Combined USABLE VRAM across all active GPUs for placement — the sum
+        # of the exact per-card caps section 4d enforces, never raw free VRAM.
+        combined_usable_vram_gb = sum(gpu_usable_caps.values())
         effective_moe_vram = (
             combined_usable_vram_gb
             - vision_vram_gb
@@ -2406,6 +2428,20 @@ def compute_config(
             - runtime_vram_overhead_gb
         )
     else:
+        if multi_gpu_candidate and primary_gpu is not None:
+            primary_pool_cap = gpu_usable_caps.get(
+                id(primary_gpu), _gpu_usable_cap_gb(primary_gpu, True)
+            )
+            free_vram = primary_pool_cap
+            effective_free_vram = max(
+                0.0,
+                primary_pool_cap
+                - vision_vram_gb
+                - draft_vram_gb
+                - runtime_vram_overhead_gb
+                - shared_host_reserve_gb,
+            )
+            effective_primary_free_vram = effective_free_vram
         effective_moe_vram = effective_primary_free_vram
     if effective_moe_vram < 0:
         effective_moe_vram = 0.0
@@ -2610,9 +2646,18 @@ def compute_config(
         else 0.0
     )
 
-    # If all fixed GPU allocations fit the preferred card, size KV from that
-    # card too. This preserves the "keep the secondary free" policy without
-    # approving context from aggregate VRAM and then hiding the peer GPU.
+    # Prefer one GPU only when it can deliver BOTH the requested/model-maximum
+    # context and the best normal KV precision (F16/BF16). The previous test
+    # looked only at fixed weights: Qwen3.8 Q3–Q6 therefore fit on the R9700,
+    # were pinned there, and lost context or fell to Q4/Q5 while the RX 9070 XT
+    # sat idle. The larger Q8 crossed the weight-only threshold, used both GPUs,
+    # and paradoxically achieved a better context/precision result.
+    #
+    # The objective is now lexicographic:
+    #   1. preserve requested/native context;
+    #   2. maximise KV precision;
+    #   3. keep peer GPUs free only when (1) and (2) already fit on primary.
+    # A hard force_gpu pin remains authoritative even when it sacrifices (1/2).
     planned_single_gpu = forced_gpu is not None
     gpu_budget_free_vram = free_vram
     fixed_gpu_footprint = (
@@ -2624,10 +2669,38 @@ def compute_config(
         + recurrent_state_vram_gb
     )
     if not planned_single_gpu and has_multiple_gpus and primary_gpu is not None:
+        # A spread must respect the same per-card caps used by tensor placement;
+        # raw summed free VRAM includes headroom that cannot safely host KV.
+        gpu_budget_free_vram = combined_usable_vram_gb
         primary_cap = _gpu_usable_cap_gb(primary_gpu, True)
         if fixed_gpu_footprint <= primary_cap:
-            planned_single_gpu = True
-            gpu_budget_free_vram = primary_cap
+            quality_target_ctx = max(2048, int(target_ctx_for_placement))
+            quality_rope_scaling = bool(
+                force_rope_scale is True
+                or profile_rope_scale
+                or (
+                    user_ctx is not None
+                    and native_ctx > 0
+                    and user_ctx > native_ctx
+                    and (model.supports_rope_scale or profile_rope_scale)
+                )
+            )
+            primary_raw_kv_budget = max(
+                0.0,
+                primary_cap - effective_vram_safety - fixed_gpu_footprint,
+            )
+            primary_usable_kv_budget = _usable_kv_budget_after_headroom(
+                primary_raw_kv_budget,
+                quality_target_ctx,
+                n_parallel,
+                quality_rope_scaling,
+            )
+            full_precision_kv_gb = (
+                quality_target_ctx * base_kv_mb * n_parallel
+            ) / 1024.0
+            if full_precision_kv_gb <= primary_usable_kv_budget * 0.98:
+                planned_single_gpu = True
+                gpu_budget_free_vram = primary_cap
 
     free_vram_after = max(
         0.0,
@@ -2877,13 +2950,14 @@ def compute_config(
         if user_ctx is not None
         else (rope_scaled_ctx if rope_scaling_active else profile_max)
     )
-    _abs_reserve, _frac_reserve = _kv_headroom_reserve(
-        _reserve_target_ctx, n_parallel, rope_scaling_active
+    kv_budget_gb = _usable_kv_budget_after_headroom(
+        kv_budget_gb,
+        _reserve_target_ctx,
+        n_parallel,
+        rope_scaling_active,
     )
-    kv_budget_gb = max(0.0, kv_budget_gb - _abs_reserve - _frac_reserve * kv_budget_gb)
 
     # ---- (3) Context + KV quant
-    target_ctx = user_ctx if user_ctx is not None else profile_max
 
     # Bestimme das effektive Modell-Maximum für die KV-Quantisierung:
     # - rope_scaled_ctx: erweiterbares Maximum via YaRN (wenn aktiviert)
@@ -2898,6 +2972,13 @@ def compute_config(
     # honours it instead of being overridden by native_ctx (262144).
     if is_diffusion_gemma and user_ctx is None:
         model_ctx_limit = min(model_ctx_limit, profile_max)
+
+    # Pick precision against the context Auto will actually attempt. The old
+    # target used profile_max even when the final auto branch aimed at a larger
+    # native/YaRN limit. Once F16 upgrades became possible this mismatch chose
+    # F16 for an easy 8k profile target, then discovered it could only hold
+    # 152k of a 262k+ model — sacrificing context despite denser KV fitting it.
+    target_ctx = user_ctx if user_ctx is not None else model_ctx_limit
 
     # Expert overrides for KV-quant: when both K and V are pinned we
     # respect the user's pair as-is; when only one is pinned we still
@@ -3261,31 +3342,49 @@ def compute_config(
 
         primary_cap = _gpu_usable_cap_gb(primary_gpu, True)
 
-        # Full GPU footprint we need to place. KV is included because a
-        # visibility pin hides every peer device; approving it from aggregate
-        # VRAM would otherwise create a deterministic single-card OOM.
-        model_footprint_gb = (
+        # Full GPU footprint we need to place. --no-kv-offload keeps the KV
+        # cache in RAM; every other full-offload/MoE path places it on GPUs.
+        # A visibility pin hides every peer device, so approving this footprint
+        # from aggregate VRAM would otherwise create a deterministic OOM.
+        gpu_kv_footprint_gb = 0.0 if no_kv_offload else estimated_kv_gb
+        fixed_primary_footprint_gb = (
             model_vram
-            + estimated_kv_gb
             + vision_vram_gb
             + draft_vram_gb
             + runtime_vram_overhead_gb
             + moe_batch_vram_reserve_gb
             + recurrent_state_vram_gb
         )
+        model_footprint_gb = fixed_primary_footprint_gb + gpu_kv_footprint_gb
 
-        # Pin the whole model to the primary GPU when its GPU-resident
-        # complete footprint fits the primary's usable cap. Context sizing
-        # already used the same primary cap when fixed allocations fit there,
-        # preserving the secondary card without borrowing its KV capacity.
-        #
+        # Pin only when the selected cache PLUS the same long-context scratch
+        # reserve used during sizing fits the primary. Testing the raw footprint
+        # alone can repin a config that borrowed aggregate VRAM, discarding the
+        # reserve and recreating a single-card Vulkan OOM. Conversely, an Expert
+        # Q8 pin may legitimately fit one card even when Auto's preferred F16
+        # needed both; this exact post-selection test keeps that card free.
+        primary_raw_kv_budget = max(
+            0.0,
+            primary_cap - effective_vram_safety - fixed_primary_footprint_gb,
+        )
+        primary_usable_kv_budget = _usable_kv_budget_after_headroom(
+            primary_raw_kv_budget,
+            ctx,
+            n_parallel,
+            rope_scaling_active,
+        )
+        fixed_footprint_fits_primary = (
+            fixed_primary_footprint_gb + effective_vram_safety <= primary_cap
+        )
+        selected_cache_fits_primary = (
+            fixed_footprint_fits_primary
+            and gpu_kv_footprint_gb <= primary_usable_kv_budget * 0.98
+        )
+
         # A user-supplied force_gpu ALWAYS pins exclusively: the user has
         # explicitly chosen the card this server boots on, so we hide every
-        # other GPU and never spread — even if the weights are large. If they
-        # don't fit, MoE experts spill to CPU (--n-cpu-moe, computed against
-        # this card's free VRAM above) rather than silently bleeding onto the
-        # card the user wanted left alone.
-        pin_to_primary = (forced_gpu is not None) or (model_footprint_gb <= primary_cap)
+        # other GPU and never spread — even if the model is overcommitted.
+        pin_to_primary = (forced_gpu is not None) or selected_cache_fits_primary
 
         if pin_to_primary:
             if hip_known:
@@ -3345,7 +3444,31 @@ def compute_config(
                 reverse=True,  # primary (highest score) first
             )
             caps = [_gpu_usable_cap_gb(g, g is primary_gpu) for g in ordered]
-            total_cap = sum(caps)
+
+            # Vision, external draft, and runner/batch workspaces live wholly
+            # on main_gpu; tensor-split distributes only layer-owned weights,
+            # KV, and recurrent state. Dense placement previously folded these
+            # primary-only allocations into a proportional footprint, making a
+            # split look cap-safe while the real primary exceeded its cap once
+            # the complete mmproj was added back.
+            primary_only_gpu_gb = (
+                vision_vram_gb
+                + draft_vram_gb
+                + runtime_vram_overhead_gb
+                + moe_batch_vram_reserve_gb
+            )
+            if is_moe_cfg:
+                distribution_caps = list(caps)
+                distribution_footprint_gb = model_footprint_gb
+            else:
+                distribution_caps = [
+                    max(0.0, cap - primary_only_gpu_gb) if gpu is primary_gpu else cap
+                    for gpu, cap in zip(ordered, caps)
+                ]
+                distribution_footprint_gb = max(
+                    0.0, model_footprint_gb - primary_only_gpu_gb
+                )
+            total_cap = sum(distribution_caps)
 
             # ---- MoE per-layer GPU byte weights --------------------------
             # llama.cpp splits --tensor-split by LAYER COUNT (device 0 gets
@@ -3393,28 +3516,31 @@ def compute_config(
                 weights = [_gpu_score(g) for g in ordered]
             total_weight = sum(weights)
 
-            # First pass: allocate proportionally by the chosen weighting,
-            # respecting each card's usable cap.
+            # First pass: allocate the distributable footprint proportionally
+            # by the chosen weighting, respecting each adjusted card cap.
             alloc: List[float] = []
-            for i, cap in enumerate(caps):
+            for i, cap in enumerate(distribution_caps):
                 proportion = weights[i] / total_weight if total_weight > 0 else 0
-                alloc.append(min(cap, model_footprint_gb * proportion))
+                alloc.append(min(cap, distribution_footprint_gb * proportion))
 
-            # Second pass: if there's remaining footprint, distribute it
-            # proportionally among GPUs that haven't hit their cap.
-            remaining = model_footprint_gb - sum(alloc)
-            if remaining > 0.01:  # small epsilon to avoid floating-point noise
-                for _ in range(3):  # iterate a few times to converge
-                    if remaining <= 0.01:
-                        break
-                    for i, cap in enumerate(caps):
-                        if alloc[i] < cap and remaining > 0.01:
-                            space = cap - alloc[i]
-                            take = min(
-                                space, remaining * 0.5
-                            )  # give half to each available GPU
-                            alloc[i] += take
-                            remaining -= take
+            # Second pass: distribute the full remainder across every card's
+            # residual capacity. The old three-round "take half" loop stopped
+            # early, then normalised the undersized allocation back to 100%; the
+            # resulting tensor split could exceed a card's own cap by ~0.3 GB.
+            remaining = max(0.0, distribution_footprint_gb - sum(alloc))
+            if remaining > 1e-9:
+                spaces = [
+                    max(0.0, cap - used) for cap, used in zip(distribution_caps, alloc)
+                ]
+                total_space = sum(spaces)
+                if total_space > 0:
+                    if remaining >= total_space:
+                        alloc = [used + space for used, space in zip(alloc, spaces)]
+                    else:
+                        alloc = [
+                            used + remaining * (space / total_space)
+                            for used, space in zip(alloc, spaces)
+                        ]
 
             denom = sum(alloc) if sum(alloc) > 0 else (total_cap or 1.0)
 

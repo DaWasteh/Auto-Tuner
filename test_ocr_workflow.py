@@ -86,8 +86,8 @@ def test_unlimited_profile_pins_reference_quality_runtime() -> None:
     assert profile.flash_attn is False
     assert profile.recommended_kv_quant == "f16"
     assert _pick_kv_quant(" f16 ", 32768, 0.01, 64.0) == ("f16", "f16")
-    assert _pick_kv_quant("q4_1", 1024, 0.001, 64.0) == ("q8_0", "q8_0")
-    assert _pick_kv_quant("", 1024, 0.001, 64.0) == ("q8_0", "q8_0")
+    assert _pick_kv_quant("q4_1", 1024, 0.001, 64.0) == ("f16", "f16")
+    assert _pick_kv_quant("", 1024, 0.001, 64.0) == ("f16", "f16")
 
 
 def test_profile_loader_accepts_numeric_flash_attention(tmp_path) -> None:
@@ -132,7 +132,9 @@ def test_strip_grounding_keeps_recognized_text() -> None:
     assert strip_grounding_markup(raw) == "Invoice\nTotal 42"
 
 
-def test_http_payload_places_image_before_unlimited_prompt(tmp_path, monkeypatch) -> None:
+def test_http_payload_places_image_before_unlimited_prompt(
+    tmp_path, monkeypatch
+) -> None:
     import ocr_workflow
 
     image = tmp_path / "page.png"
@@ -204,7 +206,9 @@ def test_windows_cancel_always_targets_libreoffice_process_tree(monkeypatch) -> 
     assert calls == [["taskkill", "/PID", "4321", "/T", "/F"]]
 
 
-def test_cancel_interrupts_request_before_response_headers(tmp_path, monkeypatch) -> None:
+def test_cancel_interrupts_request_before_response_headers(
+    tmp_path, monkeypatch
+) -> None:
     import threading
     import ocr_workflow
 
@@ -228,9 +232,7 @@ def test_cancel_interrupts_request_before_response_headers(tmp_path, monkeypatch
         def close(self):
             closed.set()
 
-    monkeypatch.setattr(
-        ocr_workflow.http.client, "HTTPConnection", DelayedConnection
-    )
+    monkeypatch.setattr(ocr_workflow.http.client, "HTTPConnection", DelayedConnection)
     runner = OcrJobRunner(
         "http://127.0.0.1:1234",
         "ocr",
@@ -511,9 +513,7 @@ def test_cancel_before_work_returns_cancelled_manifest(tmp_path) -> None:
     runner = _FakeRunner(
         "http://127.0.0.1:1234",
         "ocr-model",
-        OcrJobOptions(
-            inputs=[image], output_dir=tmp_path / "output", prompt="OCR"
-        ),
+        OcrJobOptions(inputs=[image], output_dir=tmp_path / "output", prompt="OCR"),
     )
     runner.cancel()
     result = runner.run()

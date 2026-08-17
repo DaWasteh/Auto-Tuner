@@ -544,10 +544,12 @@ def test_nvidia_auto_kv_stays_symmetric_for_cuda_flash_attention(tmp_path) -> No
         profile,
     )
 
-    # AMD may choose an asymmetric pair when it fits, but must fall back to a
-    # safe symmetric pair rather than overcommitting a tight real VRAM budget.
-    assert amd_cfg.cache_k in {"q8_0", "q5_0", "q4_0"}
-    assert amd_cfg.cache_v in {"q8_0", "q5_0", "q4_0"}
+    # AMD may choose an asymmetric pair when it fits, but NVIDIA must retain
+    # a symmetric pair. Auto is allowed to upgrade all the way to F16/BF16
+    # when full context still fits.
+    normal_types = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
+    assert amd_cfg.cache_k in normal_types
+    assert amd_cfg.cache_v in normal_types
     assert nvidia_cfg.cache_k == nvidia_cfg.cache_v
 
 
@@ -1107,7 +1109,6 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_chk_vision",
         "_chk_mmproj_cpu",
         "_chk_draft",
-        "_chk_turbo_kv",
         "_chk_ngram",
         "_chk_prompt_cache",
         "_sp_prompt_cache_mib",
@@ -1124,6 +1125,9 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_btn_quit",
     )
     widgets.extend(getattr(window, name) for name in main_names)
+    assert not hasattr(window, "_chk_turbo_kv")
+    assert "bf16" in expert._KV_QUANT_OPTIONS
+    assert "turbo3" in expert._KV_QUANT_OPTIONS
     toolbar_texts = {
         "📂 Models folder",
         "🔄 Refresh",
@@ -1234,6 +1238,133 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     paths_dialog.close()
     app_dialog.close()
     parent.close()
+
+
+def test_mmproj_dropdown_shows_projector_file_size(tmp_path, monkeypatch) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+
+    model_path = tmp_path / "Qwen3.8-27B-Q4_K_M.gguf"
+    projector = tmp_path / "mmproj-Qwen3.8-27B-BF16.gguf"
+    _write_minimal_gguf(model_path)
+    _write_minimal_gguf(projector)
+    entry = ModelEntry(
+        path=model_path,
+        name=model_path.stem,
+        group=".",
+        size_bytes=model_path.stat().st_size,
+        mmproj=projector,
+        folder_mmprojs=[projector],
+    )
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._populate_mmproj_combo(entry, {})
+    labels = [window._cb_mmproj.itemText(i) for i in range(window._cb_mmproj.count())]
+    projector_label = next(label for label in labels if projector.name in label)
+    assert "(0.0 GB)" in projector_label
+    assert "(auto)" in projector_label
+    window.close()
+
+
+def test_turbo_kv_expert_warning_has_dismiss_and_never_show_again(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+
+    dialogs = []
+
+    class FakeMessageBox:
+        class Icon:
+            Warning = object()
+
+        class ButtonRole:
+            AcceptRole = object()
+            DestructiveRole = object()
+
+        def __init__(self, parent):
+            self.parent = parent
+            self.buttons = {}
+            dialogs.append(self)
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setIcon(self, icon):
+            self.icon = icon
+
+        def setText(self, text):
+            self.text = text
+
+        def setInformativeText(self, text):
+            self.informative_text = text
+
+        def addButton(self, label, role):
+            button = object()
+            self.buttons[label] = button
+            return button
+
+        def setDefaultButton(self, button):
+            self.default_button = button
+
+        def exec(self):
+            return 0
+
+        def clickedButton(self):
+            return self.buttons["Never Show Again"]
+
+    parent = qt_widgets.QWidget()
+    monkeypatch.setattr(qt_launcher, "QMessageBox", FakeMessageBox)
+    assert qt_launcher._show_turbo_kv_fork_warning(parent) is True
+    assert set(dialogs[0].buttons) == {"Dismiss", "Never Show Again"}
+    assert "special" not in dialogs[0].text.lower()  # details live below
+    assert "mainline llama.cpp" in dialogs[0].text
+    assert "compatible TurboQuant fork" in dialogs[0].informative_text
+    assert qt_launcher.app_settings.get_turbo_kv_warning_suppressed() is True
+    assert qt_launcher._show_turbo_kv_fork_warning(parent) is False
+    assert len(dialogs) == 1
+    parent.close()
+
+
+def test_expert_turbo_kv_warning_is_once_per_session(tmp_path, monkeypatch) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    calls = []
+    monkeypatch.setattr(
+        qt_launcher,
+        "_show_turbo_kv_fork_warning",
+        lambda parent: calls.append(parent) or True,
+    )
+
+    panel = qt_launcher.ExpertPanel()
+    panel._cb_cache_k.setCurrentText("turbo3")
+    panel._cb_cache_v.setCurrentText("turbo4")
+    assert calls == [panel]
+    panel.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pipe/pump streaming path")
@@ -1822,16 +1953,19 @@ def _fake_dual_gpu_system(
     )
 
 
-def test_multi_gpu_pins_to_largest_when_model_fits(tmp_path) -> None:
-    """Smart placement: a model that fits on the 9700 Pro (32 GB) alone
-    must NOT be tensor-split across the 9070 XT. Tensor-split should be
-    "1.000,0.000" so the 9070 XT stays free for OBS/desktop work."""
+def test_multi_gpu_pins_to_largest_when_model_and_best_kv_fit(tmp_path) -> None:
+    """Keep the peer GPU free only after requested context and F16 KV fit.
+
+    The explicit 32k request makes the synthetic metadata-free fallback small
+    enough for the R9700. A 262k request that needed lower KV precision would
+    intentionally spread under the context-first/quality-second policy.
+    """
     profiles = load_profiles(SETTINGS_DIR)
-    # 9B model, easily fits on a 32GB GPU even with full KV cache.
     model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
     profile = match_profile(model.name, profiles)
-    cfg = compute_config(model, _fake_dual_gpu_system(), profile)
+    cfg = compute_config(model, _fake_dual_gpu_system(), profile, user_ctx=32768)
 
+    assert cfg.cache_k == cfg.cache_v == "f16"
     assert cfg.tensor_split is not None, "Expected tensor_split to be set"
     assert cfg.main_gpu == 0, f"Expected main_gpu=0 (largest), got {cfg.main_gpu}"
 
@@ -1839,6 +1973,186 @@ def test_multi_gpu_pins_to_largest_when_model_fits(tmp_path) -> None:
     assert len(parts) == 2
     assert parts[0] > 0.99, f"Expected ~1.0 on GPU 0, got {parts[0]}"
     assert parts[1] < 0.01, f"Expected ~0.0 on GPU 1, got {parts[1]}"
+
+
+def _fake_qwen38_27b_model(tmp_path, name: str, size_gb: float):
+    """Qwen3.8-27B metadata shared by the user's Q3–Q8 GGUF variants."""
+    return _fake_model_md(
+        tmp_path,
+        name,
+        size_gb,
+        {
+            "general.architecture": "qwen35",
+            "qwen35.block_count": 65,
+            "qwen35.context_length": 262144,
+            "qwen35.embedding_length": 5120,
+            "qwen35.attention.head_count": 24,
+            "qwen35.attention.head_count_kv": 4,
+            "qwen35.attention.key_length": 256,
+            "qwen35.attention.value_length": 256,
+            "qwen35.nextn_predict_layers": 1,
+            "qwen35.ssm.conv_kernel": 4,
+            "qwen35.ssm.state_size": 128,
+            "qwen35.ssm.group_count": 16,
+            "qwen35.ssm.time_step_rank": 48,
+            "qwen35.ssm.inner_size": 6144,
+            "qwen35.full_attention_interval": 4,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "size_gb"),
+    [
+        ("Qwen3.8-27B-UD-Q3_K_XL", 12.52),
+        ("Qwen3.8-27B-UD-Q4_K_XL", 16.69),
+        ("Qwen3.8-27B-UD-Q5_K_XL", 18.83),
+        ("Qwen3.8-27B-UD-Q6_K_XL", 24.14),
+        ("Qwen3.8-27B-UD-Q8_K_XL", 29.30),
+    ],
+)
+def test_qwen38_dual_gpu_preserves_full_context_then_maximises_kv_quality(
+    tmp_path, name, size_gb
+) -> None:
+    """Regression for Q5/Q6 losing context while Q8 used both GPUs.
+
+    Every quant must first reach the native 262,144-token window. Remaining
+    headroom then upgrades KV above Q4/Q5; peer-GPU use is valid whenever it
+    is what makes the better context/precision pair safe.
+    """
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_qwen38_27b_model(tmp_path, name, size_gb)
+    profile = match_profile(model.name, profiles, model.architecture)
+    system = _fake_dual_gpu_system_with_vk_order(
+        large_free=31,
+        small_free=16,
+        ram_total=48,
+        ram_free=30,
+    )
+    cfg = compute_config(
+        model,
+        system,
+        profile,
+        gpu_priorities={
+            "AMD Radeon AI PRO R9700": 2,
+            "AMD Radeon RX 9070 XT": 1,
+        },
+    )
+
+    assert cfg.ctx == 262144
+    assert cfg.cache_k in {"f16", "bf16", "q8_0"}
+    assert cfg.cache_v in {"f16", "bf16", "q8_0"}
+    assert cfg.tensor_split is not None
+    parts = [float(part) for part in cfg.tensor_split.split(",")]
+    assert all(part > 0 for part in parts), cfg.tensor_split
+
+    # tensor_split is in Vulkan order: RX 9070 XT (0), then R9700 (1).
+    from tuner import _gpu_usable_cap_gb
+
+    footprint = (
+        cfg.estimated_model_vram_gb
+        + cfg.kv_vram_gb
+        + cfg.recurrent_state_vram_gb
+        + cfg.runtime_vram_overhead_gb
+        + cfg.batch_vram_overhead_gb
+    )
+    small_cap = _gpu_usable_cap_gb(system.gpus[1], False)
+    large_cap = _gpu_usable_cap_gb(system.gpus[0], True)
+    assert footprint * parts[0] <= small_cap + 0.05
+    assert footprint * parts[1] <= large_cap + 0.05
+
+
+def test_dense_split_reserves_primary_only_mmproj_vram(tmp_path) -> None:
+    """A dense tensor split must not pretend the mmproj is split by layer."""
+    from tuner import _gpu_usable_cap_gb
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_qwen38_27b_model(tmp_path, "Qwen3.8-27B-UD-Q5_K_XL", size_gb=18.83)
+    model.mmproj = types.SimpleNamespace(
+        stat=lambda: types.SimpleNamespace(st_size=int(3.585 * 1024**3))
+    )
+    profile = match_profile(model.name, profiles, model.architecture)
+    system = _fake_dual_gpu_system_with_vk_order(large_free=31, small_free=16)
+    cfg = compute_config(
+        model,
+        system,
+        profile,
+        gpu_priorities={
+            "AMD Radeon AI PRO R9700": 2,
+            "AMD Radeon RX 9070 XT": 1,
+        },
+    )
+
+    assert cfg.tensor_split is not None
+    small_share, large_share = map(float, cfg.tensor_split.split(","))
+    distributed = (
+        cfg.estimated_model_vram_gb + cfg.kv_vram_gb + cfg.recurrent_state_vram_gb
+    )
+    primary_only = (
+        cfg.vision_vram_gb
+        + cfg.draft_vram_gb
+        + cfg.runtime_vram_overhead_gb
+        + cfg.batch_vram_overhead_gb
+    )
+    small_cap = _gpu_usable_cap_gb(system.gpus[1], False)
+    large_cap = _gpu_usable_cap_gb(system.gpus[0], True)
+    assert distributed * small_share <= small_cap + 0.05
+    assert distributed * large_share + primary_only <= large_cap + 0.05
+
+
+def test_low_vram_multi_gpu_does_not_pin_oversized_weights_to_one_card(
+    tmp_path,
+) -> None:
+    """--no-kv-offload cannot make oversized fixed weights look pin-safe."""
+    from performance_target import PERFORMANCE_TARGETS
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS", size_gb=40.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(
+        model,
+        _fake_dual_gpu_system_with_vk_order(large_free=31, small_free=16),
+        profile,
+        user_ctx=32768,
+        perf_target=PERFORMANCE_TARGETS["low_vram"],
+    )
+
+    assert cfg.no_kv_offload is True
+    assert cfg.estimated_model_vram_gb > 32.0
+    assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "0,1"
+    assert cfg.tensor_split is not None
+    assert all(float(part) > 0 for part in cfg.tensor_split.split(","))
+
+
+def test_low_vram_ignores_full_peer_and_reduces_primary_gpu_weights(
+    tmp_path,
+) -> None:
+    """An unusable peer cannot make oversized weights look single-card safe."""
+    from performance_target import PERFORMANCE_TARGETS
+    from tuner import _gpu_usable_cap_gb
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS", size_gb=40.0)
+    profile = match_profile(model.name, profiles)
+    system = _fake_dual_gpu_system_with_vk_order(large_free=31, small_free=1)
+    cfg = compute_config(
+        model,
+        system,
+        profile,
+        user_ctx=32768,
+        perf_target=PERFORMANCE_TARGETS["low_vram"],
+    )
+
+    primary_cap = _gpu_usable_cap_gb(system.gpus[0], True)
+    assert cfg.no_kv_offload is True
+    assert cfg.full_offload is False
+    assert (
+        cfg.estimated_model_vram_gb
+        + PERFORMANCE_TARGETS["low_vram"].dense_vram_safety_gb
+        <= primary_cap + 0.01
+    )
+    assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "1"
+    assert cfg.tensor_split is None
 
 
 def test_multi_gpu_spreads_when_model_too_large_for_single_gpu(tmp_path) -> None:
@@ -1916,7 +2230,7 @@ def test_vulkan_env_var_emitted_for_single_gpu_pinning(tmp_path) -> None:
     model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
     profile = match_profile(model.name, profiles)
     sys_info = _fake_dual_gpu_system_with_vk_order()
-    cfg = compute_config(model, sys_info, profile)
+    cfg = compute_config(model, sys_info, profile, user_ctx=32768)
 
     assert cfg.full_offload is True
     assert cfg.main_gpu == 0  # remapped: only one device visible
@@ -2018,6 +2332,47 @@ def test_second_server_avoids_full_primary(tmp_path) -> None:
     assert cfg.env_overrides.get("HIP_VISIBLE_DEVICES") == "0"
 
 
+def test_second_server_launch_balance_keeps_available_gpu_pin(
+    tmp_path, monkeypatch
+) -> None:
+    """Exercise live re-detect → choose → final pin, not only compute_config."""
+    import qt_launcher
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=10.0)
+    profile = match_profile(model.name, profiles)
+    system = _fake_dual_gpu_system_with_vk_order(large_free=1, small_free=13)
+    cfg = compute_config(
+        model,
+        system,
+        profile,
+        user_ctx=16384,
+        gpu_priorities={
+            "AMD Radeon AI PRO R9700": 2,
+            "AMD Radeon RX 9070 XT": 1,
+        },
+    )
+    logs = []
+    window = types.SimpleNamespace(
+        _system=system,
+        _log=logs.append,
+        _active_llama_binary=lambda: "llama-server",
+        _last_pinned_gpu=None,
+    )
+    monkeypatch.setattr(qt_launcher, "detect_system", lambda _binary: system)
+
+    chosen, refusal = qt_launcher.MainWindow._choose_gpu_for_launch(
+        window, cfg, model, "llama-server"
+    )
+    assert refusal is None
+    assert chosen is system.gpus[1]
+    qt_launcher.MainWindow._pin_cfg_to_gpu(window, cfg, chosen)
+    assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "0"
+    assert cfg.env_overrides.get("HIP_VISIBLE_DEVICES") == "0"
+    assert cfg.tensor_split is None
+    assert window._last_pinned_gpu == chosen.name
+
+
 def test_force_gpu_pins_to_named_card(tmp_path) -> None:
     """force_gpu must pin the server to the named card EXCLUSIVELY, even
     when another GPU scores higher by priority×VRAM. This is the manual
@@ -2054,7 +2409,7 @@ def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
     profile = match_profile(model.name, profiles)
     sys_info = _fake_dual_gpu_system_with_vk_order()
 
-    cfg = compute_config(model, sys_info, profile, force_gpu="RTX 5090")
+    cfg = compute_config(model, sys_info, profile, user_ctx=32768, force_gpu="RTX 5090")
 
     # Falls back to auto: small model pins to the R9700 (Vulkan index 1).
     assert cfg.full_offload is True
@@ -3413,6 +3768,23 @@ def test_alternate_kv_head_key_is_used_by_sizing() -> None:
     assert not any(w.id == "KV-HEAD-COUNT-MISSING" for w in audit_model_metadata(model))
 
 
+def test_auto_kv_upgrades_profile_default_after_full_context_fits() -> None:
+    """A q5 profile hint is not a ceiling when F16 preserves max context."""
+    from tuner import _pick_kv_quant
+
+    pair = _pick_kv_quant(
+        "q5_0",
+        262144,
+        0.0625,
+        20.0,
+        262144,
+        asymmetric=True,
+        base_k_per_token_mb=0.03125,
+        base_v_per_token_mb=0.03125,
+    )
+    assert pair == ("f16", "f16")
+
+
 def test_asymmetric_kv_quant_weights_unequal_kv_dimensions() -> None:
     from tuner import (
         _pick_kv_quant,
@@ -3689,7 +4061,7 @@ def test_multi_gpu_cuda_pinning_does_not_emit_hip_or_vulkan(tmp_path) -> None:
     for gpu in system.gpus:
         gpu.vendor = "nvidia"
         gpu.runtime_backend = "CUDA"
-    cfg = compute_config(model, system, profile)
+    cfg = compute_config(model, system, profile, user_ctx=32768)
     assert cfg.env_overrides == {"CUDA_VISIBLE_DEVICES": "1"}
     assert cfg.main_gpu == 0
 

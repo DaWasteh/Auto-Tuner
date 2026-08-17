@@ -660,28 +660,30 @@ When you start the tuner, you can choose between:
 1. **Standard-Quant**: Uses standard `llama.cpp` binaries.
 2. **Turbo-Quant**: Uses the `tq_llama.cpp` binary for faster inference.
 
-#### Turbo-Quant labels & KV-quant options
+#### KV precision and TurboQuant options
 
-`kv_quant_factor()` now supports the following Turbo-Quant labels:
-`turbo2`, `turbo3`, `turbo4`, `iq4_nl`, `tq3_0`, `turbo3_tcq`.
+Auto mode first preserves the requested/native context window, then spends any
+remaining memory on the least-quantized KV cache that fits. Its quality ladder
+starts at F16 (or profile-requested BF16), then steps through asymmetric
+F16/Q8, Q8, Q5, and Q4 pairs. On multi-GPU systems, a peer GPU is used when it
+is needed to preserve context or improve KV precision; it stays free only when
+the primary card already fits both goals.
 
-`_TURBO_QUANT_MAP` corrects the real labels:
+The Expert K/V dropdowns expose the mainline types `f16`, `bf16`, `q8_0`,
+`q5_0`, `q5_1`, `q4_0`, `q4_1`, and `iq4_nl`, plus fork-only `turbo2`,
+`turbo3`, and `turbo4`. Turbo KV is no longer duplicated as a Launch options
+checkbox. Selecting a TurboQuant type shows a special-fork warning with
+**Dismiss** and **Never Show Again**; current mainline llama.cpp rejects those
+types.
+
+`kv_quant_factor()` also understands `tq3_0`, `turbo3_tcq`, and the normal to
+Turbo mapping used by compatible terminal/fork flows:
 
 | Label   | Turbo-Quant | Factor (vs F16) |
 |---------|-------------|-----------------|
 | `q8_0`  | `turbo4`    | ~3.8x           |
 | `q5_0`  | `turbo3`    | ~4.3x           |
 | `q4_0`  | `turbo3`    | ~4.3x           |
-
-(It previously mapped incorrectly to `q4_1`/`q5_1`, which are mainline
-labels, NOT TurboQuant.)
-
-`_pick_kv_quant` now computes the budget with the Turbo factors — when you
-switch, the real token-count increase shows up (measured: 48k → 63k on
-Qwen3.6-35B-A3B).
-
-The KV dropdowns in the GUI show the full selection: `iq4_nl`,
-`q4_1`, `q5_1`, `turbo2`, `turbo3`, `turbo4`.
 
 #### Specialized Binary Logic
 
@@ -1292,13 +1294,13 @@ massively lowers time-to-first-token on repeated prompts.
 
 ### Choosing among several mmproj precisions
 
-If a model ships several projectors side by side (`…-bf16`, `…-f16`,
-`…-f32`), the scanner keeps **all** of them as candidates
-(`mmproj_candidates`). A **dropdown** then appears in the Launch options
-where you pick the precision you want; the choice is remembered per model
-in `autotuner_settings.json` (`mmproj_selection`). The automatic pre-pick
-now prefers the **highest** precision (f32 > f16 > bf16) instead of, as
-before, always taking bf16 purely alphabetically.
+If a model ships projectors side by side (`…-bf16`, `…-f16`, `…-f32`),
+the scanner keeps all same-folder candidates. The always-visible **mmproj**
+dropdown lists each projector with its file size (just like external drafters),
+marks incompatible experiments, and remembers the choice per model in
+`autotuner_settings.json` (`mmproj_selection`). The automatic pre-pick prefers
+the **highest** precision (f32 > f16 > bf16) instead of taking bf16 purely
+alphabetically.
 
 ### Intel CPU, SYCL, and OpenVINO
 

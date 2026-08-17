@@ -2529,6 +2529,39 @@ def expert_cfg_from_values(base: TunedConfig, vals: dict) -> TunedConfig:
 # ---------------------------------------------------------------------------
 
 
+_TURBO_KV_TYPES = frozenset(
+    {"turbo2", "turbo2_tcq", "turbo3", "turbo3_tcq", "turbo4", "tq3_0"}
+)
+
+
+def _is_turbo_kv_type(value: str) -> bool:
+    return str(value or "").strip().lower() in _TURBO_KV_TYPES
+
+
+def _show_turbo_kv_fork_warning(parent: QWidget) -> bool:
+    """Warn once per Expert-panel session about fork-only cache formats."""
+    if app_settings.get_turbo_kv_warning_suppressed():
+        return False
+    box = QMessageBox(parent)
+    box.setWindowTitle("TurboQuant fork required")
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText("Turbo KV-cache formats are not available in mainline llama.cpp yet.")
+    box.setInformativeText(
+        "Select a compatible TurboQuant fork before launching with turbo2, "
+        "turbo3, or turbo4. A normal mainline build will reject these cache "
+        "types during startup."
+    )
+    dismiss_button = box.addButton("Dismiss", QMessageBox.ButtonRole.AcceptRole)
+    never_button = box.addButton(
+        "Never Show Again", QMessageBox.ButtonRole.DestructiveRole
+    )
+    box.setDefaultButton(dismiss_button)
+    box.exec()
+    if box.clickedButton() is never_button:
+        app_settings.set_turbo_kv_warning_suppressed(True)
+    return True
+
+
 class ExpertPanel(QWidget):
     """Editable replacement for the read-only config preview.
 
@@ -2569,10 +2602,10 @@ class ExpertPanel(QWidget):
     # the saved override for the current model and reloads pure Auto.
     resetRequested = pyqtSignal()
 
-    # Upstream supports the first six; turbo3/turbo4 only resolve on the
-    # TurboQuant forks (TheTom/turboquant_plus, AtomicBot, spiritbuun).
-    # The combo accepts both either way — a fork that doesn't understand
-    # turbo3 will refuse to start and surface a clear error.
+    # Mainline types are followed by fork-only TurboQuant formats. BF16 has
+    # the same memory footprint as F16 and is available for exact Expert use;
+    # Auto prefers F16's higher mantissa precision unless a profile explicitly
+    # requests BF16. Selecting a Turbo type shows a special-fork warning.
     _KV_QUANT_OPTIONS = [
         "q4_0",
         "q4_1",
@@ -2581,6 +2614,7 @@ class ExpertPanel(QWidget):
         "q5_1",
         "q8_0",
         "f16",
+        "bf16",
         "turbo4",
         "turbo3",
         "turbo2",
@@ -2618,6 +2652,7 @@ class ExpertPanel(QWidget):
         # echo or an infinite loop) NOR schedule a debounced save (which
         # would persist the just-loaded state back over itself).
         self._populating = False
+        self._turbo_warning_shown = False
 
         # Debounced auto-save. Any real user edit (in either mode) arms a
         # single-shot 300 ms timer; when it fires we emit `stateChanged`
@@ -2789,7 +2824,7 @@ class ExpertPanel(QWidget):
         self._cb_cache_k = QComboBox()
         self._cb_cache_k.addItems(self._KV_QUANT_OPTIONS)
         self._cb_cache_k.currentTextChanged.connect(
-            lambda _: self._on_edit("force_cache_k")
+            lambda value: self._on_kv_quant_changed("force_cache_k", value)
         )
         _add(
             "K-quant",
@@ -2808,7 +2843,7 @@ class ExpertPanel(QWidget):
         self._cb_cache_v = QComboBox()
         self._cb_cache_v.addItems(self._KV_QUANT_OPTIONS)
         self._cb_cache_v.currentTextChanged.connect(
-            lambda _: self._on_edit("force_cache_v")
+            lambda value: self._on_kv_quant_changed("force_cache_v", value)
         )
         _add(
             "V-quant",
@@ -3599,6 +3634,16 @@ class ExpertPanel(QWidget):
     # ------------------------------------------------------------------
     # Auto-cascade
     # ------------------------------------------------------------------
+    def _on_kv_quant_changed(self, kind: str, value: str) -> None:
+        """Handle Expert K/V edits and warn about fork-only Turbo types."""
+        if (
+            not self._populating
+            and not self._turbo_warning_shown
+            and _is_turbo_kv_type(value)
+        ):
+            self._turbo_warning_shown = _show_turbo_kv_fork_warning(self)
+        self._on_edit(kind)
+
     def _on_edit(self, kind: str) -> None:
         """A cascading widget was edited.
 
@@ -3846,6 +3891,11 @@ class ExpertPanel(QWidget):
             self._last_cfg = self._build_manual_config()
         if self._last_cfg is not None:
             self.configChanged.emit(self._last_cfg)
+            if not self._turbo_warning_shown and (
+                _is_turbo_kv_type(self._last_cfg.cache_k)
+                or _is_turbo_kv_type(self._last_cfg.cache_v)
+            ):
+                self._turbo_warning_shown = _show_turbo_kv_fork_warning(self)
 
     def reset_to_auto(self) -> None:
         """Reload the AutoTuner's automatically-best config (Reset button).
@@ -4496,22 +4546,6 @@ class MainWindow(QMainWindow):
                 "drafter can be slower or fail to load.",
             )
         )
-        # NEW: Turbo KV-quant toggle. Sits between Draft and Thinking,
-        # as requested. When on, the AutoTuner maps the chosen KV
-        # quants to their TurboQuant equivalents (denser packing on
-        # the TheTom/AtomicBot forks; harmless no-op on stock builds
-        # because the mapping is identity for unknown labels).
-        self._chk_turbo_kv = QCheckBox("Turbo KV-quant (TurboQuant forks)")
-        self._chk_turbo_kv.setToolTip(
-            _setting_tooltip(
-                "Uses TurboQuant KV-cache formats to fit more context when a compatible "
-                "llama.cpp fork is selected.",
-                "AutoTuner maps normal KV choices to turbo2/turbo3/turbo4 labels on "
-                "known TurboQuant forks. Stock or older builds may not recognize these "
-                "types, so the option is intended for TheTom, AtomicBot, spiritbuun, "
-                "or other explicitly compatible builds.",
-            )
-        )
         # n-gram (ngram-mod) self-speculative decoding. Unlike Draft, this
         # needs no draft model and works on ANY GGUF (builds a rolling-hash
         # lookup table from the live context, ~16 MB). It is therefore always
@@ -4574,7 +4608,6 @@ class MainWindow(QMainWindow):
             self._chk_vision,
             self._chk_mmproj_cpu,
             self._chk_draft,
-            self._chk_turbo_kv,
             self._chk_ngram,
             self._chk_prompt_cache,
             self._chk_thinking,
@@ -4588,7 +4621,6 @@ class MainWindow(QMainWindow):
         self._chk_vision.toggled.connect(self._on_vision_toggled)
         self._chk_mmproj_cpu.toggled.connect(self._on_mmproj_cpu_toggled)
         self._chk_draft.toggled.connect(self._on_draft_toggled)
-        self._chk_turbo_kv.toggled.connect(self._on_turbo_toggled)
         self._chk_ngram.toggled.connect(self._on_ngram_toggled)
         self._chk_prompt_cache.toggled.connect(self._on_prompt_cache_toggled)
         self._sp_prompt_cache_mib.valueChanged.connect(
@@ -6710,17 +6742,6 @@ class MainWindow(QMainWindow):
         self._chk_thinking.setChecked(has_thinking and thinking_state)
         self._chk_thinking.blockSignals(False)
 
-        # ── Turbo KV-quant ──────────────────────────────────────────
-        # Always enabled — the AutoTuner cannot detect whether the
-        # active fork is a TurboQuant build (binary inspection would
-        # be expensive and unreliable). On stock builds the toggle is
-        # a harmless no-op because _turbo_quant_for() returns the
-        # input label when no mapping exists. State is NOT persisted
-        # per-model (it's a fork-level capability flag).
-        self._chk_turbo_kv.setEnabled(True)
-        # Don't touch the checked state on model switch — Turbo is a
-        # session-global preference.
-
         # ── n-gram (ngram-mod) ──────────────────────────────────────
         # Always enabled: ngram-mod needs no draft model and works on any
         # GGUF, so it must never be greyed out (the whole point — "ngram
@@ -6789,7 +6810,11 @@ class MainWindow(QMainWindow):
         deliberate_none = remembered == app_settings.MMPROJ_NONE_SENTINEL
         for c in folder:
             compatible = is_mmproj_compatible(entry.path, c)
-            label = c.name
+            try:
+                size_label = f"{c.stat().st_size / (1024**3):.1f} GB"
+            except OSError:
+                size_label = "size unavailable"
+            label = f"{c.name}   ({size_label})"
             if c == auto:
                 label += "   (auto)"
             if not compatible:
@@ -7002,19 +7027,6 @@ class MainWindow(QMainWindow):
             self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
-    def _on_turbo_toggled(self, checked: bool) -> None:
-        """Turbo KV-quant toggle. Not persisted per-model: it's a
-        fork-level capability flag rather than a model preference, so
-        flipping it just rebuilds the preview / current Expert config.
-        """
-        self._refresh_config_preview()
-        if self._config_stack.currentIndex() == 1:
-            # Already in Expert mode → re-cascade through the panel so
-            # the K/V quant widgets update to show the turbo-mapped labels.
-            self._expert_panel._recompute(
-                force_overrides=dict(self._expert_panel._user_pins)
-            )
-
     def _on_thinking_toggled(self, checked: bool) -> None:
         self._record_override("thinking", checked)
         self._refresh_config_preview()
@@ -7133,15 +7145,13 @@ class MainWindow(QMainWindow):
         current checkbox states. Returns None when system info is missing.
 
         Centralised so both the preview path and the Expert panel's
-        recompute callback share the same code path (and therefore the
-        same handling of vision / draft / turbo_kv).
+        recompute callback share the same vision/draft handling.
         """
         if self._system is None:
             return None
 
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
-        turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
         no_mmproj_offload = (
             self._chk_mmproj_cpu.isChecked() and self._chk_mmproj_cpu.isEnabled()
         )
@@ -7170,7 +7180,6 @@ class MainWindow(QMainWindow):
                 force_mlock=False,
                 perf_target=self._resolve_perf_target_for_profile(profile),
                 mode=self._current_mode(),
-                turbo_kv=turbo_kv,
                 no_mmproj_offload=no_mmproj_offload,
                 prompt_cache_ram_mib=prompt_cache_ram_mib,
                 gpu_priorities=app_settings.get_gpu_priorities(),
@@ -7273,7 +7282,6 @@ class MainWindow(QMainWindow):
         assert self._system is not None
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
-        turbo_kv = self._chk_turbo_kv.isChecked() and self._chk_turbo_kv.isEnabled()
         use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
         use_prompt_cache = (
             self._chk_prompt_cache.isChecked() and self._chk_prompt_cache.isEnabled()
@@ -7329,8 +7337,8 @@ class MainWindow(QMainWindow):
         kv_line = f"KV cache quant  : K={cfg.cache_k}  V={cfg.cache_v}"
         if cfg.kv_quant_strategy and cfg.kv_quant_strategy != "symmetric":
             kv_line += f"  [{cfg.kv_quant_strategy}]"
-        elif turbo_kv:
-            kv_line += "  [turbo]"
+        if _is_turbo_kv_type(cfg.cache_k) or _is_turbo_kv_type(cfg.cache_v):
+            kv_line += "  [TurboQuant fork required]"
 
         lines += [
             f"Placement       : {placement}",
@@ -8075,7 +8083,6 @@ class MainWindow(QMainWindow):
             self._chk_vision,
             self._chk_mmproj_cpu,
             self._chk_draft,
-            self._chk_turbo_kv,
             self._chk_ngram,
             self._chk_prompt_cache,
             self._sp_prompt_cache_mib,
@@ -8474,8 +8481,6 @@ class MainWindow(QMainWindow):
         use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
         use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
         use_thinking = self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
-        # turbo_kv is read by _build_auto_config/_effective_config straight
-        # from the checkbox, so there's no local to forward here.
         use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
         use_prompt_cache = (
             self._chk_prompt_cache.isChecked() and self._chk_prompt_cache.isEnabled()
