@@ -738,6 +738,12 @@ def test_parse_llama_build_number_supports_current_and_legacy_output() -> None:
     )
     assert _parse_llama_build_number(current) == 10423
     assert (
+        _parse_llama_build_number(
+            "version: 0.1.2 (build 10486, commit 1511ce3bc)\nbuilt with MSVC 19.51"
+        )
+        == 10486
+    )
+    assert (
         _parse_llama_build_number("version: 10058 (788e07dc9)\nbuilt with MSVC 19.51")
         == 10058
     )
@@ -2420,6 +2426,21 @@ def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
 # llama-server resolver
 
 
+def test_semver_prerelease_build_recipe_preserves_compatibility_build_number() -> None:
+    recipe = (ROOT / "building llama.cpp" / "llama_prerelease_build.txt").read_text(
+        encoding="utf-8"
+    )
+    clone_line = next(
+        line for line in recipe.splitlines() if "git clone --branch" in line
+    )
+
+    assert '$dir = "${Tag}_llama.cpp"' in recipe
+    assert "-DLLAMA_BUILD_IS_DEV=OFF" in recipe
+    assert "git rev-list --count HEAD" in recipe
+    assert "--depth" not in clone_line
+    assert "reportedBuild -ne $expectedBuild" in recipe
+
+
 def _fake_llama_server_path(fork_root: Path) -> Path:
     binary = "llama-server.exe" if os.name == "nt" else "llama-server"
     return fork_root / "build" / "bin" / "Release" / binary
@@ -2478,6 +2499,8 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
     container = tmp_path / "ai-local"
     runnable_root = container / "ocr_b17400_llama.cpp"
     _write_fake_server(_fake_llama_server_path(runnable_root))
+    semantic_root = container / "v0.1.2_llama.cpp"
+    _write_fake_server(_fake_llama_server_path(semantic_root))
 
     cli_only_root = container / "ocr_cli_only_llama.cpp"
     mtmd_name = "llama-mtmd-cli.exe" if os.name == "nt" else "llama-mtmd-cli"
@@ -2492,6 +2515,10 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
         name == "ocr_b17400_llama.cpp" and path.resolve() == runnable_root.resolve()
         for name, path in found
     )
+    assert any(
+        name == "v0.1.2_llama.cpp" and path.resolve() == semantic_root.resolve()
+        for name, path in found
+    )
     assert all(name != "ocr_cli_only_llama.cpp" for name, _path in found)
 
     # GUI has a separate container scanner; keep its server-only contract in
@@ -2501,6 +2528,10 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
     gui_found = MainWindow._expand_fork_container(container)
     assert any(
         name == "ocr_b17400_llama.cpp" and path.resolve() == runnable_root.resolve()
+        for name, path in gui_found
+    )
+    assert any(
+        name == "v0.1.2_llama.cpp" and path.resolve() == semantic_root.resolve()
         for name, path in gui_found
     )
     assert all(name != "ocr_cli_only_llama.cpp" for name, _path in gui_found)
@@ -2574,6 +2605,8 @@ def test_resolver_matches_versioned_fork_dir(tmp_path, monkeypatch) -> None:
     assert _fork_family("2b_b8840_llama.cpp") == "2b_llama"
     assert _fork_family("1b_llama.cpp") == "1b_llama"
     assert _fork_family("b9840_llama.cpp") == "llama"
+    assert _fork_family("v0.1.2_llama.cpp") == "llama"
+    assert _fork_family("tq_v0.1.2_llama.cpp") == "tq_llama"
 
     auto_dir = tmp_path / "Auto Tuner"
     auto_dir.mkdir()
@@ -5660,6 +5693,35 @@ def test_model_view_mode_defaults_validates_and_persists(_isolated_settings) -> 
         json.dumps({"model_view_mode": "corrupt"}), encoding="utf-8"
     )
     assert app_settings.get_model_view_mode() == "list"
+
+
+def test_model_tree_collapsed_paths_round_trip_and_ignore_invalid_values(
+    _isolated_settings,
+) -> None:
+    import json
+
+    import app_settings
+
+    collapsed = {"favorites", "folder:Alibaba", "folder:Alibaba\x1fQwen3.6"}
+    assert app_settings.get_model_tree_collapsed_paths() == set()
+    app_settings.set_model_tree_collapsed_paths(collapsed)
+    assert app_settings.get_model_tree_collapsed_paths() == collapsed
+
+    raw = json.loads(_isolated_settings.read_text(encoding="utf-8"))
+    setting_key = f"model_tree_collapsed_paths.{app_settings._OS_KEY_SUFFIX}"
+    assert raw[setting_key] == sorted(collapsed, key=str.casefold)
+
+    raw[setting_key] = ["favorites", "folder:Google", "folder:", "", 42, None]
+    _isolated_settings.write_text(
+        json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    assert app_settings.get_model_tree_collapsed_paths() == {
+        "favorites",
+        "folder:Google",
+    }
+
+    app_settings.set_model_tree_collapsed_paths(set())
+    assert app_settings.get_model_tree_collapsed_paths() == set()
 
 
 def test_application_close_preference_is_opt_in(_isolated_settings) -> None:

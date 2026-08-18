@@ -75,6 +75,9 @@ the RAM/VRAM you actually have free — without manual edits.
 - **Favorite models stay at the top** — click the star left of a model name
   to mark it. Active and inactive star colors follow the selected theme, and
   the choice is persisted across AutoTuner restarts.
+- **Persistent folder tree** — folders and the Favorites section start open,
+  but every branch you manually open or close keeps that exact state when you
+  switch list/folder views and after restarting AutoTuner.
 - **Capability badges in the model list** — symbols make it obvious
   what each model can do at a glance:
   - 👁 vision (mmproj projector paired)
@@ -133,8 +136,10 @@ the RAM/VRAM you actually have free — without manual edits.
   click them again.
 - **Fork-folder memory** — if you point the GUI at a parent folder
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
-  the next launch re-expands the same set of builds in the dropdown.
-  No more re-navigating one folder up after every restart.
+  the next launch re-expands the same set of builds in the dropdown. Both
+  build-number names such as `b10485_llama.cpp` and semantic-release names
+  such as `v0.1.2_llama.cpp` are recognized. No more re-navigating one folder
+  up after every restart.
 - **Window geometry, state & inner layout** — QMainWindow
   `saveGeometry()` (size, position, maximize-state) and `saveState()`
   (toolbars/docks) are persisted as base64 in the settings JSON. **In
@@ -842,6 +847,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | File | Purpose |
 |------|---------|
 | [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline llama.cpp Vulkan build (Windows/AMD-friendly; versioned `bXXXX_llama.cpp`). |
+| [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Exact semantic-version pre-release build (defaults to `v0.1.2`, output `v0.1.2_llama.cpp`). |
 | [`turboquant_llama_build.txt`](building%20llama.cpp/turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
 | [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
 | [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
@@ -853,6 +859,10 @@ The `*.txt` build recipes are PowerShell commands for the documented local
 workspace (`L:/LAB/ai-local` on the documented Pandaking setup). They handle both llama.cpp UI
 layouts automatically (`tools/ui` since b9174, `tools/server/webui` on older
 forks) and fall back to the prebuilt UI if the fork does not ship UI sources.
+The semantic pre-release recipe deliberately keeps full Git history (so the
+embedded numeric compatibility build is not incorrectly reported as `b1`) and
+sets `LLAMA_BUILD_IS_DEV=OFF`, making `llama-server --version` report the exact
+release version plus its real build number for AutoTuner's feature gates.
 
 Ubuntu/Linux users can either build upstream llama.cpp normally or adapt the
 same CMake flags from the recipes. The only AutoTuner requirement is that the

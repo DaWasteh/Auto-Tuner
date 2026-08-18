@@ -27,6 +27,8 @@ Public API:
     set_font_size(int)
     get_model_view_mode()  -> str
     set_model_view_mode(str)
+    get_model_tree_collapsed_paths() -> set[str]
+    set_model_tree_collapsed_paths(set[str])
     get_theme_id()         -> str
     set_theme_id(str)
     get_minimize_on_close() -> bool
@@ -623,6 +625,35 @@ def set_model_view_mode(mode: str) -> None:
     value = str(mode or "").lower().strip()
     if value in _VALID_MODEL_VIEW_MODES:
         _update("model_view_mode", value)
+
+
+def _valid_model_tree_path(value: Any) -> bool:
+    """Return whether *value* is one of the tree's stable branch identities."""
+    return isinstance(value, str) and (
+        value == "favorites" or (value.startswith("folder:") and len(value) > 7)
+    )
+
+
+def get_model_tree_collapsed_paths() -> set[str]:
+    """Return folder-tree branches the user explicitly collapsed on this OS."""
+    settings = load_settings()
+    raw = settings.get(_os_path_key("model_tree_collapsed_paths"))
+    if not isinstance(raw, list):
+        # Plain-key fallback keeps hand-written/early-development settings valid.
+        raw = settings.get("model_tree_collapsed_paths")
+    if not isinstance(raw, list):
+        return set()
+    return {value for value in raw if _valid_model_tree_path(value)}
+
+
+def set_model_tree_collapsed_paths(paths: set[str]) -> None:
+    """Persist the exact set of manually collapsed model-tree branches."""
+    clean = {value for value in paths if _valid_model_tree_path(value)}
+    settings = load_settings()
+    settings[_os_path_key("model_tree_collapsed_paths")] = sorted(
+        clean, key=str.casefold
+    )
+    save_settings(settings)
 
 
 # ---------------------------------------------------------------------------

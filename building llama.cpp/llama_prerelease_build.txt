@@ -1,0 +1,145 @@
+# PowerShell build recipe for llama.cpp semantic-version pre-releases.
+#
+# Default: https://github.com/ggml-org/llama.cpp/releases/tag/v0.1.2
+# Output:  L:\LAB\ai-local\v0.1.2_llama.cpp
+#
+# IMPORTANT: This intentionally performs a full-history clone. llama.cpp derives
+# its numeric compatibility build from `git rev-list --count HEAD`; a shallow
+# clone would report build 1 and make AutoTuner reject profiles requiring a
+# current b-number even though the source itself is current.
+
+param(
+    [ValidatePattern('^v\d+\.\d+\.\d+$')]
+    [string]$Tag = "v0.1.2",
+    [string]$Workspace = "L:\LAB\ai-local",
+    [string]$Generator = "Visual Studio 18 2026",
+    [ValidateRange(1, 256)]
+    [int]$Parallel = 20
+)
+
+$ErrorActionPreference = "Stop"
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][scriptblock]$Command
+    )
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+}
+
+if (-not (Test-Path $Workspace -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
+}
+Set-Location (Resolve-Path $Workspace)
+
+$version = $Tag.Substring(1)
+$dir = "${Tag}_llama.cpp"
+$repo = Join-Path (Get-Location) $dir
+if (Test-Path $repo) {
+    throw "Build directory already exists; nothing was removed: $repo"
+}
+
+# Keep the Vulkan shader headers independent from the versioned llama.cpp tree.
+$spirv = Join-Path (Get-Location) "SPIRV-Headers"
+if (-not (Test-Path "$spirv\.git")) {
+    Invoke-NativeChecked "SPIRV-Headers clone" {
+        git clone https://github.com/KhronosGroup/SPIRV-Headers.git $spirv
+    }
+} else {
+    Invoke-NativeChecked "SPIRV-Headers update" { git -C $spirv pull --ff-only }
+}
+
+$spirvInstall = (Join-Path $spirv "install").Replace('\', '/')
+Invoke-NativeChecked "SPIRV-Headers configure" {
+    cmake -S $spirv -B "$spirv\build" `
+        -G $Generator `
+        -A x64 `
+        "-DCMAKE_INSTALL_PREFIX=$spirvInstall"
+}
+Invoke-NativeChecked "SPIRV-Headers build" {
+    cmake --build "$spirv\build" --config Release --parallel $Parallel
+}
+Invoke-NativeChecked "SPIRV-Headers install" {
+    cmake --install "$spirv\build" --config Release
+}
+
+# Clone the exact semantic release tag. Do NOT add --depth: the commit count is
+# embedded in `llama-server --version` and AutoTuner uses it for feature gates.
+$tmp = Join-Path (Get-Location) "_tmp_${Tag}_llama_$PID"
+if (Test-Path $tmp) {
+    throw "Staging directory already exists: $tmp"
+}
+Invoke-NativeChecked "llama.cpp $Tag clone" {
+    git clone --branch $Tag --single-branch https://github.com/ggml-org/llama.cpp.git $tmp
+}
+
+$resolvedTag = (git -C $tmp describe --tags --exact-match HEAD 2>$null).Trim()
+if ($LASTEXITCODE -ne 0 -or $resolvedTag -ne $Tag) {
+    throw "Checkout is not the requested exact tag $Tag (found '$resolvedTag')"
+}
+$commit = (git -C $tmp rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $commit) {
+    throw "Could not determine the llama.cpp commit"
+}
+$expectedBuild = [int](git -C $tmp rev-list --count HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $expectedBuild -lt 1000) {
+    throw "History is incomplete; refusing to embed suspicious build number $expectedBuild"
+}
+
+Rename-Item $tmp $dir
+Write-Host "==> Build directory: $repo ($Tag, build $expectedBuild, commit $commit)"
+
+Push-Location "$repo\tools\ui"
+try {
+    Invoke-NativeChecked "Web UI dependency install" { npm ci }
+    Invoke-NativeChecked "Web UI build" { npm run build }
+} finally {
+    Pop-Location
+}
+
+Invoke-NativeChecked "llama.cpp configure" {
+    cmake -S $repo -B "$repo\build" `
+        -G $Generator `
+        -A x64 `
+        -DLLAMA_BUILD_IS_DEV=OFF `
+        -DGGML_VULKAN=ON `
+        -DGGML_NATIVE=OFF `
+        -DGGML_AVX2=ON `
+        -DGGML_FMA=ON `
+        -DGGML_F16C=ON `
+        -DBUILD_SHARED_LIBS=OFF `
+        -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
+        -DLLAMA_BUILD_SERVER=ON `
+        -DLLAMA_BUILD_UI=ON `
+        -DLLAMA_USE_PREBUILT_UI=OFF `
+        -DLLAMA_CURL=OFF `
+        -DGGML_CCACHE=OFF `
+        -DGGML_VULKAN_CHECK_RESULTS=OFF `
+        "-DCMAKE_PREFIX_PATH=$spirvInstall"
+}
+Invoke-NativeChecked "llama.cpp build" {
+    cmake --build "$repo\build" --config Release --parallel $Parallel
+}
+
+$server = "$repo\build\bin\Release\llama-server.exe"
+$versionOutput = (& $server --version 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "llama-server smoke test failed with exit code $LASTEXITCODE"
+}
+Write-Host $versionOutput
+$versionPattern = "(?im)^\s*version:\s*$([regex]::Escape($version))\s+\(build\s+(\d+),"
+$versionMatch = [regex]::Match($versionOutput, $versionPattern)
+if (-not $versionMatch.Success) {
+    throw "Expected semantic version $version with an explicit numeric build in --version output"
+}
+$reportedBuild = [int]$versionMatch.Groups[1].Value
+if ($reportedBuild -ne $expectedBuild) {
+    throw "History/build mismatch: git count $expectedBuild, llama-server reports $reportedBuild"
+}
+
+Write-Host ""
+Write-Host "Success: $server"
+Write-Host "AutoTuner discovers this build as '$dir' and reads compatibility build b$reportedBuild."

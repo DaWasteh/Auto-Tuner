@@ -4025,8 +4025,8 @@ class MainWindow(QMainWindow):
         self._favorite_models = app_settings.get_favorite_models()
         self._model_view_mode = app_settings.get_model_view_mode()
         # New folders start expanded. Explicit collapses survive filtering,
-        # rescans, and favorite changes for the rest of the session.
-        self._tree_collapsed_paths: set[str] = set()
+        # rescans, view switches, favorite changes, and application restarts.
+        self._tree_collapsed_paths = app_settings.get_model_tree_collapsed_paths()
         self._tree_native_toggle_item: Optional[QTreeWidgetItem] = None
         self._tree_manual_toggle = False
         # Rebuilding a QTreeWidget synchronously inside its item delegate's
@@ -6328,10 +6328,15 @@ class MainWindow(QMainWindow):
         key = item.data(0, _TREE_PATH_ROLE)
         if not isinstance(key, str) or not key:
             return
-        if expanded:
-            self._tree_collapsed_paths.discard(key)
-        else:
+        changed = False
+        if expanded and key in self._tree_collapsed_paths:
+            self._tree_collapsed_paths.remove(key)
+            changed = True
+        elif not expanded and key not in self._tree_collapsed_paths:
             self._tree_collapsed_paths.add(key)
+            changed = True
+        if changed:
+            app_settings.set_model_tree_collapsed_paths(self._tree_collapsed_paths)
 
     def _on_tree_expansion_changed(self, item: QTreeWidgetItem, expanded: bool) -> None:
         """Remember expansion and distinguish native arrow clicks from labels."""
@@ -9529,22 +9534,28 @@ class MainWindow(QMainWindow):
 
 # ---------------------------------------------------------------------------
 def _run_model_tree_interaction_smoke(app: QApplication, settings_path: Path) -> None:
-    """Exercise the crash-prone tree favorite event through production slots."""
-    root = Path(tempfile.gettempdir()) / "autotuner-model-tree-smoke"
+    """Exercise crash-safe favorites and persistent folder expansion end to end."""
+    temp_state = tempfile.TemporaryDirectory(prefix="autotuner-model-tree-smoke-")
+    root = Path(temp_state.name)
     entry = ModelEntry(
         path=root / "Alibaba" / "Qwen3.6" / "Qwen3.6-27B-Q4_K_M.gguf",
         name="Qwen3.6-27B-Q4_K_M",
         group="Alibaba/Qwen3.6",
         size_bytes=1 * 1024**3,
     )
-    window = MainWindow(root, settings_path, start_background=False)
+    original_settings_file = app_settings._settings_file
     original_set_favorite = app_settings.set_model_favorite
     persisted: List[Tuple[Path, bool]] = []
+    windows: List[MainWindow] = []
     try:
-        # The smoke test must never modify a user's portable settings file.
+        # The smoke test must never read or modify a user's portable settings.
+        app_settings._settings_file = lambda: root / "autotuner_settings.json"
         app_settings.set_model_favorite = lambda path, favorite: persisted.append(
             (path, favorite)
         )
+
+        window = MainWindow(root, settings_path, start_background=False)
+        windows.append(window)
         window._favorite_models = set()
         window._all_entries = [entry]
         window._last_scan_roots = [root]
@@ -9587,10 +9598,65 @@ def _run_model_tree_interaction_smoke(app: QApplication, settings_path: Path) ->
             raise RuntimeError("deferred tree favorite refresh did not complete")
         if persisted != [(entry.path, True)]:
             raise RuntimeError("tree favorite state was not persisted exactly once")
-    finally:
-        app_settings.set_model_favorite = original_set_favorite
+
+        # Collapse through the same label-click production slot used by the UI,
+        # then prove a view switch leaves the user's choice untouched.
+        vendor_folder = window._model_tree.topLevelItem(1)
+        collapsed_key = vendor_folder.data(0, _TREE_PATH_ROLE)
+        window._on_tree_item_clicked(vendor_folder, 0)
+        if vendor_folder.isExpanded():
+            raise RuntimeError("folder label click did not collapse the branch")
+        if app_settings.get_model_tree_collapsed_paths() != {collapsed_key}:
+            raise RuntimeError("collapsed folder state was not persisted")
+        window._set_model_view("list", persist=False)
+        window._set_model_view("tree", persist=False)
+        if vendor_folder.isExpanded():
+            raise RuntimeError("view switch forgot the collapsed folder state")
+
         window.deleteLater()
         app.processEvents()
+        windows.remove(window)
+
+        # Recreate the real MainWindow to exercise the application-restart path.
+        restored = MainWindow(root, settings_path, start_background=False)
+        windows.append(restored)
+        restored._favorite_models = set()
+        restored._all_entries = [entry]
+        restored._last_scan_roots = [root]
+        restored._populate_list(restored._all_entries)
+        restored._set_model_view("tree", persist=False)
+        restored_vendor = restored._model_tree.topLevelItem(1)
+        if restored_vendor.isExpanded():
+            raise RuntimeError("application restart forgot the collapsed folder state")
+
+        # Opening the branch is a manual state change too: it must clear the
+        # persisted collapse so the next restart starts that branch open.
+        restored._on_tree_item_clicked(restored_vendor, 0)
+        if not restored_vendor.isExpanded():
+            raise RuntimeError("folder label click did not expand the branch")
+        if app_settings.get_model_tree_collapsed_paths():
+            raise RuntimeError("expanded folder remained persisted as collapsed")
+
+        restored.deleteLater()
+        app.processEvents()
+        windows.remove(restored)
+
+        reopened = MainWindow(root, settings_path, start_background=False)
+        windows.append(reopened)
+        reopened._favorite_models = set()
+        reopened._all_entries = [entry]
+        reopened._last_scan_roots = [root]
+        reopened._populate_list(reopened._all_entries)
+        reopened._set_model_view("tree", persist=False)
+        if not reopened._model_tree.topLevelItem(1).isExpanded():
+            raise RuntimeError("application restart forgot the expanded folder state")
+    finally:
+        app_settings.set_model_favorite = original_set_favorite
+        app_settings._settings_file = original_settings_file
+        for window in windows:
+            window.deleteLater()
+        app.processEvents()
+        temp_state.cleanup()
 
 
 def main(argv: Optional[List[str]] = None) -> None:
