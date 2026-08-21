@@ -1477,7 +1477,7 @@
 |---|---|
 | `GGUF.version` | `[3]` |
 | `GGUF.tensor_count` | `[866]` |
-| `GGUF.kv_count` | `[51]` |
+| `GGUF.kv_count` | `[50]` |
 | `general.architecture` | `[113 119 101 110  51  53]` |
 | `general.type` | `[109 111 100 101 108]` |
 | `general.sampling.top_k` | `[20]` |
@@ -1523,11 +1523,10 @@
 | `tokenizer.ggml.padding_token_id` | `[248055]` |
 | `tokenizer.ggml.bos_token_id` | `[248044]` |
 | `general.quantization_version` | `[2]` |
-| `general.file_type` | `[14]` |
+| `general.file_type` | `[13]` |
 | `quantize.imatrix.file` | *Siehe Code-Block unten* |
-| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
 | `quantize.imatrix.entries_count` | `[496]` |
-| `quantize.imatrix.chunks_count` | `[45]` |
+| `quantize.imatrix.chunks_count` | `[1251]` |
 | `tokenizer.chat_template` | *Siehe Code-Block unten* |
 
 **general.description:**
@@ -1560,19 +1559,9 @@
 
 **quantize.imatrix.file:**
 ```jinja
-[ 47 109 110 116  47 100 105 115 107 115  47 117 110 115 108 111 116 104
-  97 105  47 117  98 117 110 116 117  47 119 111 114 107 115 112  97  99
- 101  95  51  57  47 107 108 100  95 109 111 100 101 108 115  47 113 119
- 101 110  51  56  45  50  55  98  45 103 103 117 102  47 105 109  97 116
- 114 105 120  47  81 119 101 110  51  46  56  45  50  55  66  45  71  71
-  85  70  47 105 109  97 116 114 105 120  95 117 110 115 108 111 116 104
-  46 103 103 117 102]
-```
-
-**quantize.imatrix.dataset:**
-```jinja
-[117 110 115 108 111 116 104  95  99  97 108 105  98 114  97 116 105 111
- 110  95  81 119 101 110  51  46  56  45  50  55  66  46 116 120 116]
+[ 81 119 101 110  51  46  56  45  50  55  66  45  71  71  85  70  47 105
+ 109  97 116 114 105 120  95 117 110 115 108 111 116 104  46 103 103 117
+ 102]
 ```
 
 **tokenizer.chat_template:**
@@ -1589,7 +1578,7 @@
 |---|---|
 | `GGUF.version` | `[3]` |
 | `GGUF.tensor_count` | `[866]` |
-| `GGUF.kv_count` | `[51]` |
+| `GGUF.kv_count` | `[50]` |
 | `general.architecture` | `[113 119 101 110  51  53]` |
 | `general.type` | `[109 111 100 101 108]` |
 | `general.sampling.top_k` | `[20]` |
@@ -1635,11 +1624,10 @@
 | `tokenizer.ggml.padding_token_id` | `[248055]` |
 | `tokenizer.ggml.bos_token_id` | `[248044]` |
 | `general.quantization_version` | `[2]` |
-| `general.file_type` | `[14]` |
+| `general.file_type` | `[15]` |
 | `quantize.imatrix.file` | *Siehe Code-Block unten* |
-| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
 | `quantize.imatrix.entries_count` | `[496]` |
-| `quantize.imatrix.chunks_count` | `[45]` |
+| `quantize.imatrix.chunks_count` | `[1251]` |
 | `tokenizer.chat_template` | *Siehe Code-Block unten* |
 
 **general.description:**
@@ -1672,19 +1660,9 @@
 
 **quantize.imatrix.file:**
 ```jinja
-[ 47 109 110 116  47 100 105 115 107 115  47 117 110 115 108 111 116 104
-  97 105  47 117  98 117 110 116 117  47 119 111 114 107 115 112  97  99
- 101  95  51  57  47 107 108 100  95 109 111 100 101 108 115  47 113 119
- 101 110  51  56  45  50  55  98  45 103 103 117 102  47 105 109  97 116
- 114 105 120  47  81 119 101 110  51  46  56  45  50  55  66  45  71  71
-  85  70  47 105 109  97 116 114 105 120  95 117 110 115 108 111 116 104
-  46 103 103 117 102]
-```
-
-**quantize.imatrix.dataset:**
-```jinja
-[117 110 115 108 111 116 104  95  99  97 108 105  98 114  97 116 105 111
- 110  95  81 119 101 110  51  46  56  45  50  55  66  46 116 120 116]
+[ 81 119 101 110  51  46  56  45  50  55  66  45  71  71  85  70  47 105
+ 109  97 116 114 105 120  95 117 110 115 108 111 116 104  46 103 103 117
+ 102]
 ```
 
 **tokenizer.chat_template:**
@@ -1701,7 +1679,7 @@
 |---|---|
 | `GGUF.version` | `[3]` |
 | `GGUF.tensor_count` | `[866]` |
-| `GGUF.kv_count` | `[51]` |
+| `GGUF.kv_count` | `[50]` |
 | `general.architecture` | `[113 119 101 110  51  53]` |
 | `general.type` | `[109 111 100 101 108]` |
 | `general.sampling.top_k` | `[20]` |
@@ -1747,11 +1725,10 @@
 | `tokenizer.ggml.padding_token_id` | `[248055]` |
 | `tokenizer.ggml.bos_token_id` | `[248044]` |
 | `general.quantization_version` | `[2]` |
-| `general.file_type` | `[14]` |
+| `general.file_type` | `[17]` |
 | `quantize.imatrix.file` | *Siehe Code-Block unten* |
-| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
 | `quantize.imatrix.entries_count` | `[496]` |
-| `quantize.imatrix.chunks_count` | `[45]` |
+| `quantize.imatrix.chunks_count` | `[1251]` |
 | `tokenizer.chat_template` | *Siehe Code-Block unten* |
 
 **general.description:**
@@ -1784,19 +1761,9 @@
 
 **quantize.imatrix.file:**
 ```jinja
-[ 47 109 110 116  47 100 105 115 107 115  47 117 110 115 108 111 116 104
-  97 105  47 117  98 117 110 116 117  47 119 111 114 107 115 112  97  99
- 101  95  51  57  47 107 108 100  95 109 111 100 101 108 115  47 113 119
- 101 110  51  56  45  50  55  98  45 103 103 117 102  47 105 109  97 116
- 114 105 120  47  81 119 101 110  51  46  56  45  50  55  66  45  71  71
-  85  70  47 105 109  97 116 114 105 120  95 117 110 115 108 111 116 104
-  46 103 103 117 102]
-```
-
-**quantize.imatrix.dataset:**
-```jinja
-[117 110 115 108 111 116 104  95  99  97 108 105  98 114  97 116 105 111
- 110  95  81 119 101 110  51  46  56  45  50  55  66  46 116 120 116]
+[ 81 119 101 110  51  46  56  45  50  55  66  45  71  71  85  70  47 105
+ 109  97 116 114 105 120  95 117 110 115 108 111 116 104  46 103 103 117
+ 102]
 ```
 
 **tokenizer.chat_template:**
@@ -1813,7 +1780,7 @@
 |---|---|
 | `GGUF.version` | `[3]` |
 | `GGUF.tensor_count` | `[866]` |
-| `GGUF.kv_count` | `[51]` |
+| `GGUF.kv_count` | `[50]` |
 | `general.architecture` | `[113 119 101 110  51  53]` |
 | `general.type` | `[109 111 100 101 108]` |
 | `general.sampling.top_k` | `[20]` |
@@ -1859,11 +1826,10 @@
 | `tokenizer.ggml.padding_token_id` | `[248055]` |
 | `tokenizer.ggml.bos_token_id` | `[248044]` |
 | `general.quantization_version` | `[2]` |
-| `general.file_type` | `[14]` |
+| `general.file_type` | `[18]` |
 | `quantize.imatrix.file` | *Siehe Code-Block unten* |
-| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
 | `quantize.imatrix.entries_count` | `[496]` |
-| `quantize.imatrix.chunks_count` | `[45]` |
+| `quantize.imatrix.chunks_count` | `[1251]` |
 | `tokenizer.chat_template` | *Siehe Code-Block unten* |
 
 **general.description:**
@@ -1896,19 +1862,9 @@
 
 **quantize.imatrix.file:**
 ```jinja
-[ 47 109 110 116  47 100 105 115 107 115  47 117 110 115 108 111 116 104
-  97 105  47 117  98 117 110 116 117  47 119 111 114 107 115 112  97  99
- 101  95  51  57  47 107 108 100  95 109 111 100 101 108 115  47 113 119
- 101 110  51  56  45  50  55  98  45 103 103 117 102  47 105 109  97 116
- 114 105 120  47  81 119 101 110  51  46  56  45  50  55  66  45  71  71
-  85  70  47 105 109  97 116 114 105 120  95 117 110 115 108 111 116 104
-  46 103 103 117 102]
-```
-
-**quantize.imatrix.dataset:**
-```jinja
-[117 110 115 108 111 116 104  95  99  97 108 105  98 114  97 116 105 111
- 110  95  81 119 101 110  51  46  56  45  50  55  66  46 116 120 116]
+[ 81 119 101 110  51  46  56  45  50  55  66  45  71  71  85  70  47 105
+ 109  97 116 114 105 120  95 117 110 115 108 111 116 104  46 103 103 117
+ 102]
 ```
 
 **tokenizer.chat_template:**
@@ -2703,148 +2659,6 @@
 [117 110 115 108 111 116 104  95  99  97 108 105  98 114  97 116 105 111
  110  95  78 111 114 116 104  45  77 105 110 105  45  67 111 100 101  45
   49  46  48  46 116 120 116]
-```
-
----
-
-## ornith-1.0-35b-Q6_K.gguf
-**Pfad:** `deepreinforce-ai\ornith-1.0-35b-Q6_K.gguf`
-
-| Metadaten-Schlüssel | Wert |
-|---|---|
-| `GGUF.version` | `[3]` |
-| `GGUF.tensor_count` | `[733]` |
-| `GGUF.kv_count` | `[44]` |
-| `general.architecture` | `[113 119 101 110  51  53 109 111 101]` |
-| `general.type` | `[109 111 100 101 108]` |
-| `general.sampling.top_k` | `[20]` |
-| `general.sampling.top_p` | `[0.95]` |
-| `general.sampling.temp` | `[1.]` |
-| `general.name` | `[ 79 114 110 105 116 104  32  49  46  48  32  51  53  66]` |
-| `general.basename` | `[ 79 114 110 105 116 104  45  49  46  48]` |
-| `general.size_label` | `[51 53 66]` |
-| `qwen35moe.block_count` | `[40]` |
-| `qwen35moe.context_length` | `[262144]` |
-| `qwen35moe.embedding_length` | `[2048]` |
-| `qwen35moe.attention.head_count` | `[16]` |
-| `qwen35moe.attention.head_count_kv` | `[2]` |
-| `qwen35moe.rope.dimension_sections` | `[0]` |
-| `qwen35moe.rope.freq_base` | `[1.e+07]` |
-| `qwen35moe.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
-| `qwen35moe.expert_count` | `[256]` |
-| `qwen35moe.expert_used_count` | `[8]` |
-| `qwen35moe.attention.key_length` | `[256]` |
-| `qwen35moe.attention.value_length` | `[256]` |
-| `qwen35moe.expert_feed_forward_length` | `[512]` |
-| `qwen35moe.expert_shared_feed_forward_length` | `[512]` |
-| `qwen35moe.ssm.conv_kernel` | `[4]` |
-| `qwen35moe.ssm.state_size` | `[128]` |
-| `qwen35moe.ssm.group_count` | `[16]` |
-| `qwen35moe.ssm.time_step_rank` | `[32]` |
-| `qwen35moe.ssm.inner_size` | `[4096]` |
-| `qwen35moe.full_attention_interval` | `[4]` |
-| `qwen35moe.rope.dimension_count` | `[64]` |
-| `tokenizer.ggml.model` | `[103 112 116  50]` |
-| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
-| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
-| `tokenizer.ggml.token_type` | `[5]` |
-| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
-| `tokenizer.ggml.eos_token_id` | `[248046]` |
-| `tokenizer.ggml.padding_token_id` | `[248044]` |
-| `tokenizer.ggml.bos_token_id` | `[248044]` |
-| `tokenizer.chat_template` | *Siehe Code-Block unten* |
-| `general.quantization_version` | `[2]` |
-| `general.file_type` | `[18]` |
-| `quantize.imatrix.file` | *Siehe Code-Block unten* |
-| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
-| `quantize.imatrix.entries_count` | `[510]` |
-| `quantize.imatrix.chunks_count` | `[1608]` |
-
-**tokenizer.ggml.merges:**
-```jinja
-[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
- 195 163 196 163 196 187  32 195 163 196 163 196 173]
-```
-
-**tokenizer.chat_template:**
-```jinja
-[123  37  45 ...  37 125  10]
-```
-
-**quantize.imatrix.file:**
-```jinja
-[111 114 110 105 116 104  95  51  53  98  47 105 109  97 116 114 105 120
-  46 100  97 116]
-```
-
-**quantize.imatrix.dataset:**
-```jinja
-[ 47 109 103 102 115  47 115 104  97 114 101 100  47  71 114 111 117 112
-  95  71  89  47 119 101 110  99 104  97 111  47 115 101  47 103 103 117
- 102  47  99  97 108 105  98 114  97 116 105 111 110  95  51  53  98  95
-  56  48  48 107  46 116 120 116]
-```
-
----
-
-## ornith-1.0-35b-Q8_0.gguf
-**Pfad:** `deepreinforce-ai\ornith-1.0-35b-Q8_0.gguf`
-
-| Metadaten-Schlüssel | Wert |
-|---|---|
-| `GGUF.version` | `[3]` |
-| `GGUF.tensor_count` | `[733]` |
-| `GGUF.kv_count` | `[40]` |
-| `general.architecture` | `[113 119 101 110  51  53 109 111 101]` |
-| `general.type` | `[109 111 100 101 108]` |
-| `general.sampling.top_k` | `[20]` |
-| `general.sampling.top_p` | `[0.95]` |
-| `general.sampling.temp` | `[1.]` |
-| `general.name` | `[ 79 114 110 105 116 104  32  49  46  48  32  51  53  66]` |
-| `general.basename` | `[ 79 114 110 105 116 104  45  49  46  48]` |
-| `general.size_label` | `[51 53 66]` |
-| `qwen35moe.block_count` | `[40]` |
-| `qwen35moe.context_length` | `[262144]` |
-| `qwen35moe.embedding_length` | `[2048]` |
-| `qwen35moe.attention.head_count` | `[16]` |
-| `qwen35moe.attention.head_count_kv` | `[2]` |
-| `qwen35moe.rope.dimension_sections` | `[0]` |
-| `qwen35moe.rope.freq_base` | `[1.e+07]` |
-| `qwen35moe.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
-| `qwen35moe.expert_count` | `[256]` |
-| `qwen35moe.expert_used_count` | `[8]` |
-| `qwen35moe.attention.key_length` | `[256]` |
-| `qwen35moe.attention.value_length` | `[256]` |
-| `qwen35moe.expert_feed_forward_length` | `[512]` |
-| `qwen35moe.expert_shared_feed_forward_length` | `[512]` |
-| `qwen35moe.ssm.conv_kernel` | `[4]` |
-| `qwen35moe.ssm.state_size` | `[128]` |
-| `qwen35moe.ssm.group_count` | `[16]` |
-| `qwen35moe.ssm.time_step_rank` | `[32]` |
-| `qwen35moe.ssm.inner_size` | `[4096]` |
-| `qwen35moe.full_attention_interval` | `[4]` |
-| `qwen35moe.rope.dimension_count` | `[64]` |
-| `tokenizer.ggml.model` | `[103 112 116  50]` |
-| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
-| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
-| `tokenizer.ggml.token_type` | `[5]` |
-| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
-| `tokenizer.ggml.eos_token_id` | `[248046]` |
-| `tokenizer.ggml.padding_token_id` | `[248044]` |
-| `tokenizer.ggml.bos_token_id` | `[248044]` |
-| `tokenizer.chat_template` | *Siehe Code-Block unten* |
-| `general.quantization_version` | `[2]` |
-| `general.file_type` | `[7]` |
-
-**tokenizer.ggml.merges:**
-```jinja
-[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
- 195 163 196 163 196 187  32 195 163 196 163 196 173]
-```
-
-**tokenizer.chat_template:**
-```jinja
-[123  37  45 ...  37 125  10]
 ```
 
 ---
@@ -6451,6 +6265,480 @@
 **tokenizer.chat_template:**
 ```jinja
 [123  35  32 ...  32  35 125]
+```
+
+---
+
+## mmproj-Ornith-1.5-35B-BF16.gguf
+**Pfad:** `ornith-ai\mmproj-Ornith-1.5-35B-BF16.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[334]` |
+| `GGUF.kv_count` | `[26]` |
+| `general.architecture` | `[ 99 108 105 112]` |
+| `general.type` | `[109 109 112 114 111 106]` |
+| `general.sampling.top_k` | `[20]` |
+| `general.sampling.top_p` | `[0.95]` |
+| `general.sampling.temp` | `[1.]` |
+| `general.name` | `[51 53 98 32 52 48 48 48]` |
+| `general.version` | `[52 48 48 48]` |
+| `general.finetune` | `[51 53 98]` |
+| `general.size_label` | `[52 52 55 77]` |
+| `general.file_type` | `[32]` |
+| `clip.has_vision_encoder` | `[ True]` |
+| `clip.vision.projection_dim` | `[2048]` |
+| `clip.vision.image_size` | `[768]` |
+| `clip.vision.patch_size` | `[16]` |
+| `clip.vision.embedding_length` | `[1152]` |
+| `clip.vision.feed_forward_length` | `[4304]` |
+| `clip.vision.block_count` | `[27]` |
+| `clip.vision.attention.head_count` | `[16]` |
+| `clip.vision.image_mean` | `[0.5]` |
+| `clip.vision.image_std` | `[0.5]` |
+| `clip.projector_type` | `[113 119 101 110  51 118 108  95 109 101 114 103 101 114]` |
+| `clip.use_gelu` | `[ True]` |
+| `clip.vision.spatial_merge_size` | `[2]` |
+| `clip.vision.attention.layer_norm_epsilon` | `[1.e-06]` |
+| `clip.vision.is_deepstack_layers` | `[False]` |
+| `general.quantization_version` | `[2]` |
+
+---
+
+## mmproj-Ornith-1.5-9B-BF16.gguf
+**Pfad:** `ornith-ai\mmproj-Ornith-1.5-9B-BF16.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[334]` |
+| `GGUF.kv_count` | `[22]` |
+| `general.architecture` | `[ 99 108 105 112]` |
+| `general.type` | `[109 109 112 114 111 106]` |
+| `general.name` | `[ 57  98  32  67 107 112 116  49  48  48  48]` |
+| `general.finetune` | `[ 57  98  45  99 107 112 116  49  48  48  48]` |
+| `general.size_label` | `[52 53 54 77]` |
+| `general.file_type` | `[32]` |
+| `clip.has_vision_encoder` | `[ True]` |
+| `clip.vision.projection_dim` | `[4096]` |
+| `clip.vision.image_size` | `[768]` |
+| `clip.vision.patch_size` | `[16]` |
+| `clip.vision.embedding_length` | `[1152]` |
+| `clip.vision.feed_forward_length` | `[4304]` |
+| `clip.vision.block_count` | `[27]` |
+| `clip.vision.attention.head_count` | `[16]` |
+| `clip.vision.image_mean` | `[0.5]` |
+| `clip.vision.image_std` | `[0.5]` |
+| `clip.projector_type` | `[113 119 101 110  51 118 108  95 109 101 114 103 101 114]` |
+| `clip.use_gelu` | `[ True]` |
+| `clip.vision.spatial_merge_size` | `[2]` |
+| `clip.vision.attention.layer_norm_epsilon` | `[1.e-06]` |
+| `clip.vision.is_deepstack_layers` | `[False]` |
+| `general.quantization_version` | `[2]` |
+
+---
+
+## ornith-1.0-35b-Q6_K.gguf
+**Pfad:** `ornith-ai\ornith-1.0-35b-Q6_K.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[733]` |
+| `GGUF.kv_count` | `[44]` |
+| `general.architecture` | `[113 119 101 110  51  53 109 111 101]` |
+| `general.type` | `[109 111 100 101 108]` |
+| `general.sampling.top_k` | `[20]` |
+| `general.sampling.top_p` | `[0.95]` |
+| `general.sampling.temp` | `[1.]` |
+| `general.name` | `[ 79 114 110 105 116 104  32  49  46  48  32  51  53  66]` |
+| `general.basename` | `[ 79 114 110 105 116 104  45  49  46  48]` |
+| `general.size_label` | `[51 53 66]` |
+| `qwen35moe.block_count` | `[40]` |
+| `qwen35moe.context_length` | `[262144]` |
+| `qwen35moe.embedding_length` | `[2048]` |
+| `qwen35moe.attention.head_count` | `[16]` |
+| `qwen35moe.attention.head_count_kv` | `[2]` |
+| `qwen35moe.rope.dimension_sections` | `[0]` |
+| `qwen35moe.rope.freq_base` | `[1.e+07]` |
+| `qwen35moe.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
+| `qwen35moe.expert_count` | `[256]` |
+| `qwen35moe.expert_used_count` | `[8]` |
+| `qwen35moe.attention.key_length` | `[256]` |
+| `qwen35moe.attention.value_length` | `[256]` |
+| `qwen35moe.expert_feed_forward_length` | `[512]` |
+| `qwen35moe.expert_shared_feed_forward_length` | `[512]` |
+| `qwen35moe.ssm.conv_kernel` | `[4]` |
+| `qwen35moe.ssm.state_size` | `[128]` |
+| `qwen35moe.ssm.group_count` | `[16]` |
+| `qwen35moe.ssm.time_step_rank` | `[32]` |
+| `qwen35moe.ssm.inner_size` | `[4096]` |
+| `qwen35moe.full_attention_interval` | `[4]` |
+| `qwen35moe.rope.dimension_count` | `[64]` |
+| `tokenizer.ggml.model` | `[103 112 116  50]` |
+| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
+| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
+| `tokenizer.ggml.token_type` | `[5]` |
+| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
+| `tokenizer.ggml.eos_token_id` | `[248046]` |
+| `tokenizer.ggml.padding_token_id` | `[248044]` |
+| `tokenizer.ggml.bos_token_id` | `[248044]` |
+| `tokenizer.chat_template` | *Siehe Code-Block unten* |
+| `general.quantization_version` | `[2]` |
+| `general.file_type` | `[18]` |
+| `quantize.imatrix.file` | *Siehe Code-Block unten* |
+| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
+| `quantize.imatrix.entries_count` | `[510]` |
+| `quantize.imatrix.chunks_count` | `[1608]` |
+
+**tokenizer.ggml.merges:**
+```jinja
+[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
+ 195 163 196 163 196 187  32 195 163 196 163 196 173]
+```
+
+**tokenizer.chat_template:**
+```jinja
+[123  37  45 ...  37 125  10]
+```
+
+**quantize.imatrix.file:**
+```jinja
+[111 114 110 105 116 104  95  51  53  98  47 105 109  97 116 114 105 120
+  46 100  97 116]
+```
+
+**quantize.imatrix.dataset:**
+```jinja
+[ 47 109 103 102 115  47 115 104  97 114 101 100  47  71 114 111 117 112
+  95  71  89  47 119 101 110  99 104  97 111  47 115 101  47 103 103 117
+ 102  47  99  97 108 105  98 114  97 116 105 111 110  95  51  53  98  95
+  56  48  48 107  46 116 120 116]
+```
+
+---
+
+## ornith-1.0-35b-Q8_0.gguf
+**Pfad:** `ornith-ai\ornith-1.0-35b-Q8_0.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[733]` |
+| `GGUF.kv_count` | `[40]` |
+| `general.architecture` | `[113 119 101 110  51  53 109 111 101]` |
+| `general.type` | `[109 111 100 101 108]` |
+| `general.sampling.top_k` | `[20]` |
+| `general.sampling.top_p` | `[0.95]` |
+| `general.sampling.temp` | `[1.]` |
+| `general.name` | `[ 79 114 110 105 116 104  32  49  46  48  32  51  53  66]` |
+| `general.basename` | `[ 79 114 110 105 116 104  45  49  46  48]` |
+| `general.size_label` | `[51 53 66]` |
+| `qwen35moe.block_count` | `[40]` |
+| `qwen35moe.context_length` | `[262144]` |
+| `qwen35moe.embedding_length` | `[2048]` |
+| `qwen35moe.attention.head_count` | `[16]` |
+| `qwen35moe.attention.head_count_kv` | `[2]` |
+| `qwen35moe.rope.dimension_sections` | `[0]` |
+| `qwen35moe.rope.freq_base` | `[1.e+07]` |
+| `qwen35moe.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
+| `qwen35moe.expert_count` | `[256]` |
+| `qwen35moe.expert_used_count` | `[8]` |
+| `qwen35moe.attention.key_length` | `[256]` |
+| `qwen35moe.attention.value_length` | `[256]` |
+| `qwen35moe.expert_feed_forward_length` | `[512]` |
+| `qwen35moe.expert_shared_feed_forward_length` | `[512]` |
+| `qwen35moe.ssm.conv_kernel` | `[4]` |
+| `qwen35moe.ssm.state_size` | `[128]` |
+| `qwen35moe.ssm.group_count` | `[16]` |
+| `qwen35moe.ssm.time_step_rank` | `[32]` |
+| `qwen35moe.ssm.inner_size` | `[4096]` |
+| `qwen35moe.full_attention_interval` | `[4]` |
+| `qwen35moe.rope.dimension_count` | `[64]` |
+| `tokenizer.ggml.model` | `[103 112 116  50]` |
+| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
+| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
+| `tokenizer.ggml.token_type` | `[5]` |
+| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
+| `tokenizer.ggml.eos_token_id` | `[248046]` |
+| `tokenizer.ggml.padding_token_id` | `[248044]` |
+| `tokenizer.ggml.bos_token_id` | `[248044]` |
+| `tokenizer.chat_template` | *Siehe Code-Block unten* |
+| `general.quantization_version` | `[2]` |
+| `general.file_type` | `[7]` |
+
+**tokenizer.ggml.merges:**
+```jinja
+[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
+ 195 163 196 163 196 187  32 195 163 196 163 196 173]
+```
+
+**tokenizer.chat_template:**
+```jinja
+[123  37  45 ...  37 125  10]
+```
+
+---
+
+## Ornith-1.5-35B-Q4_K_M.gguf
+**Pfad:** `ornith-ai\Ornith-1.5-35B-Q4_K_M.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[753]` |
+| `GGUF.kv_count` | `[47]` |
+| `general.architecture` | `[113 119 101 110  51  53 109 111 101]` |
+| `general.type` | `[109 111 100 101 108]` |
+| `general.sampling.top_k` | `[20]` |
+| `general.sampling.top_p` | `[0.95]` |
+| `general.sampling.temp` | `[1.]` |
+| `general.name` | `[ 79 114 110 105 116 104  45  49  46  53  45  51  53  66]` |
+| `general.version` | `[52 48 48 48]` |
+| `general.finetune` | `[51 53 98]` |
+| `general.size_label` | `[ 50  53  54 120  50  46  54  66]` |
+| `qwen35moe.block_count` | `[41]` |
+| `qwen35moe.context_length` | `[262144]` |
+| `qwen35moe.embedding_length` | `[2048]` |
+| `qwen35moe.attention.head_count` | `[16]` |
+| `qwen35moe.attention.head_count_kv` | `[2]` |
+| `qwen35moe.rope.dimension_sections` | `[0]` |
+| `qwen35moe.rope.freq_base` | `[1.e+07]` |
+| `qwen35moe.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
+| `qwen35moe.expert_count` | `[256]` |
+| `qwen35moe.expert_used_count` | `[8]` |
+| `qwen35moe.attention.key_length` | `[256]` |
+| `qwen35moe.attention.value_length` | `[256]` |
+| `qwen35moe.expert_feed_forward_length` | `[512]` |
+| `qwen35moe.expert_shared_feed_forward_length` | `[512]` |
+| `qwen35moe.nextn_predict_layers` | `[1]` |
+| `qwen35moe.ssm.conv_kernel` | `[4]` |
+| `qwen35moe.ssm.state_size` | `[128]` |
+| `qwen35moe.ssm.group_count` | `[16]` |
+| `qwen35moe.ssm.time_step_rank` | `[32]` |
+| `qwen35moe.ssm.inner_size` | `[4096]` |
+| `qwen35moe.full_attention_interval` | `[4]` |
+| `qwen35moe.rope.dimension_count` | `[64]` |
+| `tokenizer.ggml.model` | `[103 112 116  50]` |
+| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
+| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
+| `tokenizer.ggml.token_type` | `[5]` |
+| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
+| `tokenizer.ggml.eos_token_id` | `[248046]` |
+| `tokenizer.ggml.padding_token_id` | `[248044]` |
+| `tokenizer.ggml.bos_token_id` | `[248044]` |
+| `tokenizer.ggml.add_bos_token` | `[False]` |
+| `tokenizer.chat_template` | *Siehe Code-Block unten* |
+| `general.quantization_version` | `[2]` |
+| `general.file_type` | `[15]` |
+| `quantize.imatrix.file` | *Siehe Code-Block unten* |
+| `quantize.imatrix.dataset` | *Siehe Code-Block unten* |
+| `quantize.imatrix.entries_count` | `[510]` |
+| `quantize.imatrix.chunks_count` | `[3636]` |
+
+**tokenizer.ggml.merges:**
+```jinja
+[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
+ 195 163 196 163 196 187  32 195 163 196 163 196 173]
+```
+
+**tokenizer.chat_template:**
+```jinja
+[123  37  45 ...  32  35 125]
+```
+
+**quantize.imatrix.file:**
+```jinja
+[ 47 109 103 102 115  47 115 104  97 114 101 100  47  71 114 111 117 112
+  95  71  89  47 119 101 110  99 104  97 111  47 103 103 117 102  95 119
+ 111 114 107  47 111 117 116  47  51  53  98  45  52  48  48  48  47  79
+ 114 110 105 116 104  45  49  46  53  45  51  53  66  46 105 109  97 116
+ 114 105 120  46 103 103 117 102]
+```
+
+**quantize.imatrix.dataset:**
+```jinja
+[ 47 109 103 102 115  47 115 104  97 114 101 100  47  71 114 111 117 112
+  95  71  89  47 119 101 110  99 104  97 111  47 103 103 117 102  95 119
+ 111 114 107  47  99  97 108 105  98  47 109 101 114 103 101 100  47 115
+ 104  97 114 100 115  45  51  53  98  45  52  48  48  48  47 115  95  48
+  48]
+```
+
+---
+
+## Ornith-1.5-35B-Q8_0.gguf
+**Pfad:** `ornith-ai\Ornith-1.5-35B-Q8_0.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[753]` |
+| `GGUF.kv_count` | `[43]` |
+| `general.architecture` | `[113 119 101 110  51  53 109 111 101]` |
+| `general.type` | `[109 111 100 101 108]` |
+| `general.sampling.top_k` | `[20]` |
+| `general.sampling.top_p` | `[0.95]` |
+| `general.sampling.temp` | `[1.]` |
+| `general.name` | `[ 79 114 110 105 116 104  45  49  46  53  45  51  53  66]` |
+| `general.version` | `[52 48 48 48]` |
+| `general.finetune` | `[51 53 98]` |
+| `general.size_label` | `[ 50  53  54 120  50  46  54  66]` |
+| `qwen35moe.block_count` | `[41]` |
+| `qwen35moe.context_length` | `[262144]` |
+| `qwen35moe.embedding_length` | `[2048]` |
+| `qwen35moe.attention.head_count` | `[16]` |
+| `qwen35moe.attention.head_count_kv` | `[2]` |
+| `qwen35moe.rope.dimension_sections` | `[0]` |
+| `qwen35moe.rope.freq_base` | `[1.e+07]` |
+| `qwen35moe.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
+| `qwen35moe.expert_count` | `[256]` |
+| `qwen35moe.expert_used_count` | `[8]` |
+| `qwen35moe.attention.key_length` | `[256]` |
+| `qwen35moe.attention.value_length` | `[256]` |
+| `qwen35moe.expert_feed_forward_length` | `[512]` |
+| `qwen35moe.expert_shared_feed_forward_length` | `[512]` |
+| `qwen35moe.nextn_predict_layers` | `[1]` |
+| `qwen35moe.ssm.conv_kernel` | `[4]` |
+| `qwen35moe.ssm.state_size` | `[128]` |
+| `qwen35moe.ssm.group_count` | `[16]` |
+| `qwen35moe.ssm.time_step_rank` | `[32]` |
+| `qwen35moe.ssm.inner_size` | `[4096]` |
+| `qwen35moe.full_attention_interval` | `[4]` |
+| `qwen35moe.rope.dimension_count` | `[64]` |
+| `tokenizer.ggml.model` | `[103 112 116  50]` |
+| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
+| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
+| `tokenizer.ggml.token_type` | `[5]` |
+| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
+| `tokenizer.ggml.eos_token_id` | `[248046]` |
+| `tokenizer.ggml.padding_token_id` | `[248044]` |
+| `tokenizer.ggml.bos_token_id` | `[248044]` |
+| `tokenizer.ggml.add_bos_token` | `[False]` |
+| `tokenizer.chat_template` | *Siehe Code-Block unten* |
+| `general.quantization_version` | `[2]` |
+| `general.file_type` | `[7]` |
+
+**tokenizer.ggml.merges:**
+```jinja
+[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
+ 195 163 196 163 196 187  32 195 163 196 163 196 173]
+```
+
+**tokenizer.chat_template:**
+```jinja
+[123  37  45 ...  32  35 125]
+```
+
+---
+
+## Ornith-1.5-9B-BF16.gguf
+**Pfad:** `ornith-ai\Ornith-1.5-9B-BF16.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[427]` |
+| `GGUF.kv_count` | `[33]` |
+| `general.architecture` | `[113 119 101 110  51  53]` |
+| `general.type` | `[109 111 100 101 108]` |
+| `general.name` | `[ 79 114 110 105 116 104  45  49  46  53  45  57  66]` |
+| `general.finetune` | `[ 57  98  45  99 107 112 116  49  48  48  48]` |
+| `general.size_label` | `[57 46 48 66]` |
+| `qwen35.block_count` | `[32]` |
+| `qwen35.context_length` | `[262144]` |
+| `qwen35.embedding_length` | `[4096]` |
+| `qwen35.feed_forward_length` | `[12288]` |
+| `qwen35.attention.head_count` | `[16]` |
+| `qwen35.attention.head_count_kv` | `[4]` |
+| `qwen35.rope.dimension_sections` | `[0]` |
+| `qwen35.rope.freq_base` | `[1.e+07]` |
+| `qwen35.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
+| `qwen35.attention.key_length` | `[256]` |
+| `qwen35.attention.value_length` | `[256]` |
+| `general.file_type` | `[32]` |
+| `qwen35.ssm.conv_kernel` | `[4]` |
+| `qwen35.ssm.state_size` | `[128]` |
+| `qwen35.ssm.group_count` | `[16]` |
+| `qwen35.ssm.time_step_rank` | `[32]` |
+| `qwen35.ssm.inner_size` | `[4096]` |
+| `qwen35.full_attention_interval` | `[4]` |
+| `qwen35.rope.dimension_count` | `[64]` |
+| `general.quantization_version` | `[2]` |
+| `tokenizer.ggml.model` | `[103 112 116  50]` |
+| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
+| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
+| `tokenizer.ggml.token_type` | `[5]` |
+| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
+| `tokenizer.ggml.eos_token_id` | `[248046]` |
+| `tokenizer.ggml.padding_token_id` | `[248044]` |
+| `tokenizer.chat_template` | *Siehe Code-Block unten* |
+
+**tokenizer.ggml.merges:**
+```jinja
+[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
+ 195 163 196 163 196 187  32 195 163 196 163 196 173]
+```
+
+**tokenizer.chat_template:**
+```jinja
+[123  37  45 ...  32  35 125]
+```
+
+---
+
+## Ornith-1.5-9B-Q8_0.gguf
+**Pfad:** `ornith-ai\Ornith-1.5-9B-Q8_0.gguf`
+
+| Metadaten-Schlüssel | Wert |
+|---|---|
+| `GGUF.version` | `[3]` |
+| `GGUF.tensor_count` | `[427]` |
+| `GGUF.kv_count` | `[33]` |
+| `general.architecture` | `[113 119 101 110  51  53]` |
+| `general.type` | `[109 111 100 101 108]` |
+| `general.name` | `[ 79 114 110 105 116 104  45  49  46  53  45  57  66]` |
+| `general.finetune` | `[ 57  98  45  99 107 112 116  49  48  48  48]` |
+| `general.size_label` | `[57 46 48 66]` |
+| `qwen35.block_count` | `[32]` |
+| `qwen35.context_length` | `[262144]` |
+| `qwen35.embedding_length` | `[4096]` |
+| `qwen35.feed_forward_length` | `[12288]` |
+| `qwen35.attention.head_count` | `[16]` |
+| `qwen35.attention.head_count_kv` | `[4]` |
+| `qwen35.rope.dimension_sections` | `[0]` |
+| `qwen35.rope.freq_base` | `[1.e+07]` |
+| `qwen35.attention.layer_norm_rms_epsilon` | `[1.e-06]` |
+| `qwen35.attention.key_length` | `[256]` |
+| `qwen35.attention.value_length` | `[256]` |
+| `qwen35.ssm.conv_kernel` | `[4]` |
+| `qwen35.ssm.state_size` | `[128]` |
+| `qwen35.ssm.group_count` | `[16]` |
+| `qwen35.ssm.time_step_rank` | `[32]` |
+| `qwen35.ssm.inner_size` | `[4096]` |
+| `qwen35.full_attention_interval` | `[4]` |
+| `qwen35.rope.dimension_count` | `[64]` |
+| `tokenizer.ggml.model` | `[103 112 116  50]` |
+| `tokenizer.ggml.pre` | `[113 119 101 110  51  53]` |
+| `tokenizer.ggml.tokens` | `[91 80 65 68 50 52 56 51 49 57 93]` |
+| `tokenizer.ggml.token_type` | `[5]` |
+| `tokenizer.ggml.merges` | *Siehe Code-Block unten* |
+| `tokenizer.ggml.eos_token_id` | `[248046]` |
+| `tokenizer.ggml.padding_token_id` | `[248044]` |
+| `tokenizer.chat_template` | *Siehe Code-Block unten* |
+| `general.quantization_version` | `[2]` |
+| `general.file_type` | `[7]` |
+
+**tokenizer.ggml.merges:**
+```jinja
+[195 163 196 163 196 164 195 163 196 164 196 172 195 163 196 163 194 190
+ 195 163 196 163 196 187  32 195 163 196 163 196 173]
+```
+
+**tokenizer.chat_template:**
+```jinja
+[123  37  45 ...  32  35 125]
 ```
 
 ---
