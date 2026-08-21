@@ -304,11 +304,21 @@ if (-not $CMAKE_EXE) { throw "CMake wurde installiert, aber nicht gefunden." }
 OK "CMake: $CMAKE_EXE ($(& $CMAKE_EXE --version | Select-Object -First 1))"
 
 # --- 4. NODE.JS ---
-Log "Installiere/aktualisiere Node.js auf die neueste LTS-Version"
-Install-OrUpgrade-LatestPackage -WingetId "OpenJS.NodeJS.LTS" -ChocoName "nodejs-lts" -CheckCommand "node"
+$NODE_VERSION = "24.19.0"
+Log "Installiere/aktualisiere Node.js auf v$NODE_VERSION"
+Install-OrUpgrade-LatestPackage `
+    -WingetId "OpenJS.NodeJS.LTS" `
+    -ChocoName "nodejs-lts" `
+    -WingetOverride @("--version", $NODE_VERSION) `
+    -ChocoExtraArgs @("--version=$NODE_VERSION", "--allow-downgrade") `
+    -CheckCommand "node"
 Refresh-Path
 Add-ToPath "C:\Program Files\nodejs"
-OK "Node.js: $(node --version)"
+$installedNodeVersion = (node --version).TrimStart("v")
+if ($installedNodeVersion -ne $NODE_VERSION) {
+    throw "Node.js v$NODE_VERSION wurde angefordert, gefunden wurde aber v$installedNodeVersion."
+}
+OK "Node.js: v$installedNodeVersion"
 OK "npm: $(npm --version)"
 
 # --- 5. VISUAL STUDIO BUILD TOOLS ---
