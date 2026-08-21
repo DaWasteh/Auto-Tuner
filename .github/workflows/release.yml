@@ -48,10 +48,10 @@ jobs:
             artifact: AutoTuner-macOS-arm64.zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -182,7 +182,7 @@ jobs:
           (cd stage && zip -r ../${{ matrix.artifact }} AutoTuner)
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -216,10 +216,10 @@ jobs:
             image: debian:stable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download Linux build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: AutoTuner-Linux-x64.zip
           path: artifacts
@@ -243,7 +243,7 @@ jobs:
     # workflow_dispatch always runs; tag pushes only when the tag matches v<VERSION>.
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read AutoTuner version
         id: ver
@@ -262,7 +262,7 @@ jobs:
           fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: assets
           merge-multiple: true
@@ -271,7 +271,7 @@ jobs:
         run: ls -la assets/
 
       - name: Create / update release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: AutoTuner v${{ steps.ver.outputs.version }}
