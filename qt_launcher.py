@@ -106,7 +106,6 @@ from scanner import (
 )
 from settings_loader import load_profiles, match_profile, ModelProfile
 from tuner import (
-    _probe_supported_flags,
     _visibility_env_for_gpus,
     build_command,
     check_profile_build,
@@ -4015,12 +4014,10 @@ class MainWindow(QMainWindow):
         self._current_entry: Optional[ModelEntry] = None
         self._current_draft: Optional[ModelEntry] = None
 
-        # Per-model override cache for the vision/draft/thinking checkboxes.
-        # Populated when the user toggles a checkbox, so switching to a
-        # different model and back preserves the manual choice for the
-        # rest of the session. Persisted to JSON on every change so the
-        # choice also survives an app restart.
-        # Shape:  { "<model_name>": {"vision": bool, "draft": bool, "thinking": bool} }
+        # Per-model override cache for launch-option checkboxes. mmproj and
+        # draft are controlled exclusively by their dropdown selections;
+        # legacy vision/draft booleans are only read once as migration input.
+        # Shape: { "<model_name>": {"thinking": bool, "ngram": bool, ...} }
         self._option_overrides: dict = {}
         self._favorite_models = app_settings.get_favorite_models()
         self._model_view_mode = app_settings.get_model_view_mode()
@@ -4503,8 +4500,8 @@ class MainWindow(QMainWindow):
             "by proposing tokens for the main model to verify.",
             "Lists external draft, EAGLE-3, DFlash, and supported embedded MTP paths. "
             "AutoTuner marks likely incompatibilities with ⚠ but keeps them selectable. "
-            "The choice is remembered per model and only takes effect when Draft model "
-            "is enabled.",
+            "Selecting a draft enables it immediately; selecting no draft disables "
+            "model-based speculative decoding. The choice is remembered per model.",
         )
         self._cb_draft.setToolTip(draft_tip)
         self._draft_row.setToolTip(draft_tip)
@@ -4513,17 +4510,6 @@ class MainWindow(QMainWindow):
         self._draft_row.setVisible(True)
         ol.addWidget(self._draft_row)
 
-        self._chk_vision = QCheckBox("Vision (mmproj)")
-        self._chk_vision.setToolTip(
-            _setting_tooltip(
-                "Enables image understanding for models that have a compatible vision "
-                "projector. Turn it off for text-only use and lower memory use.",
-                "When enabled, the selected mmproj is passed to llama-server and its "
-                "estimated memory is included in fitting. Availability comes from GGUF "
-                "and folder pairing; incompatible manual selections are allowed with a "
-                "warning for advanced testing.",
-            )
-        )
         self._chk_mmproj_cpu = QCheckBox("Keep mmproj in RAM (--no-mmproj-offload)")
         self._chk_mmproj_cpu.setToolTip(
             _setting_tooltip(
@@ -4533,17 +4519,6 @@ class MainWindow(QMainWindow):
                 "from VRAM to RAM in AutoTuner's budget; text-token generation is "
                 "mostly unaffected after image encoding, while each image prefill uses "
                 "CPU execution.",
-            )
-        )
-        self._chk_draft = QCheckBox("Draft model (speculative decoding)")
-        self._chk_draft.setToolTip(
-            _setting_tooltip(
-                "Enables the selected draft path to try to generate tokens faster. "
-                "Results should stay equivalent because the main model verifies them.",
-                "llama-server receives the selected external -md drafter or embedded "
-                "MTP configuration. Speed depends on proposal acceptance, draft "
-                "overhead, backend, and draft n-max; an incompatible or oversized "
-                "drafter can be slower or fail to load.",
             )
         )
         # n-gram (ngram-mod) self-speculative decoding. Unlike Draft, this
@@ -4605,9 +4580,7 @@ class MainWindow(QMainWindow):
         )
 
         for chk in (
-            self._chk_vision,
             self._chk_mmproj_cpu,
-            self._chk_draft,
             self._chk_ngram,
             self._chk_prompt_cache,
             self._chk_thinking,
@@ -4618,9 +4591,7 @@ class MainWindow(QMainWindow):
 
         # Checkbox toggles → persist the override AND refresh the
         # context / memory estimates. Each slot knows which option it owns.
-        self._chk_vision.toggled.connect(self._on_vision_toggled)
         self._chk_mmproj_cpu.toggled.connect(self._on_mmproj_cpu_toggled)
-        self._chk_draft.toggled.connect(self._on_draft_toggled)
         self._chk_ngram.toggled.connect(self._on_ngram_toggled)
         self._chk_prompt_cache.toggled.connect(self._on_prompt_cache_toggled)
         self._sp_prompt_cache_mib.valueChanged.connect(
@@ -5771,8 +5742,8 @@ class MainWindow(QMainWindow):
     def _on_perf_changed(self, index: int) -> None:
         """User picked a new performance target — persist + refresh view.
 
-        Only the *config text* is recomputed; the vision/draft/thinking
-        checkboxes must NOT be touched here. Performance target affects
+        Only the *config text* is recomputed; launch-option selections must
+        NOT be touched here. Performance target affects
         VRAM placement and KV-cache decisions, never feature selection.
         """
         name = self._perf_combo.itemText(index).strip()
@@ -5781,9 +5752,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"[Warning] Could not save performance target: {exc}")
         self._log(f"[Perf] → {name}")
-        # Recompute the displayed config in-place, leaving every
-        # checkbox alone — `_update_config_text` reads the current
-        # checkbox state and reflects it back into the preview.
+        # Recompute the displayed config in-place, leaving every launch option
+        # alone — `_update_config_text` reads the current state into the preview.
         entry = getattr(self, "_current_entry", None)
         if entry is not None and self._system is not None:
             try:
@@ -5898,7 +5868,7 @@ class MainWindow(QMainWindow):
         """User picked a GPU pin — persist + refresh the preview.
 
         Like the perf/mode handlers, this only recomputes the *config text*;
-        feature checkboxes (vision/draft/thinking) are never touched. The
+        launch-option dropdowns and checkboxes are never touched. The
         persisted forced_gpu is read by both launch paths via
         app_settings.get_forced_gpu().
         """
@@ -6642,14 +6612,12 @@ class MainWindow(QMainWindow):
         self._update_config_text(entry, profile)
 
     def _update_checkboxes(self, entry: ModelEntry) -> None:
-        """Set checkbox enabled/checked states.
+        """Refresh dropdown selections and the remaining checkbox states.
 
-        Defaults reflect the model's capabilities (vision when an mmproj
-        was paired, draft when an assistant sibling was found, thinking
-        when the chat template advertises it). Once the user has
-        manually toggled any of them for this model, that override wins
-        — both within the session (in-memory cache) and across restarts
-        (persisted to autotuner_settings.json).
+        The mmproj and draft dropdowns are authoritative: selecting a file or
+        embedded MTP enables it, while their leading ``none`` entries disable
+        it. Legacy ``vision``/``draft`` checkbox overrides are used only when
+        no dropdown choice has been stored yet, preserving existing settings.
         """
         # Pull persisted overrides first so a fresh app launch already
         # honours last session's choices. The in-memory cache wins if
@@ -6658,81 +6626,18 @@ class MainWindow(QMainWindow):
         cached = self._option_overrides.get(entry.name, {})
         ov = {**persisted, **cached}
 
-        # Resolve the draft dropdown FIRST. It sets self._current_draft from
-        # the remembered/auto selection, which the Vision + Draft sections
-        # below read (an active external draft blocks vision). Populating it
-        # here keeps a single source of truth for the chosen drafter.
+        # Resolve both dropdowns before any dependent controls. The chosen
+        # entries themselves now replace the former Vision and Draft checkboxes.
         self._populate_draft_combo(entry, ov)
+        self._populate_mmproj_combo(entry, ov)
 
-        # ── Vision ──────────────────────────────────────────────────
-        mmproj = entry.mmproj
-        has_external_draft = self._current_draft is not None
-        is_embedded_mtp = entry.has_embedded_mtp
-        # Determine whether the external draft will actually be used.
-        # Having an external draft file available but draft unchecked does
-        # NOT block vision — only an active (checked) external draft does.
-        # The override dict already contains "draft": False when the user
-        # has unticked the Draft checkbox for this model.
-        draft_override = ov.get("draft", None)
-        draft_default = has_external_draft  # default: enabled when file exists
-        draft_effectively_on = has_external_draft and (
-            draft_override if draft_override is not None else draft_default
-        )
-        # External draft (-md) + --mmproj: only OLD builds (pre --spec-type,
-        # b9190) abort on that combination — current mainline loads draft
-        # and vision side by side (verified against b9940 server sources,
-        # unverändert bis b9963),
-        # and build_command gates -md on the same probe. Blocking here on a
-        # modern build forced users to choose between Vision and the Gemma-4
-        # drafter for no reason. Integrated MTP was never blocked (in-GGUF,
-        # no second model-load; Qwen3.6-MTP even requires vision).
-        vision_blocked = (
-            draft_effectively_on
-            and not is_embedded_mtp
-            and not self._selected_binary_supports_spec_type()
-        )
-        has_vision = mmproj is not None and not vision_blocked
-        # Default: enable vision when mmproj is present and not blocked.
-        # For embedded-MTP models default to True (they need vision).
-        default_vision = has_vision
-        vision_state = ov["vision"] if "vision" in ov else default_vision
-        self._chk_vision.blockSignals(True)
-        self._chk_vision.setEnabled(has_vision)
-        self._chk_vision.setChecked(has_vision and vision_state)
-        if mmproj is not None and vision_blocked:
-            self._chk_vision.setText(
-                f"Vision  ({mmproj.name})  [blocked: external draft active]"
-            )
-        elif mmproj is not None:
-            self._chk_vision.setText(f"Vision  ({mmproj.name})")
-        else:
-            self._chk_vision.setText("Vision (no mmproj found)")
-        self._chk_vision.blockSignals(False)
-
-        # ── mmproj CPU placement ────────────────────────────────────
-        # This option is meaningful only while Vision is active. The state is
-        # persisted per model because projector size and available VRAM vary.
+        # This option is meaningful only while a projector is selected.
         mmproj_cpu_state = ov.get("mmproj_cpu", False)
-        mmproj_cpu_enabled = has_vision and bool(vision_state)
+        mmproj_cpu_enabled = self._vision_enabled()
         self._chk_mmproj_cpu.blockSignals(True)
         self._chk_mmproj_cpu.setEnabled(mmproj_cpu_enabled)
         self._chk_mmproj_cpu.setChecked(mmproj_cpu_enabled and mmproj_cpu_state)
         self._chk_mmproj_cpu.blockSignals(False)
-
-        # ── Draft ───────────────────────────────────────────────────
-        draft = self._current_draft
-        has_draft = draft is not None or is_embedded_mtp
-        draft_state = ov["draft"] if "draft" in ov else has_draft
-        self._chk_draft.blockSignals(True)
-        self._chk_draft.setEnabled(has_draft)
-        self._chk_draft.setChecked(has_draft and draft_state)
-        if draft is not None:
-            self._chk_draft.setText(f"Draft   {draft.name}  ({draft.size_gb:.1f} GB)")
-        elif is_embedded_mtp:
-            self._chk_draft.setText("Draft   MTP (embedded in GGUF)")
-        else:
-            self._chk_draft.setText("Draft (no assistant model found)")
-        self._chk_draft.blockSignals(False)
 
         # ── Thinking / Reasoning ────────────────────────────────────
         # Read the chat template from GGUF metadata (the authoritative source);
@@ -6759,14 +6664,6 @@ class MainWindow(QMainWindow):
         self._chk_ngram.setChecked(ngram_state)
         self._chk_ngram.blockSignals(False)
 
-        # ── mmproj precision dropdown ───────────────────────────────
-        # Populate from the candidate list the scanner attached to the
-        # model. Only shown when there's a real choice (>= 2 projectors).
-        # The remembered selection (per model) wins; otherwise the entry's
-        # auto-picked `mmproj` is preselected. Selecting here updates
-        # `entry.mmproj` so the launch + preview use the chosen file.
-        self._populate_mmproj_combo(entry, ov)
-
         # ── Prompt caching (host RAM, -cram) ────────────────────────
         # Prompt caching is available for every model. build_command enables it
         # with Vision only on b10045+ and safely emits --cache-ram 0 for older
@@ -6782,11 +6679,18 @@ class MainWindow(QMainWindow):
         ocr_selected = is_ocr_model(entry)
         self._btn_ocr.setVisible(ocr_selected)
         self._btn_ocr.setEnabled(
-            ocr_selected
-            and entry.mmproj is not None
-            and self._chk_vision.isChecked()
-            and self._ocr_thread is None
+            ocr_selected and self._vision_enabled() and self._ocr_thread is None
         )
+
+    def _vision_enabled(self) -> bool:
+        """Return whether the mmproj dropdown currently selects a projector."""
+        return bool(self._cb_mmproj.currentData()) and bool(
+            self._current_entry is not None and self._current_entry.mmproj is not None
+        )
+
+    def _draft_enabled(self) -> bool:
+        """Return whether the draft dropdown selects external or embedded MTP."""
+        return bool(self._cb_draft.currentData())
 
     def _populate_mmproj_combo(self, entry: ModelEntry, ov: dict) -> None:
         """Fill the always-on mmproj dropdown from ``entry.folder_mmprojs``.
@@ -6811,8 +6715,11 @@ class MainWindow(QMainWindow):
 
         remembered = app_settings.get_mmproj_selection(entry.name)
         chosen_idx = 0  # default to "none"
-        # Explicit "none" choice → keep index 0, skip auto-pick preselection.
-        deliberate_none = remembered == app_settings.MMPROJ_NONE_SENTINEL
+        # Explicit dropdown choice wins. With no stored dropdown choice, a
+        # legacy unchecked Vision override migrates to the leading none entry.
+        deliberate_none = remembered == app_settings.MMPROJ_NONE_SENTINEL or (
+            remembered is None and ov.get("vision") is False
+        )
         for c in folder:
             compatible = is_mmproj_compatible(entry.path, c)
             try:
@@ -6829,7 +6736,7 @@ class MainWindow(QMainWindow):
             if remembered and not deliberate_none and c.name == remembered:
                 chosen_idx = idx
         # No remembered choice → preselect the scanner's auto pick if present.
-        if not remembered and auto is not None:
+        if not remembered and not deliberate_none and auto is not None:
             for i in range(1, self._cb_mmproj.count()):
                 if self._cb_mmproj.itemData(i) == str(auto):
                     chosen_idx = i
@@ -6858,7 +6765,7 @@ class MainWindow(QMainWindow):
         WARN = "⚠ "
         NONE_LABEL = "— no draft —"
         MTP_LABEL = "MTP (embedded in GGUF)"
-        MTP_DATA = "<embedded-mtp>"
+        MTP_DATA = app_settings.DRAFT_EMBEDDED_SENTINEL
         folder = list(getattr(entry, "folder_drafts", []) or [])
         auto = entry.draft  # scanner's best external pick (Path or None)
         has_embedded = entry.has_embedded_mtp
@@ -6871,9 +6778,14 @@ class MainWindow(QMainWindow):
 
         remembered = app_settings.get_draft_selection(entry.name)
         # Default selection priority: remembered → external auto → embedded.
+        # A legacy unchecked Draft override migrates to none only when no
+        # authoritative dropdown selection exists yet.
+        deliberate_none = remembered == app_settings.DRAFT_NONE_SENTINEL or (
+            remembered is None and ov.get("draft") is False
+        )
         chosen_idx = 0
-        if remembered == app_settings.DRAFT_NONE_SENTINEL:
-            chosen_idx = 0
+        if remembered == app_settings.DRAFT_EMBEDDED_SENTINEL and has_embedded:
+            chosen_idx = 1
         for c in folder:
             md = read_gguf_metadata(c)
             compatible = is_draft_compatible(entry.path, c, md)
@@ -6901,11 +6813,15 @@ class MainWindow(QMainWindow):
                 label = WARN + label
             self._cb_draft.addItem(label, userData=str(c))
             idx = self._cb_draft.count() - 1
-            if remembered and remembered not in ("", app_settings.DRAFT_NONE_SENTINEL):
+            if remembered and remembered not in (
+                "",
+                app_settings.DRAFT_NONE_SENTINEL,
+                app_settings.DRAFT_EMBEDDED_SENTINEL,
+            ):
                 if c.name == remembered:
                     chosen_idx = idx
         # No remembered choice → prefer external auto pick, else embedded MTP.
-        if not remembered:
+        if not remembered and not deliberate_none:
             if auto is not None:
                 for i in range(self._cb_draft.count()):
                     if self._cb_draft.itemData(i) == str(auto):
@@ -6931,7 +6847,7 @@ class MainWindow(QMainWindow):
         and the embedded path inside the GGUF is used at launch.
         """
         s = "" if data is None else str(data)
-        if s and s != "<embedded-mtp>":
+        if s and s != app_settings.DRAFT_EMBEDDED_SENTINEL:
             self._current_draft = _make_draft_entry(Path(s), entry.group)
         else:
             self._current_draft = None
@@ -7011,25 +6927,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"[Warning] Could not save {key} override: {exc}")
 
-    def _on_vision_toggled(self, checked: bool) -> None:
-        self._record_override("vision", checked)
-        # Vision changes whether build_command may enable prompt caching on the
-        # selected llama.cpp build, so refresh option state and the preview.
-        if self._current_entry is not None:
-            self._update_checkboxes(self._current_entry)
-        self._refresh_config_preview()
-
     def _on_mmproj_cpu_toggled(self, checked: bool) -> None:
         self._record_override("mmproj_cpu", checked)
-        self._refresh_config_preview()
-
-    def _on_draft_toggled(self, checked: bool) -> None:
-        self._record_override("draft", checked)
-        # Toggling draft changes whether vision is blocked (external draft
-        # conflicts with --mmproj). Re-evaluate the vision checkbox state
-        # before rebuilding the config preview.
-        if self._current_entry is not None:
-            self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
     def _on_thinking_toggled(self, checked: bool) -> None:
@@ -7037,8 +6936,8 @@ class MainWindow(QMainWindow):
         self._refresh_config_preview()
 
     def _on_ngram_toggled(self, checked: bool) -> None:
-        # n-gram is independent of the model (no draft file needed), so it has
-        # no effect on the vision/draft interlock — just persist and re-preview.
+        # n-gram is independent of the model (no draft file needed), so just
+        # persist the setting and refresh the preview.
         self._record_override("ngram", checked)
         self._refresh_config_preview()
 
@@ -7057,9 +6956,8 @@ class MainWindow(QMainWindow):
         """User picked a different vision projector from the dropdown.
 
         Updates the current model's ``mmproj`` to the chosen file (or None for
-        the "— no mmproj —" entry), remembers the choice per model, re-runs the
-        checkbox interlock (vision availability depends on mmproj), and
-        refreshes the preview (the projector size feeds the VRAM estimate).
+        the "— no mmproj —" entry), remembers the choice per model, refreshes
+        dependent controls, and recomputes projector memory in the preview.
         """
         if self._current_entry is None or index < 0:
             return
@@ -7076,8 +6974,7 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._log(f"[Warning] Could not save mmproj selection: {exc}")
-        # mmproj presence changes whether Vision can be enabled → re-run the
-        # interlock so the checkbox label/state matches the new selection.
+        # mmproj presence changes CPU placement and OCR availability.
         self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
@@ -7087,27 +6984,26 @@ class MainWindow(QMainWindow):
         Resolves the selection onto ``self._current_draft`` (None for
         "— no draft —", a metadata-bearing draft ModelEntry for a file, None
         for embedded MTP since it lives inside the main GGUF), remembers the
-        choice per model, re-runs the checkbox interlock (an active external
-        draft blocks vision), and refreshes the preview.
+        choice per model, refreshes dependent controls, and updates the preview.
         """
         if self._current_entry is None or index < 0:
             return
         data = self._cb_draft.itemData(index)
         s = "" if data is None else str(data)
-        # Persist: "" → deliberate "no draft" sentinel; embedded-MTP →
-        # sentinel too (no file to remember, embedded is implied by the GGUF);
-        # otherwise the chosen draft filename.
+        # Persist all three states distinctly. In particular embedded MTP must
+        # not collapse to the same sentinel as "no draft" during repopulation.
         try:
-            if not s or s == "<embedded-mtp>":
-                app_settings.set_draft_selection(
-                    self._current_entry.name, app_settings.DRAFT_NONE_SENTINEL
-                )
+            if not s:
+                selection = app_settings.DRAFT_NONE_SENTINEL
+            elif s == app_settings.DRAFT_EMBEDDED_SENTINEL:
+                selection = app_settings.DRAFT_EMBEDDED_SENTINEL
             else:
-                app_settings.set_draft_selection(self._current_entry.name, Path(s).name)
+                selection = Path(s).name
+            app_settings.set_draft_selection(self._current_entry.name, selection)
         except Exception as exc:
             self._log(f"[Warning] Could not save draft selection: {exc}")
         # Warn (don't block) when an incompatible draft was chosen.
-        if s and s != "<embedded-mtp>":
+        if s and s != app_settings.DRAFT_EMBEDDED_SENTINEL:
             chosen = Path(s)
             if not is_draft_compatible(
                 self._current_entry.path, chosen, read_gguf_metadata(chosen)
@@ -7118,15 +7014,7 @@ class MainWindow(QMainWindow):
                     "Launching anyway — speculative decoding may fail or be slow."
                 )
         self._apply_draft_selection(self._current_entry, data)
-        # Keep the Draft checkbox in sync with the dropdown: choosing a real
-        # draft (or embedded MTP) implies draft ON; choosing "none" implies
-        # OFF. We record this as the per-model "draft" override so the
-        # interlock + launch path agree with the dropdown.
-        draft_on = bool(s) and s != ""  # "" is the none entry
-        if s == "":
-            draft_on = False
-        self._record_override("draft", draft_on)
-        # An active external draft conflicts with --mmproj → re-run interlock.
+        # Re-run dependent controls; the dropdown itself is the enable state.
         self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
 
@@ -7155,8 +7043,8 @@ class MainWindow(QMainWindow):
         if self._system is None:
             return None
 
-        use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
-        use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
+        use_vision = self._vision_enabled()
+        use_draft = self._draft_enabled()
         no_mmproj_offload = (
             self._chk_mmproj_cpu.isChecked() and self._chk_mmproj_cpu.isEnabled()
         )
@@ -7203,12 +7091,12 @@ class MainWindow(QMainWindow):
         Honours a saved Expert override per model; otherwise the
         AutoTuner's auto-tuned default. This is what makes a hand-tuned
         Expert setup "stick" for a model (the low-VRAM use case): once
-        saved, the override is applied automatically, just like the
-        vision/draft/thinking checkbox overrides.
+        saved, the override is applied automatically, like the persisted
+        launch-option selections and checkbox overrides.
 
         * Auto-mode overrides are re-derived through ``compute_config``
           with the saved pins so they ADAPT to the current VRAM /
-          checkbox state, then the saved non-cascading values are
+          launch-option state, then the saved non-cascading values are
           stamped back on.
         * Manual-mode overrides are applied as a frozen config (the user
           owns the exact values); the launch-path VRAM fit-check still
@@ -7285,8 +7173,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Format ``cfg`` into the read-only preview QTextEdit."""
         assert self._system is not None
-        use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
-        use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
+        use_vision = self._vision_enabled()
+        use_draft = self._draft_enabled()
         use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
         use_prompt_cache = (
             self._chk_prompt_cache.isChecked() and self._chk_prompt_cache.isEnabled()
@@ -7771,21 +7659,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Binary resolution
     # ------------------------------------------------------------------
-    def _selected_binary_supports_spec_type(self) -> bool:
-        """True when the selected fork's llama-server advertises --spec-type.
-
-        Those builds (mainline b9190+) load -md and --mmproj together, so
-        the GUI must not enforce the legacy vision/draft mutual exclusion.
-        The probe is lru-cached per binary (path+mtime), so calling this on
-        every checkbox refresh is cheap after the first hit.
-        """
-        try:
-            _, resolve, _ = _get_fork_tools()
-            flags = _probe_supported_flags(resolve("llama-server"))
-        except Exception:
-            return False
-        return flags is not None and "--spec-type" in flags
-
     def _resolve_binary(
         self, profile: ModelProfile, use_draft: bool, model_name: str
     ) -> str:
@@ -8085,9 +7958,7 @@ class MainWindow(QMainWindow):
             self._perf_combo,
             self._mode_combo,
             self._gpu_combo,
-            self._chk_vision,
             self._chk_mmproj_cpu,
-            self._chk_draft,
             self._chk_ngram,
             self._chk_prompt_cache,
             self._sp_prompt_cache_mib,
@@ -8135,7 +8006,7 @@ class MainWindow(QMainWindow):
                 self, "OCR", "An OCR job is already starting or running."
             )
             return
-        if entry.mmproj is None or not self._chk_vision.isChecked():
+        if not self._vision_enabled():
             QMessageBox.warning(
                 self,
                 "OCR projector required",
@@ -8483,8 +8354,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        use_vision = self._chk_vision.isChecked() and self._chk_vision.isEnabled()
-        use_draft = self._chk_draft.isChecked() and self._chk_draft.isEnabled()
+        use_vision = self._vision_enabled()
+        use_draft = self._draft_enabled()
         use_thinking = self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
         use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
         use_prompt_cache = (
@@ -8738,9 +8609,8 @@ class MainWindow(QMainWindow):
                 port=port,
                 extra_args=["-a", alias],
                 use_thinking=use_thinking,
-                # The Draft checkbox governs BOTH external draft (-md) and embedded
-                # MTP. For an MTP model draft_model is None, so unchecking Draft must
-                # also flip enable_speculative off to actually suppress the MTP path.
+                # The draft dropdown governs BOTH external draft (-md) and embedded
+                # MTP. Its leading no-draft entry suppresses both paths.
                 enable_speculative=use_draft,
                 enable_ngram=use_ngram,
                 enable_prompt_cache=use_prompt_cache,

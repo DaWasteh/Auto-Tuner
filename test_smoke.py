@@ -1133,9 +1133,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_btn_diagnose",
         "_cb_mmproj",
         "_cb_draft",
-        "_chk_vision",
         "_chk_mmproj_cpu",
-        "_chk_draft",
         "_chk_ngram",
         "_chk_prompt_cache",
         "_sp_prompt_cache_mib",
@@ -1153,6 +1151,8 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     )
     widgets.extend(getattr(window, name) for name in main_names)
     assert not hasattr(window, "_chk_turbo_kv")
+    assert not hasattr(window, "_chk_vision")
+    assert not hasattr(window, "_chk_draft")
     assert "bf16" in expert._KV_QUANT_OPTIONS
     assert "turbo3" in expert._KV_QUANT_OPTIONS
     toolbar_texts = {
@@ -1298,6 +1298,71 @@ def test_mmproj_dropdown_shows_projector_file_size(tmp_path, monkeypatch) -> Non
     projector_label = next(label for label in labels if projector.name in label)
     assert "(0.0 GB)" in projector_label
     assert "(auto)" in projector_label
+    window.close()
+
+
+def test_mmproj_and_embedded_draft_dropdowns_are_authoritative(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+
+    model_path = tmp_path / "Ling-3.0-flash-Q4_K_M.gguf"
+    projector = tmp_path / "mmproj-Ling-3.0-BF16.gguf"
+    _write_minimal_gguf(model_path)
+    _write_minimal_gguf(projector)
+    entry = ModelEntry(
+        path=model_path,
+        name=model_path.stem,
+        group=".",
+        size_bytes=model_path.stat().st_size,
+        mmproj=projector,
+        folder_mmprojs=[projector],
+        metadata={
+            "general.architecture": "bailingmoe3",
+            "bailingmoe3.nextn_predict_layers": 1,
+        },
+    )
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._current_entry = entry
+    window._update_checkboxes(entry)
+    assert window._vision_enabled() is True
+    assert window._draft_enabled() is True
+    assert (
+        window._cb_draft.currentData()
+        == qt_launcher.app_settings.DRAFT_EMBEDDED_SENTINEL
+    )
+
+    # Both dropdowns can disable and re-enable their feature without a second
+    # checkbox or stale override fighting the selected item.
+    window._cb_mmproj.setCurrentIndex(0)
+    assert window._vision_enabled() is False
+    window._cb_mmproj.setCurrentIndex(1)
+    assert window._vision_enabled() is True
+
+    window._cb_draft.setCurrentIndex(0)
+    assert window._draft_enabled() is False
+    embedded_idx = window._cb_draft.findData(
+        qt_launcher.app_settings.DRAFT_EMBEDDED_SENTINEL
+    )
+    assert embedded_idx > 0
+    window._cb_draft.setCurrentIndex(embedded_idx)
+    assert window._draft_enabled() is True
+    assert (
+        qt_launcher.app_settings.get_draft_selection(entry.name)
+        == qt_launcher.app_settings.DRAFT_EMBEDDED_SENTINEL
+    )
+    assert not hasattr(window, "_chk_vision")
+    assert not hasattr(window, "_chk_draft")
     window.close()
 
 
@@ -1595,6 +1660,42 @@ def test_mtp_ud_quant_absent_suppresses_false_positive() -> None:
         }
     )
     assert metadata_has_embedded_mtp(md) is False
+
+
+@pytest.mark.parametrize(("last_block", "expected"), [(41, False), (42, True)])
+def test_sharded_mtp_scan_combines_all_part_headers(
+    tmp_path, monkeypatch, last_block, expected
+) -> None:
+    """A stale nextn key must not expose MTP when every shard proves that the
+    extra block is absent; a real final-shard block remains detected."""
+    import scanner
+
+    part1 = tmp_path / "Ling-3.0-flash-00001-of-00002.gguf"
+    part2 = tmp_path / "Ling-3.0-flash-00002-of-00002.gguf"
+    _write_minimal_gguf(part1)
+    _write_minimal_gguf(part2)
+
+    def fake_metadata(path):
+        common = {
+            "split.count": 2,
+            "__mtp_scan__": "inconclusive",
+            "__tensor_scan_complete__": True,
+        }
+        if path == part1:
+            return {
+                **common,
+                "general.architecture": "bailingmoe3",
+                "bailingmoe3.block_count": 42,
+                "bailingmoe3.nextn_predict_layers": 1,
+                "__max_block_index__": 41,
+            }
+        return {**common, "__max_block_index__": last_block}
+
+    monkeypatch.setattr(scanner, "read_gguf_metadata", fake_metadata)
+    entries = scanner.scan_models(tmp_path)
+    assert len(entries) == 1
+    assert entries[0].metadata["__mtp_scan__"] == ("found" if expected else "absent")
+    assert entries[0].has_embedded_mtp is expected
 
 
 def test_mtp_name_based_without_key() -> None:

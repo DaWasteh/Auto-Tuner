@@ -128,9 +128,9 @@ the RAM/VRAM you actually have free — without manual edits.
   builds conservatively receive `--cache-ram 0` when Vision is active.
   The default cap is **2048 MiB**, editable in the GUI or with
   `--cache-ram-mib`; the reserved amount is included in the RAM estimate.
-- **Sticky GUI choices** — the Qt launcher remembers per-model
-  vision / draft / thinking / **n-gram** / **prompt-cache** toggles **and
-  the chosen mmproj projector** in `autotuner_settings.json`. Switch to
+- **Sticky GUI choices** — the Qt launcher remembers each model's selected
+  **mmproj** and **draft/MTP** dropdown entries plus thinking / **n-gram** /
+  **prompt-cache** toggles in `autotuner_settings.json`. Switch to
   another model and back, restart the app, change the performance
   target — your manual choices stay put. They only revert when you
   click them again.
@@ -448,16 +448,17 @@ that only make sense with persistent state:
   mutable launch controls are locked until the validated server starts, Cancel
   interrupts LibreOffice/HTTP/model loading, and successful output can be opened
   directly from the completion dialog.
-- **Sticky per-model options.** Toggle vision / draft / thinking /
-  n-gram / prompt-cache once, and pick an mmproj precision from the
-  dropdown; the choices survive switching to another model and back,
-  swapping performance targets, and restarting the app. Stored in
-  `autotuner_settings.json` under `model_overrides` and `mmproj_selection`.
+- **Sticky per-model options.** Choose mmproj and draft/MTP directly from
+  their dropdowns (`none` disables either feature), then toggle thinking /
+  n-gram / prompt-cache as needed. The choices survive model switches,
+  performance-target changes, and restarts. Stored in
+  `autotuner_settings.json` under `mmproj_selection`, `draft_selection`, and
+  `model_overrides`.
 - **Expert settings are saved per model (autosave).** Every edit you make
   in the Expert panel — Auto-cascade pins *or* a full Manual setup — is
   debounced-saved under `expert_overrides` keyed by model name and applied
   automatically the next time you select that model (just like the
-  checkbox overrides above), so a low-VRAM hand-tuning never has to be
+  persisted launch options above), so a low-VRAM hand-tuning never has to be
   re-entered. Auto-mode saves adapt to the current VRAM on launch
   (re-cascaded from the saved pins); Manual-mode saves are applied as the
   exact frozen values (the launch VRAM fit-check still gates them). The

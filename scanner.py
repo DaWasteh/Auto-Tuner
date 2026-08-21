@@ -162,6 +162,7 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
 
             has_mtp_tensors = False
             has_dspark_tensors = False
+            max_block_index = -1
             scan_complete = False
             try:
                 for _ in range(n_tensors):
@@ -183,6 +184,14 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
                         or "markov_head" in tl
                     ):
                         has_dspark_tensors = True
+                    block_match = _BLK_IDX_RE.match(tname)
+                    if block_match:
+                        try:
+                            max_block_index = max(
+                                max_block_index, int(block_match.group(1))
+                            )
+                        except (TypeError, ValueError):
+                            pass
                     if not has_mtp_tensors:
                         # (a) Name-based: the canonical llama.cpp nextn tensors
                         #     are named "blk.{N}.nextn.*" (eh_proj, embed_tokens,
@@ -194,14 +203,8 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
                             has_mtp_tensors = True
                         # (b) Index-based: a block index at/after block_count is
                         #     an extra draft head grafted past the main stack.
-                        elif block_count > 0:
-                            m = _BLK_IDX_RE.match(tname)
-                            if m:
-                                try:
-                                    if int(m.group(1)) >= block_count:
-                                        has_mtp_tensors = True
-                                except (TypeError, ValueError):
-                                    pass
+                        elif block_count > 0 and max_block_index >= block_count:
+                            has_mtp_tensors = True
                 else:
                     # Loop ran to completion without break/exception → the whole
                     # tensor-info section of THIS file was parsed successfully.
@@ -221,6 +224,11 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
                 md["__mtp_scan__"] = "inconclusive"
             if has_dspark_tensors:
                 md["__dspark_scan__"] = "found"
+            # Preserve enough bounded scan evidence for ``scan_models`` to
+            # combine all headers of a split GGUF. This distinguishes a real
+            # last-shard MTP block from stale ``nextn_predict_layers`` metadata.
+            md["__tensor_scan_complete__"] = scan_complete
+            md["__max_block_index__"] = max_block_index
 
             return md
     except (OSError, struct.error, EOFError, ValueError, UnicodeDecodeError):
@@ -1770,6 +1778,47 @@ def scan_models(
         pairing_path = part1.parent / (base + ".gguf")
         parent = str(part1.parent)
         md = read_gguf_metadata(part1) if read_metadata else {}
+        if read_metadata and len(ordered_parts) > 1:
+            # Some quantizers preserve ``nextn_predict_layers`` after dropping
+            # the actual MTP tensors. A primary-shard scan is inconclusive by
+            # design, so verify every shard header before advertising internal
+            # MTP in the GUI. Only models declaring nextn need this extra work.
+            declares_nextn = False
+            for key, value in md.items():
+                if "nextn_predict" not in key.lower():
+                    continue
+                try:
+                    declares_nextn = int(value) > 0
+                except (TypeError, ValueError):
+                    pass
+                if declares_nextn:
+                    break
+            if declares_nextn:
+                shard_metadata = [md]
+                shard_metadata.extend(
+                    read_gguf_metadata(part) for part in ordered_parts[1:]
+                )
+                scans_complete = all(
+                    item.get("__tensor_scan_complete__") is True
+                    for item in shard_metadata
+                )
+                if scans_complete:
+                    block_count = 0
+                    arch = str(md.get("general.architecture", "") or "")
+                    try:
+                        block_count = int(md.get(f"{arch}.block_count", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                    found = any(
+                        item.get("__mtp_scan__") == "found" for item in shard_metadata
+                    ) or (
+                        block_count > 0
+                        and any(
+                            int(item.get("__max_block_index__", -1)) >= block_count
+                            for item in shard_metadata
+                        )
+                    )
+                    md["__mtp_scan__"] = "found" if found else "absent"
         entries.append(
             ModelEntry(
                 path=part1,

@@ -814,17 +814,20 @@ def set_mmproj_selection(model_name: str, filename: Optional[str]) -> None:
 # re-enable the auto draft on the next launch).
 #
 # Schema:
-#   "draft_selection": { "<model_name>": "…-assistant-Q4_K_M.gguf" | "<none>" }
+#   "draft_selection": {
+#       "<model_name>": "…-assistant-Q4_K_M.gguf" | "<embedded-mtp>" | "<none>"
+#   }
 
 DRAFT_NONE_SENTINEL = "<none>"
+DRAFT_EMBEDDED_SENTINEL = "<embedded-mtp>"
 
 
 def get_draft_selection(model_name: str) -> Optional[str]:
     """Return the remembered draft filename for *model_name*.
 
-    Returns the literal ``"<none>"`` sentinel when the user explicitly chose
-    no draft, the chosen filename when one was picked, or ``None`` when there
-    is no stored preference (caller should use the scanner's auto pick).
+    Returns ``"<none>"`` when the user explicitly chose no draft,
+    ``"<embedded-mtp>"`` for the main GGUF's internal head, the chosen
+    filename for an external draft, or ``None`` when there is no preference.
     """
     if not model_name:
         return None
@@ -838,9 +841,9 @@ def get_draft_selection(model_name: str) -> Optional[str]:
 def set_draft_selection(model_name: str, filename: Optional[str]) -> None:
     """Persist (or clear) the chosen draft filename for *model_name*.
 
-    Pass the filename to remember a specific draft, ``"<none>"`` to record a
-    deliberate "no draft" choice, or ``None`` / empty to drop the override
-    entirely (model reverts to the scanner's automatic pick).
+    Pass the filename to remember an external draft, ``"<embedded-mtp>"``
+    for the internal head, ``"<none>"`` for no draft, or ``None`` / empty to
+    drop the override entirely (model reverts to the scanner's automatic pick).
     """
     if not model_name:
         return
