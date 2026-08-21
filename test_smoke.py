@@ -822,7 +822,9 @@ def test_mmproj_cpu_offload_moves_memory_and_emits_flag(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10045)
     cmd = build_command(model, cpu_cfg, profile)
+    assert cpu_cfg.mmproj_device is None
     assert "--no-mmproj-offload" in cmd
+    assert "--mmproj-device" not in cmd
 
     no_vision = _fake_model(tmp_path, "Bonsai-8B", size_gb=4.0)
     no_vision_cfg = compute_config(
@@ -897,6 +899,8 @@ def test_prepare_command_for_binary_prunes_unsupported_flags(tmp_path) -> None:
         "-1",
         "--mcp-servers-config",
         "-trusted-mcp.json",
+        "--mmproj-device",
+        "Vulkan1",
         "--host",
         "127.0.0.1",
         "--metrics",
@@ -917,8 +921,25 @@ def test_prepare_command_for_binary_prunes_unsupported_flags(tmp_path) -> None:
         "--fit off",
         "--cache-ram -1",
         "--mcp-servers-config -trusted-mcp.json",
+        "--mmproj-device Vulkan1",
         "--metrics",
     ]
+
+
+def test_filter_command_keeps_mmproj_device_through_short_alias() -> None:
+    """A fork advertising only -mmdev still supports our long spelling."""
+    from tuner import _filter_command_for_supported_flags
+
+    cmd = [
+        "llama-server",
+        "-m",
+        "model.gguf",
+        "--mmproj-device",
+        "Vulkan1",
+    ]
+    filtered, removed = _filter_command_for_supported_flags(cmd, {"-m", "-mmdev"})
+    assert filtered == cmd
+    assert removed == []
 
 
 def test_filter_command_keeps_negative_values_of_supported_flags() -> None:
@@ -2228,6 +2249,50 @@ def _fake_dual_gpu_system_with_vk_order(
     )
 
 
+def test_mmproj_device_tracks_post_visibility_main_gpu(tmp_path) -> None:
+    """MTMD must use the same physical GPU that owns its VRAM budget."""
+    profiles = load_profiles(SETTINGS_DIR)
+    mmproj = tmp_path / "mmproj-gemma-4-f16.gguf"
+    mmproj.write_bytes(b"x" * 1024)
+
+    def exact_vulkan_system() -> SystemInfo:
+        system = _fake_dual_gpu_system_with_vk_order()
+        for gpu in system.gpus:
+            gpu.runtime_backend = "Vulkan"
+            gpu.runtime_device = f"Vulkan{gpu.hip_index}"
+        return system
+
+    # Pin: Vulkan1 is hidden/remapped to Vulkan0, so the projector must use 0.
+    pinned_model = _fake_model(tmp_path, "gemma-4-12b-it-q4", size_gb=9.0)
+    pinned_model.mmproj = mmproj
+    pinned_profile = match_profile(
+        pinned_model.name, profiles, pinned_model.architecture
+    )
+    pinned = compute_config(
+        pinned_model, exact_vulkan_system(), pinned_profile, user_ctx=32768
+    )
+    assert pinned.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "1"
+    assert pinned.main_gpu == 0
+    assert pinned.mmproj_device == "Vulkan0"
+
+    pinned_cmd = build_command(pinned_model, pinned, pinned_profile)
+    mmdev_idx = pinned_cmd.index("--mmproj-device")
+    assert pinned_cmd[mmdev_idx + 1] == "Vulkan0"
+
+    # Spread: both devices remain visible in Vulkan order and the R9700 is 1.
+    spread_model = _fake_model(
+        tmp_path, "Mistral-Medium-3.5-128B-UD-IQ3_XXS", size_gb=40.0
+    )
+    spread_model.mmproj = mmproj
+    spread_profile = match_profile(
+        spread_model.name, profiles, spread_model.architecture
+    )
+    spread = compute_config(spread_model, exact_vulkan_system(), spread_profile)
+    assert spread.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "0,1"
+    assert spread.main_gpu == 1
+    assert spread.mmproj_device == "Vulkan1"
+
+
 def test_vulkan_env_var_emitted_for_single_gpu_pinning(tmp_path) -> None:
     """When hip_index is known and the model fits on one GPU, both
     HIP_VISIBLE_DEVICES and GGML_VK_VISIBLE_DEVICES must be emitted
@@ -2426,6 +2491,20 @@ def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
 # llama-server resolver
 
 
+def test_mainline_build_recipe_never_mislabels_development_head() -> None:
+    recipe = (ROOT / "building llama.cpp" / "llama_build.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "git rev-list --count HEAD" in recipe
+    assert "Get-ExactLlamaBuildTag" in recipe
+    assert '"${buildTag}_dev_${shortCommit}"' in recipe
+    assert "Get-LlamaBuildTag" not in recipe
+    assert 'return "bUNKNOWN"' not in recipe
+    assert "reportedBuild -ne $expectedBuild" in recipe
+    assert "not yet an exact release tag" in recipe
+
+
 def test_semver_prerelease_build_recipe_preserves_compatibility_build_number() -> None:
     recipe = (ROOT / "building llama.cpp" / "llama_prerelease_build.txt").read_text(
         encoding="utf-8"
@@ -2605,6 +2684,8 @@ def test_resolver_matches_versioned_fork_dir(tmp_path, monkeypatch) -> None:
     assert _fork_family("2b_b8840_llama.cpp") == "2b_llama"
     assert _fork_family("1b_llama.cpp") == "1b_llama"
     assert _fork_family("b9840_llama.cpp") == "llama"
+    assert _fork_family("b10548_dev_a298422da_llama.cpp") == "llama"
+    assert _fork_family("b10545_a30273376_llama.cpp") == "llama"
     assert _fork_family("v0.1.2_llama.cpp") == "llama"
     assert _fork_family("tq_v0.1.2_llama.cpp") == "tq_llama"
 
@@ -3193,6 +3274,10 @@ def test_hybrid_architecture_detection_by_name() -> None:
         metadata_is_hybrid_architecture({"general.architecture": "nemotron_h"}) is True
     )
     assert metadata_is_hybrid_architecture({"general.architecture": "jamba"}) is True
+    assert (
+        metadata_is_hybrid_architecture({"general.architecture": "bailingmoe3"}) is True
+    )
+    assert metadata_is_hybrid_architecture({"general.architecture": "kimi-k3"}) is True
     # Pure Transformer
     assert (
         metadata_is_hybrid_architecture({"general.architecture": "qwen3moe"}) is False
@@ -3278,6 +3363,30 @@ def test_attention_layer_count_hybrid_with_heuristic() -> None:
     # Nemotron heuristic: ~25%
     n = metadata_attention_layer_count(md)
     assert 10 <= n <= 16, f"expected ~25% of 50, got {n}"
+
+
+def test_new_hybrid_architecture_fallback_counts() -> None:
+    """Current Kimi-K3 and Ling-3 layouts get their published MLA counts."""
+    from scanner import metadata_attention_layer_count
+
+    assert (
+        metadata_attention_layer_count(
+            {
+                "general.architecture": "kimi-k3",
+                "kimi-k3.block_count": 93,
+            }
+        )
+        == 24
+    )
+    assert (
+        metadata_attention_layer_count(
+            {
+                "general.architecture": "bailingmoe3",
+                "bailingmoe3.block_count": 42,
+            }
+        )
+        == 7
+    )
 
 
 def test_kv_per_token_estimate_smaller_for_hybrid(tmp_path) -> None:
@@ -3965,6 +4074,9 @@ def test_known_moe_architecture_survives_missing_expert_count(tmp_path) -> None:
         "bailingmoe2.5",
         "bailingmoe2_5",
         "bailing_hybrid",
+        "bailingmoe3",
+        "kimi-k3",
+        "kimi_k3",
         "ernie4_5_moe",
         "hunyuan_moe",
         "llada_moe",
@@ -5425,11 +5537,13 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
     assert muse.sampling["chat"]["top_k"] == 64
     assert muse.draft_max == 15
 
-    ling3 = match_profile("Ling-3.0-flash-int4.gguf", profiles, "bailing_hybrid")
+    ling3 = match_profile("Ling-3.0-flash-int4.gguf", profiles, "bailingmoe3")
     assert ling3.source_file == "ling-3.yaml"
     assert ling3.max_context == 262144
+    assert ling3.min_llama_build == 10460
     assert ling3.sampling["coding"]["temperature"] == 0.6
-    assert "b10362" in ling3.notes
+    assert "b10460" in ling3.notes
+    assert "bailingmoe3" in ling3.arch_fallback
     # Ling 2.6 keeps its separate filename profile despite the broad shared
     # HF model_type; neither generation may steal the other's named GGUF.
     ling26 = match_profile("Ling-2.6-flash-Q4_K_M.gguf", profiles, "bailing_hybrid")
@@ -5457,7 +5571,9 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
     kimi3 = match_profile("Kimi-K3-UD-Q2_K-00001-of-00034.gguf", profiles, "kimi-k3")
     assert kimi3.source_file == "kimi-k3.yaml"
     assert kimi3.max_context == 1048576
-    assert "not in a released mainline build" in kimi3.notes
+    assert kimi3.min_llama_build == 10448
+    assert "b10448" in kimi3.notes
+    assert "TEXT loader" in kimi3.notes
     assert (
         match_profile("Kimi-K2.5-Q4_K_M.gguf", profiles, "deepseek2").source_file
         == "kimi-k2.yaml"
@@ -5494,6 +5610,7 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         ("opaque-a.gguf", "muse-glimmer", "muse-glimmer.yaml"),
         ("opaque-b.gguf", "minimax-m3", "minimax-m3.yaml"),
         ("opaque-c.gguf", "kimi-k3", "kimi-k3.yaml"),
+        ("opaque-c2.gguf", "bailingmoe3", "ling-3.yaml"),
         ("opaque-d.gguf", "glm-dsa", "glm-5_2.yaml"),
         ("opaque-e.gguf", "deepseek4", "deepseek-v4.yaml"),
         ("opaque-f.gguf", "graniteswitch", "granite-switch-4_1.yaml"),

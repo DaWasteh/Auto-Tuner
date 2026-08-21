@@ -846,7 +846,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 
 | File | Purpose |
 |------|---------|
-| [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline llama.cpp Vulkan build (Windows/AMD-friendly; versioned `bXXXX_llama.cpp`). |
+| [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline llama.cpp Vulkan build (Windows/AMD-friendly; exact tags use `bNNNN_llama.cpp`, untagged master uses `bNNNN_dev_COMMIT_llama.cpp`). |
 | [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Exact semantic-version pre-release build (defaults to `v0.1.2`, output `v0.1.2_llama.cpp`). |
 | [`turboquant_llama_build.txt`](building%20llama.cpp/turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
 | [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
@@ -859,17 +859,21 @@ The `*.txt` build recipes are PowerShell commands for the documented local
 workspace (`L:/LAB/ai-local` on the documented Pandaking setup). They handle both llama.cpp UI
 layouts automatically (`tools/ui` since b9174, `tools/server/webui` on older
 forks) and fall back to the prebuilt UI if the fork does not ship UI sources.
-The semantic pre-release recipe deliberately keeps full Git history (so the
-embedded numeric compatibility build is not incorrectly reported as `b1`) and
-sets `LLAMA_BUILD_IS_DEV=OFF`, making `llama-server --version` report the exact
-release version plus its real build number for AutoTuner's feature gates.
+Both mainline recipes deliberately keep full Git history (so the embedded
+numeric compatibility build is not incorrectly reported as `b1`). The normal
+master recipe now distinguishes an exact b-tag from an unreleased HEAD and
+checks the compiled binary against `git rev-list --count HEAD`; it never labels
+a development build with the previous release tag. The semantic pre-release
+recipe additionally sets `LLAMA_BUILD_IS_DEV=OFF`, making
+`llama-server --version` report the exact semantic version plus its real build
+number for AutoTuner's feature gates.
 
 Ubuntu/Linux users can either build upstream llama.cpp normally or adapt the
 same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (as of b10441)
+## Server features (as of b10549)
 
 The following `llama-server` features are supported (verified against `llama-server --help` / `tools/server/README.md`):
 
@@ -900,11 +904,38 @@ The following `llama-server` features are supported (verified against `llama-ser
 | `--spec-draft-ngl` | ✅ Always 99 (keep the MTP head on GPU) |
 | `--n-cpu-moe` / `--override-tensor` | ✅ `--n-cpu-moe` active; `-ot` prepared for targeted expert placement |
 | `--tensor-split` / `--main-gpu` | ✅ Priority-weighted for dense, **capacity-fill for MoE**, with single-GPU pinning; for multi-server the 2nd/3rd model is pinned to the emptier card via `HIP_/GGML_VK_VISIBLE_DEVICES`. A manual hard-pin to one card is available three ways — CLI `--gpu NAME`, the toolbar **GPU** dropdown, or the `forced_gpu` key in the settings JSON — all resolving through `compute_config(force_gpu=…)` |
+| `-mmdev, --mmproj-device DEVICE` | ✅ b10541+: automatically pins the complete multimodal projector to AutoTuner's selected post-visibility-remap `main_gpu`, matching the VRAM budget. Safely pruned for older/forked binaries that do not advertise the flag. |
 | `--rope-scaling yarn` | ✅ Already present |
 | `--numa` | ✅ Already present |
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+
+### Review b10441 → b10549
+
+Reviewed all **108 upstream commits** from exact tag **b10441**
+(`0177dcc7`) through **b10549** (`b2e5e9b2`). Full source/build evidence is in
+[`docs/llama-b10549-audit.md`](docs/llama-b10549-audit.md).
+
+- **Integrated:** b10541 `--mmproj-device` keeps MTMD on the same exact GPU that
+  owns AutoTuner's projector VRAM budget, including visibility-remapped
+  dual-GPU launches; old binaries lose the complete option/value pair through
+  help-based pruning.
+- **Current model support:** Kimi-K3's b10448 mainline **text** loader is now
+  build-gated without falsely claiming K3 vision; Ling 3.0 Flash/Tiny use the
+  native b10460 `bailingmoe3` loader, official sampling, hybrid KV count, and
+  integrated/sidecar MTP detection.
+- **Automatic rebuild benefits:** DSpark speculator formats/LFM2 targets,
+  b10549 LFM2/LFM2MoE tensor split, Granite SWA/MoE SWA metadata, repeated MTMD
+  prompt caching, DeepSeek-OCR, Vulkan Q8-KV/FA, HIP, CUDA, Metal, SYCL,
+  OpenCL, and server/router fixes need no additional launch controls.
+- **Build-number mismatch fixed:** master can legitimately be commits ahead of
+  the newest release (`build 10548` while b10545 is still latest). The recipe
+  now uses the embedded full-history commit count, accepts only an exact HEAD
+  tag, marks untagged builds `_dev_<commit>`, and verifies the compiled
+  `--version`; no hard-coded offset or waiting is required.
+- **Not promoted:** router preset-only `dedup-cache-models` remains a preset
+  concern, not a normal AutoTuner performance control.
 
 ### Review b10329 → b10441
 

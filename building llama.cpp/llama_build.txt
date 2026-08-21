@@ -13,25 +13,29 @@ function Invoke-NativeChecked {
 }
 
 
-function Get-LlamaBuildTag {
+function Get-ExactLlamaBuildTag {
     param(
         [string]$Commit = "HEAD",
         [string]$Remote = "origin"
     )
 
     $sha = (git rev-parse $Commit 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $sha) {
-        # llama.cpp b10470+ creates/pushes the lightweight release tag explicitly
-        # in CI, before the GitHub Release is created. Ask the remote tag
-        # namespace directly first, so even a just-created tag is recognized.
-        $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
-        foreach ($row in $remoteTags) {
-            if ($row -match "^$sha\s+refs/tags/(b\d+)$") { return $Matches[1] }
+    if ($LASTEXITCODE -ne 0 -or -not $sha) {
+        throw "Could not resolve llama.cpp commit '$Commit'"
+    }
+
+    # llama.cpp b10470+ pushes the lightweight tag before publishing the
+    # GitHub Release. Query the remote directly so that short release-window
+    # race is recognized without ever treating an older nearest tag as HEAD.
+    $escapedSha = [regex]::Escape($sha)
+    $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
+    foreach ($row in $remoteTags) {
+        if ($row -match "^$escapedSha\s+refs/tags/(b\d+)(?:\^\{\})?$") {
+            return $Matches[1]
         }
     }
 
     git fetch $Remote --tags --force 2>$null
-
     $pointingTags = @(
         git tag --points-at $Commit --list "b[0-9]*" 2>$null |
             Where-Object { $_ -match '^b\d+$' } |
@@ -39,10 +43,7 @@ function Get-LlamaBuildTag {
     )
     if ($pointingTags.Count -gt 0) { return $pointingTags[0] }
 
-    $desc = (git describe --tags --abbrev=0 --match "b[0-9]*" $Commit 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $desc -match 'b\d+') { return $Matches[0] }
-
-    return "bUNKNOWN"
+    return $null
 }
 
 $spirv = Join-Path (Get-Location) "SPIRV-Headers"
@@ -79,29 +80,57 @@ Invoke-NativeChecked "llama.cpp clone" {
 
 Push-Location $tmp
 try {
-    $version = Get-LlamaBuildTag -Commit HEAD -Remote origin
-    $description = (git describe --tags --always --match "b[0-9]*" 2>$null).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $description) { $description = $version }
     $commit = (git rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "Could not determine llama.cpp commit" }
+    if ($LASTEXITCODE -ne 0 -or -not $commit) {
+        throw "Could not determine llama.cpp commit"
+    }
     $shortCommit = $commit.Substring(0, 9)
+
+    # This is the same full-history count embedded by cmake/build-info.cmake.
+    # It can legitimately be ahead of the latest published release while
+    # master contains unreleased commits.
+    $buildText = (git rev-list --count HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $buildText -notmatch '^\d+$') {
+        throw "Could not determine the llama.cpp compatibility build"
+    }
+    $expectedBuild = [int]$buildText
+    if ($expectedBuild -lt 1000) {
+        throw "History is incomplete; refusing suspicious build number $expectedBuild"
+    }
+    $buildTag = "b$expectedBuild"
+
+    $exactTag = Get-ExactLlamaBuildTag -Commit HEAD -Remote origin
+    if ($exactTag -and $exactTag -ne $buildTag) {
+        throw "Tag/history mismatch: exact tag $exactTag, commit count $buildTag"
+    }
+    $isRelease = $exactTag -eq $buildTag
+
+    $description = (git describe --tags --always --match "b[0-9]*" 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $description) { $description = $shortCommit }
 } finally {
     Pop-Location
 }
 
-$dir = "${version}_llama.cpp"
+# Exact release tags keep the familiar bNNNN_llama.cpp name. Unreleased
+# master commits get an explicit dev+commit suffix, so a binary reporting
+# build 10548 can never be mislabeled as the previous b10545 release.
+$folderVersion = if ($isRelease) { $buildTag } else { "${buildTag}_dev_${shortCommit}" }
+$dir = "${folderVersion}_llama.cpp"
 $repo = Join-Path (Get-Location) $dir
-if (Test-Path $repo) {
-    # Preserve the existing versioned build and publish this exact newer HEAD
-    # under a commit-qualified folder that AutoTuner also discovers.
-    $dir = "${version}_${shortCommit}_llama.cpp"
+if ((Test-Path $repo) -and $isRelease) {
+    # Preserve an existing exact release build without deleting it.
+    $dir = "${buildTag}_${shortCommit}_llama.cpp"
     $repo = Join-Path (Get-Location) $dir
 }
 if (Test-Path $repo) {
     throw "Build directory already exists; nothing was removed: $repo"
 }
 Rename-Item $tmp $dir
-Write-Host "==> Build directory: $repo ($description, commit $commit)"
+$channel = if ($isRelease) { "exact release tag $buildTag" } else { "development HEAD after $description" }
+Write-Host "==> Build directory: $repo ($channel, commit $commit)"
+if (-not $isRelease) {
+    Write-Host "NOTE: $buildTag is the embedded commit-count build, not yet an exact release tag."
+}
 
 Push-Location "$repo\tools\ui"
 try {
@@ -133,11 +162,23 @@ Invoke-NativeChecked "llama.cpp configure" {
 Invoke-NativeChecked "llama.cpp build" {
     cmake --build "$repo\build" --config Release --parallel 20
 }
-Invoke-NativeChecked "llama-server smoke test" {
-    & "$repo\build\bin\Release\llama-server.exe" --version
+$server = "$repo\build\bin\Release\llama-server.exe"
+$versionOutput = (& $server --version 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "llama-server smoke test failed with exit code $LASTEXITCODE"
+}
+Write-Host $versionOutput
+$versionMatch = [regex]::Match($versionOutput, '(?im)^\s*version:[^\r\n]*?\(\s*build\s+(\d+)\b')
+if (-not $versionMatch.Success) {
+    throw "llama-server --version did not report an explicit numeric build"
+}
+$reportedBuild = [int]$versionMatch.Groups[1].Value
+if ($reportedBuild -ne $expectedBuild) {
+    throw "History/build mismatch: git count $expectedBuild, llama-server reports $reportedBuild"
 }
 
 Write-Host ""
+Write-Host "Success: $server ($buildTag, exact release: $isRelease)"
 Write-Host "OCR note: no CMake option controls Unlimited-OCR max_tiles."
 Write-Host "Use llama.cpp b10287+ and an mmproj whose GGUF metadata contains:"
 Write-Host "  clip.vision.preproc_max_tiles = 32"

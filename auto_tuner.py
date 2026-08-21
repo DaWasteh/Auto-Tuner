@@ -903,19 +903,24 @@ def _candidate_search_roots() -> List[Path]:
 
 # Fork dir naming convention: '{prefix}_llama.cpp', '{prefix}_b{NUM}_llama.cpp',
 # semantic-release '{prefix}_vX.Y.Z_llama.cpp', or bare versioned/mainline
-# names such as 'b10485_llama.cpp', 'v0.1.2_llama.cpp', and 'llama.cpp'. To
-# match a profile's fork hint (e.g. "2b_llama") against the versioned dir
-# actually on disk, normalize both to a family form by stripping '.cpp' and
-# the numeric b-tag / semantic-version segment:
-#     '2b_b8840_llama.cpp'  -> '2b_llama'
-#     '2b_llama.cpp'        -> '2b_llama'
-#     'b9840_llama.cpp'     -> 'llama'
-#     'v0.1.2_llama.cpp'    -> 'llama'
-#     'tq_v0.1.2_llama.cpp' -> 'tq_llama'
-#     '1b_llama.cpp'        -> '1b_llama'
+# names such as 'b10485_llama.cpp', 'v0.1.2_llama.cpp', and 'llama.cpp'. A
+# master checkout without an exact release tag uses the truthful form
+# 'b10548_dev_a298422da_llama.cpp'. To match a profile's fork hint (e.g.
+# "2b_llama") against the versioned dir actually on disk, normalize both to
+# a family form by stripping '.cpp' and the complete build/version segment:
+#     '2b_b8840_llama.cpp'              -> '2b_llama'
+#     '2b_llama.cpp'                    -> '2b_llama'
+#     'b9840_llama.cpp'                 -> 'llama'
+#     'b10548_dev_a298422da_llama.cpp'  -> 'llama'
+#     'v0.1.2_llama.cpp'                -> 'llama'
+#     'tq_v0.1.2_llama.cpp'             -> 'tq_llama'
+#     '1b_llama.cpp'                    -> '1b_llama'
 # This keeps the 1-bit ('1b_') and 2-bit/Ternary ('2b_') families distinct
-# while tolerating build-numbered, semantic-versioned, and bare names.
-_FORK_VERSION_RE = re.compile(r"(?:^|_)(?:b\d+|v\d+\.\d+\.\d+)(?=_|$)", re.IGNORECASE)
+# while tolerating release, development, semantic-versioned, and bare names.
+_FORK_VERSION_RE = re.compile(
+    r"(?:^|_)(?:b\d+(?:_dev)?(?:_[0-9a-f]{7,40})?|v\d+\.\d+\.\d+)(?=_|$)",
+    re.IGNORECASE,
+)
 
 
 def _fork_family(name: str) -> str:

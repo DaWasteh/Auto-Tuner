@@ -91,6 +91,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-fa",
     "-m",
     "-md",
+    "-mmdev",
     "-lm",
     "-n",
     "-ngl",
@@ -133,6 +134,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--mcp-servers-json",
     "--min-p",
     "--mmproj",
+    "--mmproj-device",
     "--models-dir",
     "--models-max",
     "--models-preset",
@@ -190,6 +192,7 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-fa", "--flash-attn"},
     {"-m", "--model"},
     {"-md", "--model-draft"},
+    {"-mmdev", "--mmproj-device"},
     {"-lm", "--load-mode"},
     {"-n", "--predict"},
     {"-ngl", "--gpu-layers", "--n-gpu-layers"},
@@ -1172,6 +1175,7 @@ _KNOWN_MOE_ARCHS = frozenset(
         "bailingmoe",
         "bailingmoe2",
         "bailingmoe2.5",
+        "bailingmoe3",
         "bailingmoe2_5",
         "bailing_hybrid",
         "cohere2moe",
@@ -1193,6 +1197,8 @@ _KNOWN_MOE_ARCHS = frozenset(
         "hunyuan-moe",
         "hunyuan_moe",
         "jamba",
+        "kimi-k3",
+        "kimi_k3",
         "kimi-linear",
         "lfm2moe",
         "llada-moe",
@@ -1292,6 +1298,10 @@ class TunedConfig:
     numa: Optional[str] = None
     tensor_split: Optional[str] = None
     main_gpu: Optional[int] = None
+    # Exact backend-qualified device for the multimodal projector (for
+    # example ``Vulkan1``). b10541+ can pin MTMD independently from model
+    # tensors; older binaries safely lose the flag during help-based pruning.
+    mmproj_device: Optional[str] = None
 
     n_cpu_moe: Optional[int] = None
     is_moe: bool = False
@@ -3327,6 +3337,7 @@ def compute_config(
     # receive conservative vendor-appropriate selectors.
     tensor_split: Optional[str] = None
     main_gpu: Optional[int] = None
+    mmproj_device: Optional[str] = None
     env_overrides: Dict[str, str] = {}
 
     if has_gpu and len(system.gpus) > 1 and primary_gpu is not None:
@@ -3618,6 +3629,21 @@ def compute_config(
                     )
                 main_gpu = primary_pos
 
+    # b10541 lets MTMD select a projector device independently. Before this,
+    # a dual-GPU launch budgeted the whole mmproj on ``main_gpu`` but upstream
+    # silently initialized the first visible GPU instead. Keep planning and
+    # runtime placement identical whenever the exact binary supplied a
+    # backend-qualified device map. Visibility selectors renumber devices, so
+    # use the post-remap ``main_gpu`` ordinal rather than the original one.
+    if model.mmproj is not None and not no_mmproj_offload and primary_gpu is not None:
+        backend = str(primary_gpu.runtime_backend or "").strip()
+        if main_gpu is not None and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", backend):
+            mmproj_device = f"{backend}{main_gpu}"
+        elif not env_overrides:
+            runtime_device = str(primary_gpu.runtime_device or "").strip()
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\d+", runtime_device):
+                mmproj_device = runtime_device
+
     # ---- (4d) NUMA — immer aktivieren bei genügend Kernen für bessere Performance
     numa = None
     if system.cpu_cores_physical >= 16:
@@ -3764,6 +3790,7 @@ def compute_config(
         numa=numa,
         tensor_split=tensor_split,
         main_gpu=main_gpu,
+        mmproj_device=mmproj_device,
         n_cpu_moe=n_cpu_moe,
         is_moe=is_moe,
         expert_count=expert_count,
@@ -4553,6 +4580,8 @@ def build_command(
 
     if model.mmproj is not None:
         cmd += ["--mmproj", str(model.mmproj)]
+        if config.mmproj_device and not config.no_mmproj_offload:
+            cmd += ["--mmproj-device", config.mmproj_device]
 
     # Thinking/Reasoning-Modus (Gemma 4, DeepSeek, etc.)
     # Thinking wird über Prompt-Tags gesteuert (<|think|>), nicht über CLI-Argumente.

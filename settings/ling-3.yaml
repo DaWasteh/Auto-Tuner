@@ -1,17 +1,22 @@
-display_name: "Ling 3.0 Flash (InclusionAI, fork-only)"
+display_name: "Ling 3.0 (InclusionAI, BailingMoE3)"
 patterns:
   - ling-3.0-flash
   - ling3.0-flash
   - ling-3-flash
   - ling3-flash
+  - ling-3.0-tiny
+  - ling3.0-tiny
+  - bailingmoe3
 
-# Do not claim bailing_hybrid as an architecture fallback: older Ling 2.6
-# checkpoints use the same broad HF model_type, while no released mainline
-# llama.cpp GGUF architecture exists for Ling 3.0 yet. Filename matching keeps
-# the two generations deterministic.
+# b10460 introduced the dedicated bailingmoe3 architecture. Keep this separate
+# from Ling 2.6's bailingmoe2.5/bailing_hybrid fork profile.
+arch_fallback:
+  - bailingmoe3
+
 max_context: 262144
 recommended_kv_quant: q8_0
 performance_target: throughput
+min_llama_build: 10460
 
 sampling:
   chat:
@@ -38,12 +43,10 @@ draft_p_min: 0.75
 ngram_method: ngram-map-k4v
 
 notes: >
-  InclusionAI Ling 3.0 Flash is a text-only 124B-A5.1B hybrid KDA/MLA MoE
-  trained to 256k context. Official sampling is temp 0.6 / top_p 0.95 /
-  top_k 20 with thinking enabled. The released model is trained with NEXTN
-  MTP, so a compatible runtime can use up to three speculative tokens.
-  IMPORTANT: as of llama.cpp b10362 there is no released mainline Ling 3.0
-  GGUF loader/runtime. This profile supplies correct matching and sampling
-  for a compatible future build or dedicated fork; it does not make an
-  unsupported GGUF load in stock llama.cpp. Do not reuse the older Ling 2.6
-  bailing_hybrid fork merely because the HF model_type looks related.
+  InclusionAI Ling 3.0 uses the bailingmoe3 hybrid KDA/MLA MoE architecture.
+  Flash is 124B-A5.1B with 256k context; Tiny is the smaller 7.9B-A1.3B
+  sibling. Official sampling is temp 0.6 / top_p 0.95 / top_k 20 with
+  thinking enabled. llama.cpp b10460 added conversion, inference, integrated
+  and separate NEXTN/MTP support for this architecture. Compatible MTP weights
+  can use up to three speculative tokens. Do not route these checkpoints
+  through the older Ling 2.6 bailingmoe2.5/bailing_hybrid fork profile.

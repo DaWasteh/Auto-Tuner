@@ -8,6 +8,7 @@ for 100+ GB files.
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 from dataclasses import dataclass, field
@@ -515,7 +516,7 @@ def metadata_supports_rope_scale(md: Dict[str, Any]) -> bool:
 # only budgeted for the full-attention layers:
 #   llama-arch.cpp:  JAMBA, FALCON_H1, PLAMO2, GRANITE_HYBRID, LFM2,
 #                    LFM2MOE, NEMOTRON_H, NEMOTRON_H_MOE, QWEN3NEXT,
-#                    KIMI_LINEAR, QWEN35, QWEN35MOE
+#                    KIMI_LINEAR, KIMI_K3, BAILINGMOE3, QWEN35, QWEN35MOE
 # Qwen3.5/3.6/3.8 use SSM-style metadata (ssm.conv_kernel / ssm.state_size /
 # ssm.group_count) so the generic ``.ssm.`` fallback in
 # ``metadata_is_hybrid_architecture`` already catches them — but listing
@@ -543,6 +544,7 @@ _HYBRID_ARCHS = frozenset(
         "bailing_hybrid",  # Ling-2.6 fork: KDA/short-conv + attention
         "bailingmoe2.5",
         "bailingmoe2_5",
+        "bailingmoe3",  # Ling 3.0: KDA + gated MLA (b10460)
         "falcon_h1",
         "plamo2",  # Plamo-2 hybrid
         "zamba2",  # Zamba2 hybrid
@@ -551,6 +553,8 @@ _HYBRID_ARCHS = frozenset(
         "qwen3next",  # Qwen3-Next: gated-delta-net + full attention
         "kimi-linear",  # Kimi-Linear hybrid
         "kimi_linear",
+        "kimi-k3",  # Kimi-K3: KDA + gated MLA (b10448, text path)
+        "kimi_k3",
         "qwen35",  # Qwen3.5–3.8 dense: linear + full attention
         "qwen35moe",  # Qwen3.5–3.8 MoE: linear + full attention
         "minimax-01",  # MiniMax-Text-01: lightning + full attention (b10441)
@@ -753,9 +757,15 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
         # LFM2 / LFM2.5-MoE: short-conv recurrent blocks with a small
         # number of GQA attention layers (~1 in 6, ~17%).
         ratio = 0.20
-    elif "kimi" in arch_l and "linear" in arch_l:
-        # Kimi-Linear: linear attention with ~1-in-4 full attention.
+    elif ("kimi" in arch_l and "linear" in arch_l) or arch_l in {
+        "kimi-k3",
+        "kimi_k3",
+    }:
+        # Kimi-Linear/K3: three KDA layers per gated-MLA layer (~25%).
         ratio = 0.25
+    elif "bailingmoe3" in arch_l:
+        # Ling 3.0 Flash: 35 KDA + 7 gated-MLA layers (one in six).
+        ratio = 1.0 / 6.0
     elif "nemotron" in arch_l:
         # Nemotron-H / Nemotron-H-MoE: roughly 1 attention block per 4
         # Mamba blocks.
@@ -779,7 +789,9 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
         # Unknown hybrid — assume 25% attention layers (conservative).
         ratio = 0.25
 
-    return max(1, int(total * ratio))
+    # Round upward: these are safety estimates of context-growing KV layers;
+    # flooring 93 × 1/4 miscounted Kimi-K3's known 24 MLA layers as 23.
+    return max(1, math.ceil(total * ratio))
 
 
 # ---------------------------------------------------------------------------
