@@ -733,22 +733,22 @@ def test_parse_llama_build_number_supports_current_and_legacy_output() -> None:
     from tuner import _parse_llama_build_number
 
     current = (
-        "version: 0.1.0-dev (build 10423, commit a94d563ed)\n"
+        "version: 0.2.0-dev (build 10572, commit 3af988fab)\n"
         "built with MSVC 19.51.36256.0 for x64"
     )
-    assert _parse_llama_build_number(current) == 10423
+    assert _parse_llama_build_number(current) == 10572
     assert (
         _parse_llama_build_number(
-            "version: 0.1.2 (build 10486, commit 1511ce3bc)\nbuilt with MSVC 19.51"
+            "version: 0.2.0 (build 10566, commit bb4caa754)\nbuilt with MSVC 19.51"
         )
-        == 10486
+        == 10566
     )
     assert (
         _parse_llama_build_number("version: 10058 (788e07dc9)\nbuilt with MSVC 19.51")
         == 10058
     )
     assert _parse_llama_build_number("  version: b10056 (b85833e)\n") == 10056
-    assert _parse_llama_build_number("version: 0.1.0-dev (commit a94d563ed)") is None
+    assert _parse_llama_build_number("version: 0.2.0-dev (commit 3af988fab)") is None
     assert _parse_llama_build_number("built with MSVC 19.51") is None
 
 
@@ -1131,6 +1131,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_btn_tree_view",
         "_btn_expert",
         "_btn_diagnose",
+        "_btn_benchmark",
         "_cb_mmproj",
         "_cb_draft",
         "_chk_mmproj_cpu",
@@ -2602,11 +2603,15 @@ def test_mainline_build_recipe_never_mislabels_development_head() -> None:
     assert '"${buildTag}_dev_${shortCommit}"' in recipe
     assert "Get-LlamaBuildTag" not in recipe
     assert 'return "bUNKNOWN"' not in recipe
+    assert "-DLLAMA_BUILD_IS_DEV=ON" in recipe
+    assert "$expectedRuntimeVersion = \"$semanticVersion-dev\"" in recipe
+    assert "reportedVersion -ne $expectedRuntimeVersion" in recipe
     assert "reportedBuild -ne $expectedBuild" in recipe
-    assert "not yet an exact release tag" in recipe
+    assert "$env:ComSpec" in recipe  # --version is emitted on stderr
+    assert "not yet an exact bNNNN release tag" in recipe
 
 
-def test_semver_prerelease_build_recipe_preserves_compatibility_build_number() -> None:
+def test_semver_release_build_recipe_resolves_latest_and_preserves_build_number() -> None:
     recipe = (ROOT / "building llama.cpp" / "llama_prerelease_build.txt").read_text(
         encoding="utf-8"
     )
@@ -2614,11 +2619,32 @@ def test_semver_prerelease_build_recipe_preserves_compatibility_build_number() -
         line for line in recipe.splitlines() if "git clone --branch" in line
     )
 
+    assert '[string]$Tag = "latest"' in recipe
+    assert "Get-LatestStableSemanticTag" in recipe
+    assert "v0.2.0" in recipe
     assert '$dir = "${Tag}_llama.cpp"' in recipe
     assert "-DLLAMA_BUILD_IS_DEV=OFF" in recipe
     assert "git rev-list --count HEAD" in recipe
+    assert '--tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$nightlyTag"' in recipe
+    assert "Release/nightly mismatch" in recipe
     assert "--depth" not in clone_line
+    assert "$env:ComSpec" in recipe  # avoid NativeCommandError on valid stderr
     assert "reportedBuild -ne $expectedBuild" in recipe
+
+
+def test_cuda_setup_never_updates_a_stale_versioned_folder_in_place() -> None:
+    recipe = (ROOT / "building llama.cpp" / "setup_llamacpp_cuda.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+
+    assert "Get-ExactLlamaBuildTag" in recipe
+    assert "_tmp_llama_$PID" in recipe
+    assert '"${buildTag}_dev_${shortCommit}"' in recipe
+    assert "git pull --ff-only origin" not in recipe
+    assert "-DLLAMA_BUILD_IS_DEV=ON" in recipe
+    assert "reportedVersion -ne $expectedRuntimeVersion" in recipe
+    assert "reportedBuild -ne $expectedBuild" in recipe
+    assert "$env:ComSpec" in recipe
 
 
 def _fake_llama_server_path(fork_root: Path) -> Path:

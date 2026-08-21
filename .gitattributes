@@ -1,4 +1,5 @@
 # These two legacy sources are stored with CRLF in repository history.
 # Treat CR as part of the line ending, not trailing whitespace in diff checks.
 auto_tuner.py whitespace=cr-at-eol
+app_settings.py whitespace=cr-at-eol
 settings_loader.py whitespace=cr-at-eol

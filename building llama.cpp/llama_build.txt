@@ -86,6 +86,19 @@ try {
     }
     $shortCommit = $commit.Substring(0, 9)
 
+    # Nightly builds keep their bNNNN identity, while llama.cpp's runtime
+    # version now also reports the current semantic development line
+    # (for example 0.2.0-dev). Read the source of truth instead of pinning it.
+    $cmakeText = Get-Content (Join-Path $tmp "CMakeLists.txt") -Raw
+    $majorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MAJOR\s+(\d+)\)')
+    $minorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MINOR\s+(\d+)\)')
+    $patchMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_PATCH\s+(\d+)\)')
+    if (-not ($majorMatch.Success -and $minorMatch.Success -and $patchMatch.Success)) {
+        throw "Could not determine llama.cpp semantic version from CMakeLists.txt"
+    }
+    $semanticVersion = "$($majorMatch.Groups[1].Value).$($minorMatch.Groups[1].Value).$($patchMatch.Groups[1].Value)"
+    $expectedRuntimeVersion = "$semanticVersion-dev"
+
     # This is the same full-history count embedded by cmake/build-info.cmake.
     # It can legitimately be ahead of the latest published release while
     # master contains unreleased commits.
@@ -128,8 +141,9 @@ if (Test-Path $repo) {
 Rename-Item $tmp $dir
 $channel = if ($isRelease) { "exact release tag $buildTag" } else { "development HEAD after $description" }
 Write-Host "==> Build directory: $repo ($channel, commit $commit)"
+Write-Host "==> Nightly identity: $buildTag; runtime version: $expectedRuntimeVersion"
 if (-not $isRelease) {
-    Write-Host "NOTE: $buildTag is the embedded commit-count build, not yet an exact release tag."
+    Write-Host "NOTE: $buildTag is the embedded commit-count build, not yet an exact bNNNN release tag."
 }
 
 Push-Location "$repo\tools\ui"
@@ -144,6 +158,7 @@ Invoke-NativeChecked "llama.cpp configure" {
     cmake -S $repo -B "$repo\build" `
         -G "Visual Studio 18 2026" `
         -A x64 `
+        -DLLAMA_BUILD_IS_DEV=ON `
         -DGGML_VULKAN=ON `
         -DGGML_NATIVE=OFF `
         -DGGML_AVX2=ON `
@@ -163,22 +178,33 @@ Invoke-NativeChecked "llama.cpp build" {
     cmake --build "$repo\build" --config Release --parallel 20
 }
 $server = "$repo\build\bin\Release\llama-server.exe"
-$versionOutput = (& $server --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0) {
-    throw "llama-server smoke test failed with exit code $LASTEXITCODE"
+# llama-server writes --version to stderr. Route both streams through cmd.exe
+# so PowerShell's ErrorActionPreference=Stop does not turn valid output into a
+# terminating NativeCommandError before we can inspect the exit code.
+$versionOutput = (& $env:ComSpec /d /s /c "`"$server`" --version 2>&1" | Out-String).Trim()
+$versionExit = $LASTEXITCODE
+if ($versionExit -ne 0) {
+    throw "llama-server smoke test failed with exit code $versionExit"
 }
 Write-Host $versionOutput
-$versionMatch = [regex]::Match($versionOutput, '(?im)^\s*version:[^\r\n]*?\(\s*build\s+(\d+)\b')
+$versionMatch = [regex]::Match(
+    $versionOutput,
+    '(?im)^\s*version:\s*(\d+\.\d+\.\d+-dev)\s+\(\s*build\s+(\d+)\b'
+)
 if (-not $versionMatch.Success) {
-    throw "llama-server --version did not report an explicit numeric build"
+    throw "llama-server --version did not report a semantic dev version plus numeric build"
 }
-$reportedBuild = [int]$versionMatch.Groups[1].Value
+$reportedVersion = $versionMatch.Groups[1].Value
+$reportedBuild = [int]$versionMatch.Groups[2].Value
+if ($reportedVersion -ne $expectedRuntimeVersion) {
+    throw "Source/runtime version mismatch: expected $expectedRuntimeVersion, llama-server reports $reportedVersion"
+}
 if ($reportedBuild -ne $expectedBuild) {
     throw "History/build mismatch: git count $expectedBuild, llama-server reports $reportedBuild"
 }
 
 Write-Host ""
-Write-Host "Success: $server ($buildTag, exact release: $isRelease)"
+Write-Host "Success: $server ($reportedVersion, nightly $buildTag, exact b-tag: $isRelease)"
 Write-Host "OCR note: no CMake option controls Unlimited-OCR max_tiles."
 Write-Host "Use llama.cpp b10287+ and an mmproj whose GGUF metadata contains:"
 Write-Host "  clip.vision.preproc_max_tiles = 32"

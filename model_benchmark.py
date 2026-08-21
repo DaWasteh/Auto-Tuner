@@ -1,0 +1,785 @@
+"""Bounded, real llama-server performance tuning for one selected GGUF.
+
+The engine is deliberately UI-independent.  It starts a private loopback
+llama-server for each candidate, waits for the exact server identity, runs a
+fixed deterministic inference workload, compares median prompt/decode speed,
+and returns the safest materially faster configuration.  Qt only supplies a
+thread, progress dialog, and persistence.
+
+Quality-affecting choices (context, KV precision, GPU placement, Flash
+Attention, speculative mode, sampling) stay fixed.  The first implementation
+searches the high-value, low-risk runtime axes that users otherwise tune by
+restarting the server repeatedly: CPU threads, batch threads, batch, and
+ubatch.
+"""
+
+from __future__ import annotations
+
+import copy
+import http.client
+import json
+import math
+import os
+import socket
+import statistics
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from scanner import ModelEntry
+from server_process import ServerProcess
+from settings_loader import ModelProfile
+from tuner import (
+    TunedConfig,
+    build_command,
+    check_profile_build,
+    prepare_command_for_binary,
+    probe_binary_build_number,
+)
+
+
+class BenchmarkCancelled(RuntimeError):
+    """Raised internally when the user cancels a benchmark sweep."""
+
+
+class BenchmarkFailure(RuntimeError):
+    """Raised when the baseline or benchmark infrastructure cannot run."""
+
+
+@dataclass(frozen=True)
+class BenchmarkLimits:
+    """Hard bounds that keep a tuning run useful but finite."""
+
+    max_candidates: int = 8
+    confirmation_runs: int = 2
+    samples_per_candidate: int = 2
+    startup_timeout_s: float = 300.0
+    request_timeout_s: float = 120.0
+    total_timeout_s: float = 1800.0
+    generated_tokens: int = 64
+    min_improvement: float = 0.03
+    max_sample_spread: float = 0.35
+
+
+@dataclass(frozen=True)
+class BenchmarkCandidate:
+    """The non-quality settings varied for one fresh server launch."""
+
+    id: str
+    label: str
+    threads: int
+    batch_threads: int
+    batch: int
+    ubatch: int
+
+    def apply(self, base: TunedConfig) -> TunedConfig:
+        cfg = copy.copy(base)
+        cfg.threads = max(1, int(self.threads))
+        cfg.batch_threads = max(1, int(self.batch_threads))
+        cfg.batch = max(1, int(self.batch))
+        cfg.ubatch = max(1, min(int(self.ubatch), cfg.batch))
+        # One slot makes the requested context exact and keeps every candidate
+        # a single-user latency/throughput comparison instead of a concurrency
+        # benchmark. All memory/quality choices from compute_config stay fixed.
+        cfg.n_parallel = 1
+        cfg.n_parallel_forced = True
+        return cfg
+
+    def settings(self) -> Dict[str, int]:
+        return {
+            "threads": self.threads,
+            "batch_threads": self.batch_threads,
+            "batch": self.batch,
+            "ubatch": self.ubatch,
+        }
+
+
+@dataclass(frozen=True)
+class BenchmarkSample:
+    prompt_tps: float
+    generation_tps: float
+    prompt_tokens: int
+    generated_tokens: int
+    elapsed_s: float
+
+
+@dataclass
+class CandidateResult:
+    candidate: BenchmarkCandidate
+    samples: List[BenchmarkSample] = field(default_factory=list)
+    error: str = ""
+    log_tail: List[str] = field(default_factory=list)
+    confirmations: int = 0
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.samples) and not self.error
+
+    @property
+    def prompt_tps(self) -> float:
+        return statistics.median(s.prompt_tps for s in self.samples)
+
+    @property
+    def generation_tps(self) -> float:
+        return statistics.median(s.generation_tps for s in self.samples)
+
+    def sample_spread(self) -> float:
+        """Worst relative min/max spread across prompt and decode samples."""
+        spreads: List[float] = []
+        for values in (
+            [s.prompt_tps for s in self.samples],
+            [s.generation_tps for s in self.samples],
+        ):
+            if not values or max(values) <= 0:
+                return math.inf
+            spreads.append((max(values) - min(values)) / max(values))
+        return max(spreads, default=math.inf)
+
+
+@dataclass
+class BenchmarkResult:
+    desired_context: int
+    baseline_id: str
+    winner_id: str
+    candidates: List[CandidateResult]
+    elapsed_s: float
+    runtime_binary: str
+    runtime_build: Optional[int]
+    reason: str
+
+    def by_id(self, candidate_id: str) -> CandidateResult:
+        for result in self.candidates:
+            if result.candidate.id == candidate_id:
+                return result
+        raise KeyError(candidate_id)
+
+    @property
+    def baseline(self) -> CandidateResult:
+        return self.by_id(self.baseline_id)
+
+    @property
+    def winner(self) -> CandidateResult:
+        return self.by_id(self.winner_id)
+
+    def score(self, result: CandidateResult) -> float:
+        base = self.baseline
+        if not result.valid or not base.valid:
+            return 0.0
+        return math.sqrt(
+            (result.prompt_tps / base.prompt_tps)
+            * (result.generation_tps / base.generation_tps)
+        )
+
+    def winning_config(self, base: TunedConfig) -> TunedConfig:
+        return self.winner.candidate.apply(base)
+
+    def to_record(self, *, model_path: str, model_size: int, model_mtime_ns: int) -> dict:
+        """Return bounded JSON evidence; prompts, raw argv, and full logs stay out."""
+        return {
+            "schema": 1,
+            "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "model_path": model_path,
+            "model_size": int(model_size),
+            "model_mtime_ns": int(model_mtime_ns),
+            "desired_context": int(self.desired_context),
+            "runtime_binary": self.runtime_binary,
+            "runtime_build": self.runtime_build,
+            "elapsed_s": round(self.elapsed_s, 3),
+            "winner_id": self.winner_id,
+            "reason": self.reason,
+            "winner_score": round(self.score(self.winner), 6),
+            "winner_settings": self.winner.candidate.settings(),
+            "baseline_settings": self.baseline.candidate.settings(),
+            "candidates": [
+                {
+                    "id": item.candidate.id,
+                    "label": item.candidate.label,
+                    "settings": item.candidate.settings(),
+                    "prompt_tps": round(item.prompt_tps, 4) if item.valid else None,
+                    "generation_tps": (
+                        round(item.generation_tps, 4) if item.valid else None
+                    ),
+                    "score": round(self.score(item), 6) if item.valid else None,
+                    "samples": [asdict(sample) for sample in item.samples],
+                    "confirmations": item.confirmations,
+                    "error": item.error,
+                    "log_tail": item.log_tail[-20:],
+                }
+                for item in self.candidates
+            ],
+        }
+
+
+ProgressCallback = Callable[[int, int, str], None]
+
+
+def _candidate_key(candidate: BenchmarkCandidate) -> Tuple[int, int, int, int]:
+    return (
+        candidate.threads,
+        candidate.batch_threads,
+        candidate.batch,
+        candidate.ubatch,
+    )
+
+
+def baseline_candidate(cfg: TunedConfig) -> BenchmarkCandidate:
+    return BenchmarkCandidate(
+        id="baseline",
+        label="Auto baseline",
+        threads=max(1, cfg.threads),
+        batch_threads=max(1, cfg.batch_threads),
+        batch=max(1, cfg.batch),
+        ubatch=max(1, min(cfg.ubatch, cfg.batch)),
+    )
+
+
+def thread_candidates(
+    seed: BenchmarkCandidate, physical_cores: int, logical_cores: int
+) -> List[BenchmarkCandidate]:
+    """Return deterministic, unique thread alternatives around ``seed``."""
+    physical = max(1, int(physical_cores or seed.threads))
+    logical = max(physical, int(logical_cores or physical))
+    values = [physical, max(1, physical // 2), logical]
+    out: List[BenchmarkCandidate] = []
+    seen = {_candidate_key(seed)}
+    for threads in values:
+        batch_threads = min(logical, max(1, threads))
+        item = BenchmarkCandidate(
+            id=f"threads-{threads}-{batch_threads}",
+            label=f"Threads {threads} / batch threads {batch_threads}",
+            threads=threads,
+            batch_threads=batch_threads,
+            batch=seed.batch,
+            ubatch=seed.ubatch,
+        )
+        if _candidate_key(item) not in seen:
+            seen.add(_candidate_key(item))
+            out.append(item)
+    return out
+
+
+def batch_candidates(seed: BenchmarkCandidate) -> List[BenchmarkCandidate]:
+    """Return bounded power-of-two batch/ubatch alternatives."""
+    pairs = [
+        (512, 256),
+        (1024, 512),
+        (1024, 1024),
+        (2048, 512),
+        (2048, 1024),
+    ]
+    out: List[BenchmarkCandidate] = []
+    seen = {_candidate_key(seed)}
+    for batch, ubatch in pairs:
+        item = BenchmarkCandidate(
+            id=f"batch-{batch}-{ubatch}-t{seed.threads}",
+            label=f"Batch {batch} / ubatch {ubatch}",
+            threads=seed.threads,
+            batch_threads=seed.batch_threads,
+            batch=batch,
+            ubatch=min(ubatch, batch),
+        )
+        if _candidate_key(item) not in seen:
+            seen.add(_candidate_key(item))
+            out.append(item)
+    return out
+
+
+def parse_timing_payload(
+    payload: dict,
+    elapsed_s: float,
+    *,
+    min_prompt_tokens: int = 64,
+    min_generated_tokens: int = 16,
+) -> BenchmarkSample:
+    """Parse current llama.cpp native-completion timing fields defensively."""
+    timings = payload.get("timings")
+    if not isinstance(timings, dict):
+        raise BenchmarkFailure("llama-server response has no timings object")
+
+    def _integer(*names: str) -> int:
+        for name in names:
+            value = timings.get(name, payload.get(name))
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                return parsed
+        return 0
+
+    def _positive(*names: str) -> float:
+        for name in names:
+            try:
+                parsed = float(timings.get(name))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed) and parsed > 0:
+                return parsed
+        return 0.0
+
+    prompt_n = _integer("prompt_n", "tokens_evaluated")
+    predicted_n = _integer("predicted_n", "tokens_predicted")
+    prompt_tps = _positive("prompt_per_second")
+    generation_tps = _positive("predicted_per_second")
+
+    prompt_ms = _positive("prompt_ms")
+    predicted_ms = _positive("predicted_ms")
+    if prompt_tps <= 0 and prompt_n > 0 and prompt_ms > 0:
+        prompt_tps = prompt_n / (prompt_ms / 1000.0)
+    if generation_tps <= 0 and predicted_n > 0 and predicted_ms > 0:
+        generation_tps = predicted_n / (predicted_ms / 1000.0)
+
+    if prompt_n < min_prompt_tokens:
+        raise BenchmarkFailure(
+            f"measurement prompt was too short ({prompt_n} tokens)"
+        )
+    if predicted_n < min_generated_tokens:
+        raise BenchmarkFailure(
+            f"generation ended too early ({predicted_n} tokens)"
+        )
+    if prompt_tps <= 0 or generation_tps <= 0:
+        raise BenchmarkFailure("llama-server returned invalid throughput timings")
+    return BenchmarkSample(
+        prompt_tps=prompt_tps,
+        generation_tps=generation_tps,
+        prompt_tokens=prompt_n,
+        generated_tokens=predicted_n,
+        elapsed_s=max(0.0, float(elapsed_s)),
+    )
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _fixed_prompt(target_tokens: int) -> str:
+    # Common short words tokenize consistently enough across BPE/SPM families;
+    # the response's prompt_n remains the authoritative measured count.
+    phrase = (
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+        "nu xi omicron pi rho sigma tau upsilon phi chi psi omega "
+    )
+    repeats = max(8, math.ceil(target_tokens / 24))
+    return (phrase * repeats).strip()
+
+
+class BenchmarkRunner:
+    """Run one bounded staged search against fresh private llama servers."""
+
+    def __init__(
+        self,
+        *,
+        model: ModelEntry,
+        profile: ModelProfile,
+        base_config: TunedConfig,
+        runtime_binary: str,
+        physical_cores: int,
+        logical_cores: int,
+        draft_model: Optional[ModelEntry] = None,
+        use_thinking: bool = False,
+        enable_speculative: bool = False,
+        enable_ngram: bool = False,
+        limits: Optional[BenchmarkLimits] = None,
+        progress: Optional[ProgressCallback] = None,
+        process_factory=ServerProcess,
+    ) -> None:
+        self.model = copy.copy(model)
+        self.profile = profile
+        self.base_config = copy.copy(base_config)
+        self.runtime_binary = str(runtime_binary)
+        self.physical_cores = max(1, int(physical_cores or 1))
+        self.logical_cores = max(self.physical_cores, int(logical_cores or 1))
+        self.draft_model = draft_model
+        self.use_thinking = bool(use_thinking)
+        self.enable_speculative = bool(enable_speculative)
+        self.enable_ngram = bool(enable_ngram)
+        self.limits = limits or BenchmarkLimits()
+        self.progress = progress or (lambda _done, _total, _message: None)
+        self.process_factory = process_factory
+        self._cancel = threading.Event()
+        self._active_connection: Optional[http.client.HTTPConnection] = None
+        self._connection_lock = threading.Lock()
+        self._completed_runs = 0
+        self._total_runs = self.limits.max_candidates + self.limits.confirmation_runs
+        self._deadline = 0.0
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        with self._connection_lock:
+            connection = self._active_connection
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _check_cancelled(self) -> None:
+        if self._cancel.is_set():
+            raise BenchmarkCancelled("Performance tuning cancelled")
+        if self._deadline and time.monotonic() >= self._deadline:
+            raise BenchmarkFailure("Performance tuning reached its total time limit")
+
+    def _emit(self, message: str) -> None:
+        self.progress(self._completed_runs, self._total_runs, message)
+
+    def _request_json(
+        self,
+        port: int,
+        method: str,
+        path: str,
+        payload: Optional[dict] = None,
+        *,
+        timeout: Optional[float] = None,
+        accept_status: Sequence[int] = (200,),
+    ) -> Tuple[int, dict]:
+        self._check_cancelled()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", port, timeout=timeout or self.limits.request_timeout_s
+        )
+        with self._connection_lock:
+            self._active_connection = connection
+        try:
+            body = None if payload is None else json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"} if body is not None else {}
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            raw = response.read()
+            if response.status not in accept_status:
+                detail = raw.decode("utf-8", errors="replace")[-500:]
+                raise BenchmarkFailure(
+                    f"HTTP {response.status} from {path}: {detail}"
+                )
+            if not raw:
+                return response.status, {}
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise BenchmarkFailure(f"non-object JSON from {path}")
+            return response.status, parsed
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            if self._cancel.is_set():
+                raise BenchmarkCancelled("Performance tuning cancelled") from exc
+            raise BenchmarkFailure(f"HTTP request to {path} failed: {exc}") from exc
+        finally:
+            with self._connection_lock:
+                if self._active_connection is connection:
+                    self._active_connection = None
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _wait_ready(self, process: ServerProcess, port: int, alias: str) -> None:
+        timeout_at = min(
+            self._deadline, time.monotonic() + self.limits.startup_timeout_s
+        )
+        last_error = "server still loading"
+        while time.monotonic() < timeout_at:
+            self._check_cancelled()
+            if process.proc is not None and process.proc.poll() is not None:
+                logs = "".join(process.get_logs())[-2000:]
+                raise BenchmarkFailure(
+                    f"llama-server exited during startup ({process.proc.returncode}): {logs}"
+                )
+            try:
+                status, _body = self._request_json(
+                    port,
+                    "GET",
+                    "/health",
+                    timeout=2.0,
+                    accept_status=(200, 503),
+                )
+                if status == 200:
+                    _status, models = self._request_json(
+                        port, "GET", "/v1/models", timeout=5.0
+                    )
+                    data = models.get("data")
+                    ids = {
+                        str(item.get("id"))
+                        for item in data or []
+                        if isinstance(item, dict) and item.get("id")
+                    }
+                    if alias not in ids:
+                        raise BenchmarkFailure(
+                            "the selected port answered, but not with this benchmark model"
+                        )
+                    return
+            except BenchmarkCancelled:
+                raise
+            except BenchmarkFailure as exc:
+                last_error = str(exc)
+            self._cancel.wait(0.25)
+        raise BenchmarkFailure(
+            f"llama-server did not become ready within "
+            f"{self.limits.startup_timeout_s:.0f}s ({last_error})"
+        )
+
+    def _measurement_payload(self, context: int) -> dict:
+        target_prompt = min(2048, max(128, int(context * 0.25)))
+        return {
+            "prompt": _fixed_prompt(target_prompt),
+            "n_predict": self.limits.generated_tokens,
+            "temperature": 0.0,
+            "top_k": 1,
+            "top_p": 1.0,
+            "min_p": 0.0,
+            "repeat_penalty": 1.0,
+            "seed": 424242,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "stream": False,
+        }
+
+    def _benchmark_candidate(self, candidate: BenchmarkCandidate) -> CandidateResult:
+        self._check_cancelled()
+        cfg = candidate.apply(self.base_config)
+        port = _free_loopback_port()
+        alias = f"autotuner-bench-{os.getpid()}-{port}"
+        cmd = build_command(
+            model=self.model,
+            config=cfg,
+            profile=self.profile,
+            draft_model=self.draft_model if self.enable_speculative else None,
+            server_binary=self.runtime_binary,
+            host="127.0.0.1",
+            port=port,
+            extra_args=["-a", alias],
+            use_thinking=self.use_thinking,
+            enable_speculative=self.enable_speculative,
+            enable_ngram=self.enable_ngram,
+            enable_prompt_cache=False,
+            prompt_cache_ram_mib=0,
+            enable_metrics=False,
+            enable_slots_api=False,
+        )
+        allowed, message, _build = check_profile_build(self.profile, cmd[0])
+        if not allowed:
+            raise BenchmarkFailure(message or "selected llama.cpp build is too old")
+        cmd, _removed = prepare_command_for_binary(cmd)
+        process = self.process_factory(cmd, env_overrides=cfg.env_overrides)
+        result = CandidateResult(candidate=candidate)
+        try:
+            process.start()
+            self._wait_ready(process, port, alias)
+            # Excluded warm-up: initializes kernels/JIT without favoring later
+            # candidates through server-side prompt caching.
+            self._request_json(
+                port,
+                "POST",
+                "/completion",
+                {
+                    "prompt": "Warm-up: answer with a short deterministic sequence.",
+                    "n_predict": 8,
+                    "temperature": 0.0,
+                    "top_k": 1,
+                    "seed": 424242,
+                    "ignore_eos": True,
+                    "cache_prompt": False,
+                    "stream": False,
+                },
+            )
+            payload = self._measurement_payload(cfg.ctx)
+            for _index in range(self.limits.samples_per_candidate):
+                self._check_cancelled()
+                started = time.monotonic()
+                _status, response = self._request_json(
+                    port, "POST", "/completion", payload
+                )
+                elapsed = time.monotonic() - started
+                result.samples.append(
+                    parse_timing_payload(
+                        response,
+                        elapsed,
+                        min_generated_tokens=max(
+                            16, int(self.limits.generated_tokens * 0.75)
+                        ),
+                    )
+                )
+            if result.sample_spread() > self.limits.max_sample_spread:
+                raise BenchmarkFailure(
+                    "measurements were too noisy for a deterministic decision"
+                )
+            return result
+        finally:
+            try:
+                result.log_tail = [
+                    line.rstrip() for line in process.get_logs()[-20:] if line.strip()
+                ]
+            except Exception:
+                pass
+            try:
+                process.stop()
+            finally:
+                # Give drivers a short bounded moment to release model/KV memory.
+                self._cancel.wait(0.75)
+
+    def _run_candidate(
+        self, candidate: BenchmarkCandidate, *, confirmation: bool = False
+    ) -> CandidateResult:
+        phase = "Confirming" if confirmation else "Testing"
+        self._emit(f"{phase}: {candidate.label}")
+        try:
+            result = self._benchmark_candidate(candidate)
+        except (BenchmarkCancelled, BenchmarkFailure):
+            raise
+        except Exception as exc:
+            raise BenchmarkFailure(str(exc)) from exc
+        finally:
+            self._completed_runs += 1
+        self._emit(f"Measured: {candidate.label}")
+        return result
+
+    @staticmethod
+    def _risk_distance(
+        candidate: BenchmarkCandidate, baseline: BenchmarkCandidate
+    ) -> float:
+        return sum(
+            abs(a - b) / max(1, b)
+            for a, b in zip(_candidate_key(candidate), _candidate_key(baseline))
+        )
+
+    def _score(
+        self, item: CandidateResult, baseline: CandidateResult
+    ) -> float:
+        if not item.valid:
+            return 0.0
+        return math.sqrt(
+            (item.prompt_tps / baseline.prompt_tps)
+            * (item.generation_tps / baseline.generation_tps)
+        )
+
+    def _rank(
+        self,
+        results: Sequence[CandidateResult],
+        baseline: CandidateResult,
+    ) -> List[CandidateResult]:
+        valid = [item for item in results if item.valid]
+        return sorted(
+            valid,
+            key=lambda item: (
+                -self._score(item, baseline),
+                self._risk_distance(item.candidate, baseline.candidate),
+                item.candidate.id,
+            ),
+        )
+
+    def run(self) -> BenchmarkResult:
+        started = time.monotonic()
+        self._deadline = started + self.limits.total_timeout_s
+        if self.base_config.ctx <= 0:
+            raise BenchmarkFailure("desired context must be positive")
+        if self.limits.max_candidates < 1:
+            raise BenchmarkFailure("at least one benchmark candidate is required")
+
+        baseline_spec = baseline_candidate(self.base_config)
+        results: List[CandidateResult] = []
+        by_id: Dict[str, CandidateResult] = {}
+        seen = {_candidate_key(baseline_spec)}
+
+        try:
+            baseline = self._run_candidate(baseline_spec)
+        except BenchmarkCancelled:
+            raise
+        except BenchmarkFailure as exc:
+            raise BenchmarkFailure(f"baseline failed: {exc}") from exc
+        results.append(baseline)
+        by_id[baseline_spec.id] = baseline
+
+        # Stage 1: find the best CPU thread count while every other axis stays
+        # identical. Individual failures are evidence, not a reason to abort.
+        for candidate in thread_candidates(
+            baseline_spec, self.physical_cores, self.logical_cores
+        ):
+            if len(results) >= self.limits.max_candidates:
+                break
+            self._check_cancelled()
+            try:
+                measured = self._run_candidate(candidate)
+            except BenchmarkCancelled:
+                raise
+            except BenchmarkFailure as exc:
+                measured = CandidateResult(candidate=candidate, error=str(exc))
+            results.append(measured)
+            by_id[candidate.id] = measured
+            seen.add(_candidate_key(candidate))
+
+        best_thread = self._rank(results, baseline)[0].candidate
+
+        # Stage 2: combine the winning thread setting with bounded batch pairs.
+        for candidate in batch_candidates(best_thread):
+            if len(results) >= self.limits.max_candidates:
+                break
+            if _candidate_key(candidate) in seen:
+                continue
+            self._check_cancelled()
+            try:
+                measured = self._run_candidate(candidate)
+            except BenchmarkCancelled:
+                raise
+            except BenchmarkFailure as exc:
+                measured = CandidateResult(candidate=candidate, error=str(exc))
+            results.append(measured)
+            by_id[candidate.id] = measured
+            seen.add(_candidate_key(candidate))
+
+        ranked = self._rank(results, baseline)
+        finalists = ranked[: min(2, self.limits.confirmation_runs, len(ranked))]
+        confirmed_ids: set[str] = set()
+        # Reverse order avoids always giving the exploratory winner the same
+        # thermal/order advantage during confirmation.
+        for finalist in reversed(finalists):
+            self._check_cancelled()
+            try:
+                confirmation = self._run_candidate(
+                    finalist.candidate, confirmation=True
+                )
+            except BenchmarkCancelled:
+                raise
+            except BenchmarkFailure as exc:
+                finalist.error = f"confirmation failed: {exc}"
+                continue
+            finalist.samples.extend(confirmation.samples)
+            finalist.confirmations += 1
+            finalist.log_tail = confirmation.log_tail
+            if finalist.sample_spread() <= self.limits.max_sample_spread:
+                confirmed_ids.add(finalist.candidate.id)
+            else:
+                finalist.error = "confirmation measurements were too noisy"
+
+        final_ranked = self._rank(results, baseline)
+        if not final_ranked:
+            raise BenchmarkFailure("all benchmark candidates failed")
+        winner = final_ranked[0]
+        winner_score = self._score(winner, baseline)
+        reason = "measured winner"
+        if winner.candidate.id != baseline_spec.id and (
+            winner_score < 1.0 + self.limits.min_improvement
+            or (
+                confirmed_ids
+                and winner.candidate.id not in confirmed_ids
+                and baseline_spec.id in confirmed_ids
+            )
+        ):
+            winner = baseline
+            reason = (
+                "Auto baseline kept because no confirmed candidate improved the "
+                f"combined score by {self.limits.min_improvement * 100:.0f}%"
+            )
+        elif winner.candidate.id == baseline_spec.id:
+            reason = "Auto baseline remained fastest within the noise threshold"
+
+        self._completed_runs = self._total_runs
+        self._emit("Performance tuning complete")
+        return BenchmarkResult(
+            desired_context=int(self.base_config.ctx),
+            baseline_id=baseline_spec.id,
+            winner_id=winner.candidate.id,
+            candidates=results,
+            elapsed_s=time.monotonic() - started,
+            runtime_binary=self.runtime_binary,
+            runtime_build=probe_binary_build_number(self.runtime_binary),
+            reason=reason,
+        )

@@ -353,7 +353,7 @@ _MIN_DSPARK_BUILD = 10164
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
     """Parse legacy and semantic-version llama.cpp build identifiers safely.
 
-    Current llama.cpp prints ``version: 0.1.0-dev (build 10423, commit ...)``;
+    Current llama.cpp prints ``version: 0.2.0-dev (build 10572, commit ...)``;
     older builds printed ``version: 10056 (...)``.  Prefer the explicit build
     field so the semantic major version is never mistaken for build ``b0``.
     Keeping both matches anchored to the version line also avoids compiler

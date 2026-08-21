@@ -105,6 +105,19 @@ the RAM/VRAM you actually have free — without manual edits.
   the generic `temp 0.7 / top_k 40`) now runs on its intended samplers —
   a frequent cause of repetition loops and broken tool-calls on models
   tuned for a low `top_k` with a non-zero `min_p`.
+- **Measured performance tuning** — select a normal text/chat GGUF and click
+  **🚀 Performance-Test**. AutoTuner asks for the target context (the maximum
+  currently feasible context is preselected), then starts fresh private
+  `llama-server` instances and deterministically tests CPU threads, batch
+  threads, batch, and ubatch. The sweep is bounded to at most eight candidates
+  plus two reversed-order confirmations, uses one excluded warm-up and median
+  prompt/decode throughput, and keeps the safer Auto baseline unless a measured
+  winner improves the combined score materially. The winning values and bounded
+  evidence are saved for the exact GGUF path and become editable Expert settings.
+  Context, KV quality, GPU placement, Flash Attention, and selected model
+  features stay fixed. AutoTuner deliberately does **not** alter clocks, voltage,
+  fan curves, or power limits: hardware overclocking would make the result less
+  reproducible and is outside the app's safe process-level scope.
 - **Multi-server (run several models at once)** — Launch no longer
   refuses while a server is running. Each new model gets the **next free
   port**: 0 servers → `1234`, 1 → `1235`, 2 → `1236`, … When a server is
@@ -137,8 +150,8 @@ the RAM/VRAM you actually have free — without manual edits.
 - **Fork-folder memory** — if you point the GUI at a parent folder
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
   the next launch re-expands the same set of builds in the dropdown. Both
-  build-number names such as `b10485_llama.cpp` and semantic-release names
-  such as `v0.1.2_llama.cpp` are recognized. No more re-navigating one folder
+  build-number names such as `b10566_llama.cpp` and semantic-release names
+  such as `v0.2.0_llama.cpp` are recognized. No more re-navigating one folder
   up after every restart.
 - **Window geometry, state & inner layout** — QMainWindow
   `saveGeometry()` (size, position, maximize-state) and `saveState()`
@@ -820,6 +833,7 @@ auto_tuner/
 ├── auto_tuner.py        # main entry: terminal menu + glue
 ├── qt_launcher.py       # Qt GUI (model picker + sticky options + OCR dialog)
 ├── ocr_workflow.py      # shared GUI/TUI PDF/Office/image OCR pipeline
+├── model_benchmark.py   # bounded real-server performance search + scoring
 ├── hardware.py          # CPU + multi-vendor GPU detection
 ├── scanner.py           # GGUF scanner: mmproj/draft pairing, capability detection
 ├── settings_loader.py   # YAML profile loader and matcher
@@ -847,8 +861,8 @@ repo keeps the build recipes in separate scripts so this README stays short:
 
 | File | Purpose |
 |------|---------|
-| [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline llama.cpp Vulkan build (Windows/AMD-friendly; exact tags use `bNNNN_llama.cpp`, untagged master uses `bNNNN_dev_COMMIT_llama.cpp`). |
-| [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Exact semantic-version pre-release build (defaults to `v0.1.2`, output `v0.1.2_llama.cpp`). |
+| [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline/nightly llama.cpp Vulkan build (Windows/AMD-friendly; exact nightly tags use `bNNNN_llama.cpp`, untagged master uses `bNNNN_dev_COMMIT_llama.cpp`; runtime also verifies the current `X.Y.Z-dev` line). |
+| [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Official semantic release build (historical filename; resolves the newest published stable `vX.Y.Z` automatically, currently `v0.2.0`, and verifies its corresponding nightly `bNNNN` identity). |
 | [`turboquant_llama_build.txt`](building%20llama.cpp/turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
 | [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
 | [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
@@ -862,21 +876,28 @@ layouts automatically (`tools/ui` since b9174, `tools/server/webui` on older
 forks) and fall back to the prebuilt UI if the fork does not ship UI sources.
 Both mainline recipes deliberately keep full Git history (so the embedded
 numeric compatibility build is not incorrectly reported as `b1`). The normal
-master recipe now distinguishes an exact b-tag from an unreleased HEAD and
-checks the compiled binary against `git rev-list --count HEAD`; it never labels
-a development build with the previous release tag. The semantic pre-release
-recipe additionally sets `LLAMA_BUILD_IS_DEV=OFF`, making
+master/nightly recipe now distinguishes an exact b-tag from an unreleased HEAD,
+reads the semantic base from upstream CMake, and checks the compiled binary's
+`X.Y.Z-dev` plus build number against `git rev-list --count HEAD`; it never
+labels a development build with the previous release tag. The semantic release
+recipe resolves the newest published stable `vX.Y.Z`, verifies the matching
+nightly `bNNNN` commit, and sets `LLAMA_BUILD_IS_DEV=OFF`, making
 `llama-server --version` report the exact semantic version plus its real build
-number for AutoTuner's feature gates.
+number for AutoTuner's feature gates. The CUDA setup helper likewise creates a
+fresh truthful folder instead of pulling newer source into an older `bNNNN`
+folder.
 
 Ubuntu/Linux users can either build upstream llama.cpp normally or adapt the
 same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (as of b10549)
+## Server features (compatible through v0.2.0 / b10572)
 
-The following `llama-server` features are supported (verified against `llama-server --help` / `tools/server/README.md`):
+Build/version probing and real server launches are validated against official
+`v0.2.0` (`b10566`) and main/nightly `0.2.0-dev` (`b10572`). The following
+`llama-server` features are supported (verified against `llama-server --help` /
+`tools/server/README.md`; the detailed historical source audit remains below):
 
 | Flag | Support |
 |------|---------|

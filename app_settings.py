@@ -46,9 +46,11 @@ Public API:
     favorite_model_key(model_path) -> str
     get_favorite_models() -> set[str]
     set_model_favorite(model_path, favorite)
-    get_expert_override(model_name) -> Optional[dict]   # saved Expert-panel state
-    set_expert_override(model_name, snapshot: dict)
-    clear_expert_override(model_name)
+    get_expert_override(model_name, model_path=None) -> Optional[dict]
+    set_expert_override(model_name, snapshot: dict, model_path=None)
+    clear_expert_override(model_name, model_path=None)
+    get_performance_tuning_result(model_path) -> Optional[dict]
+    save_performance_tuning_result(model_name, model_path, result, snapshot) -> bool
 """
 
 from __future__ import annotations
@@ -480,7 +482,11 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 # next time that model is selected — and applied at launch just like the
 # checkbox overrides above, completing the "remembers everything" story.
 #
-# Schema (stored under "expert_overrides", keyed by model name):
+# New writes can also use the OS-namespaced ``expert_overrides_by_path`` map,
+# keyed by normalized absolute GGUF path. The legacy name map remains a fallback
+# so existing settings migrate without losing a user's configuration.
+#
+# Schema (legacy map stored under "expert_overrides", keyed by model name):
 #   "expert_overrides": {
 #       "Qwen3.5-30B-A3B-UD-Q4_K_XL": {
 #           "mode": "auto",            # "auto" | "manual"
@@ -498,61 +504,129 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 # Reset (the new button next to Auto/Manual) simply clears the entry.
 
 
-def get_expert_override(model_name: str) -> Optional[Dict[str, Any]]:
-    """Return the saved Expert-panel snapshot for ``model_name``, or None.
+def _valid_expert_snapshot(snapshot: Any) -> bool:
+    return (
+        isinstance(snapshot, dict)
+        and "mode" in snapshot
+        and isinstance(snapshot.get("values"), dict)
+    )
+
+
+def get_expert_override(
+    model_name: str, model_path: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    """Return a path-specific Expert snapshot, then fall back to legacy name.
 
     The dict (when present) always carries ``mode`` and ``values``; ``pins``
     and ``saved_at`` are optional. A structurally invalid entry is treated
     as missing so a corrupt JSON blob never crashes the GUI.
     """
+    settings = load_settings()
+    if model_path is not None:
+        key = favorite_model_key(model_path)
+        by_path = settings.get(_os_path_key("expert_overrides_by_path")) or {}
+        if key and isinstance(by_path, dict):
+            snap = by_path.get(key)
+            if _valid_expert_snapshot(snap):
+                return snap
     if not model_name:
         return None
-    raw = load_settings().get("expert_overrides") or {}
+    raw = settings.get("expert_overrides") or {}
     if not isinstance(raw, dict):
         return None
     snap = raw.get(model_name)
-    if not isinstance(snap, dict):
-        return None
-    if "mode" not in snap or "values" not in snap:
-        return None
-    return snap
+    return snap if _valid_expert_snapshot(snap) else None
 
 
-def set_expert_override(model_name: str, snapshot: Dict[str, Any]) -> None:
-    """Persist the Expert-panel snapshot for ``model_name``.
+def set_expert_override(
+    model_name: str,
+    snapshot: Dict[str, Any],
+    model_path: Optional[Path] = None,
+) -> None:
+    """Persist a validated Expert snapshot, preferring path identity."""
+    if not model_name or not _valid_expert_snapshot(snapshot):
+        return
+    settings = load_settings()
+    key = favorite_model_key(model_path) if model_path is not None else ""
+    if key:
+        storage_key = _os_path_key("expert_overrides_by_path")
+        overrides = settings.get(storage_key)
+        if not isinstance(overrides, dict):
+            overrides = {}
+        overrides[key] = snapshot
+        settings[storage_key] = overrides
+    else:
+        overrides = settings.get("expert_overrides")
+        if not isinstance(overrides, dict):
+            overrides = {}
+        overrides[model_name] = snapshot
+        settings["expert_overrides"] = overrides
+    save_settings(settings)
 
-    ``snapshot`` must contain at least ``mode`` and ``values``. ``pins``
-    and ``saved_at`` are preserved when present. An empty/invalid snapshot
-    is ignored rather than written, so a half-built state can never land
-    on disk.
-    """
+
+def clear_expert_override(model_name: str, model_path: Optional[Path] = None) -> None:
+    """Drop path-specific state and its legacy fallback for Reset."""
     if not model_name:
         return
-    if (
-        not isinstance(snapshot, dict)
-        or "mode" not in snapshot
-        or "values" not in snapshot
-    ):
-        return
-    s = load_settings()
-    overrides = s.get("expert_overrides")
-    if not isinstance(overrides, dict):
-        overrides = {}
-    overrides[model_name] = snapshot
-    s["expert_overrides"] = overrides
-    save_settings(s)
-
-
-def clear_expert_override(model_name: str) -> None:
-    """Drop the saved Expert-panel state for a single model (the Reset button)."""
-    if not model_name:
-        return
-    s = load_settings()
-    overrides = s.get("expert_overrides") or {}
+    settings = load_settings()
+    changed = False
+    if model_path is not None:
+        key = favorite_model_key(model_path)
+        storage_key = _os_path_key("expert_overrides_by_path")
+        by_path = settings.get(storage_key) or {}
+        if key and isinstance(by_path, dict) and key in by_path:
+            by_path.pop(key, None)
+            settings[storage_key] = by_path
+            changed = True
+    overrides = settings.get("expert_overrides") or {}
     if isinstance(overrides, dict) and model_name in overrides:
         overrides.pop(model_name, None)
-        s["expert_overrides"] = overrides
-        save_settings(s)
+        settings["expert_overrides"] = overrides
+        changed = True
+    if changed:
+        save_settings(settings)
+
+
+def get_performance_tuning_result(model_path: Path) -> Optional[Dict[str, Any]]:
+    """Return the latest measured tuning record for one exact GGUF path."""
+    key = favorite_model_key(model_path)
+    records = load_settings().get(_os_path_key("performance_tuning_results")) or {}
+    if not key or not isinstance(records, dict):
+        return None
+    record = records.get(key)
+    return record if isinstance(record, dict) else None
+
+
+def save_performance_tuning_result(
+    model_name: str,
+    model_path: Path,
+    result: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> bool:
+    """Atomically save benchmark evidence and the winning active snapshot."""
+    key = favorite_model_key(model_path)
+    if (
+        not model_name
+        or not key
+        or not isinstance(result, dict)
+        or not _valid_expert_snapshot(snapshot)
+    ):
+        return False
+    settings = load_settings()
+    result_key = _os_path_key("performance_tuning_results")
+    results = settings.get(result_key)
+    if not isinstance(results, dict):
+        results = {}
+    results[key] = result
+    settings[result_key] = results
+
+    expert_key = _os_path_key("expert_overrides_by_path")
+    experts = settings.get(expert_key)
+    if not isinstance(experts, dict):
+        experts = {}
+    experts[key] = snapshot
+    settings[expert_key] = experts
+    return save_settings(settings)
 
 
 def get_performance_target() -> Optional[str]:
@@ -566,13 +640,13 @@ def get_performance_target() -> Optional[str]:
     if not val:
         return None
     val = str(val).lower().strip()
-    return val if val in ("safe", "balanced", "throughput") else None
+    return val if val in ("safe", "balanced", "throughput", "low_vram") else None
 
 
 def set_performance_target(name: str) -> None:
     """Persist the GUI performance-target choice. Empty string clears it."""
     name = (name or "").lower().strip()
-    if name in ("safe", "balanced", "throughput", ""):
+    if name in ("safe", "balanced", "throughput", "low_vram", ""):
         _update("performance_target", name)
 
 

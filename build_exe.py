@@ -144,6 +144,7 @@ def main() -> int:
         "theme_manager",
         "theme_dialog",
         "ocr_workflow",
+        "model_benchmark",
         "pymupdf",
         "PIL.Image",
         "PIL.ImageOps",

@@ -33,36 +33,34 @@ function Is-Available($cmd) {
     return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
-function Get-LlamaBuildTag {
+function Get-ExactLlamaBuildTag {
     param(
         [string]$Commit = "HEAD",
         [string]$Remote = "origin"
     )
 
     $sha = (git rev-parse $Commit 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $sha) {
-        # llama.cpp b10470+ creates/pushes the lightweight release tag explicitly
-        # in CI, before the GitHub Release is created. Ask the remote tag
-        # namespace directly first, so even a just-created tag is recognized.
-        $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
-        foreach ($row in $remoteTags) {
-            if ($row -match "^$sha\s+refs/tags/(b\d+)$") { return $Matches[1] }
+    if ($LASTEXITCODE -ne 0 -or -not $sha) {
+        throw "Could not resolve llama.cpp commit '$Commit'"
+    }
+
+    # A nearest older b-tag must never name a newer development checkout.
+    $escapedSha = [regex]::Escape($sha)
+    $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
+    foreach ($row in $remoteTags) {
+        if ($row -match "^$escapedSha\s+refs/tags/(b\d+)(?:\^\{\})?$") {
+            return $Matches[1]
         }
     }
 
     git fetch $Remote --tags --force 2>$null
-
     $pointingTags = @(
         git tag --points-at $Commit --list "b[0-9]*" 2>$null |
             Where-Object { $_ -match '^b\d+$' } |
             Sort-Object { [int]($_ -replace '^b', '') } -Descending
     )
     if ($pointingTags.Count -gt 0) { return $pointingTags[0] }
-
-    $desc = (git describe --tags --abbrev=0 --match "b[0-9]*" $Commit 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $desc -match 'b\d+') { return $Matches[0] }
-
-    return "bUNKNOWN"
+    return $null
 }
 
 
@@ -467,39 +465,72 @@ foreach ($cmd in @("git","node","npm","nvcc")) {
 if (-not $allOk) { exit 1 }
 OK "cmake OK: $CMAKE_EXE"
 
-# --- 8. LLAMA.CPP KLONEN (ueberspringen falls vorhanden) ---
-Log "Pruefe llama.cpp"
+# --- 8. LLAMA.CPP FRISCH UND VERSIONSRICHTIG KLONEN ---
+Log "Pruefe llama.cpp Nightly/Main"
 Set-Location $INSTALL_DIR
 
-# Vorhandenes b*_llama.cpp Verzeichnis suchen
-$existingDir = Get-ChildItem $INSTALL_DIR -Directory | Where-Object { $_.Name -match "^b\d+_llama\.cpp$" } | Sort-Object Name -Descending | Select-Object -First 1
+# Nie einen alten bNNNN-Ordner in-place auf einen neueren Commit ziehen: sonst
+# sagt der Ordner z.B. b10549, waehrend die EXE bereits build 10572 meldet. Ein
+# prozessspezifisches Staging bewahrt den letzten funktionierenden Build.
+$tmpDir = Join-Path $INSTALL_DIR "_tmp_llama_$PID"
+if (Test-Path $tmpDir) {
+    throw "Staging-Verzeichnis existiert bereits: $tmpDir"
+}
+git clone https://github.com/ggml-org/llama.cpp.git $tmpDir
+if ($LASTEXITCODE -ne 0) { throw "llama.cpp konnte nicht geklont werden." }
 
-if ($existingDir) {
-    $dir = $existingDir.FullName
-    OK "Vorhandenes Verzeichnis gefunden: $dir"
-    if (Test-Path (Join-Path $dir ".git")) {
-        Log "Aktualisiere llama.cpp auf den neuesten Stand"
-        Push-Location $dir
-        git fetch --prune origin
-        $currentBranch = (git branch --show-current).Trim()
-        if (-not $currentBranch) { $currentBranch = "master" }
-        git pull --ff-only origin $currentBranch
-        if ($LASTEXITCODE -ne 0) { Pop-Location; throw "llama.cpp-Repository konnte nicht aktualisiert werden." }
-        Pop-Location
-        OK "llama.cpp-Quellcode aktualisiert"
+Push-Location $tmpDir
+try {
+    $commit = (git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $commit) {
+        throw "llama.cpp Commit konnte nicht bestimmt werden."
     }
-} else {
-    $tmpDir = Join-Path $INSTALL_DIR "_tmp_llama"
-    if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
-    git clone https://github.com/ggml-org/llama.cpp.git $tmpDir
-    Push-Location $tmpDir
-    $ver = Get-LlamaBuildTag -Commit HEAD -Remote origin
+    $shortCommit = $commit.Substring(0, 9)
+    $buildText = (git rev-list --count HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $buildText -notmatch '^\d+$') {
+        throw "llama.cpp Buildnummer konnte nicht bestimmt werden."
+    }
+    $expectedBuild = [int]$buildText
+    if ($expectedBuild -lt 1000) {
+        throw "Unvollstaendige Git-History; verdaechtige Buildnummer $expectedBuild."
+    }
+    $buildTag = "b$expectedBuild"
+    $exactTag = Get-ExactLlamaBuildTag -Commit HEAD -Remote origin
+    if ($exactTag -and $exactTag -ne $buildTag) {
+        throw "Tag/History-Widerspruch: $exactTag vs. $buildTag"
+    }
+    $isExactTag = $exactTag -eq $buildTag
+
+    $cmakeText = Get-Content (Join-Path $tmpDir "CMakeLists.txt") -Raw
+    $majorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MAJOR\s+(\d+)\)')
+    $minorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MINOR\s+(\d+)\)')
+    $patchMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_PATCH\s+(\d+)\)')
+    if (-not ($majorMatch.Success -and $minorMatch.Success -and $patchMatch.Success)) {
+        throw "Semantische llama.cpp Version konnte nicht gelesen werden."
+    }
+    $semanticVersion = "$($majorMatch.Groups[1].Value).$($minorMatch.Groups[1].Value).$($patchMatch.Groups[1].Value)"
+    $expectedRuntimeVersion = "$semanticVersion-dev"
+} finally {
     Pop-Location
-    $dir = Join-Path $INSTALL_DIR "${ver}_llama.cpp"
-    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+}
+
+$folderVersion = if ($isExactTag) { $buildTag } else { "${buildTag}_dev_${shortCommit}" }
+$dir = Join-Path $INSTALL_DIR "${folderVersion}_llama.cpp"
+if (Test-Path $dir) {
+    $existingCommit = ""
+    if (Test-Path (Join-Path $dir ".git")) {
+        $existingCommit = (git -C $dir rev-parse HEAD 2>$null).Trim()
+    }
+    if ($existingCommit -ne $commit) {
+        throw "Zielordner existiert mit anderem Commit; nichts geloescht: $dir"
+    }
+    Remove-Item $tmpDir -Recurse -Force
+    OK "Exakter Quellordner bereits vorhanden: $dir"
+} else {
     Rename-Item $tmpDir $dir
     OK "Verzeichnis: $dir"
 }
+OK "Nightly $buildTag; Runtime-Version $expectedRuntimeVersion; Commit $commit"
 
 # --- 9. UI BAUEN (ueberspringen falls dist vorhanden) ---
 Log "Pruefe Web-UI"
@@ -557,6 +588,7 @@ $cmakeArgs = @(
     "-S", $dir, "-B", $buildDir,
     "-G", $vsGenerator, "-A", "x64",
     "-DCMAKE_BUILD_TYPE=Release",
+    "-DLLAMA_BUILD_IS_DEV=ON",
     "-DGGML_CUDA=ON", "-DGGML_VULKAN=OFF",
     "-DGGML_NATIVE=OFF", "-DGGML_AVX2=ON", "-DGGML_FMA=ON", "-DGGML_F16C=ON",
     "-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_BUILD_SERVER=ON",
@@ -586,6 +618,30 @@ $binPath = Join-Path $buildDir "bin\Release"
 Log "Kopiere CUDA Runtime-DLLs neben die EXE-Dateien"
 Deploy-CudaRuntimeDlls -CudaBin (Join-Path $cudaInstallDir "bin") -Destination $binPath
 
+# Runtime-Identitaet gegen Quellversion + volle Git-History pruefen.
+$server = Join-Path $binPath "llama-server.exe"
+# llama-server schreibt --version auf stderr. Beide Streams via cmd.exe
+# zusammenfuehren, damit ErrorActionPreference=Stop gueltige Ausgabe nicht als
+# terminierenden NativeCommandError behandelt.
+$versionOutput = (& $env:ComSpec /d /s /c "`"$server`" --version 2>&1" | Out-String).Trim()
+$versionExit = $LASTEXITCODE
+if ($versionExit -ne 0) {
+    throw "llama-server Smoke-Test fehlgeschlagen (Exitcode $versionExit)."
+}
+Write-Host $versionOutput
+$versionMatch = [regex]::Match(
+    $versionOutput,
+    '(?im)^\s*version:\s*(\d+\.\d+\.\d+-dev)\s+\(\s*build\s+(\d+)\b'
+)
+if (-not $versionMatch.Success) {
+    throw "llama-server meldet keine semantische Dev-Version plus Buildnummer."
+}
+$reportedVersion = $versionMatch.Groups[1].Value
+$reportedBuild = [int]$versionMatch.Groups[2].Value
+if ($reportedVersion -ne $expectedRuntimeVersion -or $reportedBuild -ne $expectedBuild) {
+    throw "Source/Runtime-Widerspruch: erwartet $expectedRuntimeVersion ($buildTag), gemeldet $reportedVersion (b$reportedBuild)."
+}
+
 # CUDA-bin auch dauerhaft in den System-PATH aufnehmen. Das ist nur ein Fallback;
 # die lokale DLL-Kopie macht den Build direkt portabel innerhalb dieses Ordners.
 $machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
@@ -598,6 +654,7 @@ if (($machinePath -split ';') -notcontains $cudaBinPath) {
 # --- FERTIG ---
 Log "BUILD ERFOLGREICH!"
 OK "Binaries: $binPath"
+OK "Version: $reportedVersion (Nightly $buildTag, Commit $shortCommit)"
 $exes = Get-ChildItem $binPath -Filter "*.exe" -ErrorAction SilentlyContinue
 if ($exes) { $exes | ForEach-Object { OK "  $($_.Name)" } }
 Write-Host "`nServer starten:" -ForegroundColor Green

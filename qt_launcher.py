@@ -138,6 +138,12 @@ from ocr_workflow import (
     server_model_ids,
 )
 from autotuner_version import VERSION, GITHUB_REPO, USER_AGENT
+from model_benchmark import (
+    BenchmarkCancelled,
+    BenchmarkFailure,
+    BenchmarkResult,
+    BenchmarkRunner,
+)
 from theme_dialog import ThemeEditorDialog
 from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
 
@@ -1079,6 +1085,90 @@ class _OcrWorker(QObject):
     def run(self) -> None:
         try:
             self.finished.emit(self.runner.run())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def cancel(self) -> None:
+        self.runner.cancel()
+
+
+class _PerformanceTuneDialog(QDialog):
+    """Non-blocking progress surface for the real server benchmark sweep."""
+
+    cancel_requested = pyqtSignal()
+
+    def __init__(
+        self, model_name: str, desired_context: int, parent: Optional[QWidget] = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AutoTuner performance test")
+        self.setModal(False)
+        self.setMinimumWidth(620)
+        self._finished = False
+        layout = QVBoxLayout(self)
+        title = QLabel(
+            f"Testing {model_name} at {desired_context:,} tokens context.\n"
+            "Each candidate starts a fresh private llama-server; this can take a while."
+        )
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        self.status_label = QLabel("Preparing deterministic candidates…")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+        self.cancel_button = QPushButton("Cancel performance test")
+        self.cancel_button.clicked.connect(self._request_cancel)
+        layout.addWidget(self.cancel_button, 0, Qt.AlignmentFlag.AlignRight)
+
+    def _request_cancel(self) -> None:
+        if self._finished or not self.cancel_button.isEnabled():
+            return
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText(
+            "Cancelling and stopping the active benchmark server…"
+        )
+        self.cancel_requested.emit()
+
+    def update_progress(self, completed: int, total: int, message: str) -> None:
+        self.status_label.setText(message)
+        if total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(max(0, min(completed, total)))
+        else:
+            self.progress_bar.setRange(0, 0)
+
+    def mark_finished(self) -> None:
+        self._finished = True
+        self.cancel_button.setEnabled(False)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if not self._finished:
+            self._request_cancel()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+class _PerformanceTuneWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, runner: BenchmarkRunner) -> None:
+        super().__init__()
+        self.runner = runner
+
+    def run(self) -> None:
+        try:
+            self.runner.progress = self.progress.emit
+            self.finished.emit(self.runner.run())
+        except BenchmarkCancelled:
+            self.cancelled.emit()
+        except BenchmarkFailure as exc:
+            self.failed.emit(str(exc))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -4053,6 +4143,13 @@ class MainWindow(QMainWindow):
         self._ocr_prepared_runner: Optional[OcrJobRunner] = None
         self._ocr_prepare_error: str = ""
         self._ocr_locked_states: Dict[QWidget, bool] = {}
+        self._benchmark_thread: Optional[QThread] = None
+        self._benchmark_worker: Optional[_PerformanceTuneWorker] = None
+        self._benchmark_dialog: Optional[_PerformanceTuneDialog] = None
+        self._benchmark_base_config: Optional[TunedConfig] = None
+        self._benchmark_entry: Optional[ModelEntry] = None
+        self._benchmark_system: Optional[SystemInfo] = None
+        self._benchmark_locked_states: Dict[QWidget, bool] = {}
         self._sysinfo_busy = False
         # Persisted font size — falls back to 10pt on first launch.
         self._font_size = app_settings.get_font_size()
@@ -4441,12 +4538,28 @@ class MainWindow(QMainWindow):
         )
         self._btn_diagnose.clicked.connect(self._show_diagnostic_report)
         self._btn_diagnose.setEnabled(False)  # disabled until a model is picked
+        self._btn_benchmark = QPushButton("🚀 Performance test")
+        self._btn_benchmark.setEnabled(False)
+        self._btn_benchmark.setToolTip(
+            _setting_tooltip(
+                "Starts the selected model repeatedly with bounded settings and saves "
+                "the fastest stable result for your requested context.",
+                "Runs fresh private loopback llama-server instances with one warm-up "
+                "and deterministic measured requests. It searches CPU threads, batch "
+                "threads, batch, and ubatch while freezing context, KV quality, GPU "
+                "placement, Flash Attention, and model features. The top candidates "
+                "are confirmed before a path-specific Expert snapshot is saved. No "
+                "clock, voltage, fan, power-limit, or overclock setting is changed.",
+            )
+        )
+        self._btn_benchmark.clicked.connect(self._start_performance_tuning)
         self._btn_expert_row = QWidget()
         bex = QHBoxLayout(self._btn_expert_row)
         bex.setContentsMargins(0, 0, 0, 0)
         bex.addStretch(1)
         bex.addWidget(self._btn_expert)
         bex.addWidget(self._btn_diagnose)
+        bex.addWidget(self._btn_benchmark)
         bex.addStretch(1)
 
         # ── Launch options (checkboxes) ────────────────────────────────
@@ -6610,6 +6723,7 @@ class MainWindow(QMainWindow):
         )
         self._auto_select_fork(profile)
         self._update_config_text(entry, profile)
+        self._update_benchmark_button(profile)
 
     def _update_checkboxes(self, entry: ModelEntry) -> None:
         """Refresh dropdown selections and the remaining checkbox states.
@@ -7105,7 +7219,7 @@ class MainWindow(QMainWindow):
         base = self._build_auto_config(entry, profile)
         if base is None:
             return None
-        override = app_settings.get_expert_override(entry.name)
+        override = app_settings.get_expert_override(entry.name, entry.path)
         if not override:
             return base
         vals = override.get("values") or {}
@@ -7146,7 +7260,7 @@ class MainWindow(QMainWindow):
                 entry, profile, overrides
             ),
         )
-        override = app_settings.get_expert_override(entry.name)
+        override = app_settings.get_expert_override(entry.name, entry.path)
         if override:
             self._expert_panel.restore_from_snapshot(override)
 
@@ -7393,7 +7507,7 @@ class MainWindow(QMainWindow):
         # Auto/Manual/Reset toggles inside the panel take its place at
         # the top of the same area).
         self._btn_expert_row.setVisible(False)
-        override = app_settings.get_expert_override(entry.name)
+        override = app_settings.get_expert_override(entry.name, entry.path)
         if override:
             self._log(
                 f"[Expert] Entered Expert mode — restored saved "
@@ -7452,7 +7566,7 @@ class MainWindow(QMainWindow):
         if entry is None or not isinstance(snapshot, dict):
             return
         try:
-            app_settings.set_expert_override(entry.name, snapshot)
+            app_settings.set_expert_override(entry.name, snapshot, entry.path)
         except Exception as exc:
             self._log(f"[Warning] Could not save Expert settings: {exc}")
 
@@ -7471,7 +7585,7 @@ class MainWindow(QMainWindow):
         # the clear (it would resurrect the override we just dropped).
         self._expert_panel._save_timer.stop()
         try:
-            app_settings.clear_expert_override(entry.name)
+            app_settings.clear_expert_override(entry.name, entry.path)
         except Exception as exc:
             self._log(f"[Warning] Could not clear Expert settings: {exc}")
         # Reload pure Auto into the panel (no save) and refresh preview.
@@ -7545,10 +7659,474 @@ class MainWindow(QMainWindow):
         self._log(f"[Diagnose] Inspected metadata for {self._current_entry.name}")
 
     # ------------------------------------------------------------------
+    # Deterministic real-model performance tuning
+    # ------------------------------------------------------------------
+    def _update_benchmark_button(
+        self, profile: Optional[ModelProfile] = None
+    ) -> None:
+        button = getattr(self, "_btn_benchmark", None)
+        if button is None:
+            return
+        entry = self._current_entry
+        eligible = bool(
+            entry is not None
+            and self._system is not None
+            and self._benchmark_thread is None
+            and not self._benchmark_locked_states
+            and not self._servers
+        )
+        if eligible and entry is not None:
+            profile = profile or match_profile(
+                entry.name,
+                self._profiles,
+                getattr(entry, "architecture", ""),
+            )
+            runner = str(profile.runner or "llama-server")
+            extra = {str(arg).strip().lower() for arg in profile.extra_args}
+            eligible = bool(
+                runner in ("", "llama-server")
+                and not entry.is_diffusion
+                and not is_ocr_model(entry)
+                and "--embeddings" not in extra
+                and "--embedding" not in extra
+            )
+        button.setEnabled(eligible)
+
+    def _set_benchmark_controls_locked(self, locked: bool) -> None:
+        controls: List[QWidget] = [
+            self._model_list,
+            self._model_tree,
+            self._btn_list_view,
+            self._btn_tree_view,
+            self._btn_models_folder,
+            self._btn_refresh,
+            self._btn_update,
+            self._btn_settings,
+            self._fork_combo,
+            self._btn_fork_folder,
+            self._perf_combo,
+            self._mode_combo,
+            self._gpu_combo,
+            self._chk_mmproj_cpu,
+            self._chk_ngram,
+            self._chk_prompt_cache,
+            self._sp_prompt_cache_mib,
+            self._chk_thinking,
+            self._cb_mmproj,
+            self._cb_draft,
+            self._btn_expert,
+            self._btn_diagnose,
+            self._btn_benchmark,
+            self._btn_launch,
+            self._expert_panel,
+            self._host_edit,
+            self._port_edit,
+            self._port_offset_combo,
+        ]
+        if locked:
+            if self._benchmark_locked_states:
+                return
+            self._benchmark_locked_states = {
+                widget: widget.isEnabled() for widget in controls
+            }
+            for widget in controls:
+                widget.setEnabled(False)
+            return
+        states = self._benchmark_locked_states
+        self._benchmark_locked_states = {}
+        for widget, enabled in states.items():
+            try:
+                widget.setEnabled(enabled)
+            except RuntimeError:
+                pass
+        self._update_benchmark_button()
+
+    @staticmethod
+    def _benchmark_snapshot(cfg: TunedConfig) -> dict:
+        """Translate a measured winner into the existing Expert schema."""
+        extras_in = list(cfg.extra_cli_flags or [])
+        reasoning, think_budget, leftovers = ExpertPanel._parse_reasoning_from_extras(
+            extras_in
+        )
+        modeled = {
+            "--jinja",
+            "--verbose",
+            "--metrics",
+            "--slots",
+            "--reasoning-preserve",
+        }
+        values = {
+            "ctx": int(cfg.ctx),
+            "cache_k": str(cfg.cache_k),
+            "cache_v": str(cfg.cache_v),
+            "ngl": int(cfg.ngl),
+            "n_cpu_moe": int(cfg.n_cpu_moe or 0),
+            "threads": int(cfg.threads),
+            "batch_threads": int(cfg.batch_threads),
+            "batch": int(cfg.batch),
+            "ubatch": int(cfg.ubatch),
+            "flash_attn": bool(cfg.flash_attn),
+            "load_mode": effective_load_mode(cfg) or "auto",
+            "jinja": "--jinja" in extras_in,
+            "verbose": "--verbose" in extras_in,
+            "metrics_enabled": bool(cfg.metrics_enabled),
+            "slots_api_enabled": bool(cfg.slots_api_enabled),
+            "numa": cfg.numa or "off",
+            "rope_scaling": bool(cfg.rope_scaling),
+            "rope_factor": float(cfg.rope_scale_factor or 1.0),
+            "temperature": float(cfg.sampling.get("temperature", 0.7)),
+            "top_k": int(cfg.sampling.get("top_k", 40)),
+            "top_p": float(cfg.sampling.get("top_p", 0.9)),
+            "min_p": float(cfg.sampling.get("min_p", 0.05)),
+            "repeat_penalty": float(cfg.sampling.get("repeat_penalty", 1.05)),
+            "presence_penalty": float(cfg.sampling.get("presence_penalty", 0.0)),
+            "reasoning": reasoning,
+            "think_budget": int(think_budget),
+            "reasoning_preserve": "--reasoning-preserve" in extras_in,
+            "parallel_enabled": True,
+            "parallel_count": 1,
+            "draft_n_max": int(cfg.draft_n_max or 0),
+            "extras": " ".join(flag for flag in leftovers if flag not in modeled),
+        }
+        return {
+            "mode": "auto",
+            "pins": {"user_ctx": int(cfg.ctx), "force_n_parallel": 1},
+            "values": values,
+            "source": "measured-performance-test",
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _start_performance_tuning(self) -> None:
+        self._prune_dead_servers()
+        entry = self._current_entry
+        if entry is None or self._system is None:
+            QMessageBox.information(
+                self, "Performance test", "Select a model and wait for hardware detection."
+            )
+            return
+        if self._benchmark_thread is not None:
+            QMessageBox.information(
+                self, "Performance test", "A performance test is already running."
+            )
+            return
+        if self._servers:
+            QMessageBox.warning(
+                self,
+                "Stop running servers first",
+                "Performance measurements need uncontaminated RAM, VRAM, and GPU "
+                "time. Stop all AutoTuner servers before starting the test.",
+            )
+            return
+
+        try:
+            hw_thread = getattr(self, "_hw_detect_thread", None)
+            hardware_busy = self._sysinfo_busy or (
+                hw_thread is not None and hw_thread.isRunning()
+            )
+        except RuntimeError:
+            hardware_busy = self._sysinfo_busy
+        if hardware_busy:
+            QMessageBox.information(
+                self,
+                "Hardware refresh in progress",
+                "Wait for the current hardware refresh to finish, then start the "
+                "performance test. This avoids overlapping GPU probes.",
+            )
+            return
+
+        profile = match_profile(
+            entry.name, self._profiles, getattr(entry, "architecture", "")
+        )
+        self._update_benchmark_button(profile)
+        if not self._btn_benchmark.isEnabled():
+            QMessageBox.information(
+                self,
+                "Model is not benchmarkable",
+                "The automatic performance test currently supports normal "
+                "llama-server text/chat models. Diffusion, OCR-only, and embedding "
+                "runners use different workloads and are intentionally excluded.",
+            )
+            return
+
+        use_draft = self._draft_enabled()
+        try:
+            runtime_binary = self._resolve_binary(profile, use_draft, entry.name)
+            if not self._is_runnable_binary(
+                Path(runtime_binary)
+            ) and not shutil.which(runtime_binary):
+                raise FileNotFoundError(runtime_binary)
+            exact_system = detect_system(runtime_binary)
+            self._update_sysinfo_labels(exact_system)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "llama-server unavailable",
+                f"The selected runtime could not be resolved or probed:\n{exc}",
+            )
+            return
+
+        # One slot maximizes usable context and makes every measurement a
+        # single-user performance comparison. The clean auto result is the
+        # default requested target (maximum currently feasible with the user's
+        # selected model features and quality policy).
+        baseline = self._build_auto_config(
+            entry, profile, {"force_n_parallel": 1}
+        )
+        if baseline is None:
+            QMessageBox.warning(
+                self, "Performance test", "AutoTuner could not build a baseline."
+            )
+            return
+        upper_context = max(
+            int(baseline.ctx),
+            int(entry.native_context or 0),
+            int(profile.max_context or 0),
+            int(profile.rope_scale_max_ctx or 0),
+            512,
+        )
+        upper_context = min(10_000_000, upper_context)
+        desired_context, accepted = QInputDialog.getInt(
+            self,
+            "Performance test context",
+            "Desired context in tokens. The default is AutoTuner's maximum "
+            "currently feasible target:",
+            int(baseline.ctx),
+            512,
+            upper_context,
+            1024,
+        )
+        if not accepted:
+            return
+        requested = int(desired_context)
+        baseline = self._build_auto_config(
+            entry,
+            profile,
+            {"user_ctx": requested, "force_n_parallel": 1},
+        )
+        if baseline is None:
+            return
+        if baseline.ctx != requested:
+            answer = QMessageBox.question(
+                self,
+                "Requested context does not fit",
+                f"{requested:,} tokens do not fit with the selected model, quality, "
+                f"and launch options. AutoTuner can test {baseline.ctx:,} tokens.\n\n"
+                "Use the attainable context instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            desired_context = int(baseline.ctx)
+
+        confirmation = QMessageBox.question(
+            self,
+            "Start real performance test?",
+            f"AutoTuner will repeatedly load {entry.name} at "
+            f"{int(desired_context):,} context and test up to 8 settings plus "
+            "2 confirmations. A large model can take up to about 30 minutes.\n\n"
+            "Context, KV quality, GPU placement, Flash Attention, and model "
+            "features stay fixed. Hardware clocks/voltages are never changed.\n\n"
+            "Start now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        runner = BenchmarkRunner(
+            model=copy.copy(entry),
+            profile=profile,
+            base_config=baseline,
+            runtime_binary=runtime_binary,
+            physical_cores=exact_system.cpu_cores_physical,
+            logical_cores=exact_system.cpu_cores_logical,
+            draft_model=self._current_draft if use_draft else None,
+            use_thinking=(
+                self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
+            ),
+            enable_speculative=use_draft,
+            enable_ngram=(
+                self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
+            ),
+        )
+        worker = _PerformanceTuneWorker(runner)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        dialog = _PerformanceTuneDialog(entry.name, int(baseline.ctx), self)
+        dialog.cancel_requested.connect(self._cancel_performance_tuning)
+        thread.started.connect(worker.run)
+        worker.progress.connect(dialog.update_progress)
+        worker.progress.connect(self._on_performance_tuning_progress)
+        worker.finished.connect(self._on_performance_tuning_finished)
+        worker.failed.connect(self._on_performance_tuning_failed)
+        worker.cancelled.connect(self._on_performance_tuning_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(self._on_performance_tuning_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._benchmark_thread = thread
+        self._benchmark_worker = worker
+        self._benchmark_dialog = dialog
+        self._benchmark_base_config = copy.copy(baseline)
+        self._benchmark_entry = copy.copy(entry)
+        self._benchmark_system = exact_system
+        self._set_benchmark_controls_locked(True)
+        self._status.showMessage(
+            f"Performance test running — {entry.name}, ctx {baseline.ctx:,}"
+        )
+        self._log(
+            f"[Performance] Starting bounded real-model sweep: {entry.path}; "
+            f"ctx={baseline.ctx}, binary={runtime_binary}."
+        )
+        dialog.show()
+        thread.start()
+
+    def _cancel_performance_tuning(self) -> None:
+        worker = self._benchmark_worker
+        if worker is not None:
+            self._status.showMessage("Cancelling performance test…")
+            worker.cancel()
+
+    def _on_performance_tuning_progress(
+        self, completed: int, total: int, message: str
+    ) -> None:
+        self._status.showMessage(
+            f"Performance test {min(completed + 1, total)}/{total}: {message}"
+        )
+        self._log(f"[Performance] {message}")
+
+    def _finish_performance_tuning_ui(self) -> None:
+        dialog = self._benchmark_dialog
+        self._benchmark_dialog = None
+        if dialog is not None:
+            dialog.mark_finished()
+            dialog.close()
+            dialog.deleteLater()
+        self._set_benchmark_controls_locked(False)
+
+    def _on_performance_tuning_finished(self, result: object) -> None:
+        if not isinstance(result, BenchmarkResult):
+            self._on_performance_tuning_failed("benchmark returned an invalid result")
+            return
+        entry = self._benchmark_entry
+        base = self._benchmark_base_config
+        system = self._benchmark_system
+        if entry is None or base is None or system is None:
+            self._on_performance_tuning_failed("benchmark state was lost")
+            return
+
+        winning_cfg = result.winning_config(base)
+        snapshot = self._benchmark_snapshot(winning_cfg)
+        try:
+            stat = entry.path.stat()
+            record = result.to_record(
+                model_path=str(entry.path.resolve(strict=False)),
+                model_size=stat.st_size,
+                model_mtime_ns=stat.st_mtime_ns,
+            )
+        except OSError:
+            record = result.to_record(
+                model_path=str(entry.path.resolve(strict=False)),
+                model_size=0,
+                model_mtime_ns=0,
+            )
+        record["performance_target"] = winning_cfg.performance_target
+        record["quality_frozen"] = {
+            "cache_k": winning_cfg.cache_k,
+            "cache_v": winning_cfg.cache_v,
+            "flash_attn": winning_cfg.flash_attn,
+            "ngl": winning_cfg.ngl,
+            "n_cpu_moe": winning_cfg.n_cpu_moe,
+            "tensor_split": winning_cfg.tensor_split,
+            "main_gpu": winning_cfg.main_gpu,
+        }
+        record["hardware"] = {
+            "os": system.os_name,
+            "cpu": system.cpu_name,
+            "physical_cores": system.cpu_cores_physical,
+            "logical_cores": system.cpu_cores_logical,
+            "gpus": [
+                {
+                    "name": gpu.name,
+                    "vram_mb": gpu.total_vram_mb,
+                    "runtime_device": gpu.runtime_device,
+                }
+                for gpu in system.gpus
+            ],
+        }
+        saved = app_settings.save_performance_tuning_result(
+            entry.name, entry.path, record, snapshot
+        )
+        self._finish_performance_tuning_ui()
+        if not saved:
+            self._status.showMessage("Performance test complete, but save failed.")
+            QMessageBox.warning(
+                self,
+                "Could not save performance result",
+                "The measurements completed, but autotuner_settings.json could not "
+                "be updated. The previous configuration remains active.",
+            )
+            return
+
+        if self._current_entry is not None and self._current_entry.path == entry.path:
+            self._refresh_config_preview()
+        winner = result.winner
+        baseline_result = result.baseline
+        improvement = (result.score(winner) - 1.0) * 100.0
+        self._status.showMessage(
+            f"Performance settings saved for {entry.name}: {winner.candidate.label}"
+        )
+        self._log(
+            f"[Performance] Saved winner for {entry.path}: "
+            f"threads={winner.candidate.threads}, "
+            f"batch_threads={winner.candidate.batch_threads}, "
+            f"batch={winner.candidate.batch}, ubatch={winner.candidate.ubatch}, "
+            f"score={result.score(winner):.3f}."
+        )
+        QMessageBox.information(
+            self,
+            "Performance test complete",
+            f"Saved for this exact GGUF path at {result.desired_context:,} context.\n\n"
+            f"Winner: {winner.candidate.label}\n"
+            f"Threads: {winner.candidate.threads} / "
+            f"batch threads: {winner.candidate.batch_threads}\n"
+            f"Batch / ubatch: {winner.candidate.batch} / {winner.candidate.ubatch}\n\n"
+            f"Prompt: {baseline_result.prompt_tps:.1f} → {winner.prompt_tps:.1f} tok/s\n"
+            f"Generation: {baseline_result.generation_tps:.1f} → "
+            f"{winner.generation_tps:.1f} tok/s\n"
+            f"Combined change: {improvement:+.1f}%\n\n"
+            f"Decision: {result.reason}\n"
+            "The values are active now and remain editable under Expert settings.",
+        )
+
+    def _on_performance_tuning_failed(self, message: str) -> None:
+        self._finish_performance_tuning_ui()
+        self._status.showMessage("Performance test failed.")
+        self._log(f"[Performance] Failed: {message}")
+        QMessageBox.warning(self, "Performance test failed", message)
+
+    def _on_performance_tuning_cancelled(self) -> None:
+        self._finish_performance_tuning_ui()
+        self._status.showMessage("Performance test cancelled; no settings changed.")
+        self._log("[Performance] Cancelled; previous settings preserved.")
+
+    def _on_performance_tuning_thread_finished(self) -> None:
+        self._benchmark_thread = None
+        self._benchmark_worker = None
+        self._benchmark_base_config = None
+        self._benchmark_entry = None
+        self._benchmark_system = None
+        self._update_benchmark_button()
+
+    # ------------------------------------------------------------------
     # System info — non-blocking (daemon thread → signal/slot)
     # ------------------------------------------------------------------
     def _sysinfo_async(self) -> None:
-        if self._sysinfo_busy:
+        if self._sysinfo_busy or self._benchmark_thread is not None:
             return
         # Do NOT start a concurrent detect_system() while the initial
         # _HwDetectWorker QThread is still running.  On new RDNA5 hardware the
@@ -7655,6 +8233,7 @@ class MainWindow(QMainWindow):
 
         # Keep the GPU pin dropdown in sync with the detected cards.
         self._populate_gpu_combo(s)
+        self._update_benchmark_button()
 
     # ------------------------------------------------------------------
     # Binary resolution
@@ -7993,8 +8572,13 @@ class MainWindow(QMainWindow):
             self._ocr_thread is not None
             or self._ocr_server_record is not None
             or self._ocr_locked_states
+            or self._benchmark_thread is not None
+            or self._benchmark_locked_states
         )
-        self._btn_launch.setEnabled(not active)
+        self._btn_launch.setEnabled(
+            not active and self._current_entry is not None and self._system is not None
+        )
+        self._update_benchmark_button()
 
     def _open_ocr_workflow(self) -> None:
         entry = self._current_entry
@@ -9016,6 +9600,7 @@ class MainWindow(QMainWindow):
         elif combo.count() > 0:
             combo.setCurrentIndex(combo.count() - 1)
         combo.blockSignals(False)
+        self._update_benchmark_button()
 
     def _toggle_log_panel(self) -> None:
         """Fully retract or restore the bottom info panel in one click."""
@@ -9296,6 +9881,53 @@ class MainWindow(QMainWindow):
             if a0 is not None:
                 a0.ignore()
             return
+
+        # A benchmark owns a private llama-server and active HTTP connection.
+        # Cancel it explicitly and wait for its finally block to stop the process;
+        # destroying a live worker thread can leave the model resident in VRAM.
+        benchmark_thread = self._benchmark_thread
+        try:
+            benchmark_running = (
+                benchmark_thread is not None and benchmark_thread.isRunning()
+            )
+        except RuntimeError:
+            benchmark_running = False
+            self._benchmark_thread = None
+            self._benchmark_worker = None
+        if benchmark_running:
+            reply = QMessageBox.question(
+                self,
+                "Performance test still running",
+                "Cancel the active performance test and quit AutoTuner?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._force_quit = False
+                if a0 is not None:
+                    a0.ignore()
+                return
+            if self._benchmark_worker is not None:
+                self._benchmark_worker.cancel()
+            assert benchmark_thread is not None
+            benchmark_thread.quit()
+            if not benchmark_thread.wait(20000):
+                QMessageBox.warning(
+                    self,
+                    "Performance test is still stopping",
+                    "The benchmark server has not released its resources yet. "
+                    "Please wait a moment and try Quit again.",
+                )
+                self._force_quit = False
+                if a0 is not None:
+                    a0.ignore()
+                return
+            self._benchmark_thread = None
+            self._benchmark_worker = None
+            self._benchmark_base_config = None
+            self._benchmark_entry = None
+            self._benchmark_system = None
+            self._finish_performance_tuning_ui()
 
         # Never destroy a QThread while document conversion or an HTTP OCR
         # request is active. Give the user an explicit cancel-and-quit path,
