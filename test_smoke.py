@@ -1032,6 +1032,48 @@ def test_theme_replacement_is_only_authorized_for_selected_unchanged_user_id():
     assert qt_launcher._theme_replace_id(user, renamed) is None
 
 
+def test_launch_button_recovers_after_selection_and_benchmark_cleanup(
+    tmp_path, monkeypatch
+) -> None:
+    """A scan/benchmark must never leave Launch permanently disabled."""
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    model = _fake_model(tmp_path, "Qwen3.8-27B-Q4_K_M", 12.0)
+    window._system = _fake_system()
+    window._all_entries = [model]
+
+    # _start_scan() disables Launch. Selecting a valid model after the scan
+    # must be an explicit transition back to enabled.
+    window._btn_launch.setEnabled(False)
+    window._show_config(model)
+    assert window._btn_launch.isEnabled()
+
+    # While a benchmark thread is winding down, Launch stays locked. Once its
+    # finished callback clears the worker state, Launch must recover even when
+    # the saved pre-benchmark widget state happened to be disabled.
+    window._benchmark_thread = object()  # type: ignore[assignment]
+    window._set_benchmark_controls_locked(True)
+    window._benchmark_locked_states[window._btn_launch] = False
+    window._set_benchmark_controls_locked(False)
+    assert not window._btn_launch.isEnabled()
+    window._on_performance_tuning_thread_finished()
+    assert window._btn_launch.isEnabled()
+    window.close()
+
+
 def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> None:
     """Lock in complete beginner + technical help for settings dialogs."""
     global _QT_TEST_APP

@@ -6723,7 +6723,10 @@ class MainWindow(QMainWindow):
         )
         self._auto_select_fork(profile)
         self._update_config_text(entry, profile)
-        self._update_benchmark_button(profile)
+        # _start_scan() deliberately disables Launch. Model selection is the
+        # state transition that must restore it once no exclusive workflow is
+        # active; otherwise the button remains grey for the whole session.
+        self._enable_launch_when_ocr_idle()
 
     def _update_checkboxes(self, entry: ModelEntry) -> None:
         """Refresh dropdown selections and the remaining checkbox states.
@@ -7739,7 +7742,9 @@ class MainWindow(QMainWindow):
                 widget.setEnabled(enabled)
             except RuntimeError:
                 pass
-        self._update_benchmark_button()
+        # Do not trust a stale pre-benchmark widget snapshot for the primary
+        # action. Keep Launch disabled until the worker thread really exits.
+        self._enable_launch_when_ocr_idle()
 
     @staticmethod
     def _benchmark_snapshot(cfg: TunedConfig) -> dict:
@@ -8120,7 +8125,8 @@ class MainWindow(QMainWindow):
         self._benchmark_base_config = None
         self._benchmark_entry = None
         self._benchmark_system = None
-        self._update_benchmark_button()
+        # This is the authoritative unlock after success, failure, or cancel.
+        self._enable_launch_when_ocr_idle()
 
     # ------------------------------------------------------------------
     # System info — non-blocking (daemon thread → signal/slot)
@@ -8575,9 +8581,12 @@ class MainWindow(QMainWindow):
             or self._benchmark_thread is not None
             or self._benchmark_locked_states
         )
-        self._btn_launch.setEnabled(
-            not active and self._current_entry is not None and self._system is not None
-        )
+        # Preserve the pre-v5.2.2 launcher contract: after a successful model
+        # scan the primary action is available, and _launch_server() itself
+        # reports a missing selection/system if needed. Requiring
+        # _current_entry here caused Launch to stay disabled because scan
+        # population intentionally blocks selection signals.
+        self._btn_launch.setEnabled(not active)
         self._update_benchmark_button()
 
     def _open_ocr_workflow(self) -> None:
@@ -10036,7 +10045,7 @@ class MainWindow(QMainWindow):
 
 # ---------------------------------------------------------------------------
 def _run_model_tree_interaction_smoke(app: QApplication, settings_path: Path) -> None:
-    """Exercise crash-safe favorites and persistent folder expansion end to end."""
+    """Exercise favorites, launch-state recovery, and folder persistence."""
     temp_state = tempfile.TemporaryDirectory(prefix="autotuner-model-tree-smoke-")
     root = Path(temp_state.name)
     entry = ModelEntry(
@@ -10063,6 +10072,30 @@ def _run_model_tree_interaction_smoke(app: QApplication, settings_path: Path) ->
         window._last_scan_roots = [root]
         window._populate_list(window._all_entries)
         window._set_model_view("tree", persist=False)
+
+        # Frozen regression for v5.2.2: scan setup disables Launch, and model
+        # selection plus benchmark cleanup must deterministically restore it.
+        window._system = SystemInfo(
+            os_name="smoke",
+            cpu_name="smoke-cpu",
+            cpu_cores_physical=4,
+            cpu_cores_logical=8,
+            total_ram_gb=32.0,
+            free_ram_gb=24.0,
+        )
+        window._btn_launch.setEnabled(False)
+        window._show_config(entry)
+        if not window._btn_launch.isEnabled():
+            raise RuntimeError("model selection left Launch disabled")
+        window._benchmark_thread = QThread(window)
+        window._set_benchmark_controls_locked(True)
+        window._benchmark_locked_states[window._btn_launch] = False
+        window._set_benchmark_controls_locked(False)
+        if window._btn_launch.isEnabled():
+            raise RuntimeError("Launch unlocked before benchmark thread cleanup")
+        window._on_performance_tuning_thread_finished()
+        if not window._btn_launch.isEnabled():
+            raise RuntimeError("benchmark cleanup left Launch disabled")
 
         favorite_root = window._model_tree.topLevelItem(0)
         vendor_folder = window._model_tree.topLevelItem(1)
