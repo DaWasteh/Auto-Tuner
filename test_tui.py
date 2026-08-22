@@ -152,8 +152,22 @@ def test_non_interactive_features_include_embedded_mtp() -> None:
     vision, draft, thinking, ngram, effective = auto_tuner._ask_interactive_features(
         model, None, Path("settings"), non_interactive=True, draft_available=True
     )
-    assert vision and draft and thinking and not ngram
+    assert vision and draft and thinking and ngram
     assert effective is None
+
+
+def test_non_interactive_ngram_can_be_disabled() -> None:
+    model = _entry()
+    _vision, _draft, _thinking, ngram, _effective = (
+        auto_tuner._ask_interactive_features(
+            model,
+            None,
+            Path("settings"),
+            non_interactive=True,
+            disable_ngram=True,
+        )
+    )
+    assert not ngram
 
 
 def test_disabled_thinking_skips_interactive_prompt(monkeypatch) -> None:

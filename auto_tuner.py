@@ -427,6 +427,7 @@ def _ask_interactive_features(
     draft_model: Optional[ModelEntry],
     settings_path: Path,
     force_ngram: bool = False,
+    disable_ngram: bool = False,
     non_interactive: bool = False,
     draft_available: Optional[bool] = None,
     thinking_available: Optional[bool] = None,
@@ -446,13 +447,14 @@ def _ask_interactive_features(
         model.supports_thinking if thinking_available is None else thinking_available
     )
     # Non-interactive runs use the same availability defaults as the GUI:
-    # vision/draft/thinking on when available, n-gram only when explicit.
+    # vision/draft/thinking on when available and n-gram on unless explicitly
+    # disabled. --ngram remains a compatible explicit-on spelling.
     if non_interactive:
         return (
             model.mmproj is not None,
             draft_available,
             thinking_available,
-            force_ngram,
+            bool(force_ngram or not disable_ngram),
             draft_model,
         )
 
@@ -485,15 +487,17 @@ def _ask_interactive_features(
             default_yes=True,
         )
 
-    # ── n-gram (ngram-mod) ──────────────────────────────────────────
-    # Model-agnostic self-speculative decoding — always offered. --ngram
-    # forces it on without prompting; otherwise ask, defaulting to off.
-    if force_ngram:
+    # ── n-gram self-speculation ─────────────────────────────────────
+    # Model-agnostic and default-on for every model. --no-ngram is the
+    # explicit opt-out; --ngram remains a compatible explicit-on spelling.
+    if disable_ngram:
+        use_ngram = False
+    elif force_ngram:
         use_ngram = True
     else:
         use_ngram = _confirm(
-            "n-gram (ngram-mod) self-speculative decoding aktivieren?",
-            default_yes=False,
+            "n-gram self-speculative decoding aktivieren?",
+            default_yes=True,
         )
 
     return use_vision, use_draft, use_thinking, use_ngram, effective_draft
@@ -688,6 +692,8 @@ def _pick_model(
                 "nodraft",
                 "nothinking",
                 "ngram",
+                "no-ngram",
+                "nongram",
             ):
                 flags.append(p.lower().lstrip("-"))
             else:
@@ -722,6 +728,8 @@ def _pick_model(
                 "nodraft",
                 "nothinking",
                 "ngram",
+                "no-ngram",
+                "nongram",
             ):
                 flags.append(p.lower().lstrip("-"))
             elif model_idx_str is None and p.isdigit():
@@ -1419,9 +1427,13 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument(
         "--ngram",
         action="store_true",
-        help="Enable n-gram (ngram-mod) self-speculative decoding. Needs no "
-        "draft model and works on any model; good for code/text iteration, "
-        "reasoning models and summarisation.",
+        help="Explicitly enable n-gram self-speculative decoding (already on by "
+        "default for every model).",
+    )
+    p.add_argument(
+        "--no-ngram",
+        action="store_true",
+        help="Disable the default n-gram self-speculative decoding path.",
     )
     p.add_argument(
         "--no-mmproj-offload",
@@ -1757,6 +1769,11 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         use_nodraft = args.nodraft or "nodraft" in selection_flags
         use_nothinking = args.nothinking or "nothinking" in selection_flags
         use_ngram_flag = args.ngram or "ngram" in selection_flags
+        disable_ngram_flag = (
+            args.no_ngram
+            or "no-ngram" in selection_flags
+            or "nongram" in selection_flags
+        )
         model = __import__("copy").copy(model)
 
         if use_novision and model.mmproj is not None:
@@ -1849,6 +1866,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 draft_model,
                 args.settings_path,
                 force_ngram=use_ngram_flag,
+                disable_ngram=disable_ngram_flag,
                 non_interactive=non_interactive,
                 draft_available=(draft_model is not None or model.has_embedded_mtp)
                 and not use_nodraft,

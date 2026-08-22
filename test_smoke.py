@@ -1074,6 +1074,273 @@ def test_launch_button_recovers_after_selection_and_benchmark_cleanup(
     window.close()
 
 
+def test_ngram_defaults_on_but_explicit_model_off_survives(tmp_path, monkeypatch) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    model = _fake_model(tmp_path, "Qwen3.8-27B-Q4_K_M", 12.0)
+    window._system = _fake_system()
+    window._all_entries = [model]
+    window._show_config(model)
+    assert window._chk_ngram.isChecked()
+
+    qt_launcher.app_settings.set_model_override(model.name, "ngram", False)
+    window._option_overrides.clear()
+    window._update_checkboxes(model)
+    assert not window._chk_ngram.isChecked()
+    window.close()
+
+
+def test_performance_test_real_validates_qwen38_above_static_estimate(
+    tmp_path, monkeypatch
+) -> None:
+    """The user's 110,592-token setup must be tried, not rejected at ~78k."""
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+
+    model = _fake_qwen38_27b_model(
+        tmp_path, "Qwen3.8-27B-3.27bpw", size_gb=13.04
+    )
+    profile = match_profile(
+        model.name, load_profiles(SETTINGS_DIR), model.architecture
+    )
+    system = _fake_system(
+        ram_total=64,
+        ram_free=55.7,
+        vram_total=16,
+        vram_free=15.97,
+        vendor="amd",
+    )
+    manual = {
+        "mode": "manual",
+        "values": {
+            "ctx": 110592,
+            "cache_k": "q4_0",
+            "cache_v": "q4_0",
+            "ngl": 999,
+            "n_cpu_moe": 0,
+            "threads": 8,
+            "batch_threads": 8,
+            "batch": 512,
+            "ubatch": 64,
+            "flash_attn": True,
+            "draft_n_max": 2,
+            "parallel_enabled": True,
+            "parallel_count": 1,
+        },
+    }
+    qt_launcher.app_settings.set_expert_override(
+        model.name, manual, model.path, "throughput"
+    )
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._system = system
+    options = window._benchmark_model_options(model, tune_mtp=True)
+    static_cfg, static_context, static_trial = window._benchmark_config_for_target(
+        model,
+        profile,
+        system,
+        "throughput",
+        options,
+        desired_context=110592,
+        enable_yarn=False,
+        real_validation=False,
+    )
+    assert not static_trial
+    assert 70000 <= static_context <= 85000
+    assert static_cfg.ctx == static_context
+
+    trial_cfg, safe_context, exact_trial = window._benchmark_config_for_target(
+        model,
+        profile,
+        system,
+        "throughput",
+        options,
+        desired_context=110592,
+        enable_yarn=False,
+        real_validation=True,
+    )
+    assert exact_trial is True
+    assert safe_context == static_context
+    assert trial_cfg.ctx == 110592
+    assert (trial_cfg.cache_k, trial_cfg.cache_v) == ("q4_0", "q4_0")
+    assert trial_cfg.ngl == 999
+    assert (trial_cfg.batch, trial_cfg.ubatch) == (512, 64)
+
+    # RAM-backed KV is tested as its own mode instead of unsafely adding spare
+    # RAM to a full-offload VRAM budget.
+    ram_cfg, ram_safe, ram_trial = window._benchmark_config_for_target(
+        model,
+        profile,
+        system,
+        "low_vram",
+        options,
+        desired_context=110592,
+        enable_yarn=False,
+        real_validation=False,
+    )
+    assert not ram_trial
+    assert ram_safe == 110592
+    assert ram_cfg.no_kv_offload is True
+    assert ram_cfg.kv_ram_gb > 2.0
+
+    validated_snapshot = window._benchmark_snapshot(
+        trial_cfg, validated_exact_context=True
+    )
+    assert validated_snapshot["mode"] == "manual"
+    restored = qt_launcher.expert_cfg_from_values(
+        static_cfg, validated_snapshot["values"]
+    )
+    assert restored.ctx == 110592
+    assert restored.estimated_kv_gb > static_cfg.estimated_kv_gb
+    window.close()
+
+
+def test_performance_suite_selects_and_reports_fastest_mode(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    from model_benchmark import (
+        BenchmarkCandidate,
+        BenchmarkResult,
+        BenchmarkRunner,
+        BenchmarkSample,
+        BenchmarkSuiteJob,
+        BenchmarkSuiteJobResult,
+        BenchmarkSuiteResult,
+        CandidateResult,
+    )
+    from tuner import TunedConfig
+
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+    messages: list[str] = []
+    monkeypatch.setattr(
+        qt_launcher.QMessageBox,
+        "information",
+        lambda *args, **_kwargs: messages.append(str(args[-1])),
+    )
+
+    model = _fake_model(tmp_path, "Qwen3.8-27B-Q4_K_M", 4.0)
+    profile = match_profile(model.name, load_profiles(SETTINGS_DIR))
+    system = _fake_system()
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._system = system
+    window._all_entries = [model]
+    window._show_config(model)
+
+    def outcome(target: str, prompt: float, decode: float):
+        cfg = TunedConfig(
+            ctx=8192,
+            ngl=999,
+            threads=8,
+            batch_threads=8,
+            batch=512,
+            ubatch=256,
+            cache_k="q4_0",
+            cache_v="q4_0",
+            flash_attn=True,
+            sampling={},
+            performance_target=target,
+        )
+        baseline_candidate = BenchmarkCandidate(
+            "baseline", "Auto baseline", 8, 8, 512, 256
+        )
+        winner_candidate = BenchmarkCandidate(
+            f"winner-{target}", f"Winner {target}", 8, 8, 1024, 512
+        )
+        baseline_sample = BenchmarkSample(100.0, 20.0, 4096, 256, 1.0)
+        winner_sample = BenchmarkSample(prompt, decode, 4096, 256, 1.0)
+        measured = BenchmarkResult(
+            desired_context=8192,
+            baseline_id="baseline",
+            winner_id=winner_candidate.id,
+            candidates=[
+                CandidateResult(baseline_candidate, [baseline_sample, baseline_sample]),
+                CandidateResult(winner_candidate, [winner_sample, winner_sample]),
+            ],
+            elapsed_s=10.0,
+            runtime_binary="llama-server",
+            runtime_build=10572,
+            reason="measured winner",
+        )
+        runner = BenchmarkRunner(
+            model=model,
+            profile=profile,
+            base_config=cfg,
+            runtime_binary="llama-server",
+            physical_cores=8,
+            logical_cores=16,
+        )
+        job = BenchmarkSuiteJob(
+            key=target,
+            label=f"{model.name} [{target}]",
+            performance_target=target,
+            runner=runner,
+            metadata={"system": system, "safe_context": 8192},
+        )
+        return BenchmarkSuiteJobResult(job=job, result=measured)
+
+    suite_result = BenchmarkSuiteResult(
+        jobs=[
+            outcome("safe", 180.0, 24.0),
+            outcome("throughput", 260.0, 42.0),
+        ],
+        elapsed_s=20.0,
+    )
+    window._on_performance_tuning_finished(suite_result)
+
+    assert window._perf_combo.currentText() == "throughput"
+    assert qt_launcher.app_settings.get_performance_target() == "throughput"
+    assert (
+        qt_launcher.app_settings.get_model_performance_target(model.path)
+        == "throughput"
+    )
+    assert messages
+    assert "safe: PP" in messages[-1]
+    assert "★ throughput:" in messages[-1]
+    assert "Selected model now uses the fastest measured mode: throughput" in messages[-1]
+
+    # Per-model choice is restored when returning to a model, not just kept as
+    # a one-session global combo value.
+    qt_launcher.app_settings.set_model_performance_target(model.path, "safe")
+    window._show_config(model)
+    assert window._perf_combo.currentText() == "safe"
+    window.close()
+
+
 def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> None:
     """Lock in complete beginner + technical help for settings dialogs."""
     global _QT_TEST_APP
@@ -1149,6 +1416,8 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
             app_dialog.customize_theme_button,
             app_dialog.open_themes_button,
             app_dialog.about_button,
+            app_dialog.export_profiles_button,
+            app_dialog.import_profiles_button,
         ]
     )
     widgets.extend(

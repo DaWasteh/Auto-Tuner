@@ -1,16 +1,16 @@
-"""Bounded, real llama-server performance tuning for one selected GGUF.
+"""Real llama-server performance tuning for one or more GGUF profiles.
 
-The engine is deliberately UI-independent.  It starts a private loopback
-llama-server for each candidate, waits for the exact server identity, runs a
-fixed deterministic inference workload, compares median prompt/decode speed,
-and returns the safest materially faster configuration.  Qt only supplies a
-thread, progress dialog, and persistence.
+The engine is deliberately UI-independent. It starts a private loopback
+llama-server for every candidate, waits for the exact server identity, runs a
+long deterministic prompt + decode workload, and records llama.cpp's native
+prompt-processing and n_decode timings. Winner ranking uses the measured
+end-to-end inference time instead of a geometric mean that could exaggerate a
+large prompt-only gain as a similarly large real-world speedup.
 
-Quality-affecting choices (context, KV precision, GPU placement, Flash
-Attention, speculative mode, sampling) stay fixed.  The first implementation
-searches the high-value, low-risk runtime axes that users otherwise tune by
-restarting the server repeatedly: CPU threads, batch threads, batch, and
-ubatch.
+Context, KV precision, GPU placement, Flash Attention, sampling, and the chosen
+performance target stay fixed inside one sweep. Runtime axes (CPU threads,
+batch threads, batch, and ubatch) are searched for every target independently;
+an optional final stage also measures MTP/draft rollback depths.
 """
 
 from __future__ import annotations
@@ -50,15 +50,18 @@ class BenchmarkFailure(RuntimeError):
 
 @dataclass(frozen=True)
 class BenchmarkLimits:
-    """Hard bounds that keep a tuning run useful but finite."""
+    """Hard bounds that keep a thorough tuning run finite."""
 
-    max_candidates: int = 8
+    max_candidates: int = 14
     confirmation_runs: int = 2
     samples_per_candidate: int = 2
     startup_timeout_s: float = 300.0
-    request_timeout_s: float = 120.0
-    total_timeout_s: float = 1800.0
-    generated_tokens: int = 64
+    request_timeout_s: float = 900.0
+    total_timeout_s: float = 7200.0
+    generated_tokens: int = 256
+    min_prompt_tokens: int = 4096
+    max_prompt_tokens: int = 65536
+    prompt_context_fraction: float = 0.25
     min_improvement: float = 0.03
     max_sample_spread: float = 0.35
 
@@ -73,6 +76,7 @@ class BenchmarkCandidate:
     batch_threads: int
     batch: int
     ubatch: int
+    draft_n_max: int = 0
 
     def apply(self, base: TunedConfig) -> TunedConfig:
         cfg = copy.copy(base)
@@ -80,6 +84,7 @@ class BenchmarkCandidate:
         cfg.batch_threads = max(1, int(self.batch_threads))
         cfg.batch = max(1, int(self.batch))
         cfg.ubatch = max(1, min(int(self.ubatch), cfg.batch))
+        cfg.draft_n_max = max(0, int(self.draft_n_max))
         # One slot makes the requested context exact and keeps every candidate
         # a single-user latency/throughput comparison instead of a concurrency
         # benchmark. All memory/quality choices from compute_config stay fixed.
@@ -93,6 +98,7 @@ class BenchmarkCandidate:
             "batch_threads": self.batch_threads,
             "batch": self.batch,
             "ubatch": self.ubatch,
+            "draft_n_max": self.draft_n_max,
         }
 
 
@@ -103,6 +109,20 @@ class BenchmarkSample:
     prompt_tokens: int
     generated_tokens: int
     elapsed_s: float
+
+    @property
+    def inference_s(self) -> float:
+        """Native llama.cpp prompt + decode time reconstructed from timings."""
+        return (self.prompt_tokens / self.prompt_tps) + (
+            self.generated_tokens / self.generation_tps
+        )
+
+    @property
+    def overall_tps(self) -> float:
+        elapsed = self.inference_s
+        if elapsed <= 0:
+            return 0.0
+        return (self.prompt_tokens + self.generated_tokens) / elapsed
 
 
 @dataclass
@@ -124,6 +144,15 @@ class CandidateResult:
     @property
     def generation_tps(self) -> float:
         return statistics.median(s.generation_tps for s in self.samples)
+
+    @property
+    def overall_tps(self) -> float:
+        """Median end-to-end native inference throughput for winner ranking."""
+        return statistics.median(s.overall_tps for s in self.samples)
+
+    @property
+    def inference_s(self) -> float:
+        return statistics.median(s.inference_s for s in self.samples)
 
     def sample_spread(self) -> float:
         """Worst relative min/max spread across prompt and decode samples."""
@@ -164,13 +193,11 @@ class BenchmarkResult:
         return self.by_id(self.winner_id)
 
     def score(self, result: CandidateResult) -> float:
+        """Measured end-to-end speed ratio for this exact benchmark workload."""
         base = self.baseline
-        if not result.valid or not base.valid:
+        if not result.valid or not base.valid or base.overall_tps <= 0:
             return 0.0
-        return math.sqrt(
-            (result.prompt_tps / base.prompt_tps)
-            * (result.generation_tps / base.generation_tps)
-        )
+        return result.overall_tps / base.overall_tps
 
     def winning_config(self, base: TunedConfig) -> TunedConfig:
         return self.winner.candidate.apply(base)
@@ -178,7 +205,7 @@ class BenchmarkResult:
     def to_record(self, *, model_path: str, model_size: int, model_mtime_ns: int) -> dict:
         """Return bounded JSON evidence; prompts, raw argv, and full logs stay out."""
         return {
-            "schema": 1,
+            "schema": 2,
             "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "model_path": model_path,
             "model_size": int(model_size),
@@ -201,6 +228,8 @@ class BenchmarkResult:
                     "generation_tps": (
                         round(item.generation_tps, 4) if item.valid else None
                     ),
+                    "overall_tps": round(item.overall_tps, 4) if item.valid else None,
+                    "inference_s": round(item.inference_s, 4) if item.valid else None,
                     "score": round(self.score(item), 6) if item.valid else None,
                     "samples": [asdict(sample) for sample in item.samples],
                     "confirmations": item.confirmations,
@@ -215,16 +244,24 @@ class BenchmarkResult:
 ProgressCallback = Callable[[int, int, str], None]
 
 
-def _candidate_key(candidate: BenchmarkCandidate) -> Tuple[int, int, int, int]:
+def _candidate_key(candidate: BenchmarkCandidate) -> Tuple[int, int, int, int, int]:
     return (
         candidate.threads,
         candidate.batch_threads,
         candidate.batch,
         candidate.ubatch,
+        candidate.draft_n_max,
     )
 
 
-def baseline_candidate(cfg: TunedConfig) -> BenchmarkCandidate:
+def baseline_candidate(
+    cfg: TunedConfig, *, effective_draft_n_max: Optional[int] = None
+) -> BenchmarkCandidate:
+    draft_n_max = (
+        max(0, int(effective_draft_n_max))
+        if effective_draft_n_max is not None
+        else max(0, int(cfg.draft_n_max or 0))
+    )
     return BenchmarkCandidate(
         id="baseline",
         label="Auto baseline",
@@ -232,6 +269,7 @@ def baseline_candidate(cfg: TunedConfig) -> BenchmarkCandidate:
         batch_threads=max(1, cfg.batch_threads),
         batch=max(1, cfg.batch),
         ubatch=max(1, min(cfg.ubatch, cfg.batch)),
+        draft_n_max=draft_n_max,
     )
 
 
@@ -253,6 +291,7 @@ def thread_candidates(
             batch_threads=batch_threads,
             batch=seed.batch,
             ubatch=seed.ubatch,
+            draft_n_max=seed.draft_n_max,
         )
         if _candidate_key(item) not in seen:
             seen.add(_candidate_key(item))
@@ -279,6 +318,34 @@ def batch_candidates(seed: BenchmarkCandidate) -> List[BenchmarkCandidate]:
             batch_threads=seed.batch_threads,
             batch=batch,
             ubatch=min(ubatch, batch),
+            draft_n_max=seed.draft_n_max,
+        )
+        if _candidate_key(item) not in seen:
+            seen.add(_candidate_key(item))
+            out.append(item)
+    return out
+
+
+def draft_candidates(
+    seed: BenchmarkCandidate, *, maximum: int
+) -> List[BenchmarkCandidate]:
+    """Return bounded speculative draft depths around the current winner."""
+    upper = max(1, min(8, int(maximum)))
+    values = list(range(1, min(4, upper) + 1))
+    for value in (6, 8):
+        if value <= upper:
+            values.append(value)
+    out: List[BenchmarkCandidate] = []
+    seen = {_candidate_key(seed)}
+    for draft_n_max in values:
+        item = BenchmarkCandidate(
+            id=f"draft-{draft_n_max}-t{seed.threads}-b{seed.batch}-{seed.ubatch}",
+            label=f"MTP/draft n-max {draft_n_max}",
+            threads=seed.threads,
+            batch_threads=seed.batch_threads,
+            batch=seed.batch,
+            ubatch=seed.ubatch,
+            draft_n_max=draft_n_max,
         )
         if _candidate_key(item) not in seen:
             seen.add(_candidate_key(item))
@@ -301,6 +368,8 @@ def parse_timing_payload(
     def _integer(*names: str) -> int:
         for name in names:
             value = timings.get(name, payload.get(name))
+            if value is None:
+                continue
             try:
                 parsed = int(value)
             except (TypeError, ValueError):
@@ -311,8 +380,11 @@ def parse_timing_payload(
 
     def _positive(*names: str) -> float:
         for name in names:
+            value = timings.get(name)
+            if value is None:
+                continue
             try:
-                parsed = float(timings.get(name))
+                parsed = float(value)
             except (TypeError, ValueError):
                 continue
             if math.isfinite(parsed) and parsed > 0:
@@ -357,14 +429,24 @@ def _free_loopback_port() -> int:
 
 
 def _fixed_prompt(target_tokens: int) -> str:
-    # Common short words tokenize consistently enough across BPE/SPM families;
-    # the response's prompt_n remains the authoritative measured count.
-    phrase = (
-        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
-        "nu xi omicron pi rho sigma tau upsilon phi chi psi omega "
-    )
-    repeats = max(8, math.ceil(target_tokens / 24))
-    return (phrase * repeats).strip()
+    """Build a deterministic document/code mix without trivial exact repeats."""
+    # Numbered records keep tokenisation stable across BPE/SPM families while
+    # avoiding the old 24-word loop that made n-gram speculation unrealistically
+    # easy. The response's prompt_n remains the authoritative measured count.
+    lines: List[str] = []
+    estimated = 0
+    index = 0
+    while estimated < max(64, int(target_tokens)):
+        checksum = (index * 2654435761) & 0xFFFFFFFF
+        lines.append(
+            f"Record {index:05d}: validate worker_{index % 97}(input_{index % 53}) "
+            f"against policy_{index % 31}; checksum=0x{checksum:08x}. "
+            "If validation succeeds, preserve ordering, explain edge cases, "
+            "and return the normalized result."
+        )
+        estimated += 32
+        index += 1
+    return "\n".join(lines)
 
 
 class BenchmarkRunner:
@@ -383,6 +465,9 @@ class BenchmarkRunner:
         use_thinking: bool = False,
         enable_speculative: bool = False,
         enable_ngram: bool = False,
+        tune_draft_n_max: bool = False,
+        enable_prompt_cache: bool = False,
+        prompt_cache_ram_mib: int = 0,
         limits: Optional[BenchmarkLimits] = None,
         progress: Optional[ProgressCallback] = None,
         process_factory=ServerProcess,
@@ -397,6 +482,9 @@ class BenchmarkRunner:
         self.use_thinking = bool(use_thinking)
         self.enable_speculative = bool(enable_speculative)
         self.enable_ngram = bool(enable_ngram)
+        self.tune_draft_n_max = bool(tune_draft_n_max and enable_speculative)
+        self.enable_prompt_cache = bool(enable_prompt_cache)
+        self.prompt_cache_ram_mib = int(prompt_cache_ram_mib)
         self.limits = limits or BenchmarkLimits()
         self.progress = progress or (lambda _done, _total, _message: None)
         self.process_factory = process_factory
@@ -517,8 +605,16 @@ class BenchmarkRunner:
             f"{self.limits.startup_timeout_s:.0f}s ({last_error})"
         )
 
+    def _target_prompt_tokens(self, context: int) -> int:
+        """Use a meaningful portion of context while keeping sweeps bounded."""
+        generated = max(1, int(self.limits.generated_tokens))
+        available = max(128, int(context) - generated - 128)
+        proportional = int(max(0, context) * self.limits.prompt_context_fraction)
+        requested = max(self.limits.min_prompt_tokens, proportional)
+        return max(128, min(self.limits.max_prompt_tokens, requested, available))
+
     def _measurement_payload(self, context: int) -> dict:
-        target_prompt = min(2048, max(128, int(context * 0.25)))
+        target_prompt = self._target_prompt_tokens(context)
         return {
             "prompt": _fixed_prompt(target_prompt),
             "n_predict": self.limits.generated_tokens,
@@ -550,8 +646,8 @@ class BenchmarkRunner:
             use_thinking=self.use_thinking,
             enable_speculative=self.enable_speculative,
             enable_ngram=self.enable_ngram,
-            enable_prompt_cache=False,
-            prompt_cache_ram_mib=0,
+            enable_prompt_cache=self.enable_prompt_cache,
+            prompt_cache_ram_mib=self.prompt_cache_ram_mib,
             enable_metrics=False,
             enable_slots_api=False,
         )
@@ -581,6 +677,7 @@ class BenchmarkRunner:
                     "stream": False,
                 },
             )
+            target_prompt_tokens = self._target_prompt_tokens(cfg.ctx)
             payload = self._measurement_payload(cfg.ctx)
             for _index in range(self.limits.samples_per_candidate):
                 self._check_cancelled()
@@ -593,8 +690,9 @@ class BenchmarkRunner:
                     parse_timing_payload(
                         response,
                         elapsed,
+                        min_prompt_tokens=max(64, int(target_prompt_tokens * 0.50)),
                         min_generated_tokens=max(
-                            16, int(self.limits.generated_tokens * 0.75)
+                            32, int(self.limits.generated_tokens * 0.80)
                         ),
                     )
                 )
@@ -644,12 +742,9 @@ class BenchmarkRunner:
     def _score(
         self, item: CandidateResult, baseline: CandidateResult
     ) -> float:
-        if not item.valid:
+        if not item.valid or not baseline.valid or baseline.overall_tps <= 0:
             return 0.0
-        return math.sqrt(
-            (item.prompt_tps / baseline.prompt_tps)
-            * (item.generation_tps / baseline.generation_tps)
-        )
+        return item.overall_tps / baseline.overall_tps
 
     def _rank(
         self,
@@ -674,7 +769,19 @@ class BenchmarkRunner:
         if self.limits.max_candidates < 1:
             raise BenchmarkFailure("at least one benchmark candidate is required")
 
-        baseline_spec = baseline_candidate(self.base_config)
+        effective_draft_n_max: Optional[int] = None
+        if self.enable_speculative:
+            effective_draft_n_max = max(
+                1,
+                int(
+                    self.base_config.draft_n_max
+                    or getattr(self.profile, "draft_max", 0)
+                    or 2
+                ),
+            )
+        baseline_spec = baseline_candidate(
+            self.base_config, effective_draft_n_max=effective_draft_n_max
+        )
         results: List[CandidateResult] = []
         by_id: Dict[str, CandidateResult] = {}
         seen = {_candidate_key(baseline_spec)}
@@ -725,6 +832,38 @@ class BenchmarkRunner:
             by_id[candidate.id] = measured
             seen.add(_candidate_key(candidate))
 
+        # Stage 3 (optional): retain the best runtime axes and measure actual
+        # speculative rollback depths. This is deliberately opt-in because it
+        # adds several full model reloads and is useful only with MTP/draft.
+        if self.tune_draft_n_max and len(results) < self.limits.max_candidates:
+            best_runtime = self._rank(results, baseline)[0].candidate
+            profile_depth = max(
+                1,
+                int(
+                    best_runtime.draft_n_max
+                    or getattr(self.profile, "draft_max", 0)
+                    or 2
+                ),
+            )
+            maximum_depth = min(8, max(4, profile_depth * 2))
+            for candidate in draft_candidates(
+                best_runtime, maximum=maximum_depth
+            ):
+                if len(results) >= self.limits.max_candidates:
+                    break
+                if _candidate_key(candidate) in seen:
+                    continue
+                self._check_cancelled()
+                try:
+                    measured = self._run_candidate(candidate)
+                except BenchmarkCancelled:
+                    raise
+                except BenchmarkFailure as exc:
+                    measured = CandidateResult(candidate=candidate, error=str(exc))
+                results.append(measured)
+                by_id[candidate.id] = measured
+                seen.add(_candidate_key(candidate))
+
         ranked = self._rank(results, baseline)
         finalists = ranked[: min(2, self.limits.confirmation_runs, len(ranked))]
         confirmed_ids: set[str] = set()
@@ -766,7 +905,7 @@ class BenchmarkRunner:
             winner = baseline
             reason = (
                 "Auto baseline kept because no confirmed candidate improved the "
-                f"combined score by {self.limits.min_improvement * 100:.0f}%"
+                f"end-to-end workload by {self.limits.min_improvement * 100:.0f}%"
             )
         elif winner.candidate.id == baseline_spec.id:
             reason = "Auto baseline remained fastest within the noise threshold"
@@ -782,4 +921,103 @@ class BenchmarkRunner:
             runtime_binary=self.runtime_binary,
             runtime_build=probe_binary_build_number(self.runtime_binary),
             reason=reason,
+        )
+
+
+@dataclass
+class BenchmarkSuiteJob:
+    """One model/performance-target sweep in a sequential benchmark suite."""
+
+    key: str
+    label: str
+    performance_target: str
+    runner: BenchmarkRunner
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class BenchmarkSuiteJobResult:
+    job: BenchmarkSuiteJob
+    result: Optional[BenchmarkResult] = None
+    error: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return self.result is not None and not self.error
+
+
+@dataclass
+class BenchmarkSuiteResult:
+    jobs: List[BenchmarkSuiteJobResult]
+    elapsed_s: float
+
+    @property
+    def successful(self) -> List[BenchmarkSuiteJobResult]:
+        return [item for item in self.jobs if item.valid]
+
+    @property
+    def failed(self) -> List[BenchmarkSuiteJobResult]:
+        return [item for item in self.jobs if not item.valid]
+
+
+class BenchmarkSuiteRunner:
+    """Run model/target sweeps sequentially so RAM, VRAM, and thermals stay sane."""
+
+    def __init__(
+        self,
+        jobs: Sequence[BenchmarkSuiteJob],
+        *,
+        progress: Optional[ProgressCallback] = None,
+    ) -> None:
+        self.jobs = list(jobs)
+        self.progress = progress or (lambda _done, _total, _message: None)
+        self._cancel = threading.Event()
+        self._active: Optional[BenchmarkRunner] = None
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        if self._active is not None:
+            self._active.cancel()
+
+    def run(self) -> BenchmarkSuiteResult:
+        if not self.jobs:
+            raise BenchmarkFailure("no benchmark jobs were prepared")
+        started = time.monotonic()
+        total = sum(max(1, job.runner._total_runs) for job in self.jobs)
+        completed = 0
+        outcomes: List[BenchmarkSuiteJobResult] = []
+        for index, job in enumerate(self.jobs, start=1):
+            if self._cancel.is_set():
+                raise BenchmarkCancelled("Performance tuning cancelled")
+            allocation = max(1, job.runner._total_runs)
+            prefix = f"[{index}/{len(self.jobs)}] {job.label}"
+
+            def relay(done: int, _job_total: int, message: str) -> None:
+                self.progress(
+                    min(total, completed + max(0, done)),
+                    total,
+                    f"{prefix}: {message}",
+                )
+
+            job.runner.progress = relay
+            self.progress(completed, total, f"{prefix}: preparing")
+            self._active = job.runner
+            try:
+                result = job.runner.run()
+                outcomes.append(BenchmarkSuiteJobResult(job=job, result=result))
+            except BenchmarkCancelled:
+                raise
+            except BenchmarkFailure as exc:
+                outcomes.append(BenchmarkSuiteJobResult(job=job, error=str(exc)))
+            finally:
+                self._active = None
+                completed += allocation
+                self.progress(
+                    min(total, completed),
+                    total,
+                    f"{prefix}: complete",
+                )
+        return BenchmarkSuiteResult(
+            jobs=outcomes,
+            elapsed_s=time.monotonic() - started,
         )

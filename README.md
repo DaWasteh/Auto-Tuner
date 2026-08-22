@@ -105,19 +105,25 @@ the RAM/VRAM you actually have free — without manual edits.
   the generic `temp 0.7 / top_k 40`) now runs on its intended samplers —
   a frequent cause of repetition loops and broken tool-calls on models
   tuned for a low `top_k` with a non-zero `min_p`.
-- **Measured performance tuning** — select a normal text/chat GGUF and click
-  **🚀 Performance-Test**. AutoTuner asks for the target context (the maximum
-  currently feasible context is preselected), then starts fresh private
-  `llama-server` instances and deterministically tests CPU threads, batch
-  threads, batch, and ubatch. The sweep is bounded to at most eight candidates
-  plus two reversed-order confirmations, uses one excluded warm-up and median
-  prompt/decode throughput, and keeps the safer Auto baseline unless a measured
-  winner improves the combined score materially. The winning values and bounded
-  evidence are saved for the exact GGUF path and become editable Expert settings.
-  Context, KV quality, GPU placement, Flash Attention, and selected model
-  features stay fixed. AutoTuner deliberately does **not** alter clocks, voltage,
-  fan curves, or power limits: hardware overclocking would make the result less
-  reproducible and is outside the app's safe process-level scope.
+- **Measured performance profiles for every mode** — select a normal text/chat
+  GGUF and click **🚀 Performance test**. The setup dialog can test any or all
+  of `safe`, `balanced`, `throughput`, and `low_vram`, optionally enable YaRN,
+  tune MTP/draft `n-max`, or queue every benchmarkable scanned model. Each mode
+  gets its own persistent Expert snapshot. Every candidate starts a fresh private
+  `llama-server`, uses an excluded warm-up, then measures a deterministic prompt
+  covering up to 25% of context (bounded at 65,536 tokens) plus **256 n_decode
+  tokens**. AutoTuner reports native prompt-processing, n_decode, and measured
+  end-to-end throughput separately; winner ranking uses real workload time rather
+  than the old geometric score that could exaggerate prompt-only gains. The best
+  mode for each model is marked, remembered, and automatically selected. A
+  requested context above the conservative static estimate can be tried in the
+  isolated server; only a successful load + inference run is saved (for example,
+  a backend-proven 110,592-token profile is no longer rejected merely because
+  static headroom estimated ~78k). `low_vram` remains the explicit, safe way to
+  place KV in abundant system RAM via `--no-kv-offload`; spare RAM is never added
+  to a full-offload VRAM budget implicitly. Settings → **Performance profiles**
+  exports/imports a portable JSON backup matched by GGUF filename and byte size.
+  AutoTuner never changes clocks, voltage, fan curves, or power limits.
 - **Multi-server (run several models at once)** — Launch no longer
   refuses while a server is running. Each new model gets the **next free
   port**: 0 servers → `1234`, 1 → `1235`, 2 → `1236`, … When a server is
@@ -143,10 +149,11 @@ the RAM/VRAM you actually have free — without manual edits.
   `--cache-ram-mib`; the reserved amount is included in the RAM estimate.
 - **Sticky GUI choices** — the Qt launcher remembers each model's selected
   **mmproj** and **draft/MTP** dropdown entries plus thinking / **n-gram** /
-  **prompt-cache** toggles in `autotuner_settings.json`. Switch to
-  another model and back, restart the app, change the performance
-  target — your manual choices stay put. They only revert when you
-  click them again.
+  **prompt-cache** toggles in `autotuner_settings.json`. n-gram self-speculation
+  now defaults **on for every model**; an explicit per-model off choice remains
+  authoritative. Each model also remembers its selected/fastest performance
+  target and independent Expert settings for all four targets. Switch models,
+  restart, or change targets — the corresponding choices return.
 - **Fork-folder memory** — if you point the GUI at a parent folder
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
   the next launch re-expands the same set of builds in the dropdown. Both
@@ -440,8 +447,9 @@ logs, pipes, and `--plain` automatically use an ASCII-only, ANSI-free view.
 
 For repeatable scripts, use an unambiguous model with `--non-interactive` (or
 `--dry-run` / `--yes`). These paths do not read prompts: available vision,
-draft, and thinking features use their normal defaults, while n-gram remains
-opt-in via `--ngram`. The terminal UI shares the launch engine, but the GUI
+draft, thinking, and n-gram features use their normal defaults. n-gram is on by
+default for every model; use `--no-ngram` to disable it (`--ngram` remains a
+compatible explicit-on spelling). The terminal UI shares the launch engine, but the GUI
 remains the place for persisted per-model Expert controls; advanced
 llama-server options can still be passed after `--`. OCR models expose the same
 shared document pipeline through `--ocr-input` / `--ocr-output`; the job-owned
@@ -463,20 +471,17 @@ that only make sense with persistent state:
   directly from the completion dialog.
 - **Sticky per-model options.** Choose mmproj and draft/MTP directly from
   their dropdowns (`none` disables either feature), then toggle thinking /
-  n-gram / prompt-cache as needed. The choices survive model switches,
-  performance-target changes, and restarts. Stored in
-  `autotuner_settings.json` under `mmproj_selection`, `draft_selection`, and
-  `model_overrides`.
-- **Expert settings are saved per model (autosave).** Every edit you make
-  in the Expert panel — Auto-cascade pins *or* a full Manual setup — is
-  debounced-saved under `expert_overrides` keyed by model name and applied
-  automatically the next time you select that model (just like the
-  persisted launch options above), so a low-VRAM hand-tuning never has to be
-  re-entered. Auto-mode saves adapt to the current VRAM on launch
-  (re-cascaded from the saved pins); Manual-mode saves are applied as the
-  exact frozen values (the launch VRAM fit-check still gates them). The
-  **⟲ Reset** button next to *Auto* / *Manual* drops the saved state for
-  the current model and reloads the AutoTuner's automatically-best config.
+  n-gram / prompt-cache as needed. n-gram starts on but can be disabled per
+  model. Choices survive model switches and restarts.
+- **Expert settings are saved per model *and performance target* (autosave).**
+  Auto-cascade pins and full Manual setups are independently persisted for
+  `safe`, `balanced`, `throughput`, and `low_vram`; changing the toolbar target
+  restores that target's values instead of leaking one winner into every mode.
+  Auto-mode saves re-cascade against current hardware. A context proven by the
+  isolated real benchmark is stored as an exact Manual profile so a later static
+  estimate cannot silently clamp it. **⟲ Reset** resets only the current mode.
+  Settings → **Performance profiles** exports/imports these snapshots and their
+  measurement evidence without copying unrelated application settings.
 - **Run several models at once.** Launch stays enabled while servers are
   running — each new model is placed on the **emptier GPU** and given the
   **next free port** (1234, 1235, 1236, …). Stop a server and its port is
@@ -533,7 +538,7 @@ that only make sense with persistent state:
 | `--ctx N` | Override the auto-tuned context length |
 | `--model SUBSTR` | Skip the menu, pick a model by name substring |
 | `--gpu NAME` | Hard-pin the server to a single GPU by name substring (e.g. `--gpu 9070`, `--gpu R9700`). Overrides the persisted `forced_gpu`; omit for free-VRAM-aware auto selection. The GUI exposes the same pin via the toolbar **GPU** dropdown |
-| `--ngram` | Enable n-gram (ngram-mod) self-speculative decoding |
+| `--ngram` / `--no-ngram` | Explicitly enable / disable default-on n-gram self-speculative decoding |
 | `--no-mmproj-offload` | Keep an active vision projector in system RAM instead of VRAM; its size is moved into the RAM budget |
 | `--cache-ram-mib MIB` | Bound host prompt caching (`-1` unlimited, `0` disabled); without this flag the saved GUI cache limit is used |
 | `--no-prompt-cache` | Disable host-memory prompt caching (`--cache-ram 0`). Caching is auto-on; Vision requires llama.cpp b10045+ and falls back to off on older/unprobeable builds |
@@ -1309,9 +1314,9 @@ An unknown `ngram_method` value in the YAML falls back to `ngram-mod` with
 a warning at load time (instead of crashing only at server start).
 
 > ⚠️ **Reality check:** on bandwidth-limited MoE-A3B models, speculative
-> decoding often does *not* beat the baseline according to current
-> benchmarks (expert saturation). `ngram_method` is therefore deliberately
-> opt-in — measure tok/s before and after.
+> decoding can fail to beat baseline (expert saturation). n-gram is now
+> default-on, but remains user-toggleable; use the Performance test's separate
+> prompt-processing and n_decode results to decide whether to disable it.
 
 ### Several models at once + GPU load-balancing
 

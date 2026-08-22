@@ -195,9 +195,9 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         rope_scale_factor = float(rope_scale_cfg.get("scale_factor", 4.0))
 
         # Performance target preset (optional). Validate softly: any string
-        # other than the three known names is treated as "use global default".
+        # outside the four GUI targets is treated as "use global default".
         perf_target_raw = str(data.get("performance_target", "") or "").lower().strip()
-        if perf_target_raw not in ("safe", "balanced", "throughput", ""):
+        if perf_target_raw not in ("safe", "balanced", "throughput", "low_vram", ""):
             print(
                 f"[AutoTuner] {yml.name}: unknown performance_target "
                 f"'{perf_target_raw}', ignoring (using global default)."

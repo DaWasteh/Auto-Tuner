@@ -143,6 +143,9 @@ from model_benchmark import (
     BenchmarkFailure,
     BenchmarkResult,
     BenchmarkRunner,
+    BenchmarkSuiteJob,
+    BenchmarkSuiteResult,
+    BenchmarkSuiteRunner,
 )
 from theme_dialog import ThemeEditorDialog
 from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
@@ -793,6 +796,38 @@ class _ApplicationSettingsDialog(QDialog):
             )
         layout.addWidget(self.minimize_checkbox)
 
+        profiles = QGroupBox("Performance profiles")
+        profiles.setMaximumWidth(760)
+        profile_layout = QVBoxLayout(profiles)
+        profile_help = QLabel(
+            "Export or import measured per-model/performance-mode profiles. The "
+            "portable bundle matches moved models by GGUF filename and file size; "
+            "appearance, paths, ports, and unrelated application settings are excluded."
+        )
+        profile_help.setWordWrap(True)
+        profile_layout.addWidget(profile_help)
+        profile_buttons = QHBoxLayout()
+        self.export_profiles_button = QPushButton("Export profiles…")
+        self.import_profiles_button = QPushButton("Import profiles…")
+        self.export_profiles_button.setToolTip(
+            _setting_tooltip(
+                "Saves measured tuning profiles to a portable JSON backup.",
+                "Exports validated Expert snapshots and benchmark evidence for all "
+                "four performance targets. Atomic writing prevents partial bundles.",
+            )
+        )
+        self.import_profiles_button.setToolTip(
+            _setting_tooltip(
+                "Restores performance profiles from an AutoTuner JSON backup.",
+                "Strictly validates the bundle schema, merges valid target profiles, "
+                "and maps local GGUFs by exact filename plus byte size.",
+            )
+        )
+        profile_buttons.addWidget(self.export_profiles_button)
+        profile_buttons.addWidget(self.import_profiles_button)
+        profile_layout.addLayout(profile_buttons)
+        layout.addWidget(profiles)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -1092,13 +1127,114 @@ class _OcrWorker(QObject):
         self.runner.cancel()
 
 
+class _PerformanceTuneSetupDialog(QDialog):
+    """Collect scope and optional expensive axes for a performance suite."""
+
+    def __init__(
+        self,
+        model_name: str,
+        default_context: int,
+        maximum_context: int,
+        model_count: int,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Performance test options")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            f"Tune <b>{escape(model_name)}</b>. Every selected performance mode "
+            "gets its own saved profile. Tests use a long prompt and 256-token "
+            "n_decode window, so they take longer but report realistic native timings."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        context_group = QGroupBox("Context and validation")
+        context_layout = QGridLayout(context_group)
+        context_layout.addWidget(QLabel("Desired context:"), 0, 0)
+        self.context_spin = QSpinBox()
+        self.context_spin.setRange(0, max(512, min(10_000_000, maximum_context)))
+        self.context_spin.setSingleStep(1024)
+        self.context_spin.setSpecialValueText("Auto maximum per model")
+        self.context_spin.setValue(max(0, min(default_context, self.context_spin.maximum())))
+        context_layout.addWidget(self.context_spin, 0, 1)
+        self.real_validation = QCheckBox(
+            "Try the exact requested context in the isolated test server"
+        )
+        self.real_validation.setChecked(True)
+        self.real_validation.setToolTip(
+            "A conservative static estimate may be lower than what a backend can "
+            "actually allocate. The private benchmark server performs the real check; "
+            "an OOM fails only that model/mode and saves no profile."
+        )
+        context_layout.addWidget(self.real_validation, 1, 0, 1, 2)
+        self.enable_yarn = QCheckBox("Enable YaRN when context exceeds native context")
+        self.enable_yarn.setChecked(False)
+        context_layout.addWidget(self.enable_yarn, 2, 0, 1, 2)
+        layout.addWidget(context_group)
+
+        modes_group = QGroupBox("Performance modes (independent saved profiles)")
+        modes_layout = QGridLayout(modes_group)
+        self.mode_checks: Dict[str, QCheckBox] = {}
+        for index, name in enumerate(list_target_names()):
+            check = QCheckBox(name)
+            check.setChecked(True)
+            check.setToolTip(PERFORMANCE_TARGETS[name].description)
+            self.mode_checks[name] = check
+            modes_layout.addWidget(check, index // 2, index % 2)
+        layout.addWidget(modes_group)
+
+        scope_group = QGroupBox("Optional extended search")
+        scope_layout = QVBoxLayout(scope_group)
+        self.tune_mtp = QCheckBox("Tune MTP/draft n-max (adds draft-depth runs)")
+        self.tune_mtp.setChecked(False)
+        scope_layout.addWidget(self.tune_mtp)
+        self.all_models = QCheckBox(
+            f"Run all benchmarkable scanned models ({max(1, model_count)} found)"
+        )
+        self.all_models.setChecked(False)
+        scope_layout.addWidget(self.all_models)
+        warning = QLabel(
+            "All modes or all models can require many model reloads. Runs are "
+            "strictly sequential and can be cancelled without replacing existing profiles."
+        )
+        warning.setWordWrap(True)
+        scope_layout.addWidget(warning)
+        layout.addWidget(scope_group)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok is not None:
+            ok.setText("Prepare performance test")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_targets(self) -> List[str]:
+        return [name for name, check in self.mode_checks.items() if check.isChecked()]
+
+    def accept(self) -> None:
+        if not self.selected_targets():
+            QMessageBox.information(
+                self, "Select a mode", "Select at least one performance mode to test."
+            )
+            return
+        super().accept()
+
+
 class _PerformanceTuneDialog(QDialog):
-    """Non-blocking progress surface for the real server benchmark sweep."""
+    """Non-blocking progress surface for the real server benchmark suite."""
 
     cancel_requested = pyqtSignal()
 
     def __init__(
-        self, model_name: str, desired_context: int, parent: Optional[QWidget] = None
+        self, summary: str, job_count: int, parent: Optional[QWidget] = None
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("AutoTuner performance test")
@@ -1107,8 +1243,8 @@ class _PerformanceTuneDialog(QDialog):
         self._finished = False
         layout = QVBoxLayout(self)
         title = QLabel(
-            f"Testing {model_name} at {desired_context:,} tokens context.\n"
-            "Each candidate starts a fresh private llama-server; this can take a while."
+            f"{summary}\n{job_count} model/mode profile(s) will be measured "
+            "sequentially. Each candidate starts a fresh private llama-server."
         )
         title.setWordWrap(True)
         layout.addWidget(title)
@@ -1157,7 +1293,7 @@ class _PerformanceTuneWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, runner: BenchmarkRunner) -> None:
+    def __init__(self, runner: BenchmarkSuiteRunner) -> None:
         super().__init__()
         self.runner = runner
 
@@ -2591,6 +2727,8 @@ def expert_cfg_from_values(base: TunedConfig, vals: dict) -> TunedConfig:
     This is the disk equivalent of ``ExpertPanel._build_manual_config``.
     """
     cfg = copy.copy(base)
+    base_ctx = max(1, int(base.ctx or 1))
+    base_parallel = max(1, int(base.n_parallel or 1))
     cfg.ctx = int(vals.get("ctx", base.ctx))
     cfg.cache_k = str(vals.get("cache_k", base.cache_k))
     cfg.cache_v = str(vals.get("cache_v", base.cache_v))
@@ -2609,6 +2747,17 @@ def expert_cfg_from_values(base: TunedConfig, vals: dict) -> TunedConfig:
         cfg.rope_scale_factor = float(base.rope_scale_factor or 1.0)
     # Non-cascading overlay (threads / batch / flags / sampling / reasoning)
     apply_expert_values(cfg, vals)
+    # Context-validation profiles can deliberately exceed the conservative
+    # planner ceiling. Keep their preview/preflight KV footprint proportional
+    # to the exact context and slot count instead of retaining the safe base's
+    # smaller estimate. Cache precision is normally pinned to the same pair.
+    kv_scale = (
+        max(1, int(cfg.ctx or 1)) * max(1, int(cfg.n_parallel or 1))
+    ) / (base_ctx * base_parallel)
+    if abs(kv_scale - 1.0) > 1e-9:
+        cfg.estimated_kv_gb = max(0.0, base.estimated_kv_gb * kv_scale)
+        cfg.kv_vram_gb = max(0.0, base.kv_vram_gb * kv_scale)
+        cfg.kv_ram_gb = max(0.0, base.kv_ram_gb * kv_scale)
     cfg.kv_quant_strategy = "manual"
     return cfg
 
@@ -4150,6 +4299,9 @@ class MainWindow(QMainWindow):
         self._benchmark_entry: Optional[ModelEntry] = None
         self._benchmark_system: Optional[SystemInfo] = None
         self._benchmark_locked_states: Dict[QWidget, bool] = {}
+        # Expert autosave belongs to the target loaded into the panel, even if
+        # the toolbar combo changes before the debounce timer fires.
+        self._expert_loaded_performance_target = self._current_performance_target_name()
         self._sysinfo_busy = False
         # Persisted font size — falls back to 10pt on first launch.
         self._font_size = app_settings.get_font_size()
@@ -4542,14 +4694,15 @@ class MainWindow(QMainWindow):
         self._btn_benchmark.setEnabled(False)
         self._btn_benchmark.setToolTip(
             _setting_tooltip(
-                "Starts the selected model repeatedly with bounded settings and saves "
-                "the fastest stable result for your requested context.",
-                "Runs fresh private loopback llama-server instances with one warm-up "
-                "and deterministic measured requests. It searches CPU threads, batch "
-                "threads, batch, and ubatch while freezing context, KV quality, GPU "
-                "placement, Flash Attention, and model features. The top candidates "
-                "are confirmed before a path-specific Expert snapshot is saved. No "
-                "clock, voltage, fan, power-limit, or overclock setting is changed.",
+                "Measures realistic prompt and generation speed and saves an "
+                "independent optimized profile for every selected performance mode.",
+                "Runs fresh private loopback llama-server instances with a long prompt "
+                "and 256 n_decode tokens. It can test all four performance targets, "
+                "all benchmarkable models, optional YaRN, and optional MTP/draft "
+                "depths. CPU threads and batch settings are swept and confirmed; the "
+                "fastest mode is reported, remembered per model, and selected. Exact "
+                "contexts above the static safe estimate are saved only after the real "
+                "server proves them. No hardware overclock setting is changed.",
             )
         )
         self._btn_benchmark.clicked.connect(self._start_performance_tuning)
@@ -5069,6 +5222,50 @@ class MainWindow(QMainWindow):
 
         dialog.open_themes_button.clicked.connect(open_theme_folder)
         dialog.about_button.clicked.connect(lambda: self._show_about(dialog))
+
+        def export_profiles() -> None:
+            default = app_settings.app_data_dir() / "AutoTuner-performance-profiles.json"
+            selected, _filter = QFileDialog.getSaveFileName(
+                dialog,
+                "Export performance profiles",
+                str(default),
+                "AutoTuner profiles (*.json);;All files (*)",
+            )
+            if not selected:
+                return
+            destination = Path(selected)
+            if not destination.suffix:
+                destination = destination.with_suffix(".json")
+            ok, message, _count = app_settings.export_performance_profiles(
+                destination
+            )
+            if ok:
+                QMessageBox.information(dialog, "Profiles exported", message)
+                self._log(f"[Profiles] {message} → {destination}")
+            else:
+                QMessageBox.warning(dialog, "Profile export failed", message)
+
+        def import_profiles() -> None:
+            selected, _filter = QFileDialog.getOpenFileName(
+                dialog,
+                "Import performance profiles",
+                str(app_settings.app_data_dir()),
+                "AutoTuner profiles (*.json);;All files (*)",
+            )
+            if not selected:
+                return
+            ok, message, _count = app_settings.import_performance_profiles(
+                Path(selected), [entry.path for entry in self._all_entries]
+            )
+            if ok:
+                self._refresh_config_preview()
+                QMessageBox.information(dialog, "Profiles imported", message)
+                self._log(f"[Profiles] {message} ← {selected}")
+            else:
+                QMessageBox.warning(dialog, "Profile import failed", message)
+
+        dialog.export_profiles_button.clicked.connect(export_profiles)
+        dialog.import_profiles_button.clicked.connect(import_profiles)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             rollback()
             return
@@ -5862,6 +6059,9 @@ class MainWindow(QMainWindow):
         name = self._perf_combo.itemText(index).strip()
         try:
             app_settings.set_performance_target(name)
+            current_entry = getattr(self, "_current_entry", None)
+            if current_entry is not None:
+                app_settings.set_model_performance_target(current_entry.path, name)
         except Exception as exc:
             self._log(f"[Warning] Could not save performance target: {exc}")
         self._log(f"[Perf] → {name}")
@@ -6001,18 +6201,19 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._log(f"[Warning] Config refresh failed: {exc}")
 
-    def _resolve_perf_target_for_profile(self, profile: ModelProfile):
-        """Combine GUI choice with profile-level recommendation.
+    def _current_performance_target_name(self) -> str:
+        """Return the active one of the four persisted performance targets."""
+        if hasattr(self, "_perf_combo"):
+            name = self._perf_combo.currentText().strip().lower()
+            if name in PERFORMANCE_TARGETS:
+                return name
+        return DEFAULT_TARGET_NAME
 
-        GUI choice always wins; profile.performance_target is only used
-        if the user hasn't picked anything (which currently never happens
-        because the combo is initialised to "balanced", but stay robust).
-        """
-        gui_choice = (
-            self._perf_combo.currentText().strip()
-            if hasattr(self, "_perf_combo")
-            else None
-        )
+    def _resolve_perf_target_for_profile(
+        self, profile: ModelProfile, performance_target: Optional[str] = None
+    ):
+        """Combine an explicit/GUI choice with the profile recommendation."""
+        gui_choice = performance_target or self._current_performance_target_name()
         return resolve_performance_target(
             cli_choice=gui_choice,
             profile_choice=getattr(profile, "performance_target", "") or None,
@@ -6715,6 +6916,18 @@ class MainWindow(QMainWindow):
             self._config_stack.setCurrentIndex(0)
             self._btn_expert_row.setVisible(True)
         self._current_entry = entry
+        preferred_target = app_settings.get_model_performance_target(entry.path)
+        if preferred_target:
+            preferred_index = self._perf_combo.findText(preferred_target)
+            if preferred_index >= 0 and self._perf_combo.currentIndex() != preferred_index:
+                self._perf_combo.blockSignals(True)
+                self._perf_combo.setCurrentIndex(preferred_index)
+                self._perf_combo.blockSignals(False)
+                app_settings.set_performance_target(preferred_target)
+                self._log(
+                    f"[Perf] Restored {entry.name}'s preferred/fastest mode: "
+                    f"{preferred_target}"
+                )
         self._current_draft = _find_draft_model(entry, self._all_entries)
         self._btn_diagnose.setEnabled(True)
         self._update_checkboxes(entry)
@@ -6772,10 +6985,9 @@ class MainWindow(QMainWindow):
         # ── n-gram (ngram-mod) ──────────────────────────────────────
         # Always enabled: ngram-mod needs no draft model and works on any
         # GGUF, so it must never be greyed out (the whole point — "ngram
-        # should always be available"). Default off (opt-in, since it can
-        # slightly regress throughput on non-repetitive generation), but the
-        # per-model choice is remembered like vision/draft/thinking.
-        ngram_state = ov["ngram"] if "ngram" in ov else False
+        # should always be available"). v5.2.4 defaults it on for every model;
+        # an existing explicit per-model off choice remains authoritative.
+        ngram_state = ov["ngram"] if "ngram" in ov else True
         self._chk_ngram.blockSignals(True)
         self._chk_ngram.setEnabled(True)
         self._chk_ngram.setChecked(ngram_state)
@@ -7150,6 +7362,7 @@ class MainWindow(QMainWindow):
         entry: ModelEntry,
         profile: ModelProfile,
         force_overrides: Optional[dict] = None,
+        performance_target: Optional[str] = None,
     ) -> Optional[TunedConfig]:
         """Helper: rebuild a TunedConfig for the given model with the
         current checkbox states. Returns None when system info is missing.
@@ -7188,7 +7401,9 @@ class MainWindow(QMainWindow):
                 profile=profile,
                 draft_model=self._current_draft if use_draft else None,
                 force_mlock=False,
-                perf_target=self._resolve_perf_target_for_profile(profile),
+                perf_target=self._resolve_perf_target_for_profile(
+                    profile, performance_target
+                ),
                 mode=self._current_mode(),
                 no_mmproj_offload=no_mmproj_offload,
                 prompt_cache_ram_mib=prompt_cache_ram_mib,
@@ -7201,7 +7416,10 @@ class MainWindow(QMainWindow):
             return None
 
     def _effective_config(
-        self, entry: ModelEntry, profile: ModelProfile
+        self,
+        entry: ModelEntry,
+        profile: ModelProfile,
+        performance_target: Optional[str] = None,
     ) -> Optional[TunedConfig]:
         """The config actually shown in the preview and used at launch.
 
@@ -7219,10 +7437,15 @@ class MainWindow(QMainWindow):
           owns the exact values); the launch-path VRAM fit-check still
           gates them, and Reset reverts to Auto.
         """
-        base = self._build_auto_config(entry, profile)
+        target_name = performance_target or self._current_performance_target_name()
+        base = self._build_auto_config(
+            entry, profile, performance_target=target_name
+        )
         if base is None:
             return None
-        override = app_settings.get_expert_override(entry.name, entry.path)
+        override = app_settings.get_expert_override(
+            entry.name, entry.path, target_name
+        )
         if not override:
             return base
         vals = override.get("values") or {}
@@ -7235,7 +7458,9 @@ class MainWindow(QMainWindow):
             pins = {
                 k: v for k, v in (override.get("pins") or {}).items() if v is not None
             }
-            cascaded = self._build_auto_config(entry, profile, pins) or base
+            cascaded = self._build_auto_config(
+                entry, profile, pins, performance_target=target_name
+            ) or base
             if vals:
                 cascaded = apply_expert_values(cascaded, vals)
             return cascaded
@@ -7251,19 +7476,25 @@ class MainWindow(QMainWindow):
         Expert override. Used when entering Expert mode and when a
         checkbox toggles while the panel is already open."""
         assert self._system is not None  # callers guard / assert this first
-        cfg = self._build_auto_config(entry, profile)
+        target_name = self._current_performance_target_name()
+        cfg = self._build_auto_config(
+            entry, profile, performance_target=target_name
+        )
         if cfg is None:
             return
+        self._expert_loaded_performance_target = target_name
         self._expert_panel.configure_for_model(
             cfg=cfg,
             system=self._system,
             native_ctx=entry.native_context,
             profile_max=profile.max_context,
             recompute_cb=lambda overrides: self._build_auto_config(
-                entry, profile, overrides
+                entry, profile, overrides, performance_target=target_name
             ),
         )
-        override = app_settings.get_expert_override(entry.name, entry.path)
+        override = app_settings.get_expert_override(
+            entry.name, entry.path, target_name
+        )
         if override:
             self._expert_panel.restore_from_snapshot(override)
 
@@ -7466,13 +7697,15 @@ class MainWindow(QMainWindow):
         if (
             not cfg.no_kv_offload
             and self._system is not None
-            and self._system.total_vram_gb <= 12
+            and self._system.total_vram_gb <= 16.5
             and self._system.free_ram_gb >= 16
-            and cfg.ctx < 32768
+            and cfg.ctx
+            < max(32768, min(int(entry.native_context or 32768), 131072))
         ):
             lines.append(
-                "  💡 Low VRAM? Try Performance → low_vram — moves the KV "
-                "cache into RAM for far larger context (slower gen)."
+                "  💡 Spare RAM available: Performance → low_vram moves the KV "
+                "cache into RAM for larger context (slower n_decode). The "
+                "Performance test stores a separate measured profile for it."
             )
         lines.append(bar)
 
@@ -7510,7 +7743,9 @@ class MainWindow(QMainWindow):
         # Auto/Manual/Reset toggles inside the panel take its place at
         # the top of the same area).
         self._btn_expert_row.setVisible(False)
-        override = app_settings.get_expert_override(entry.name, entry.path)
+        override = app_settings.get_expert_override(
+            entry.name, entry.path, self._current_performance_target_name()
+        )
         if override:
             self._log(
                 f"[Expert] Entered Expert mode — restored saved "
@@ -7569,7 +7804,17 @@ class MainWindow(QMainWindow):
         if entry is None or not isinstance(snapshot, dict):
             return
         try:
-            app_settings.set_expert_override(entry.name, snapshot, entry.path)
+            target_name = (
+                self._expert_loaded_performance_target
+                if self._config_stack.currentIndex() == 1
+                else self._current_performance_target_name()
+            )
+            app_settings.set_expert_override(
+                entry.name,
+                snapshot,
+                entry.path,
+                target_name,
+            )
         except Exception as exc:
             self._log(f"[Warning] Could not save Expert settings: {exc}")
 
@@ -7588,7 +7833,9 @@ class MainWindow(QMainWindow):
         # the clear (it would resurrect the override we just dropped).
         self._expert_panel._save_timer.stop()
         try:
-            app_settings.clear_expert_override(entry.name, entry.path)
+            app_settings.clear_expert_override(
+                entry.name, entry.path, self._current_performance_target_name()
+            )
         except Exception as exc:
             self._log(f"[Warning] Could not clear Expert settings: {exc}")
         # Reload pure Auto into the panel (no save) and refresh preview.
@@ -7664,6 +7911,251 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Deterministic real-model performance tuning
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_benchmarkable_entry(entry: ModelEntry, profile: ModelProfile) -> bool:
+        runner = str(profile.runner or "llama-server")
+        extra = {str(arg).strip().lower() for arg in profile.extra_args}
+        return bool(
+            runner in ("", "llama-server")
+            and not entry.is_diffusion
+            and not entry.is_standalone_drafter
+            and not is_ocr_model(entry)
+            and "--embeddings" not in extra
+            and "--embedding" not in extra
+        )
+
+    def _benchmark_model_options(
+        self, entry: ModelEntry, *, tune_mtp: bool
+    ) -> Dict[str, object]:
+        """Resolve persisted launch options without mutating another model's UI."""
+        model = copy.copy(entry)
+        overrides = app_settings.get_model_overrides(entry.name)
+
+        remembered_mmproj = app_settings.get_mmproj_selection(entry.name)
+        if remembered_mmproj == app_settings.MMPROJ_NONE_SENTINEL or (
+            remembered_mmproj is None and overrides.get("vision") is False
+        ):
+            model.mmproj = None
+        elif remembered_mmproj:
+            model.mmproj = next(
+                (
+                    path
+                    for path in list(getattr(entry, "folder_mmprojs", []) or [])
+                    if path.name == remembered_mmproj
+                ),
+                model.mmproj,
+            )
+
+        remembered_draft = app_settings.get_draft_selection(entry.name)
+        draft_model: Optional[ModelEntry] = None
+        enable_speculative = False
+        external_path: Optional[Path] = None
+        if remembered_draft and remembered_draft not in (
+            app_settings.DRAFT_NONE_SENTINEL,
+            app_settings.DRAFT_EMBEDDED_SENTINEL,
+        ):
+            external_path = next(
+                (
+                    path
+                    for path in list(getattr(entry, "folder_drafts", []) or [])
+                    if path.name == remembered_draft
+                ),
+                None,
+            )
+        elif remembered_draft is None and entry.draft is not None:
+            external_path = entry.draft
+
+        deliberate_draft_off = remembered_draft == app_settings.DRAFT_NONE_SENTINEL or (
+            remembered_draft is None and overrides.get("draft") is False
+        )
+        embedded_selected = (
+            remembered_draft == app_settings.DRAFT_EMBEDDED_SENTINEL
+            or (
+                remembered_draft is None
+                and external_path is None
+                and entry.has_embedded_mtp
+                and not deliberate_draft_off
+            )
+        )
+        if tune_mtp:
+            # The explicit option asks to include an available MTP/drafter even
+            # when normal launch selection is "none"; no compatible head means
+            # the option is simply skipped for this model.
+            if entry.has_embedded_mtp:
+                embedded_selected = True
+                deliberate_draft_off = False
+            elif external_path is None and entry.draft is not None:
+                external_path = entry.draft
+                deliberate_draft_off = False
+
+        if not deliberate_draft_off and external_path is not None:
+            draft_model = _make_draft_entry(external_path, entry.group)
+            enable_speculative = True
+        elif not deliberate_draft_off and embedded_selected and entry.has_embedded_mtp:
+            enable_speculative = True
+
+        prompt_cache = overrides.get("prompt_cache", True)
+        return {
+            "model": model,
+            "draft_model": draft_model,
+            "enable_speculative": enable_speculative,
+            "use_thinking": bool(
+                entry.supports_thinking
+                and overrides.get("thinking", entry.supports_thinking)
+            ),
+            "enable_ngram": bool(overrides.get("ngram", True)),
+            "enable_prompt_cache": bool(prompt_cache),
+            "prompt_cache_ram_mib": (
+                app_settings.get_prompt_cache_ram_mib() if prompt_cache else 0
+            ),
+            "no_mmproj_offload": bool(
+                model.mmproj is not None and overrides.get("mmproj_cpu", False)
+            ),
+        }
+
+    def _benchmark_compute_config(
+        self,
+        entry: ModelEntry,
+        profile: ModelProfile,
+        system: SystemInfo,
+        performance_target: str,
+        options: Dict[str, object],
+        overrides: Optional[dict] = None,
+    ) -> TunedConfig:
+        return compute_config(
+            model=cast(ModelEntry, options["model"]),
+            system=system,
+            profile=profile,
+            draft_model=cast(Optional[ModelEntry], options["draft_model"])
+            if bool(options["enable_speculative"])
+            else None,
+            force_mlock=False,
+            perf_target=PERFORMANCE_TARGETS[performance_target],
+            mode=self._current_mode(),
+            no_mmproj_offload=bool(options["no_mmproj_offload"]),
+            prompt_cache_ram_mib=cast(int, options["prompt_cache_ram_mib"]),
+            gpu_priorities=app_settings.get_gpu_priorities(),
+            force_gpu=app_settings.get_forced_gpu(),
+            **dict(overrides or {}),
+        )
+
+    def _benchmark_config_for_target(
+        self,
+        entry: ModelEntry,
+        profile: ModelProfile,
+        system: SystemInfo,
+        performance_target: str,
+        options: Dict[str, object],
+        *,
+        desired_context: int,
+        enable_yarn: bool,
+        real_validation: bool,
+    ) -> Tuple[TunedConfig, int, bool]:
+        """Build a safe plan, then optionally let the private server prove more."""
+        auto = self._benchmark_compute_config(
+            entry, profile, system, performance_target, options
+        )
+        saved = app_settings.get_expert_override(
+            entry.name, entry.path, performance_target
+        )
+        effective = auto
+        if saved:
+            values = saved.get("values") or {}
+            if saved.get("mode") == "manual" and values:
+                effective = expert_cfg_from_values(auto, values)
+            else:
+                saved_pins = {
+                    key: value
+                    for key, value in (saved.get("pins") or {}).items()
+                    if value is not None
+                }
+                effective = self._benchmark_compute_config(
+                    entry, profile, system, performance_target, options, saved_pins
+                )
+                if values:
+                    effective = apply_expert_values(effective, values)
+
+        requested = max(0, int(desired_context))
+        if requested <= 0:
+            if enable_yarn and profile.rope_scale_max_ctx > max(0, entry.native_context):
+                requested = int(profile.rope_scale_max_ctx)
+            else:
+                requested = int(effective.ctx)
+
+        native_limit = max(0, int(entry.native_context or profile.max_context or 0))
+        rope_limit = max(native_limit, int(profile.rope_scale_max_ctx or 0))
+        model_limit = rope_limit if enable_yarn else native_limit
+        if model_limit > 0:
+            requested = min(requested, model_limit)
+
+        pins: Dict[str, object] = {
+            "user_ctx": requested,
+            "force_cache_k": effective.cache_k,
+            "force_cache_v": effective.cache_v,
+            "force_n_parallel": 1,
+            "force_draft_n_max": int(effective.draft_n_max or 0) or None,
+            "force_rope_scale": bool(enable_yarn),
+        }
+        if effective.is_moe and effective.n_cpu_moe is not None:
+            pins["force_n_cpu_moe"] = effective.n_cpu_moe
+        else:
+            pins["force_ngl"] = effective.ngl
+        safe = self._benchmark_compute_config(
+            entry,
+            profile,
+            system,
+            performance_target,
+            options,
+            {key: value for key, value in pins.items() if value is not None},
+        )
+
+        # Preserve non-cascading values from the mode-specific profile. The
+        # benchmark will deliberately vary only threads/batches/draft depth.
+        for attr in (
+            "threads",
+            "batch_threads",
+            "batch",
+            "ubatch",
+            "flash_attn",
+            "load_mode",
+            "mlock",
+            "no_mmap",
+            "numa",
+            "metrics_enabled",
+            "slots_api_enabled",
+        ):
+            setattr(safe, attr, copy.deepcopy(getattr(effective, attr)))
+        safe.sampling = copy.deepcopy(effective.sampling)
+        safe.extra_cli_flags = list(effective.extra_cli_flags or [])
+        safe.n_parallel = 1
+        safe.n_parallel_forced = True
+
+        safe_context = int(safe.ctx)
+        try_exact = bool(
+            real_validation
+            and desired_context > 0
+            and requested > safe_context
+            and (model_limit <= 0 or requested <= model_limit)
+        )
+        if try_exact:
+            # Static headroom is intentionally conservative and cannot know
+            # every backend/ubatch allocation. Only the isolated benchmark gets
+            # this exact trial; normal auto launch remains on the safe planner.
+            safe.ctx = requested
+            safe.no_context_shift = requested >= 32768 or safe.full_offload
+            if enable_yarn and native_limit > 0 and requested > native_limit:
+                safe.rope_scaling = True
+                requested_factor = (requested + native_limit - 1) // native_limit
+                safe.rope_scale_factor = max(
+                    1.0,
+                    min(float(profile.rope_scale_factor or 4.0), float(requested_factor)),
+                )
+            safe.warning = (
+                f"Real validation trial at {requested:,}; static safe estimate was "
+                f"{safe_context:,}."
+            )
+        return safe, safe_context, try_exact
+
     def _update_benchmark_button(
         self, profile: Optional[ModelProfile] = None
     ) -> None:
@@ -7684,15 +8176,7 @@ class MainWindow(QMainWindow):
                 self._profiles,
                 getattr(entry, "architecture", ""),
             )
-            runner = str(profile.runner or "llama-server")
-            extra = {str(arg).strip().lower() for arg in profile.extra_args}
-            eligible = bool(
-                runner in ("", "llama-server")
-                and not entry.is_diffusion
-                and not is_ocr_model(entry)
-                and "--embeddings" not in extra
-                and "--embedding" not in extra
-            )
+            eligible = self._is_benchmarkable_entry(entry, profile)
         button.setEnabled(eligible)
 
     def _set_benchmark_controls_locked(self, locked: bool) -> None:
@@ -7747,8 +8231,10 @@ class MainWindow(QMainWindow):
         self._enable_launch_when_ocr_idle()
 
     @staticmethod
-    def _benchmark_snapshot(cfg: TunedConfig) -> dict:
-        """Translate a measured winner into the existing Expert schema."""
+    def _benchmark_snapshot(
+        cfg: TunedConfig, *, validated_exact_context: bool = False
+    ) -> dict:
+        """Translate a measured winner into the mode-scoped Expert schema."""
         extras_in = list(cfg.extra_cli_flags or [])
         reasoning, think_budget, leftovers = ExpertPanel._parse_reasoning_from_extras(
             extras_in
@@ -7794,10 +8280,17 @@ class MainWindow(QMainWindow):
             "extras": " ".join(flag for flag in leftovers if flag not in modeled),
         }
         return {
-            "mode": "auto",
+            # A real server can prove a context above the conservative static
+            # ceiling. Store that exact winner as manual so a later auto
+            # recascade cannot silently clamp the validated value back down.
+            "mode": "manual" if validated_exact_context else "auto",
             "pins": {"user_ctx": int(cfg.ctx), "force_n_parallel": 1},
             "values": values,
-            "source": "measured-performance-test",
+            "source": (
+                "measured-real-context-validation"
+                if validated_exact_context
+                else "measured-performance-test"
+            ),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -7847,118 +8340,197 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Model is not benchmarkable",
-                "The automatic performance test currently supports normal "
-                "llama-server text/chat models. Diffusion, OCR-only, and embedding "
-                "runners use different workloads and are intentionally excluded.",
+                "The automatic performance test supports normal llama-server "
+                "text/chat models. Diffusion, OCR-only, standalone drafters, and "
+                "embedding runners use different workloads and are excluded.",
             )
             return
 
-        use_draft = self._draft_enabled()
-        try:
-            runtime_binary = self._resolve_binary(profile, use_draft, entry.name)
-            if not self._is_runnable_binary(
-                Path(runtime_binary)
-            ) and not shutil.which(runtime_binary):
-                raise FileNotFoundError(runtime_binary)
-            exact_system = detect_system(runtime_binary)
-            self._update_sysinfo_labels(exact_system)
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "llama-server unavailable",
-                f"The selected runtime could not be resolved or probed:\n{exc}",
-            )
-            return
-
-        # One slot maximizes usable context and makes every measurement a
-        # single-user performance comparison. The clean auto result is the
-        # default requested target (maximum currently feasible with the user's
-        # selected model features and quality policy).
-        baseline = self._build_auto_config(
-            entry, profile, {"force_n_parallel": 1}
-        )
-        if baseline is None:
+        preview = self._effective_config(entry, profile)
+        if preview is None:
             QMessageBox.warning(
                 self, "Performance test", "AutoTuner could not build a baseline."
             )
             return
-        upper_context = max(
-            int(baseline.ctx),
-            int(entry.native_context or 0),
-            int(profile.max_context or 0),
-            int(profile.rope_scale_max_ctx or 0),
-            512,
+        upper_context = min(
+            10_000_000,
+            max(
+                int(preview.ctx),
+                int(entry.native_context or 0),
+                int(profile.max_context or 0),
+                int(profile.rope_scale_max_ctx or 0),
+                512,
+            ),
         )
-        upper_context = min(10_000_000, upper_context)
-        desired_context, accepted = QInputDialog.getInt(
-            self,
-            "Performance test context",
-            "Desired context in tokens. The default is AutoTuner's maximum "
-            "currently feasible target:",
-            int(baseline.ctx),
-            512,
-            upper_context,
-            1024,
-        )
-        if not accepted:
-            return
-        requested = int(desired_context)
-        baseline = self._build_auto_config(
-            entry,
-            profile,
-            {"user_ctx": requested, "force_n_parallel": 1},
-        )
-        if baseline is None:
-            return
-        if baseline.ctx != requested:
-            answer = QMessageBox.question(
-                self,
-                "Requested context does not fit",
-                f"{requested:,} tokens do not fit with the selected model, quality, "
-                f"and launch options. AutoTuner can test {baseline.ctx:,} tokens.\n\n"
-                "Use the attainable context instead?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
+        benchmarkable_count = sum(
+            1
+            for candidate in self._all_entries
+            if self._is_benchmarkable_entry(
+                candidate,
+                match_profile(
+                    candidate.name,
+                    self._profiles,
+                    getattr(candidate, "architecture", ""),
+                ),
             )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            desired_context = int(baseline.ctx)
+        )
+        setup = _PerformanceTuneSetupDialog(
+            entry.name,
+            int(preview.ctx),
+            upper_context,
+            benchmarkable_count,
+            self,
+        )
+        if setup.exec() != QDialog.DialogCode.Accepted:
+            return
 
+        selected_targets = setup.selected_targets()
+        source_entries = list(self._all_entries) if setup.all_models.isChecked() else [entry]
+        source_entries = [
+            candidate
+            for candidate in source_entries
+            if self._is_benchmarkable_entry(
+                candidate,
+                match_profile(
+                    candidate.name,
+                    self._profiles,
+                    getattr(candidate, "architecture", ""),
+                ),
+            )
+        ]
+        desired_context = int(setup.context_spin.value())
+        tune_mtp = setup.tune_mtp.isChecked()
+        enable_yarn = setup.enable_yarn.isChecked()
+        real_validation = setup.real_validation.isChecked()
+
+        jobs: List[BenchmarkSuiteJob] = []
+        skipped: List[str] = []
+        system_cache: Dict[str, SystemInfo] = {}
+        for candidate in source_entries:
+            candidate_profile = match_profile(
+                candidate.name,
+                self._profiles,
+                getattr(candidate, "architecture", ""),
+            )
+            options = self._benchmark_model_options(candidate, tune_mtp=tune_mtp)
+            use_draft = bool(options["enable_speculative"])
+            try:
+                runtime_binary = self._resolve_binary(
+                    candidate_profile, use_draft, candidate.name
+                )
+                if not self._is_runnable_binary(
+                    Path(runtime_binary)
+                ) and not shutil.which(runtime_binary):
+                    raise FileNotFoundError(runtime_binary)
+                runtime_key = os.path.normcase(str(Path(runtime_binary)))
+                exact_system = system_cache.get(runtime_key)
+                if exact_system is None:
+                    exact_system = detect_system(runtime_binary)
+                    system_cache[runtime_key] = exact_system
+                if candidate.path == entry.path:
+                    self._update_sysinfo_labels(exact_system)
+            except Exception as exc:
+                skipped.append(f"{candidate.name}: runtime unavailable ({exc})")
+                continue
+
+            for target_name in selected_targets:
+                try:
+                    baseline, safe_context, exact_trial = (
+                        self._benchmark_config_for_target(
+                            candidate,
+                            candidate_profile,
+                            exact_system,
+                            target_name,
+                            options,
+                            desired_context=desired_context,
+                            enable_yarn=enable_yarn,
+                            real_validation=real_validation,
+                        )
+                    )
+                except Exception as exc:
+                    skipped.append(f"{candidate.name} [{target_name}]: {exc}")
+                    continue
+                runner = BenchmarkRunner(
+                    model=cast(ModelEntry, options["model"]),
+                    profile=candidate_profile,
+                    base_config=baseline,
+                    runtime_binary=runtime_binary,
+                    physical_cores=exact_system.cpu_cores_physical,
+                    logical_cores=exact_system.cpu_cores_logical,
+                    draft_model=cast(Optional[ModelEntry], options["draft_model"]),
+                    use_thinking=bool(options["use_thinking"]),
+                    enable_speculative=use_draft,
+                    enable_ngram=bool(options["enable_ngram"]),
+                    tune_draft_n_max=bool(tune_mtp and use_draft),
+                    enable_prompt_cache=bool(options["enable_prompt_cache"]),
+                    prompt_cache_ram_mib=cast(
+                        int, options["prompt_cache_ram_mib"]
+                    ),
+                )
+                key = f"{app_settings.favorite_model_key(candidate.path)}::{target_name}"
+                jobs.append(
+                    BenchmarkSuiteJob(
+                        key=key,
+                        label=f"{candidate.name} [{target_name}] ctx {baseline.ctx:,}",
+                        performance_target=target_name,
+                        runner=runner,
+                        metadata={
+                            "system": exact_system,
+                            "safe_context": safe_context,
+                            "exact_trial": exact_trial,
+                            "requested_context": desired_context,
+                        },
+                    )
+                )
+
+        if not jobs:
+            detail = "\n".join(skipped[:12]) or "No eligible model/mode profiles."
+            QMessageBox.warning(self, "No performance tests prepared", detail)
+            return
+
+        exact_trials = sum(bool(job.metadata.get("exact_trial")) for job in jobs)
+        candidate_runs = sum(
+            job.runner.limits.max_candidates + job.runner.limits.confirmation_runs
+            for job in jobs
+        )
+        context_label = (
+            "each model's safe auto maximum"
+            if desired_context == 0
+            else f"requested {desired_context:,} tokens"
+        )
+        warning_lines = ""
+        if exact_trials:
+            warning_lines += (
+                f"\n\n{exact_trials} profile(s) will first try the exact requested "
+                "context above the static safe estimate. An OOM only fails that "
+                "profile; existing settings stay untouched."
+            )
+        if skipped:
+            warning_lines += f"\n\n{len(skipped)} model/profile item(s) were skipped."
         confirmation = QMessageBox.question(
             self,
             "Start real performance test?",
-            f"AutoTuner will repeatedly load {entry.name} at "
-            f"{int(desired_context):,} context and test up to 8 settings plus "
-            "2 confirmations. A large model can take up to about 30 minutes.\n\n"
-            "Context, KV quality, GPU placement, Flash Attention, and model "
-            "features stay fixed. Hardware clocks/voltages are never changed.\n\n"
-            "Start now?",
+            f"Prepared {len(jobs)} independent model/mode profile(s) at "
+            f"{context_label}, with up to {candidate_runs} fresh server launches.\n\n"
+            "The workload measures a long prompt plus 256 n_decode tokens and "
+            "stores separate settings for every performance mode. Runs are "
+            "sequential and may take hours for all models. Hardware clocks, "
+            f"voltages, and power limits are never changed.{warning_lines}\n\nStart now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
 
-        runner = BenchmarkRunner(
-            model=copy.copy(entry),
-            profile=profile,
-            base_config=baseline,
-            runtime_binary=runtime_binary,
-            physical_cores=exact_system.cpu_cores_physical,
-            logical_cores=exact_system.cpu_cores_logical,
-            draft_model=self._current_draft if use_draft else None,
-            use_thinking=(
-                self._chk_thinking.isChecked() and self._chk_thinking.isEnabled()
-            ),
-            enable_speculative=use_draft,
-            enable_ngram=(
-                self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
-            ),
-        )
-        worker = _PerformanceTuneWorker(runner)
+        suite = BenchmarkSuiteRunner(jobs)
+        worker = _PerformanceTuneWorker(suite)
         thread = QThread(self)
         worker.moveToThread(thread)
-        dialog = _PerformanceTuneDialog(entry.name, int(baseline.ctx), self)
+        summary = (
+            f"Testing {len(source_entries)} model(s) across "
+            f"{len(selected_targets)} selected performance mode(s)."
+        )
+        dialog = _PerformanceTuneDialog(summary, len(jobs), self)
         dialog.cancel_requested.connect(self._cancel_performance_tuning)
         thread.started.connect(worker.run)
         worker.progress.connect(dialog.update_progress)
@@ -7973,20 +8545,26 @@ class MainWindow(QMainWindow):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
 
+        first = jobs[0]
         self._benchmark_thread = thread
         self._benchmark_worker = worker
         self._benchmark_dialog = dialog
-        self._benchmark_base_config = copy.copy(baseline)
-        self._benchmark_entry = copy.copy(entry)
-        self._benchmark_system = exact_system
+        # Retain the legacy single-job fields for cleanup/tests; completion uses
+        # the suite job metadata so every model/mode is saved independently.
+        self._benchmark_base_config = copy.copy(first.runner.base_config)
+        self._benchmark_entry = copy.copy(first.runner.model)
+        self._benchmark_system = cast(SystemInfo, first.metadata["system"])
         self._set_benchmark_controls_locked(True)
         self._status.showMessage(
-            f"Performance test running — {entry.name}, ctx {baseline.ctx:,}"
+            f"Performance test running — {len(jobs)} model/mode profile(s)"
         )
         self._log(
-            f"[Performance] Starting bounded real-model sweep: {entry.path}; "
-            f"ctx={baseline.ctx}, binary={runtime_binary}."
+            f"[Performance] Starting realistic suite with {len(jobs)} profiles, "
+            f"targets={selected_targets}, desired_ctx={desired_context or 'auto'}, "
+            f"YaRN={enable_yarn}, MTP-sweep={tune_mtp}, all-models={setup.all_models.isChecked()}."
         )
+        for message in skipped[:12]:
+            self._log(f"[Performance] Skipped: {message}")
         dialog.show()
         thread.start()
 
@@ -8014,99 +8592,260 @@ class MainWindow(QMainWindow):
         self._set_benchmark_controls_locked(False)
 
     def _on_performance_tuning_finished(self, result: object) -> None:
-        if not isinstance(result, BenchmarkResult):
+        if not isinstance(result, BenchmarkSuiteResult):
             self._on_performance_tuning_failed("benchmark returned an invalid result")
             return
-        entry = self._benchmark_entry
-        base = self._benchmark_base_config
-        system = self._benchmark_system
-        if entry is None or base is None or system is None:
-            self._on_performance_tuning_failed("benchmark state was lost")
-            return
 
-        winning_cfg = result.winning_config(base)
-        snapshot = self._benchmark_snapshot(winning_cfg)
-        try:
-            stat = entry.path.stat()
-            record = result.to_record(
-                model_path=str(entry.path.resolve(strict=False)),
-                model_size=stat.st_size,
-                model_mtime_ns=stat.st_mtime_ns,
+        saved_rows: List[str] = []
+        failed_rows: List[str] = []
+        # path -> [(target, model name, PP, n_decode, end-to-end TPS, ctx)]
+        mode_measurements: Dict[
+            str, List[Tuple[str, str, float, float, float, int]]
+        ] = {}
+        measured_model_paths: Dict[str, Path] = {}
+        detailed: Optional[Tuple[BenchmarkSuiteJob, BenchmarkResult]] = None
+        refresh_current = False
+        for outcome in result.jobs:
+            job = outcome.job
+            if not outcome.valid or outcome.result is None:
+                safe_context = int(job.metadata.get("safe_context", 0) or 0)
+                suffix = (
+                    f" (static safe estimate: {safe_context:,})"
+                    if safe_context > 0 and bool(job.metadata.get("exact_trial"))
+                    else ""
+                )
+                failed_rows.append(f"{job.label}: {outcome.error}{suffix}")
+                self._log(f"[Performance] Failed {job.label}: {outcome.error}{suffix}")
+                continue
+
+            measured = outcome.result
+            entry = job.runner.model
+            base = job.runner.base_config
+            system = cast(SystemInfo, job.metadata.get("system"))
+            winning_cfg = measured.winning_config(base)
+            snapshot = self._benchmark_snapshot(
+                winning_cfg,
+                validated_exact_context=bool(job.metadata.get("exact_trial")),
             )
-        except OSError:
-            record = result.to_record(
-                model_path=str(entry.path.resolve(strict=False)),
-                model_size=0,
-                model_mtime_ns=0,
+            try:
+                stat = entry.path.stat()
+                record = measured.to_record(
+                    model_path=str(entry.path.resolve(strict=False)),
+                    model_size=stat.st_size,
+                    model_mtime_ns=stat.st_mtime_ns,
+                )
+            except OSError:
+                record = measured.to_record(
+                    model_path=str(entry.path.resolve(strict=False)),
+                    model_size=0,
+                    model_mtime_ns=0,
+                )
+            record["performance_target"] = job.performance_target
+            record["static_safe_context"] = int(
+                job.metadata.get("safe_context", measured.desired_context) or 0
             )
-        record["performance_target"] = winning_cfg.performance_target
-        record["quality_frozen"] = {
-            "cache_k": winning_cfg.cache_k,
-            "cache_v": winning_cfg.cache_v,
-            "flash_attn": winning_cfg.flash_attn,
-            "ngl": winning_cfg.ngl,
-            "n_cpu_moe": winning_cfg.n_cpu_moe,
-            "tensor_split": winning_cfg.tensor_split,
-            "main_gpu": winning_cfg.main_gpu,
-        }
-        record["hardware"] = {
-            "os": system.os_name,
-            "cpu": system.cpu_name,
-            "physical_cores": system.cpu_cores_physical,
-            "logical_cores": system.cpu_cores_logical,
-            "gpus": [
-                {
-                    "name": gpu.name,
-                    "vram_mb": gpu.total_vram_mb,
-                    "runtime_device": gpu.runtime_device,
-                }
-                for gpu in system.gpus
-            ],
-        }
-        saved = app_settings.save_performance_tuning_result(
-            entry.name, entry.path, record, snapshot
-        )
+            record["real_context_validation"] = bool(
+                job.metadata.get("exact_trial")
+            )
+            record["quality_frozen"] = {
+                "cache_k": winning_cfg.cache_k,
+                "cache_v": winning_cfg.cache_v,
+                "flash_attn": winning_cfg.flash_attn,
+                "ngl": winning_cfg.ngl,
+                "n_cpu_moe": winning_cfg.n_cpu_moe,
+                "tensor_split": winning_cfg.tensor_split,
+                "main_gpu": winning_cfg.main_gpu,
+                "rope_scaling": winning_cfg.rope_scaling,
+                "rope_factor": winning_cfg.rope_scale_factor,
+            }
+            record["hardware"] = {
+                "os": system.os_name,
+                "cpu": system.cpu_name,
+                "physical_cores": system.cpu_cores_physical,
+                "logical_cores": system.cpu_cores_logical,
+                "gpus": [
+                    {
+                        "name": gpu.name,
+                        "vram_mb": gpu.total_vram_mb,
+                        "runtime_device": gpu.runtime_device,
+                    }
+                    for gpu in system.gpus
+                ],
+            }
+            saved = app_settings.save_performance_tuning_result(
+                entry.name,
+                entry.path,
+                record,
+                snapshot,
+                job.performance_target,
+            )
+            if not saved:
+                failed_rows.append(f"{job.label}: settings save failed")
+                self._log(f"[Performance] Save failed for {job.label}.")
+                continue
+
+            winner = measured.winner
+            improvement = (measured.score(winner) - 1.0) * 100.0
+            saved_rows.append(
+                f"{entry.name} [{job.performance_target}] ctx {measured.desired_context:,}: "
+                f"PP {winner.prompt_tps:.1f}, n_decode {winner.generation_tps:.1f} tok/s, "
+                f"end-to-end {winner.overall_tps:.1f} tok/s ({improvement:+.1f}%)"
+            )
+            model_key = app_settings.favorite_model_key(entry.path)
+            measured_model_paths[model_key] = entry.path
+            mode_measurements.setdefault(model_key, []).append(
+                (
+                    job.performance_target,
+                    entry.name,
+                    winner.prompt_tps,
+                    winner.generation_tps,
+                    winner.overall_tps,
+                    measured.desired_context,
+                )
+            )
+            self._log(
+                f"[Performance] Saved {entry.path} [{job.performance_target}]: "
+                f"threads={winner.candidate.threads}, "
+                f"batch_threads={winner.candidate.batch_threads}, "
+                f"batch={winner.candidate.batch}, ubatch={winner.candidate.ubatch}, "
+                f"draft_n_max={winner.candidate.draft_n_max}, "
+                f"PP={winner.prompt_tps:.2f}, n_decode={winner.generation_tps:.2f}, "
+                f"end_to_end_score={measured.score(winner):.3f}."
+            )
+            if detailed is None:
+                detailed = (job, measured)
+            if (
+                self._current_entry is not None
+                and self._current_entry.path == entry.path
+                and self._current_performance_target_name() == job.performance_target
+            ):
+                refresh_current = True
+
         self._finish_performance_tuning_ui()
-        if not saved:
-            self._status.showMessage("Performance test complete, but save failed.")
-            QMessageBox.warning(
-                self,
-                "Could not save performance result",
-                "The measurements completed, but autotuner_settings.json could not "
-                "be updated. The previous configuration remains active.",
-            )
+
+        fastest_by_model = {
+            model_key: max(rows, key=lambda row: row[4])
+            for model_key, rows in mode_measurements.items()
+            if rows
+        }
+        for model_key, fastest_row in fastest_by_model.items():
+            model_path = measured_model_paths.get(model_key)
+            if model_path is not None:
+                app_settings.set_model_performance_target(model_path, fastest_row[0])
+
+        selected_fastest: Optional[str] = None
+        if self._current_entry is not None:
+            current_key = app_settings.favorite_model_key(self._current_entry.path)
+            current_fastest = fastest_by_model.get(current_key)
+            if current_fastest is not None:
+                selected_fastest = current_fastest[0]
+                index = self._perf_combo.findText(selected_fastest)
+                if index >= 0:
+                    if self._perf_combo.currentIndex() != index:
+                        # The normal signal path persists and refreshes the
+                        # newly selected mode-specific Expert profile.
+                        self._perf_combo.setCurrentIndex(index)
+                    else:
+                        app_settings.set_performance_target(selected_fastest)
+                        refresh_current = True
+                self._log(
+                    f"[Performance] Fastest measured mode for "
+                    f"{self._current_entry.name}: {selected_fastest} "
+                    f"({current_fastest[4]:.2f} end-to-end tok/s); selected automatically."
+                )
+        if refresh_current:
+            self._refresh_config_preview()
+
+        if not saved_rows:
+            self._status.showMessage("Performance test finished without a saved profile.")
+            detail = "\n".join(failed_rows[:12]) or "Every profile failed."
+            QMessageBox.warning(self, "Performance test failed", detail)
             return
 
-        if self._current_entry is not None and self._current_entry.path == entry.path:
-            self._refresh_config_preview()
-        winner = result.winner
-        baseline_result = result.baseline
-        improvement = (result.score(winner) - 1.0) * 100.0
-        self._status.showMessage(
-            f"Performance settings saved for {entry.name}: {winner.candidate.label}"
-        )
-        self._log(
-            f"[Performance] Saved winner for {entry.path}: "
-            f"threads={winner.candidate.threads}, "
-            f"batch_threads={winner.candidate.batch_threads}, "
-            f"batch={winner.candidate.batch}, ubatch={winner.candidate.ubatch}, "
-            f"score={result.score(winner):.3f}."
-        )
-        QMessageBox.information(
-            self,
-            "Performance test complete",
-            f"Saved for this exact GGUF path at {result.desired_context:,} context.\n\n"
-            f"Winner: {winner.candidate.label}\n"
-            f"Threads: {winner.candidate.threads} / "
-            f"batch threads: {winner.candidate.batch_threads}\n"
-            f"Batch / ubatch: {winner.candidate.batch} / {winner.candidate.ubatch}\n\n"
-            f"Prompt: {baseline_result.prompt_tps:.1f} → {winner.prompt_tps:.1f} tok/s\n"
-            f"Generation: {baseline_result.generation_tps:.1f} → "
-            f"{winner.generation_tps:.1f} tok/s\n"
-            f"Combined change: {improvement:+.1f}%\n\n"
-            f"Decision: {result.reason}\n"
-            "The values are active now and remain editable under Expert settings.",
-        )
+        status = f"Performance test complete — saved {len(saved_rows)} profile(s)"
+        if selected_fastest:
+            status += f"; fastest mode selected: {selected_fastest}"
+        self._status.showMessage(status)
+        if len(saved_rows) == 1 and detailed is not None:
+            job, measured = detailed
+            winner = measured.winner
+            baseline = measured.baseline
+            improvement = (measured.score(winner) - 1.0) * 100.0
+            safe_context = int(job.metadata.get("safe_context", 0) or 0)
+            validation = ""
+            if bool(job.metadata.get("exact_trial")):
+                validation = (
+                    f"\nReal context validation succeeded at {measured.desired_context:,} "
+                    f"tokens (static safe estimate: {safe_context:,}).\n"
+                )
+            selection_line = (
+                f"Fastest measured mode: {job.performance_target} (selected automatically)."
+                if selected_fastest == job.performance_target
+                else f"Fastest measured mode in this run: {job.performance_target}."
+            )
+            message = (
+                f"Saved {job.performance_target} profile at "
+                f"{measured.desired_context:,} context.\n{validation}\n"
+                f"Winner: {winner.candidate.label}\n"
+                f"Threads: {winner.candidate.threads} / batch threads: "
+                f"{winner.candidate.batch_threads}\n"
+                f"Batch / ubatch: {winner.candidate.batch} / {winner.candidate.ubatch}\n"
+                f"MTP/draft n-max: {winner.candidate.draft_n_max or 'profile auto'}\n\n"
+                f"Prompt processing: {baseline.prompt_tps:.1f} → "
+                f"{winner.prompt_tps:.1f} tok/s\n"
+                f"n_decode: {baseline.generation_tps:.1f} → "
+                f"{winner.generation_tps:.1f} tok/s\n"
+                f"Measured end-to-end workload: {winner.overall_tps:.1f} tok/s "
+                f"({improvement:+.1f}%)\n\n"
+                f"Decision: {measured.reason}\n"
+                f"{selection_line}\n"
+                "This mode-specific profile remains editable under Expert settings."
+            )
+        else:
+            lines = [
+                f"Saved {len(saved_rows)} independent performance profile(s).",
+                "Speeds below are the measured winning settings for every mode;",
+                "★ marks the fastest end-to-end mode for that model.",
+            ]
+            shown_modes = 0
+            mode_order = {name: index for index, name in enumerate(list_target_names())}
+            for model_key in sorted(mode_measurements, key=str.casefold):
+                rows = sorted(
+                    mode_measurements[model_key],
+                    key=lambda row: mode_order.get(row[0], 999),
+                )
+                if not rows:
+                    continue
+                lines.extend(["", rows[0][1]])
+                fastest_target = fastest_by_model[model_key][0]
+                for target, _name, prompt_tps, decode_tps, overall_tps, ctx in rows:
+                    if shown_modes >= 20:
+                        break
+                    marker = "★" if target == fastest_target else " "
+                    lines.append(
+                        f"{marker} {target}: PP {prompt_tps:.1f}, n_decode "
+                        f"{decode_tps:.1f}, end-to-end {overall_tps:.1f} tok/s "
+                        f"(ctx {ctx:,})"
+                    )
+                    shown_modes += 1
+                lines.append(f"  Fastest: {fastest_target}")
+                if shown_modes >= 20:
+                    break
+            total_modes = sum(len(rows) for rows in mode_measurements.values())
+            if total_modes > shown_modes:
+                lines.append(f"\n… and {total_modes - shown_modes} more mode result(s).")
+            if selected_fastest:
+                lines.append(
+                    f"\nSelected model now uses the fastest measured mode: "
+                    f"{selected_fastest}."
+                )
+            if failed_rows:
+                lines.extend(
+                    ["", f"Failed/skipped during measurement: {len(failed_rows)}"]
+                )
+                lines.extend(failed_rows[:6])
+            message = "\n".join(lines)
+        QMessageBox.information(self, "Performance test complete", message)
 
     def _on_performance_tuning_failed(self, message: str) -> None:
         self._finish_performance_tuning_ui()

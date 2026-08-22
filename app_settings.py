@@ -49,8 +49,12 @@ Public API:
     get_expert_override(model_name, model_path=None) -> Optional[dict]
     set_expert_override(model_name, snapshot: dict, model_path=None)
     clear_expert_override(model_name, model_path=None)
-    get_performance_tuning_result(model_path) -> Optional[dict]
-    save_performance_tuning_result(model_name, model_path, result, snapshot) -> bool
+    get_performance_tuning_result(model_path, performance_target=None) -> Optional[dict]
+    save_performance_tuning_result(..., performance_target=None) -> bool
+    get_model_performance_target(model_path) -> Optional[str]
+    set_model_performance_target(model_path, target)
+    export_performance_profiles(path) -> (ok, message, count)
+    import_performance_profiles(path, available_model_paths=()) -> (ok, message, count)
 """
 
 from __future__ import annotations
@@ -504,6 +508,14 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 # Reset (the new button next to Auto/Manual) simply clears the entry.
 
 
+_VALID_PERFORMANCE_TARGETS = ("safe", "balanced", "throughput", "low_vram")
+
+
+def _normalise_performance_target(value: Optional[str]) -> str:
+    target = str(value or "").lower().strip()
+    return target if target in _VALID_PERFORMANCE_TARGETS else ""
+
+
 def _valid_expert_snapshot(snapshot: Any) -> bool:
     return (
         isinstance(snapshot, dict)
@@ -512,20 +524,99 @@ def _valid_expert_snapshot(snapshot: Any) -> bool:
     )
 
 
-def get_expert_override(
-    model_name: str, model_path: Optional[Path] = None
-) -> Optional[Dict[str, Any]]:
-    """Return a path-specific Expert snapshot, then fall back to legacy name.
+def portable_model_key(model_path: Path, model_size: Optional[int] = None) -> str:
+    """Return a path-independent filename+size identity for profile transfer."""
+    try:
+        path = Path(model_path).expanduser()
+        size = int(model_size) if model_size is not None else int(path.stat().st_size)
+    except (OSError, TypeError, ValueError):
+        try:
+            path = Path(model_path)
+        except (TypeError, ValueError):
+            return ""
+        size = max(0, int(model_size or 0))
+    name = path.name.strip().casefold()
+    return f"{name}|{max(0, size)}" if name else ""
 
-    The dict (when present) always carries ``mode`` and ``values``; ``pins``
-    and ``saved_at`` are optional. A structurally invalid entry is treated
-    as missing so a corrupt JSON blob never crashes the GUI.
+
+def _target_map(settings: Dict[str, Any], storage_key: str) -> Dict[str, Any]:
+    value = settings.get(storage_key)
+    return value if isinstance(value, dict) else {}
+
+
+def _set_target_value(
+    settings: Dict[str, Any], storage_key: str, identity: str, target: str, value: Any
+) -> None:
+    outer = _target_map(settings, storage_key)
+    per_model = outer.get(identity)
+    if not isinstance(per_model, dict):
+        per_model = {}
+    per_model[target] = value
+    outer[identity] = per_model
+    settings[storage_key] = outer
+
+
+def _get_target_value(
+    settings: Dict[str, Any], storage_key: str, identity: str, target: str
+) -> Tuple[bool, Any]:
+    outer = settings.get(storage_key)
+    if not identity or not isinstance(outer, dict):
+        return False, None
+    per_model = outer.get(identity)
+    if not isinstance(per_model, dict):
+        return False, None
+    # Once a model has any mode-scoped state, a missing target deliberately
+    # means "pure Auto" rather than leaking a legacy winner across all modes.
+    return True, per_model.get(target)
+
+
+def get_expert_override(
+    model_name: str,
+    model_path: Optional[Path] = None,
+    performance_target: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the Expert snapshot for one model and performance target.
+
+    v5.2.4 stores independent snapshots for safe/balanced/throughput/low_vram.
+    Exact path wins, then the portable filename+size identity used by profile
+    import, then legacy path/name state for backward compatibility.
     """
     settings = load_settings()
-    if model_path is not None:
-        key = favorite_model_key(model_path)
+    target = _normalise_performance_target(performance_target)
+    key = favorite_model_key(model_path) if model_path is not None else ""
+    if target:
+        if key:
+            found, snap = _get_target_value(
+                settings,
+                _os_path_key("expert_overrides_by_performance"),
+                key,
+                target,
+            )
+            if found:
+                return snap if _valid_expert_snapshot(snap) else None
+        portable = portable_model_key(model_path) if model_path is not None else ""
+        if portable:
+            found, snap = _get_target_value(
+                settings,
+                _os_path_key("expert_overrides_portable_by_performance"),
+                portable,
+                target,
+            )
+            if found:
+                return snap if _valid_expert_snapshot(snap) else None
+        if model_name:
+            found, snap = _get_target_value(
+                settings,
+                "expert_overrides_by_name_by_performance",
+                model_name,
+                target,
+            )
+            if found:
+                return snap if _valid_expert_snapshot(snap) else None
+
+    if key:
         by_path = settings.get(_os_path_key("expert_overrides_by_path")) or {}
-        if key and isinstance(by_path, dict):
+        if isinstance(by_path, dict):
             snap = by_path.get(key)
             if _valid_expert_snapshot(snap):
                 return snap
@@ -542,13 +633,41 @@ def set_expert_override(
     model_name: str,
     snapshot: Dict[str, Any],
     model_path: Optional[Path] = None,
+    performance_target: Optional[str] = None,
 ) -> None:
-    """Persist a validated Expert snapshot, preferring path identity."""
+    """Persist a validated Expert snapshot, scoped by performance target."""
     if not model_name or not _valid_expert_snapshot(snapshot):
         return
     settings = load_settings()
     key = favorite_model_key(model_path) if model_path is not None else ""
-    if key:
+    target = _normalise_performance_target(performance_target)
+    if target:
+        if key:
+            _set_target_value(
+                settings,
+                _os_path_key("expert_overrides_by_performance"),
+                key,
+                target,
+                snapshot,
+            )
+            portable = portable_model_key(model_path) if model_path is not None else ""
+            if portable:
+                _set_target_value(
+                    settings,
+                    _os_path_key("expert_overrides_portable_by_performance"),
+                    portable,
+                    target,
+                    snapshot,
+                )
+        else:
+            _set_target_value(
+                settings,
+                "expert_overrides_by_name_by_performance",
+                model_name,
+                target,
+                snapshot,
+            )
+    elif key:
         storage_key = _os_path_key("expert_overrides_by_path")
         overrides = settings.get(storage_key)
         if not isinstance(overrides, dict):
@@ -564,17 +683,51 @@ def set_expert_override(
     save_settings(settings)
 
 
-def clear_expert_override(model_name: str, model_path: Optional[Path] = None) -> None:
-    """Drop path-specific state and its legacy fallback for Reset."""
+def clear_expert_override(
+    model_name: str,
+    model_path: Optional[Path] = None,
+    performance_target: Optional[str] = None,
+) -> None:
+    """Reset one mode, or all legacy state when no target is supplied."""
     if not model_name:
         return
     settings = load_settings()
+    target = _normalise_performance_target(performance_target)
+    key = favorite_model_key(model_path) if model_path is not None else ""
+    if target:
+        if key:
+            _set_target_value(
+                settings,
+                _os_path_key("expert_overrides_by_performance"),
+                key,
+                target,
+                None,
+            )
+            portable = portable_model_key(model_path) if model_path is not None else ""
+            if portable:
+                _set_target_value(
+                    settings,
+                    _os_path_key("expert_overrides_portable_by_performance"),
+                    portable,
+                    target,
+                    None,
+                )
+        else:
+            _set_target_value(
+                settings,
+                "expert_overrides_by_name_by_performance",
+                model_name,
+                target,
+                None,
+            )
+        save_settings(settings)
+        return
+
     changed = False
-    if model_path is not None:
-        key = favorite_model_key(model_path)
+    if key:
         storage_key = _os_path_key("expert_overrides_by_path")
         by_path = settings.get(storage_key) or {}
-        if key and isinstance(by_path, dict) and key in by_path:
+        if isinstance(by_path, dict) and key in by_path:
             by_path.pop(key, None)
             settings[storage_key] = by_path
             changed = True
@@ -587,10 +740,32 @@ def clear_expert_override(model_name: str, model_path: Optional[Path] = None) ->
         save_settings(settings)
 
 
-def get_performance_tuning_result(model_path: Path) -> Optional[Dict[str, Any]]:
-    """Return the latest measured tuning record for one exact GGUF path."""
+def get_performance_tuning_result(
+    model_path: Path, performance_target: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Return measured evidence for one exact model/target pair."""
+    settings = load_settings()
     key = favorite_model_key(model_path)
-    records = load_settings().get(_os_path_key("performance_tuning_results")) or {}
+    target = _normalise_performance_target(performance_target)
+    if target and key:
+        found, record = _get_target_value(
+            settings,
+            _os_path_key("performance_tuning_results_by_performance"),
+            key,
+            target,
+        )
+        if found:
+            return record if isinstance(record, dict) else None
+        portable = portable_model_key(model_path)
+        found, record = _get_target_value(
+            settings,
+            _os_path_key("performance_tuning_results_portable_by_performance"),
+            portable,
+            target,
+        )
+        if found:
+            return record if isinstance(record, dict) else None
+    records = settings.get(_os_path_key("performance_tuning_results")) or {}
     if not key or not isinstance(records, dict):
         return None
     record = records.get(key)
@@ -602,8 +777,9 @@ def save_performance_tuning_result(
     model_path: Path,
     result: Dict[str, Any],
     snapshot: Dict[str, Any],
+    performance_target: Optional[str] = None,
 ) -> bool:
-    """Atomically save benchmark evidence and the winning active snapshot."""
+    """Atomically save benchmark evidence and its mode-scoped snapshot."""
     key = favorite_model_key(model_path)
     if (
         not model_name
@@ -613,20 +789,447 @@ def save_performance_tuning_result(
     ):
         return False
     settings = load_settings()
-    result_key = _os_path_key("performance_tuning_results")
-    results = settings.get(result_key)
-    if not isinstance(results, dict):
-        results = {}
-    results[key] = result
-    settings[result_key] = results
-
-    expert_key = _os_path_key("expert_overrides_by_path")
-    experts = settings.get(expert_key)
-    if not isinstance(experts, dict):
-        experts = {}
-    experts[key] = snapshot
-    settings[expert_key] = experts
+    target = _normalise_performance_target(
+        performance_target or str(result.get("performance_target", ""))
+    )
+    if target:
+        _set_target_value(
+            settings,
+            _os_path_key("performance_tuning_results_by_performance"),
+            key,
+            target,
+            result,
+        )
+        _set_target_value(
+            settings,
+            _os_path_key("expert_overrides_by_performance"),
+            key,
+            target,
+            snapshot,
+        )
+        portable = portable_model_key(model_path, result.get("model_size"))
+        if portable:
+            _set_target_value(
+                settings,
+                _os_path_key("performance_tuning_results_portable_by_performance"),
+                portable,
+                target,
+                result,
+            )
+            _set_target_value(
+                settings,
+                _os_path_key("expert_overrides_portable_by_performance"),
+                portable,
+                target,
+                snapshot,
+            )
+    else:
+        result_key = _os_path_key("performance_tuning_results")
+        results = settings.get(result_key)
+        if not isinstance(results, dict):
+            results = {}
+        results[key] = result
+        settings[result_key] = results
+        expert_key = _os_path_key("expert_overrides_by_path")
+        experts = settings.get(expert_key)
+        if not isinstance(experts, dict):
+            experts = {}
+        experts[key] = snapshot
+        settings[expert_key] = experts
     return save_settings(settings)
+
+
+_PROFILE_BUNDLE_FORMAT = "autotuner-performance-profiles"
+_PROFILE_BUNDLE_SCHEMA = 1
+_PROFILE_BUNDLE_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _profile_bundle_entry(
+    *,
+    filename: str,
+    model_size: int,
+    source_path: str,
+    model_name: str,
+    modes: Dict[str, Any],
+    preferred_target: str = "",
+) -> Optional[Dict[str, Any]]:
+    clean_modes: Dict[str, Any] = {}
+    for target, payload in modes.items():
+        target_name = _normalise_performance_target(target)
+        if not target_name or not isinstance(payload, dict):
+            continue
+        snapshot = payload.get("snapshot")
+        result = payload.get("result")
+        if not _valid_expert_snapshot(snapshot):
+            continue
+        clean_modes[target_name] = {
+            "snapshot": snapshot,
+            "result": result if isinstance(result, dict) else {},
+        }
+    clean_filename = Path(str(filename or "")).name
+    if not clean_filename or not clean_modes:
+        return None
+    return {
+        "model_name": str(model_name or Path(clean_filename).stem),
+        "filename": clean_filename,
+        "model_size": max(0, int(model_size or 0)),
+        "source_path": str(source_path or ""),
+        "preferred_target": _normalise_performance_target(preferred_target),
+        "modes": clean_modes,
+    }
+
+
+def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
+    """Export only measured/expert performance profiles, never broad settings."""
+    settings = load_settings()
+    experts_by_path = _target_map(
+        settings, _os_path_key("expert_overrides_by_performance")
+    )
+    results_by_path = _target_map(
+        settings, _os_path_key("performance_tuning_results_by_performance")
+    )
+    legacy_experts = settings.get(_os_path_key("expert_overrides_by_path"))
+    legacy_results = settings.get(_os_path_key("performance_tuning_results"))
+    preferred_by_path = settings.get(_os_path_key("model_performance_targets"))
+    if not isinstance(preferred_by_path, dict):
+        preferred_by_path = {}
+    if not isinstance(legacy_experts, dict):
+        legacy_experts = {}
+    if not isinstance(legacy_results, dict):
+        legacy_results = {}
+
+    entries: List[Dict[str, Any]] = []
+    represented_portable: set[str] = set()
+    path_keys = set(experts_by_path) | set(results_by_path) | set(legacy_experts)
+    for path_key in sorted(path_keys, key=str.casefold):
+        path = Path(path_key)
+        per_expert = experts_by_path.get(path_key)
+        per_result = results_by_path.get(path_key)
+        modes: Dict[str, Any] = {}
+        if isinstance(per_expert, dict):
+            for target, snapshot in per_expert.items():
+                result = per_result.get(target) if isinstance(per_result, dict) else {}
+                modes[target] = {"snapshot": snapshot, "result": result}
+        legacy_snapshot = legacy_experts.get(path_key)
+        if _valid_expert_snapshot(legacy_snapshot):
+            legacy_record = legacy_results.get(path_key)
+            inferred = _normalise_performance_target(
+                str(legacy_record.get("performance_target", ""))
+                if isinstance(legacy_record, dict)
+                else ""
+            ) or "balanced"
+            modes.setdefault(
+                inferred,
+                {
+                    "snapshot": legacy_snapshot,
+                    "result": legacy_record if isinstance(legacy_record, dict) else {},
+                },
+            )
+        size = 0
+        try:
+            size = int(path.stat().st_size)
+        except OSError:
+            if isinstance(per_result, dict):
+                for record in per_result.values():
+                    if isinstance(record, dict) and record.get("model_size") is not None:
+                        try:
+                            size = int(record["model_size"])
+                        except (TypeError, ValueError):
+                            pass
+                        if size > 0:
+                            break
+            legacy_record = legacy_results.get(path_key)
+            if size <= 0 and isinstance(legacy_record, dict):
+                try:
+                    size = int(legacy_record.get("model_size", 0) or 0)
+                except (TypeError, ValueError):
+                    size = 0
+        item = _profile_bundle_entry(
+            filename=path.name,
+            model_size=size,
+            source_path=path_key,
+            model_name=path.stem,
+            modes=modes,
+            preferred_target=str(preferred_by_path.get(path_key, "")),
+        )
+        if item is not None:
+            entries.append(item)
+            portable = portable_model_key(path, size)
+            if portable:
+                represented_portable.add(portable)
+
+    # Imported profiles may intentionally have no currently-scanned local path.
+    # Preserve them in subsequent exports via their portable identity.
+    portable_experts = _target_map(
+        settings, _os_path_key("expert_overrides_portable_by_performance")
+    )
+    portable_results = _target_map(
+        settings, _os_path_key("performance_tuning_results_portable_by_performance")
+    )
+    preferred_portable = settings.get(
+        _os_path_key("model_performance_targets_portable")
+    )
+    if not isinstance(preferred_portable, dict):
+        preferred_portable = {}
+    for portable in sorted(
+        set(portable_experts) | set(portable_results), key=str.casefold
+    ):
+        if portable in represented_portable:
+            continue
+        filename, separator, raw_size = portable.rpartition("|")
+        if not separator:
+            continue
+        try:
+            size = max(0, int(raw_size))
+        except (TypeError, ValueError):
+            continue
+        per_expert = portable_experts.get(portable)
+        per_result = portable_results.get(portable)
+        if not isinstance(per_expert, dict):
+            continue
+        modes = {
+            target: {
+                "snapshot": snapshot,
+                "result": per_result.get(target) if isinstance(per_result, dict) else {},
+            }
+            for target, snapshot in per_expert.items()
+        }
+        item = _profile_bundle_entry(
+            filename=filename,
+            model_size=size,
+            source_path="",
+            model_name=Path(filename).stem,
+            modes=modes,
+            preferred_target=str(preferred_portable.get(portable, "")),
+        )
+        if item is not None:
+            entries.append(item)
+
+    profile_count = sum(len(item["modes"]) for item in entries)
+    bundle = {
+        "format": _PROFILE_BUNDLE_FORMAT,
+        "schema": _PROFILE_BUNDLE_SCHEMA,
+        "profile_count": profile_count,
+        "models": entries,
+    }
+    destination = Path(destination)
+    tmp = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(tmp, destination)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False, f"Could not export profiles: {exc}", 0
+    return (
+        True,
+        f"Exported {profile_count} performance profile(s).",
+        profile_count,
+    )
+
+
+def import_performance_profiles(
+    source: Path, available_model_paths: Optional[List[Path]] = None
+) -> Tuple[bool, str, int]:
+    """Validate and merge a portable profile bundle into current settings."""
+    source = Path(source)
+    try:
+        if source.stat().st_size > _PROFILE_BUNDLE_MAX_BYTES:
+            return False, "Profile bundle is larger than 32 MiB.", 0
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"Could not read profile bundle: {exc}", 0
+    if not isinstance(payload, dict):
+        return False, "Profile bundle root must be a JSON object.", 0
+    if payload.get("format") != _PROFILE_BUNDLE_FORMAT:
+        return False, "This is not an AutoTuner performance-profile bundle.", 0
+    if payload.get("schema") != _PROFILE_BUNDLE_SCHEMA:
+        return False, f"Unsupported profile bundle schema: {payload.get('schema')!r}.", 0
+    models = payload.get("models")
+    if not isinstance(models, list) or len(models) > 10_000:
+        return False, "Profile bundle has an invalid models list.", 0
+
+    available = [Path(path) for path in (available_model_paths or [])]
+    by_filename: Dict[str, List[Path]] = {}
+    for path in available:
+        by_filename.setdefault(path.name.casefold(), []).append(path)
+
+    settings = load_settings()
+    imported = 0
+    mapped = 0
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename", "") or "").strip()
+        if not filename or Path(filename).name != filename:
+            continue
+        try:
+            model_size = max(0, int(item.get("model_size", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        model_name = str(item.get("model_name", "") or Path(filename).stem)
+        modes = item.get("modes")
+        if not isinstance(modes, dict):
+            continue
+        portable = portable_model_key(Path(filename), model_size)
+        if not portable:
+            continue
+
+        candidates = by_filename.get(filename.casefold(), [])
+        local_path: Optional[Path] = None
+        exact_size_matches: List[Path] = []
+        for candidate in candidates:
+            try:
+                if model_size > 0 and candidate.stat().st_size == model_size:
+                    exact_size_matches.append(candidate)
+            except OSError:
+                continue
+        if len(exact_size_matches) == 1:
+            local_path = exact_size_matches[0]
+        elif model_size == 0 and len(candidates) == 1:
+            local_path = candidates[0]
+        else:
+            source_path = str(item.get("source_path", "") or "")
+            if source_path:
+                candidate = Path(source_path)
+                try:
+                    if candidate.is_file() and (
+                        model_size == 0 or candidate.stat().st_size == model_size
+                    ):
+                        local_path = candidate
+                except OSError:
+                    pass
+
+        preferred_target = _normalise_performance_target(
+            str(item.get("preferred_target", ""))
+        )
+        if preferred_target:
+            portable_pref_key = _os_path_key("model_performance_targets_portable")
+            portable_prefs = settings.get(portable_pref_key)
+            if not isinstance(portable_prefs, dict):
+                portable_prefs = {}
+            portable_prefs[portable] = preferred_target
+            settings[portable_pref_key] = portable_prefs
+            if local_path is not None:
+                local_key = favorite_model_key(local_path)
+                if local_key:
+                    path_pref_key = _os_path_key("model_performance_targets")
+                    path_prefs = settings.get(path_pref_key)
+                    if not isinstance(path_prefs, dict):
+                        path_prefs = {}
+                    path_prefs[local_key] = preferred_target
+                    settings[path_pref_key] = path_prefs
+
+        for target, mode_payload in modes.items():
+            target_name = _normalise_performance_target(str(target))
+            if not target_name or not isinstance(mode_payload, dict):
+                continue
+            snapshot = mode_payload.get("snapshot")
+            result = mode_payload.get("result")
+            if not _valid_expert_snapshot(snapshot):
+                continue
+            record = result if isinstance(result, dict) else {}
+            _set_target_value(
+                settings,
+                _os_path_key("expert_overrides_portable_by_performance"),
+                portable,
+                target_name,
+                snapshot,
+            )
+            _set_target_value(
+                settings,
+                _os_path_key("performance_tuning_results_portable_by_performance"),
+                portable,
+                target_name,
+                record,
+            )
+            if local_path is not None:
+                local_key = favorite_model_key(local_path)
+                if local_key:
+                    _set_target_value(
+                        settings,
+                        _os_path_key("expert_overrides_by_performance"),
+                        local_key,
+                        target_name,
+                        snapshot,
+                    )
+                    _set_target_value(
+                        settings,
+                        _os_path_key("performance_tuning_results_by_performance"),
+                        local_key,
+                        target_name,
+                        record,
+                    )
+            elif model_name:
+                # Name fallback is only used until a matching filename+size is
+                # scanned; portable identity remains the authoritative mapping.
+                _set_target_value(
+                    settings,
+                    "expert_overrides_by_name_by_performance",
+                    model_name,
+                    target_name,
+                    snapshot,
+                )
+            imported += 1
+        if local_path is not None:
+            mapped += 1
+
+    if imported <= 0:
+        return False, "The bundle contained no valid performance profiles.", 0
+    if not save_settings(settings):
+        return False, "Profiles were valid, but settings could not be saved.", 0
+    return (
+        True,
+        f"Imported {imported} performance profile(s); mapped {mapped} model file(s).",
+        imported,
+    )
+
+
+def get_model_performance_target(model_path: Path) -> Optional[str]:
+    """Return the remembered fastest/manual target for one exact GGUF."""
+    settings = load_settings()
+    key = favorite_model_key(model_path)
+    by_path = settings.get(_os_path_key("model_performance_targets"))
+    if key and isinstance(by_path, dict):
+        target = _normalise_performance_target(by_path.get(key))
+        if target:
+            return target
+    portable = portable_model_key(model_path)
+    by_portable = settings.get(_os_path_key("model_performance_targets_portable"))
+    if portable and isinstance(by_portable, dict):
+        target = _normalise_performance_target(by_portable.get(portable))
+        if target:
+            return target
+    return None
+
+
+def set_model_performance_target(model_path: Path, performance_target: str) -> None:
+    """Remember the selected/fastest target for this model and portable identity."""
+    target = _normalise_performance_target(performance_target)
+    key = favorite_model_key(model_path)
+    if not target or not key:
+        return
+    settings = load_settings()
+    storage_key = _os_path_key("model_performance_targets")
+    by_path = settings.get(storage_key)
+    if not isinstance(by_path, dict):
+        by_path = {}
+    by_path[key] = target
+    settings[storage_key] = by_path
+    portable = portable_model_key(model_path)
+    if portable:
+        portable_key = _os_path_key("model_performance_targets_portable")
+        by_portable = settings.get(portable_key)
+        if not isinstance(by_portable, dict):
+            by_portable = {}
+        by_portable[portable] = target
+        settings[portable_key] = by_portable
+    save_settings(settings)
 
 
 def get_performance_target() -> Optional[str]:
