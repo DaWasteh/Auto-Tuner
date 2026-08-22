@@ -141,6 +141,7 @@ from autotuner_version import VERSION, GITHUB_REPO, USER_AGENT
 from model_benchmark import (
     BenchmarkCancelled,
     BenchmarkFailure,
+    BenchmarkLimits,
     BenchmarkResult,
     BenchmarkRunner,
     BenchmarkSuiteJob,
@@ -1146,8 +1147,9 @@ class _PerformanceTuneSetupDialog(QDialog):
 
         intro = QLabel(
             f"Tune <b>{escape(model_name)}</b>. Every selected performance mode "
-            "gets its own saved profile. Tests use a long prompt and 256-token "
-            "n_decode window, so they take longer but report realistic native timings."
+            "gets its own saved profile. Choose the 12%-context Quick test or the "
+            "25%-context Normal test; both use a 256-token n_decode window and "
+            "report native llama.cpp timings."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1161,6 +1163,19 @@ class _PerformanceTuneSetupDialog(QDialog):
         self.context_spin.setSpecialValueText("Auto maximum per model")
         self.context_spin.setValue(max(0, min(default_context, self.context_spin.maximum())))
         context_layout.addWidget(self.context_spin, 0, 1)
+        context_layout.addWidget(QLabel("Test length:"), 1, 0)
+        self.test_length_combo = QComboBox()
+        self.test_length_combo.addItem("Normal test — 25% context", "normal")
+        self.test_length_combo.addItem("Quick test — 12% context", "quick")
+        self.test_length_combo.setToolTip(
+            _setting_tooltip(
+                "Quick uses only 12% of the selected context; Normal uses 25%.",
+                "Both variants run the same candidate search and request 256 decode "
+                "tokens. Only the deterministic prompt length changes. Results are "
+                "stored in separate analysis groups and are never compared together.",
+            )
+        )
+        context_layout.addWidget(self.test_length_combo, 1, 1)
         self.real_validation = QCheckBox(
             "Try the exact requested context in the isolated test server"
         )
@@ -1170,10 +1185,10 @@ class _PerformanceTuneSetupDialog(QDialog):
             "actually allocate. The private benchmark server performs the real check; "
             "an OOM fails only that model/mode and saves no profile."
         )
-        context_layout.addWidget(self.real_validation, 1, 0, 1, 2)
+        context_layout.addWidget(self.real_validation, 2, 0, 1, 2)
         self.enable_yarn = QCheckBox("Enable YaRN when context exceeds native context")
         self.enable_yarn.setChecked(False)
-        context_layout.addWidget(self.enable_yarn, 2, 0, 1, 2)
+        context_layout.addWidget(self.enable_yarn, 3, 0, 1, 2)
         layout.addWidget(context_group)
 
         modes_group = QGroupBox("Performance modes (independent saved profiles)")
@@ -1219,6 +1234,13 @@ class _PerformanceTuneSetupDialog(QDialog):
     def selected_targets(self) -> List[str]:
         return [name for name, check in self.mode_checks.items() if check.isChecked()]
 
+    def benchmark_type(self) -> str:
+        value = str(self.test_length_combo.currentData() or "normal")
+        return value if value in ("quick", "normal") else "normal"
+
+    def prompt_context_fraction(self) -> float:
+        return 0.12 if self.benchmark_type() == "quick" else 0.25
+
     def accept(self) -> None:
         if not self.selected_targets():
             QMessageBox.information(
@@ -1226,6 +1248,315 @@ class _PerformanceTuneSetupDialog(QDialog):
             )
             return
         super().accept()
+
+
+class _PerformanceAnalysisDialog(QDialog):
+    """Graphical, test-type-isolated view of persisted benchmark evidence."""
+
+    _TEST_ORDER = ("quick", "normal")
+    _TEST_TITLES = {
+        "quick": "⚡ Quick performance test · 12% context",
+        "normal": "🎯 Normal performance test · 25% context",
+    }
+    _METRIC_HELP = {
+        "prompt": (
+            "Prompt processing (PP): llama.cpp's native prompt_per_second timing "
+            "after an excluded warm-up (or prompt_n / prompt_ms when the direct "
+            "field is unavailable). The deterministic prompt uses the test tile's "
+            "context fraction, is capped at 65,536 tokens, and prompt caching is "
+            "disabled."
+        ),
+        "decode": (
+            "n_decode: llama.cpp's native predicted_per_second timing (or "
+            "predicted_n / predicted_ms fallback). AutoTuner requests 256 "
+            "deterministic decode tokens with EOS ignored and uses the median of "
+            "the accepted samples."
+        ),
+        "overall": (
+            "End-to-end: (prompt tokens + generated tokens) divided by native "
+            "prompt time plus native decode time for this exact workload. This is "
+            "the score used to rank candidates and performance modes."
+        ),
+    }
+
+    def __init__(
+        self,
+        records_by_test: Dict[str, List[dict]],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Performance analysis")
+        self.resize(1100, 760)
+        self.setMinimumSize(760, 520)
+        self.test_tiles: Dict[str, QFrame] = {}
+        self.record_count_by_test: Dict[str, int] = {}
+        self.model_names_by_test: Dict[str, List[str]] = {}
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Quick and Normal runs are shown in separate tiles. Their models, "
+            "scales, maxima, and fastest-mode markers are calculated independently, "
+            "so a 12% run is never compared with a 25% run."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        contents = QWidget()
+        contents_layout = QVBoxLayout(contents)
+        contents_layout.setSpacing(14)
+        for test_type in self._TEST_ORDER:
+            raw_records = records_by_test.get(test_type, [])
+            records = [item for item in raw_records if isinstance(item, dict)]
+            tile = self._build_test_tile(test_type, records)
+            self.test_tiles[test_type] = tile
+            self.record_count_by_test[test_type] = len(records)
+            contents_layout.addWidget(tile)
+        contents_layout.addStretch(1)
+        scroll.setWidget(contents)
+        layout.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_button is not None:
+            close_button.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _positive_float(value: object) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed if parsed > 0.0 and parsed < float("inf") else 0.0
+
+    @staticmethod
+    def _nonnegative_int(value: object) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _winner_metrics(cls, record: dict) -> Tuple[float, float, float]:
+        winner_id = str(record.get("winner_id", ""))
+        candidates = record.get("candidates")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if winner_id and str(candidate.get("id", "")) != winner_id:
+                    continue
+                return (
+                    cls._positive_float(candidate.get("prompt_tps")),
+                    cls._positive_float(candidate.get("generation_tps")),
+                    cls._positive_float(candidate.get("overall_tps")),
+                )
+        return (
+            cls._positive_float(record.get("prompt_tps")),
+            cls._positive_float(record.get("generation_tps")),
+            cls._positive_float(record.get("overall_tps")),
+        )
+
+    @classmethod
+    def _winner_workload(cls, record: dict) -> Tuple[int, int, int]:
+        winner_id = str(record.get("winner_id", ""))
+        candidates = record.get("candidates")
+        if not isinstance(candidates, list):
+            return 0, 0, 0
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if winner_id and str(candidate.get("id", "")) != winner_id:
+                continue
+            samples = candidate.get("samples")
+            if not isinstance(samples, list):
+                return 0, 0, 0
+            valid = [sample for sample in samples if isinstance(sample, dict)]
+            if not valid:
+                return 0, 0, 0
+            return (
+                cls._nonnegative_int(valid[0].get("prompt_tokens")),
+                cls._nonnegative_int(valid[0].get("generated_tokens")),
+                len(valid),
+            )
+        return 0, 0, 0
+
+    @staticmethod
+    def _model_identity(record: dict) -> str:
+        path = str(record.get("model_path", "") or "").strip()
+        name = str(record.get("model_name", "") or "").strip()
+        return os.path.normcase(path) if path else name.casefold() or "unknown-model"
+
+    @staticmethod
+    def _model_name(record: dict) -> str:
+        name = str(record.get("model_name", "") or "").strip()
+        if name:
+            return name
+        path = str(record.get("model_path", "") or "").strip()
+        return Path(path).stem if path else "Unknown model"
+
+    @staticmethod
+    def _metric_bar(value: float, maximum: float, help_text: str) -> QProgressBar:
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        ratio = value / maximum if value > 0.0 and maximum > 0.0 else 0.0
+        bar.setValue(max(0, min(1000, int(round(ratio * 1000)))))
+        bar.setFormat(f"{value:.1f} tok/s" if value > 0.0 else "no timing")
+        bar.setTextVisible(True)
+        bar.setMinimumWidth(180)
+        bar.setToolTip(_setting_tooltip(help_text, help_text))
+        return bar
+
+    @staticmethod
+    def _winner_settings_text(record: dict) -> str:
+        settings = record.get("winner_settings")
+        if not isinstance(settings, dict):
+            return "No winner settings were stored."
+        ordered = ("threads", "batch_threads", "batch", "ubatch", "draft_n_max")
+        parts = [f"{key}={settings[key]}" for key in ordered if key in settings]
+        return ", ".join(parts) or "No winner settings were stored."
+
+    def _build_test_tile(self, test_type: str, records: List[dict]) -> QFrame:
+        tile = QFrame()
+        tile.setObjectName(f"performanceAnalysisTile-{test_type}")
+        tile.setProperty("benchmarkType", test_type)
+        tile.setFrameShape(QFrame.Shape.StyledPanel)
+        tile_layout = QVBoxLayout(tile)
+        title = QLabel(f"<h2>{escape(self._TEST_TITLES[test_type])}</h2>")
+        title.setTextFormat(Qt.TextFormat.RichText)
+        tile_layout.addWidget(title)
+
+        grouped: Dict[str, List[dict]] = {}
+        display_names: Dict[str, str] = {}
+        for record in records:
+            identity = self._model_identity(record)
+            grouped.setdefault(identity, []).append(record)
+            display_names.setdefault(identity, self._model_name(record))
+        self.model_names_by_test[test_type] = sorted(
+            display_names.values(), key=str.casefold
+        )
+        summary = QLabel(
+            f"{len(grouped)} tested model(s) · {len(records)} model/mode result(s). "
+            "Bar lengths are normalized only inside this tile and only against "
+            "the same metric."
+        )
+        summary.setWordWrap(True)
+        tile_layout.addWidget(summary)
+
+        if not records:
+            empty = QLabel(
+                "No saved results for this test yet. Run this test type from "
+                "Performance test; results for the other tile remain untouched."
+            )
+            empty.setWordWrap(True)
+            empty.setObjectName("performanceAnalysisEmpty")
+            tile_layout.addWidget(empty)
+        else:
+            metrics = {id(record): self._winner_metrics(record) for record in records}
+            maxima = tuple(
+                max((values[index] for values in metrics.values()), default=0.0)
+                for index in range(3)
+            )
+            target_order = {
+                name: index for index, name in enumerate(list_target_names())
+            }
+            for identity in sorted(grouped, key=lambda key: display_names[key].casefold()):
+                model_records = sorted(
+                    grouped[identity],
+                    key=lambda item: target_order.get(
+                        str(item.get("performance_target", "")), 999
+                    ),
+                )
+                card = QFrame()
+                card.setFrameShape(QFrame.Shape.StyledPanel)
+                card_layout = QVBoxLayout(card)
+                model_title = QLabel(f"<b>{escape(display_names[identity])}</b>")
+                card_layout.addWidget(model_title)
+                model_path = str(model_records[0].get("model_path", "") or "")
+                if model_path:
+                    path_label = QLabel(model_path)
+                    path_label.setObjectName("mutedLabel")
+                    path_label.setTextInteractionFlags(
+                        Qt.TextInteractionFlag.TextSelectableByMouse
+                    )
+                    card_layout.addWidget(path_label)
+
+                grid = QGridLayout()
+                for column, label in enumerate(
+                    ("Mode / context", "Prompt processing", "n_decode", "End-to-end")
+                ):
+                    header = QLabel(f"<b>{label}</b>")
+                    if column > 0:
+                        header.setToolTip(
+                            _setting_tooltip(
+                                "Hover for how this metric is collected.",
+                                self._METRIC_HELP[("prompt", "decode", "overall")[column - 1]],
+                            )
+                        )
+                    grid.addWidget(header, 0, column)
+
+                fastest_record_id = max(
+                    (id(item) for item in model_records),
+                    key=lambda record_id: metrics[record_id][2],
+                )
+                for row, record in enumerate(model_records, start=1):
+                    prompt_tps, decode_tps, overall_tps = metrics[id(record)]
+                    target = str(record.get("performance_target", "unknown"))
+                    context = self._nonnegative_int(record.get("desired_context", 0))
+                    prompt_tokens, generated_tokens, sample_count = (
+                        self._winner_workload(record)
+                    )
+                    marker = "★ " if id(record) == fastest_record_id and overall_tps > 0 else ""
+                    workload = f"ctx {context:,}"
+                    if prompt_tokens or generated_tokens:
+                        workload += (
+                            f" · prompt {prompt_tokens:,} + decode {generated_tokens:,}"
+                        )
+                    mode_label = QLabel(
+                        f"{marker}{escape(target)}<br><small>{workload}</small>"
+                    )
+                    detail = self._winner_settings_text(record)
+                    if sample_count:
+                        detail += f"; accepted samples={sample_count}"
+                    mode_label.setToolTip(
+                        _setting_tooltip(
+                            "Winning runtime settings and measured workload.",
+                            detail,
+                        )
+                    )
+                    grid.addWidget(mode_label, row, 0)
+                    grid.addWidget(
+                        self._metric_bar(prompt_tps, maxima[0], self._METRIC_HELP["prompt"]),
+                        row,
+                        1,
+                    )
+                    grid.addWidget(
+                        self._metric_bar(decode_tps, maxima[1], self._METRIC_HELP["decode"]),
+                        row,
+                        2,
+                    )
+                    grid.addWidget(
+                        self._metric_bar(overall_tps, maxima[2], self._METRIC_HELP["overall"]),
+                        row,
+                        3,
+                    )
+                card_layout.addLayout(grid)
+                tile_layout.addWidget(card)
+
+        explanation = QLabel(
+            "<b>How the metrics are collected</b><br>"
+            f"• {escape(self._METRIC_HELP['prompt'])}<br>"
+            f"• {escape(self._METRIC_HELP['decode'])}<br>"
+            f"• {escape(self._METRIC_HELP['overall'])}<br>"
+            "★ marks the highest end-to-end mode for one model inside this test tile."
+        )
+        explanation.setWordWrap(True)
+        explanation.setTextFormat(Qt.TextFormat.RichText)
+        tile_layout.addWidget(explanation)
+        return tile
 
 
 class _PerformanceTuneDialog(QDialog):
@@ -4258,6 +4589,10 @@ class MainWindow(QMainWindow):
         # legacy vision/draft booleans are only read once as migration input.
         # Shape: { "<model_name>": {"thinking": bool, "ngram": bool, ...} }
         self._option_overrides: dict = {}
+        # Internal, process-local Expert clipboard. It deliberately carries the
+        # source performance target so a copied safe/throughput profile cannot
+        # be pasted into a different target by accident.
+        self._expert_settings_clipboard: Optional[Dict[str, object]] = None
         self._favorite_models = app_settings.get_favorite_models()
         self._model_view_mode = app_settings.get_model_view_mode()
         # New folders start expanded. Explicit collapses survive filtering,
@@ -4696,8 +5031,9 @@ class MainWindow(QMainWindow):
             _setting_tooltip(
                 "Measures realistic prompt and generation speed and saves an "
                 "independent optimized profile for every selected performance mode.",
-                "Runs fresh private loopback llama-server instances with a long prompt "
-                "and 256 n_decode tokens. It can test all four performance targets, "
+                "Runs fresh private loopback llama-server instances with a selectable "
+                "12% Quick or 25% Normal prompt plus 256 n_decode tokens. It can test "
+                "all four performance targets, "
                 "all benchmarkable models, optional YaRN, and optional MTP/draft "
                 "depths. CPU threads and batch settings are swept and confirmed; the "
                 "fastest mode is reported, remembered per model, and selected. Exact "
@@ -4706,6 +5042,19 @@ class MainWindow(QMainWindow):
             )
         )
         self._btn_benchmark.clicked.connect(self._start_performance_tuning)
+        self._btn_performance_analysis = QPushButton("📊 Performance analysis")
+        self._btn_performance_analysis.setToolTip(
+            _setting_tooltip(
+                "Shows graphical results for every model that has been tested.",
+                "Quick 12%-context and Normal 25%-context evidence is loaded from "
+                "separate stores and rendered in separate tiles. PP, n_decode, and "
+                "end-to-end bars retain raw tok/s labels and explain their native "
+                "llama.cpp timing sources.",
+            )
+        )
+        self._btn_performance_analysis.clicked.connect(
+            self._show_performance_analysis
+        )
         self._btn_expert_row = QWidget()
         bex = QHBoxLayout(self._btn_expert_row)
         bex.setContentsMargins(0, 0, 0, 0)
@@ -4713,6 +5062,7 @@ class MainWindow(QMainWindow):
         bex.addWidget(self._btn_expert)
         bex.addWidget(self._btn_diagnose)
         bex.addWidget(self._btn_benchmark)
+        bex.addWidget(self._btn_performance_analysis)
         bex.addStretch(1)
 
         # ── Launch options (checkboxes) ────────────────────────────────
@@ -6837,10 +7187,28 @@ class MainWindow(QMainWindow):
         view.setCurrentItem(item)
         menu = QMenu(view)
         open_folder = menu.addAction("📂 GGUF-Ordner öffnen")
+        menu.addSeparator()
+        copy_expert = menu.addAction("📋 Expert Settings kopieren")
+        paste_expert = menu.addAction("📌 Expert Settings einfügen")
+        clipboard = self._expert_settings_clipboard
+        paste_expert.setEnabled(clipboard is not None)
+        if clipboard is not None:
+            source_name = str(clipboard.get("source_model", "model"))
+            source_target = str(clipboard.get("performance_target", ""))
+            paste_expert.setToolTip(
+                f"{source_name} [{source_target}] → {entry.name} [{source_target}]"
+            )
+
         viewport = view.viewport()
         if viewport is None:  # defensive for incomplete Qt teardown states
             return
         chosen = menu.exec(viewport.mapToGlobal(position))
+        if chosen is copy_expert:
+            self._copy_expert_settings(entry)
+            return
+        if chosen is paste_expert:
+            self._paste_expert_settings(entry)
+            return
         if chosen is not open_folder:
             return
 
@@ -6851,6 +7219,116 @@ class MainWindow(QMainWindow):
                 "Ordner konnte nicht geöffnet werden",
                 f"Der GGUF-Ordner konnte nicht geöffnet werden:\n{folder}",
             )
+
+    def _copy_expert_settings(self, entry: ModelEntry) -> None:
+        """Copy one model's active target-scoped Expert snapshot in memory."""
+        if self._current_entry is None or self._current_entry.path != entry.path:
+            self._show_config(entry)
+        target_name = self._current_performance_target_name()
+        if self._config_stack.currentIndex() == 1:
+            self._expert_panel.flush_pending_save()
+        snapshot = app_settings.get_expert_override(
+            entry.name, entry.path, target_name
+        )
+        if snapshot is None and self._system is not None:
+            profile = match_profile(
+                entry.name,
+                self._profiles,
+                getattr(entry, "architecture", ""),
+            )
+            self._load_expert_panel(entry, profile)
+            snapshot = self._expert_panel._make_snapshot()
+            snapshot["source"] = "copied-auto-expert-settings"
+        if not isinstance(snapshot, dict) or not isinstance(
+            snapshot.get("values"), dict
+        ):
+            QMessageBox.information(
+                self,
+                "Expert Settings kopieren",
+                "Für dieses Modell sind noch keine kopierbaren Expert Settings "
+                "verfügbar. Warte auf die Hardware-Erkennung oder öffne zuerst "
+                "Expert Settings.",
+            )
+            return
+        self._expert_settings_clipboard = {
+            "snapshot": copy.deepcopy(snapshot),
+            "source_model": entry.name,
+            "source_path": str(entry.path),
+            "performance_target": target_name,
+        }
+        self._status.showMessage(
+            f"Expert Settings kopiert: {entry.name} [{target_name}]", 6000
+        )
+        self._log(
+            f"[Expert] Copied {entry.name} [{target_name}] settings to the "
+            "internal clipboard."
+        )
+
+    def _paste_expert_settings(self, entry: ModelEntry) -> None:
+        """Paste the copied snapshot into the same target on another model."""
+        clipboard = self._expert_settings_clipboard
+        if not isinstance(clipboard, dict):
+            return
+        snapshot = clipboard.get("snapshot")
+        if not isinstance(snapshot, dict) or not isinstance(
+            snapshot.get("values"), dict
+        ):
+            self._expert_settings_clipboard = None
+            QMessageBox.warning(
+                self,
+                "Expert Settings einfügen",
+                "Die kopierten Expert Settings sind ungültig und wurden verworfen.",
+            )
+            return
+        target_name = str(clipboard.get("performance_target", ""))
+        if target_name not in PERFORMANCE_TARGETS:
+            target_name = self._current_performance_target_name()
+        if self._current_entry is None or self._current_entry.path != entry.path:
+            self._show_config(entry)
+        if self._config_stack.currentIndex() == 1:
+            self._expert_panel.flush_pending_save()
+
+        pasted = copy.deepcopy(snapshot)
+        pasted["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        pasted["source"] = "copied-expert-settings"
+        pasted["copied_from"] = {
+            "model": str(clipboard.get("source_model", "")),
+            "performance_target": target_name,
+        }
+        try:
+            app_settings.set_expert_override(
+                entry.name, pasted, entry.path, target_name
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Expert Settings einfügen",
+                f"Die Expert Settings konnten nicht gespeichert werden:\n{exc}",
+            )
+            return
+
+        target_index = self._perf_combo.findText(target_name)
+        if target_index >= 0 and self._perf_combo.currentIndex() != target_index:
+            self._perf_combo.setCurrentIndex(target_index)
+        elif self._config_stack.currentIndex() == 1 and self._system is not None:
+            profile = match_profile(
+                entry.name,
+                self._profiles,
+                getattr(entry, "architecture", ""),
+            )
+            self._load_expert_panel(entry, profile)
+        else:
+            self._refresh_config_preview()
+        source_name = str(clipboard.get("source_model", "model"))
+        self._status.showMessage(
+            f"Expert Settings eingefügt: {source_name} → {entry.name} "
+            f"[{target_name}]",
+            7000,
+        )
+        self._log(
+            f"[Expert] Pasted {source_name} [{target_name}] settings into "
+            f"{entry.name}; source snapshot remains unchanged."
+        )
 
     def _browse_models(self) -> None:
         dlg = _PathListDialog(
@@ -6910,9 +7388,12 @@ class MainWindow(QMainWindow):
             )
             return
         # Switching models drops the Expert state — the panel's pins were
-        # for the *previous* model. Keep the user in the read-only preview
-        # so they see the fresh AutoTuner output before re-entering Expert.
+        # for the *previous* model. Flush a pending edit while _current_entry
+        # still identifies that previous model, otherwise the delayed signal
+        # could save its snapshot onto the newly selected/right-clicked model.
         if self._config_stack.currentIndex() == 1:
+            if self._current_entry is not None and self._current_entry.path != entry.path:
+                self._expert_panel.flush_pending_save()
             self._config_stack.setCurrentIndex(0)
             self._btn_expert_row.setVisible(True)
         self._current_entry = entry
@@ -7911,6 +8392,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Deterministic real-model performance tuning
     # ------------------------------------------------------------------
+    def _show_performance_analysis(self) -> None:
+        records = app_settings.list_performance_run_results()
+        dialog = _PerformanceAnalysisDialog(records, self)
+        dialog.exec()
+
     @staticmethod
     def _is_benchmarkable_entry(entry: ModelEntry, profile: ModelProfile) -> bool:
         runner = str(profile.runner or "llama-server")
@@ -8204,6 +8690,7 @@ class MainWindow(QMainWindow):
             self._btn_expert,
             self._btn_diagnose,
             self._btn_benchmark,
+            self._btn_performance_analysis,
             self._btn_launch,
             self._expert_panel,
             self._host_edit,
@@ -8399,6 +8886,8 @@ class MainWindow(QMainWindow):
             )
         ]
         desired_context = int(setup.context_spin.value())
+        benchmark_type = setup.benchmark_type()
+        prompt_context_fraction = setup.prompt_context_fraction()
         tune_mtp = setup.tune_mtp.isChecked()
         enable_yarn = setup.enable_yarn.isChecked()
         real_validation = setup.real_validation.isChecked()
@@ -8466,6 +8955,9 @@ class MainWindow(QMainWindow):
                     prompt_cache_ram_mib=cast(
                         int, options["prompt_cache_ram_mib"]
                     ),
+                    limits=BenchmarkLimits(
+                        prompt_context_fraction=prompt_context_fraction
+                    ),
                 )
                 key = f"{app_settings.favorite_model_key(candidate.path)}::{target_name}"
                 jobs.append(
@@ -8479,6 +8971,8 @@ class MainWindow(QMainWindow):
                             "safe_context": safe_context,
                             "exact_trial": exact_trial,
                             "requested_context": desired_context,
+                            "benchmark_type": benchmark_type,
+                            "prompt_context_fraction": prompt_context_fraction,
                         },
                     )
                 )
@@ -8507,12 +9001,17 @@ class MainWindow(QMainWindow):
             )
         if skipped:
             warning_lines += f"\n\n{len(skipped)} model/profile item(s) were skipped."
+        test_label = (
+            "Quick test (12% context)"
+            if benchmark_type == "quick"
+            else "Normal test (25% context)"
+        )
         confirmation = QMessageBox.question(
             self,
             "Start real performance test?",
             f"Prepared {len(jobs)} independent model/mode profile(s) at "
             f"{context_label}, with up to {candidate_runs} fresh server launches.\n\n"
-            "The workload measures a long prompt plus 256 n_decode tokens and "
+            f"{test_label} measures a deterministic prompt plus 256 n_decode tokens and "
             "stores separate settings for every performance mode. Runs are "
             "sequential and may take hours for all models. Hardware clocks, "
             f"voltages, and power limits are never changed.{warning_lines}\n\nStart now?",
@@ -8527,7 +9026,7 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         summary = (
-            f"Testing {len(source_entries)} model(s) across "
+            f"{test_label}: testing {len(source_entries)} model(s) across "
             f"{len(selected_targets)} selected performance mode(s)."
         )
         dialog = _PerformanceTuneDialog(summary, len(jobs), self)
@@ -8561,6 +9060,7 @@ class MainWindow(QMainWindow):
         self._log(
             f"[Performance] Starting realistic suite with {len(jobs)} profiles, "
             f"targets={selected_targets}, desired_ctx={desired_context or 'auto'}, "
+            f"test={benchmark_type} ({prompt_context_fraction:.0%} context), "
             f"YaRN={enable_yarn}, MTP-sweep={tune_mtp}, all-models={setup.all_models.isChecked()}."
         )
         for message in skipped[:12]:
@@ -8640,7 +9140,22 @@ class MainWindow(QMainWindow):
                     model_size=0,
                     model_mtime_ns=0,
                 )
+            benchmark_type = str(job.metadata.get("benchmark_type", "normal"))
+            if benchmark_type not in ("quick", "normal"):
+                benchmark_type = "normal"
+            prompt_fraction = float(
+                job.metadata.get(
+                    "prompt_context_fraction",
+                    job.runner.limits.prompt_context_fraction,
+                )
+            )
+            record["model_name"] = entry.name
             record["performance_target"] = job.performance_target
+            record["benchmark_type"] = benchmark_type
+            record["prompt_context_fraction"] = prompt_fraction
+            record["generated_token_target"] = int(
+                job.runner.limits.generated_tokens
+            )
             record["static_safe_context"] = int(
                 job.metadata.get("safe_context", measured.desired_context) or 0
             )
@@ -8678,6 +9193,7 @@ class MainWindow(QMainWindow):
                 record,
                 snapshot,
                 job.performance_target,
+                benchmark_type,
             )
             if not saved:
                 failed_rows.append(f"{job.label}: settings save failed")

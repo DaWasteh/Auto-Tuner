@@ -89,9 +89,11 @@ the RAM/VRAM you actually have free — without manual edits.
   Detection reads the GGUF chat template directly — no name-based
   guessing — so `Qwen3-Coder` (no thinking) and `Qwen3-Embedding`
   (neither thinking nor tools) are correctly excluded.
-- **Open a model's folder directly** — right-click any entry in the Models
-  list and choose **GGUF-Ordner öffnen** to open its containing directory in
-  Explorer, Finder, or the Linux file manager.
+- **Model actions on right-click** — choose **GGUF-Ordner öffnen** to open the
+  containing directory, or use **Expert Settings kopieren/einfügen** to transfer
+  the active performance mode's complete Expert snapshot to another model. The
+  internal clipboard retains the source mode (`safe`, `balanced`, `throughput`,
+  or `low_vram`) so settings cannot silently land in a different mode.
 - **Reads GGUF metadata** — pulls `n_layers` and `context_length`
   straight from the file so partial GPU offload (`-ngl`) is exact.
 - **Author-recommended samplers from GGUF metadata** — many models embed
@@ -109,13 +111,17 @@ the RAM/VRAM you actually have free — without manual edits.
   GGUF and click **🚀 Performance test**. The setup dialog can test any or all
   of `safe`, `balanced`, `throughput`, and `low_vram`, optionally enable YaRN,
   tune MTP/draft `n-max`, or queue every benchmarkable scanned model. Each mode
-  gets its own persistent Expert snapshot. Every candidate starts a fresh private
-  `llama-server`, uses an excluded warm-up, then measures a deterministic prompt
-  covering up to 25% of context (bounded at 65,536 tokens) plus **256 n_decode
-  tokens**. AutoTuner reports native prompt-processing, n_decode, and measured
-  end-to-end throughput separately; winner ranking uses real workload time rather
-  than the old geometric score that could exaggerate prompt-only gains. The best
-  mode for each model is marked, remembered, and automatically selected. A
+  gets its own persistent Expert snapshot. Choose **Quick** for a deterministic
+  prompt covering 12% of context or **Normal** for 25% (both bounded at 65,536
+  tokens); every candidate starts a fresh private `llama-server`, uses an excluded
+  warm-up, and requests **256 n_decode tokens**. The **📊 Performance analysis**
+  button opens separate Quick and Normal tiles that list every tested model/mode,
+  graph native prompt-processing, n_decode, and measured end-to-end throughput,
+  and explain exactly how each metric is collected. The two workloads have
+  independent storage and chart scales, so their results are never mixed. Winner
+  ranking uses real workload time rather than the old geometric score that could
+  exaggerate prompt-only gains. The best mode for each model is marked, remembered,
+  and automatically selected. A
   requested context above the conservative static estimate can be tried in the
   isolated server; only a successful load + inference run is saved (for example,
   a backend-proven 110,592-token profile is no longer rejected merely because

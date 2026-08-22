@@ -89,6 +89,14 @@ def test_measurement_payload_is_long_and_decode_heavy_enough() -> None:
     assert payload["cache_prompt"] is False
 
 
+def test_quick_measurement_uses_twelve_percent_of_context() -> None:
+    runner = _runner(BenchmarkLimits(prompt_context_fraction=0.12))
+    assert runner._target_prompt_tokens(110592) == 13271
+    payload = runner._measurement_payload(110592)
+    assert payload["n_predict"] == 256
+    assert len(payload["prompt"]) < len(_runner()._measurement_payload(110592)["prompt"])
+
+
 def test_parse_timing_payload_supports_current_llama_fields() -> None:
     sample = parse_timing_payload(
         {
@@ -286,6 +294,64 @@ def test_mode_scoped_measured_result_round_trip(tmp_path, monkeypatch) -> None:
     assert app_settings.get_performance_tuning_result(model, "low_vram") == record
     assert app_settings.get_performance_tuning_result(model, "safe") is None
     assert app_settings.get_expert_override("model", model, "low_vram") == snapshot
+
+
+def test_quick_and_normal_results_are_retained_separately(
+    tmp_path, monkeypatch
+) -> None:
+    active_settings = [tmp_path / "settings.json"]
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: active_settings[0])
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"measured-model")
+    snapshot = {"mode": "auto", "values": {"ctx": 32768}}
+    normal = {
+        "model_name": "model",
+        "model_path": str(model),
+        "model_size": model.stat().st_size,
+        "performance_target": "balanced",
+        "benchmark_type": "normal",
+        "winner_id": "normal-winner",
+    }
+    quick = {
+        **normal,
+        "benchmark_type": "quick",
+        "winner_id": "quick-winner",
+    }
+
+    assert app_settings.save_performance_tuning_result(
+        "model", model, normal, snapshot, "balanced", "normal"
+    )
+    assert app_settings.save_performance_tuning_result(
+        "model", model, quick, snapshot, "balanced", "quick"
+    )
+
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced", "normal"
+    )["winner_id"] == "normal-winner"
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced", "quick"
+    )["winner_id"] == "quick-winner"
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced"
+    )["winner_id"] == "quick-winner"
+    grouped = app_settings.list_performance_run_results()
+    assert [item["winner_id"] for item in grouped["normal"]] == ["normal-winner"]
+    assert [item["winner_id"] for item in grouped["quick"]] == ["quick-winner"]
+
+    bundle = tmp_path / "profiles.json"
+    ok, message, count = app_settings.export_performance_profiles(bundle)
+    assert ok, message
+    assert count == 1
+    active_settings[0] = tmp_path / "imported-settings.json"
+    ok, message, count = app_settings.import_performance_profiles(bundle, [model])
+    assert ok, message
+    assert count == 1
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced", "normal"
+    )["winner_id"] == "normal-winner"
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced", "quick"
+    )["winner_id"] == "quick-winner"
 
 
 def test_performance_profile_export_import_maps_moved_model(

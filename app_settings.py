@@ -49,8 +49,9 @@ Public API:
     get_expert_override(model_name, model_path=None) -> Optional[dict]
     set_expert_override(model_name, snapshot: dict, model_path=None)
     clear_expert_override(model_name, model_path=None)
-    get_performance_tuning_result(model_path, performance_target=None) -> Optional[dict]
-    save_performance_tuning_result(..., performance_target=None) -> bool
+    get_performance_tuning_result(model_path, performance_target=None, benchmark_type=None) -> Optional[dict]
+    list_performance_run_results() -> dict[str, list[dict]]
+    save_performance_tuning_result(..., performance_target=None, benchmark_type=None) -> bool
     get_model_performance_target(model_path) -> Optional[str]
     set_model_performance_target(model_path, target)
     export_performance_profiles(path) -> (ok, message, count)
@@ -509,11 +510,17 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 
 
 _VALID_PERFORMANCE_TARGETS = ("safe", "balanced", "throughput", "low_vram")
+_VALID_BENCHMARK_TYPES = ("quick", "normal")
 
 
 def _normalise_performance_target(value: Optional[str]) -> str:
     target = str(value or "").lower().strip()
     return target if target in _VALID_PERFORMANCE_TARGETS else ""
+
+
+def _normalise_benchmark_type(value: Optional[str]) -> str:
+    benchmark_type = str(value or "").lower().strip()
+    return benchmark_type if benchmark_type in _VALID_BENCHMARK_TYPES else ""
 
 
 def _valid_expert_snapshot(snapshot: Any) -> bool:
@@ -568,6 +575,46 @@ def _get_target_value(
     # Once a model has any mode-scoped state, a missing target deliberately
     # means "pure Auto" rather than leaking a legacy winner across all modes.
     return True, per_model.get(target)
+
+
+def _set_benchmark_result_value(
+    settings: Dict[str, Any],
+    storage_key: str,
+    identity: str,
+    benchmark_type: str,
+    target: str,
+    value: Any,
+) -> None:
+    outer = _target_map(settings, storage_key)
+    per_model = outer.get(identity)
+    if not isinstance(per_model, dict):
+        per_model = {}
+    per_test = per_model.get(benchmark_type)
+    if not isinstance(per_test, dict):
+        per_test = {}
+    per_test[target] = value
+    per_model[benchmark_type] = per_test
+    outer[identity] = per_model
+    settings[storage_key] = outer
+
+
+def _get_benchmark_result_value(
+    settings: Dict[str, Any],
+    storage_key: str,
+    identity: str,
+    benchmark_type: str,
+    target: str,
+) -> Tuple[bool, Any]:
+    outer = settings.get(storage_key)
+    if not identity or not isinstance(outer, dict):
+        return False, None
+    per_model = outer.get(identity)
+    if not isinstance(per_model, dict):
+        return False, None
+    per_test = per_model.get(benchmark_type)
+    if not isinstance(per_test, dict):
+        return False, None
+    return True, per_test.get(target)
 
 
 def get_expert_override(
@@ -741,35 +788,215 @@ def clear_expert_override(
 
 
 def get_performance_tuning_result(
-    model_path: Path, performance_target: Optional[str] = None
+    model_path: Path,
+    performance_target: Optional[str] = None,
+    benchmark_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return measured evidence for one exact model/target pair."""
+    """Return measured evidence for one exact model/target/test-type tuple.
+
+    Without ``benchmark_type`` this retains the v5.2.4 contract and returns the
+    latest profile evidence. Supplying ``quick`` or ``normal`` reads the
+    independently retained analysis result so the two workloads never mix.
+    """
     settings = load_settings()
     key = favorite_model_key(model_path)
     target = _normalise_performance_target(performance_target)
-    if target and key:
-        found, record = _get_target_value(
+    test_type = _normalise_benchmark_type(benchmark_type)
+    if target and key and test_type:
+        found, record = _get_benchmark_result_value(
             settings,
-            _os_path_key("performance_tuning_results_by_performance"),
+            _os_path_key("performance_run_results_by_test"),
             key,
+            test_type,
             target,
         )
         if found:
             return record if isinstance(record, dict) else None
         portable = portable_model_key(model_path)
-        found, record = _get_target_value(
+        found, record = _get_benchmark_result_value(
             settings,
-            _os_path_key("performance_tuning_results_portable_by_performance"),
+            _os_path_key("performance_run_results_portable_by_test"),
             portable,
+            test_type,
             target,
         )
         if found:
             return record if isinstance(record, dict) else None
-    records = settings.get(_os_path_key("performance_tuning_results")) or {}
-    if not key or not isinstance(records, dict):
+
+    record: Any = None
+    found_current = False
+    if target and key:
+        found_current, record = _get_target_value(
+            settings,
+            _os_path_key("performance_tuning_results_by_performance"),
+            key,
+            target,
+        )
+        if not found_current:
+            portable = portable_model_key(model_path)
+            found_current, record = _get_target_value(
+                settings,
+                _os_path_key("performance_tuning_results_portable_by_performance"),
+                portable,
+                target,
+            )
+    if not found_current:
+        records = settings.get(_os_path_key("performance_tuning_results")) or {}
+        if key and isinstance(records, dict):
+            record = records.get(key)
+
+    if not isinstance(record, dict):
         return None
-    record = records.get(key)
-    return record if isinstance(record, dict) else None
+    if test_type:
+        stored_type = _normalise_benchmark_type(record.get("benchmark_type")) or "normal"
+        return record if stored_type == test_type else None
+    return record
+
+
+def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
+    """List latest quick and normal evidence for every tested model/mode.
+
+    The test-specific store is authoritative. Legacy v5.2.4 evidence is
+    classified as ``normal`` because that release always used 25% context.
+    Portable mirror entries are listed only when no exact-path result represents
+    the same filename+size identity, preserving unmapped imports without duplicates.
+    """
+    settings = load_settings()
+    grouped: Dict[str, List[Dict[str, Any]]] = {"quick": [], "normal": []}
+    seen: set[Tuple[str, str, str]] = set()
+
+    exact = settings.get(_os_path_key("performance_run_results_by_test"))
+    if isinstance(exact, dict):
+        for identity, per_model in exact.items():
+            if not isinstance(identity, str) or not isinstance(per_model, dict):
+                continue
+            for raw_type, per_test in per_model.items():
+                test_type = _normalise_benchmark_type(str(raw_type))
+                if not test_type or not isinstance(per_test, dict):
+                    continue
+                for raw_target, raw_record in per_test.items():
+                    target = _normalise_performance_target(str(raw_target))
+                    if not target or not isinstance(raw_record, dict):
+                        continue
+                    item = dict(raw_record)
+                    item.setdefault("model_path", identity)
+                    item["performance_target"] = target
+                    item["benchmark_type"] = test_type
+                    grouped[test_type].append(item)
+                    seen.add((identity, test_type, target))
+
+    legacy = settings.get(_os_path_key("performance_tuning_results_by_performance"))
+    if isinstance(legacy, dict):
+        for identity, per_model in legacy.items():
+            if not isinstance(identity, str) or not isinstance(per_model, dict):
+                continue
+            for raw_target, raw_record in per_model.items():
+                target = _normalise_performance_target(str(raw_target))
+                if not target or not isinstance(raw_record, dict):
+                    continue
+                test_type = (
+                    _normalise_benchmark_type(raw_record.get("benchmark_type"))
+                    or "normal"
+                )
+                marker = (identity, test_type, target)
+                if marker in seen:
+                    continue
+                item = dict(raw_record)
+                item.setdefault("model_path", identity)
+                item["performance_target"] = target
+                item["benchmark_type"] = test_type
+                grouped[test_type].append(item)
+                seen.add(marker)
+
+    legacy_single = settings.get(_os_path_key("performance_tuning_results"))
+    if isinstance(legacy_single, dict):
+        for identity, raw_record in legacy_single.items():
+            if not isinstance(identity, str) or not isinstance(raw_record, dict):
+                continue
+            target = _normalise_performance_target(raw_record.get("performance_target"))
+            if not target:
+                continue
+            test_type = (
+                _normalise_benchmark_type(raw_record.get("benchmark_type")) or "normal"
+            )
+            marker = (identity, test_type, target)
+            if marker in seen:
+                continue
+            item = dict(raw_record)
+            item.setdefault("model_path", identity)
+            item["performance_target"] = target
+            item["benchmark_type"] = test_type
+            grouped[test_type].append(item)
+            seen.add(marker)
+
+    represented_portable: set[str] = set()
+    for records in grouped.values():
+        for record in records:
+            raw_path = str(record.get("model_path", "") or "")
+            try:
+                model_size = int(record.get("model_size", 0) or 0)
+            except (TypeError, ValueError):
+                model_size = 0
+            if raw_path:
+                portable = portable_model_key(Path(raw_path), model_size)
+                if portable:
+                    represented_portable.add(portable)
+
+    portable_exact = settings.get(
+        _os_path_key("performance_run_results_portable_by_test")
+    )
+    if isinstance(portable_exact, dict):
+        for portable, per_model in portable_exact.items():
+            if portable in represented_portable or not isinstance(per_model, dict):
+                continue
+            filename = str(portable).rpartition("|")[0]
+            for raw_type, per_test in per_model.items():
+                test_type = _normalise_benchmark_type(str(raw_type))
+                if not test_type or not isinstance(per_test, dict):
+                    continue
+                for raw_target, raw_record in per_test.items():
+                    target = _normalise_performance_target(str(raw_target))
+                    marker = (f"portable:{portable}", test_type, target)
+                    if (
+                        not target
+                        or not isinstance(raw_record, dict)
+                        or marker in seen
+                    ):
+                        continue
+                    item = dict(raw_record)
+                    item.setdefault("model_name", Path(filename).stem)
+                    item["performance_target"] = target
+                    item["benchmark_type"] = test_type
+                    grouped[test_type].append(item)
+                    seen.add(marker)
+            represented_portable.add(str(portable))
+
+    portable_legacy = settings.get(
+        _os_path_key("performance_tuning_results_portable_by_performance")
+    )
+    if isinstance(portable_legacy, dict):
+        for portable, per_model in portable_legacy.items():
+            if portable in represented_portable or not isinstance(per_model, dict):
+                continue
+            filename = str(portable).rpartition("|")[0]
+            for raw_target, raw_record in per_model.items():
+                target = _normalise_performance_target(str(raw_target))
+                if not target or not isinstance(raw_record, dict):
+                    continue
+                test_type = (
+                    _normalise_benchmark_type(raw_record.get("benchmark_type"))
+                    or "normal"
+                )
+                marker = (f"portable:{portable}", test_type, target)
+                if marker in seen:
+                    continue
+                item = dict(raw_record)
+                item.setdefault("model_name", Path(filename).stem)
+                item["performance_target"] = target
+                item["benchmark_type"] = test_type
+                grouped[test_type].append(item)
+                seen.add(marker)
+    return grouped
 
 
 def save_performance_tuning_result(
@@ -778,8 +1005,9 @@ def save_performance_tuning_result(
     result: Dict[str, Any],
     snapshot: Dict[str, Any],
     performance_target: Optional[str] = None,
+    benchmark_type: Optional[str] = None,
 ) -> bool:
-    """Atomically save benchmark evidence and its mode-scoped snapshot."""
+    """Atomically save the active profile and test-type-isolated evidence."""
     key = favorite_model_key(model_path)
     if (
         not model_name
@@ -792,6 +1020,14 @@ def save_performance_tuning_result(
     target = _normalise_performance_target(
         performance_target or str(result.get("performance_target", ""))
     )
+    test_type = (
+        _normalise_benchmark_type(
+            benchmark_type or str(result.get("benchmark_type", ""))
+        )
+        or "normal"
+    )
+    history_record = dict(result)
+    history_record.setdefault("benchmark_type", test_type)
     if target:
         _set_target_value(
             settings,
@@ -806,6 +1042,14 @@ def save_performance_tuning_result(
             key,
             target,
             snapshot,
+        )
+        _set_benchmark_result_value(
+            settings,
+            _os_path_key("performance_run_results_by_test"),
+            key,
+            test_type,
+            target,
+            history_record,
         )
         portable = portable_model_key(model_path, result.get("model_size"))
         if portable:
@@ -822,6 +1066,14 @@ def save_performance_tuning_result(
                 portable,
                 target,
                 snapshot,
+            )
+            _set_benchmark_result_value(
+                settings,
+                _os_path_key("performance_run_results_portable_by_test"),
+                portable,
+                test_type,
+                target,
+                history_record,
             )
     else:
         result_key = _os_path_key("performance_tuning_results")
@@ -862,10 +1114,20 @@ def _profile_bundle_entry(
         result = payload.get("result")
         if not _valid_expert_snapshot(snapshot):
             continue
-        clean_modes[target_name] = {
+        clean_runs: Dict[str, Dict[str, Any]] = {}
+        raw_runs = payload.get("runs")
+        if isinstance(raw_runs, dict):
+            for raw_type, raw_record in raw_runs.items():
+                test_type = _normalise_benchmark_type(str(raw_type))
+                if test_type and isinstance(raw_record, dict):
+                    clean_runs[test_type] = raw_record
+        clean_mode = {
             "snapshot": snapshot,
             "result": result if isinstance(result, dict) else {},
         }
+        if clean_runs:
+            clean_mode["runs"] = clean_runs
+        clean_modes[target_name] = clean_mode
     clean_filename = Path(str(filename or "")).name
     if not clean_filename or not clean_modes:
         return None
@@ -888,6 +1150,9 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
     results_by_path = _target_map(
         settings, _os_path_key("performance_tuning_results_by_performance")
     )
+    runs_by_path = _target_map(
+        settings, _os_path_key("performance_run_results_by_test")
+    )
     legacy_experts = settings.get(_os_path_key("expert_overrides_by_path"))
     legacy_results = settings.get(_os_path_key("performance_tuning_results"))
     preferred_by_path = settings.get(_os_path_key("model_performance_targets"))
@@ -898,18 +1163,41 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
     if not isinstance(legacy_results, dict):
         legacy_results = {}
 
+    def runs_for_target(per_model: Any, target: str) -> Dict[str, Dict[str, Any]]:
+        collected: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(per_model, dict):
+            return collected
+        for raw_type, per_test in per_model.items():
+            test_type = _normalise_benchmark_type(str(raw_type))
+            if not test_type or not isinstance(per_test, dict):
+                continue
+            record = per_test.get(target)
+            if isinstance(record, dict):
+                collected[test_type] = record
+        return collected
+
     entries: List[Dict[str, Any]] = []
     represented_portable: set[str] = set()
-    path_keys = set(experts_by_path) | set(results_by_path) | set(legacy_experts)
+    path_keys = (
+        set(experts_by_path)
+        | set(results_by_path)
+        | set(runs_by_path)
+        | set(legacy_experts)
+    )
     for path_key in sorted(path_keys, key=str.casefold):
         path = Path(path_key)
         per_expert = experts_by_path.get(path_key)
         per_result = results_by_path.get(path_key)
+        per_runs = runs_by_path.get(path_key)
         modes: Dict[str, Any] = {}
         if isinstance(per_expert, dict):
             for target, snapshot in per_expert.items():
                 result = per_result.get(target) if isinstance(per_result, dict) else {}
-                modes[target] = {"snapshot": snapshot, "result": result}
+                modes[target] = {
+                    "snapshot": snapshot,
+                    "result": result,
+                    "runs": runs_for_target(per_runs, str(target)),
+                }
         legacy_snapshot = legacy_experts.get(path_key)
         if _valid_expert_snapshot(legacy_snapshot):
             legacy_record = legacy_results.get(path_key)
@@ -923,6 +1211,7 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
                 {
                     "snapshot": legacy_snapshot,
                     "result": legacy_record if isinstance(legacy_record, dict) else {},
+                    "runs": runs_for_target(per_runs, inferred),
                 },
             )
         size = 0
@@ -966,13 +1255,17 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
     portable_results = _target_map(
         settings, _os_path_key("performance_tuning_results_portable_by_performance")
     )
+    portable_runs = _target_map(
+        settings, _os_path_key("performance_run_results_portable_by_test")
+    )
     preferred_portable = settings.get(
         _os_path_key("model_performance_targets_portable")
     )
     if not isinstance(preferred_portable, dict):
         preferred_portable = {}
     for portable in sorted(
-        set(portable_experts) | set(portable_results), key=str.casefold
+        set(portable_experts) | set(portable_results) | set(portable_runs),
+        key=str.casefold,
     ):
         if portable in represented_portable:
             continue
@@ -985,12 +1278,14 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
             continue
         per_expert = portable_experts.get(portable)
         per_result = portable_results.get(portable)
+        per_runs = portable_runs.get(portable)
         if not isinstance(per_expert, dict):
             continue
         modes = {
             target: {
                 "snapshot": snapshot,
                 "result": per_result.get(target) if isinstance(per_result, dict) else {},
+                "runs": runs_for_target(per_runs, str(target)),
             }
             for target, snapshot in per_expert.items()
         }
@@ -1134,6 +1429,19 @@ def import_performance_profiles(
             if not _valid_expert_snapshot(snapshot):
                 continue
             record = result if isinstance(result, dict) else {}
+            imported_runs: Dict[str, Dict[str, Any]] = {}
+            raw_runs = mode_payload.get("runs")
+            if isinstance(raw_runs, dict):
+                for raw_type, raw_record in raw_runs.items():
+                    test_type = _normalise_benchmark_type(str(raw_type))
+                    if test_type and isinstance(raw_record, dict):
+                        imported_runs[test_type] = raw_record
+            if not imported_runs and record:
+                test_type = (
+                    _normalise_benchmark_type(record.get("benchmark_type"))
+                    or "normal"
+                )
+                imported_runs[test_type] = record
             _set_target_value(
                 settings,
                 _os_path_key("expert_overrides_portable_by_performance"),
@@ -1148,6 +1456,15 @@ def import_performance_profiles(
                 target_name,
                 record,
             )
+            for test_type, run_record in imported_runs.items():
+                _set_benchmark_result_value(
+                    settings,
+                    _os_path_key("performance_run_results_portable_by_test"),
+                    portable,
+                    test_type,
+                    target_name,
+                    run_record,
+                )
             if local_path is not None:
                 local_key = favorite_model_key(local_path)
                 if local_key:
@@ -1165,6 +1482,15 @@ def import_performance_profiles(
                         target_name,
                         record,
                     )
+                    for test_type, run_record in imported_runs.items():
+                        _set_benchmark_result_value(
+                            settings,
+                            _os_path_key("performance_run_results_by_test"),
+                            local_key,
+                            test_type,
+                            target_name,
+                            run_record,
+                        )
             elif model_name:
                 # Name fallback is only used until a matching filename+size is
                 # scanned; portable identity remains the authoritative mapping.

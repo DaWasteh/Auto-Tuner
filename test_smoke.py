@@ -1341,6 +1341,144 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     window.close()
 
 
+def test_performance_analysis_keeps_quick_and_normal_tiles_separate() -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+
+    setup = qt_launcher._PerformanceTuneSetupDialog(
+        "Example", 32768, 131072, 2
+    )
+    assert setup.benchmark_type() == "normal"
+    assert setup.prompt_context_fraction() == pytest.approx(0.25)
+    setup.test_length_combo.setCurrentIndex(
+        setup.test_length_combo.findData("quick")
+    )
+    assert setup.benchmark_type() == "quick"
+    assert setup.prompt_context_fraction() == pytest.approx(0.12)
+    setup.close()
+
+    def record(name: str, test_type: str, value: float) -> dict:
+        winner_id = f"{name}-{test_type}"
+        return {
+            "model_name": name,
+            "model_path": f"C:/{name}.gguf",
+            "benchmark_type": test_type,
+            "performance_target": "balanced",
+            "desired_context": 32768,
+            "winner_id": winner_id,
+            "winner_settings": {"threads": 8, "batch": 512, "ubatch": 256},
+            "candidates": [
+                {
+                    "id": winner_id,
+                    "prompt_tps": value * 4,
+                    "generation_tps": value,
+                    "overall_tps": value * 2,
+                }
+            ],
+        }
+
+    dialog = qt_launcher._PerformanceAnalysisDialog(
+        {
+            "quick": [record("QuickModel", "quick", 10.0)],
+            "normal": [record("NormalModel", "normal", 100.0)],
+        }
+    )
+    assert dialog.record_count_by_test == {"quick": 1, "normal": 1}
+    assert dialog.model_names_by_test["quick"] == ["QuickModel"]
+    assert dialog.model_names_by_test["normal"] == ["NormalModel"]
+    assert dialog.test_tiles["quick"].property("benchmarkType") == "quick"
+    assert dialog.test_tiles["normal"].property("benchmarkType") == "normal"
+    # Each tile normalizes its own PP/decode/end-to-end scales. With one model
+    # in each tile every non-zero bar reaches that tile's maximum.
+    for tile in dialog.test_tiles.values():
+        bars = tile.findChildren(qt_widgets.QProgressBar)
+        assert len(bars) == 3
+        assert all(bar.value() == 1000 for bar in bars)
+    text = " ".join(
+        label.text() for label in dialog.findChildren(qt_widgets.QLabel)
+    )
+    assert "Prompt processing (PP)" in text
+    assert "n_decode" in text
+    assert "End-to-end" in text
+    dialog.close()
+
+
+def test_model_expert_settings_copy_and_paste_is_target_scoped(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+
+    source = _fake_model(tmp_path / "source", "SourceModel", 1.0)
+    target = _fake_model(tmp_path / "target", "TargetModel", 1.0)
+    source_snapshot = {
+        "mode": "manual",
+        "pins": {},
+        "values": {"ctx": 24576, "threads": 6, "batch": 512, "ubatch": 128},
+        "saved_at": "2026-01-01T00:00:00",
+    }
+    qt_launcher.app_settings.set_expert_override(
+        source.name, source_snapshot, source.path, "balanced"
+    )
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._system = _fake_system()
+    window._all_entries = [source, target]
+    window._show_config(source)
+    window._copy_expert_settings(source)
+    assert window._expert_settings_clipboard is not None
+    assert window._expert_settings_clipboard["performance_target"] == "balanced"
+
+    window._show_config(target)
+    window._paste_expert_settings(target)
+    pasted = qt_launcher.app_settings.get_expert_override(
+        target.name, target.path, "balanced"
+    )
+    assert pasted is not None
+    assert pasted["mode"] == "manual"
+    assert pasted["values"]["ctx"] == 24576
+    assert pasted["values"]["threads"] == 6
+    assert pasted["source"] == "copied-expert-settings"
+    assert pasted["copied_from"] == {
+        "model": source.name,
+        "performance_target": "balanced",
+    }
+    # Provenance changes apply only to the pasted deep copy.
+    assert "copied_from" not in qt_launcher.app_settings.get_expert_override(
+        source.name, source.path, "balanced"
+    )
+
+    # A right-click/model switch must flush a pending edit while the source is
+    # still current; otherwise the delayed Expert signal could overwrite the
+    # destination with the source panel's state.
+    window._show_config(source)
+    window._enter_expert_mode()
+    window._expert_panel._sp_threads.setValue(7)
+    assert window._expert_panel._save_timer.isActive()
+    window._show_config(target)
+    assert qt_launcher.app_settings.get_expert_override(
+        source.name, source.path, "balanced"
+    )["values"]["threads"] == 7
+    assert qt_launcher.app_settings.get_expert_override(
+        target.name, target.path, "balanced"
+    )["values"]["threads"] == 6
+    window.close()
+
+
 def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> None:
     """Lock in complete beginner + technical help for settings dialogs."""
     global _QT_TEST_APP
@@ -1443,6 +1581,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_btn_expert",
         "_btn_diagnose",
         "_btn_benchmark",
+        "_btn_performance_analysis",
         "_cb_mmproj",
         "_cb_draft",
         "_chk_mmproj_cpu",
