@@ -6724,6 +6724,10 @@ class MainWindow(QMainWindow):
         self._auto_select_fork(profile)
         self._update_config_text(entry, profile)
         self._update_benchmark_button(profile)
+        # The Launch button's v5.2.2 gate (selected model + detected
+        # hardware) only re-evaluates on lifecycle events, so re-run it
+        # here: model selection is what sets ``_current_entry``.
+        self._enable_launch_when_ocr_idle()
 
     def _update_checkboxes(self, entry: ModelEntry) -> None:
         """Refresh dropdown selections and the remaining checkbox states.
@@ -8234,6 +8238,9 @@ class MainWindow(QMainWindow):
         # Keep the GPU pin dropdown in sync with the detected cards.
         self._populate_gpu_combo(s)
         self._update_benchmark_button()
+        # ``_system`` transitions (first detection, 6-second refresh,
+        # failed-run recovery) are what the Launch gate depends on.
+        self._enable_launch_when_ocr_idle()
 
     # ------------------------------------------------------------------
     # Binary resolution
