@@ -7,7 +7,7 @@ the RAM/VRAM you actually have free — without manual edits.
 
 # GUI-Design
 
-![AutoTuner GUI](image.png)
+![GUI](image.png)
 
 ## Features
 
