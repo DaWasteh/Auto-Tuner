@@ -510,7 +510,10 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 
 
 _VALID_PERFORMANCE_TARGETS = ("safe", "balanced", "throughput", "low_vram")
-_VALID_BENCHMARK_TYPES = ("quick", "normal")
+# ``quick`` is the backward-compatible storage id for the standard 12.5%
+# workload. ``normal`` remains readable/importable for legacy fixed-25% runs;
+# new UI runs use ``custom`` instead.
+_VALID_BENCHMARK_TYPES = ("quick", "custom", "normal")
 
 
 def _normalise_performance_target(value: Optional[str]) -> str:
@@ -795,8 +798,8 @@ def get_performance_tuning_result(
     """Return measured evidence for one exact model/target/test-type tuple.
 
     Without ``benchmark_type`` this retains the v5.2.4 contract and returns the
-    latest profile evidence. Supplying ``quick`` or ``normal`` reads the
-    independently retained analysis result so the two workloads never mix.
+    latest profile evidence. Supplying ``quick`` (standard 12.5%), ``custom``,
+    or legacy ``normal`` reads independently retained analysis evidence.
     """
     settings = load_settings()
     key = favorite_model_key(model_path)
@@ -854,7 +857,7 @@ def get_performance_tuning_result(
 
 
 def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
-    """List latest quick and normal evidence for every tested model/mode.
+    """List standard, custom, and legacy evidence for every tested model/mode.
 
     The test-specific store is authoritative. Legacy v5.2.4 evidence is
     classified as ``normal`` because that release always used 25% context.
@@ -862,7 +865,11 @@ def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
     the same filename+size identity, preserving unmapped imports without duplicates.
     """
     settings = load_settings()
-    grouped: Dict[str, List[Dict[str, Any]]] = {"quick": [], "normal": []}
+    grouped: Dict[str, List[Dict[str, Any]]] = {
+        "quick": [],
+        "custom": [],
+        "normal": [],
+    }
     seen: set[Tuple[str, str, str]] = set()
 
     exact = settings.get(_os_path_key("performance_run_results_by_test"))

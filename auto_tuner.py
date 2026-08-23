@@ -41,6 +41,7 @@ from tuner import (
     build_command,
     build_diffusion_command,
     build_diffusion_server_command,
+    check_draft_model_build,
     check_profile_build,
     compute_config,
     effective_load_mode,
@@ -1039,6 +1040,50 @@ def _resolve_server_binary(user_value: str) -> str:
     return user_value
 
 
+def _server_binary_in_fork(root: Path) -> Optional[str]:
+    """Return the first native llama-server inside one discovered build."""
+    for subpath in _SERVER_SUBPATHS:
+        candidate = root / subpath
+        if _is_runnable_binary(candidate):
+            return str(candidate)
+    return None
+
+
+def _find_compatible_draft_server(
+    draft_model: Optional[ModelEntry], preferred_binary: str
+) -> Optional[str]:
+    """Find a DFlash2-capable sibling build without changing global selection.
+
+    Normal drafters immediately retain ``preferred_binary``. For a DFlash2
+    sidecar, a known-incompatible stock build triggers a scan of the user's
+    discovered sibling llama.cpp builds (notably ``pr27342_dflash2_llama.cpp``).
+    This keeps b10590 selected for ordinary models while transparently routing
+    only the DFlash2 launch through its required PR runtime.
+    """
+    allowed, message, _build = check_draft_model_build(
+        draft_model, preferred_binary
+    )
+    needs_capability_search = bool(
+        draft_model is not None
+        and draft_model.is_dflash2_drafter
+        and (not allowed or message)
+    )
+    if not needs_capability_search:
+        return preferred_binary
+
+    preferred_key = os.path.normcase(str(Path(preferred_binary)))
+    for _name, root in _discover_llama_forks():
+        candidate = _server_binary_in_fork(root)
+        if not candidate or os.path.normcase(candidate) == preferred_key:
+            continue
+        candidate_allowed, _candidate_message, _candidate_build = (
+            check_draft_model_build(draft_model, candidate)
+        )
+        if candidate_allowed and not _candidate_message:
+            return candidate
+    return preferred_binary if allowed else None
+
+
 def _resolve_diffusion_binary(user_value: str, arch: Optional[str] = None) -> str:
     """Resolve the diffusion binary (fork or mainline build).
 
@@ -1930,6 +1975,29 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             tuning_binary = _resolve_server_binary(
                 resolve_specialized_binary(profile, use_draft, model.name)
             )
+
+        compatible_draft_binary = _find_compatible_draft_server(
+            effective_draft, tuning_binary
+        )
+        if compatible_draft_binary is not None and os.path.normcase(
+            compatible_draft_binary
+        ) != os.path.normcase(tuning_binary):
+            print(
+                "[AutoTuner] DFlash2 runtime: selected stock build is "
+                f"incompatible; using {compatible_draft_binary} for this launch."
+            )
+            tuning_binary = compatible_draft_binary
+
+        draft_allowed, draft_message, _draft_build = check_draft_model_build(
+            effective_draft,
+            tuning_binary,
+        )
+        if draft_message:
+            level = "Warning" if draft_allowed else "Error"
+            print(f"[AutoTuner] {level}: {draft_message}")
+        if not draft_allowed:
+            return 2
+
         system = detect_system(tuning_binary)
 
         # Resolve performance target: CLI > YAML profile > "balanced".

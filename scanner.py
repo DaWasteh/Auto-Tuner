@@ -1154,6 +1154,28 @@ class ModelEntry:
         return metadata_is_standalone_drafter(self.metadata)
 
     @property
+    def is_dflash2_drafter(self) -> bool:
+        """True for a DFlash2 sidecar with convolution + selector weights.
+
+        DFlash2 deliberately keeps ``general.architecture=dflash`` and the
+        ``draft-dflash`` CLI type used by first-generation DFlash.  The
+        checkpoint is distinguished by its extra GGUF metadata: grouped local
+        convolution and the candidate selector.  Stock llama.cpp b10590 knows
+        DFlash v1 only and therefore creates 58 tensors for these 81-tensor
+        sidecars; launch preflight uses this property to report the required
+        DFlash2 build before a multi-gigabyte target starts loading.
+        """
+        if self.architecture.lower().strip() != "dflash":
+            return False
+        md = self.metadata or {}
+        return bool(
+            md.get("dflash.conv_kernel_size")
+            and md.get("dflash.conv_group_size")
+            and md.get("dflash.selector_rank")
+            and md.get("dflash.selector_top_k")
+        )
+
+    @property
     def drafter_spec_type(self) -> Optional[str]:
         """The ``--spec-type`` token this drafter needs, or ``None``.
 

@@ -7,7 +7,11 @@ the RAM/VRAM you actually have free — without manual edits.
 
 # GUI-Design
 
+GUI:
 ![GUI](image.png)
+
+Performance Test Result:
+![Test](image1.png)
 
 ## Features
 
@@ -111,17 +115,24 @@ the RAM/VRAM you actually have free — without manual edits.
   GGUF and click **🚀 Performance test**. The setup dialog can test any or all
   of `safe`, `balanced`, `throughput`, and `low_vram`, optionally enable YaRN,
   tune MTP/draft `n-max`, or queue every benchmarkable scanned model. Each mode
-  gets its own persistent Expert snapshot. Choose **Quick** for a deterministic
-  prompt covering 12% of context or **Normal** for 25% (both bounded at 65,536
-  tokens); every candidate starts a fresh private `llama-server`, uses an excluded
-  warm-up, and requests **256 n_decode tokens**. The **📊 Performance analysis**
-  button opens separate Quick and Normal tiles that list every tested model/mode,
-  graph native prompt-processing, n_decode, and measured end-to-end throughput,
-  and explain exactly how each metric is collected. The two workloads have
-  independent storage and chart scales, so their results are never mixed. Winner
-  ranking uses real workload time rather than the old geometric score that could
-  exaggerate prompt-only gains. The best mode for each model is marked, remembered,
-  and automatically selected. A
+  gets its own persistent Expert snapshot. **Standard** uses 12.5% of context
+  with the 65,536 prompt-token cap; **Custom** accepts 0.01–100% and deliberately
+  ignores that cap. The prompt is calibrated once through the model's real
+  `/tokenize` endpoint, so these are actual token limits rather than a text-size
+  estimate. Every candidate starts a fresh private `llama-server`, uses
+  an excluded warm-up, and requests **256 n_decode tokens**. During a suite,
+  **Stop after Model** finishes/saves all modes for the active model and
+  **Stop after Performance Mode** finishes/saves only the active mode. Every
+  completed mode is atomically checkpointed before the next starts, so cancel,
+  a crash, or power loss cannot erase earlier results. MTP/draft depth increases
+  one token at a time until decode speed first regresses (for example 5 → 6 → 7),
+  instead of stopping at a fixed list. The **📊 Performance analysis** button
+  opens separate Standard, Custom, and legacy Normal tiles, graphs native
+  prompt-processing, n_decode, and measured end-to-end throughput, and explains
+  exactly how each metric is collected. Unlike workloads have independent
+  storage and chart scales. Winner ranking uses real workload time rather than
+  the old geometric score that could exaggerate prompt-only gains. The best mode
+  for each model is marked, remembered, and automatically selected. A
   requested context above the conservative static estimate can be tried in the
   isolated server; only a successful load + inference run is saved (for example,
   a backend-proven 110,592-token profile is no longer rejected merely because
@@ -878,6 +889,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
 | [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
 | [`diffusion_hip_llama_build.txt`](building%20llama.cpp/diffusion_hip_llama_build.txt) | DiffusionGemma HIP/ROCm build for AMD when Vulkan hits the ~1 GiB single-allocation limit. |
+| [`dflash2_llama_build.txt`](building%20llama.cpp/dflash2_llama_build.txt) | Pinned llama.cpp PR #27342 Windows/Vulkan build required by Qwen3.8 DFlash2 until its 81-tensor loader reaches stock mainline. |
 | [`setup_llamacpp_cuda.ps1`](building%20llama.cpp/setup_llamacpp_cuda.ps1) | Windows NVIDIA/CUDA one-shot setup helper (PowerShell/Admin; freak288-style script). |
 | [`setup_llamacpp_turboquant_cuda.ps1`](building%20llama.cpp/setup_llamacpp_turboquant_cuda.ps1) | Windows NVIDIA/CUDA TurboQuant setup helper. |
 
@@ -903,10 +915,11 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through v0.2.0 / b10572)
+## Server features (compatible through llama.cpp b10590)
 
-Build/version probing and real server launches are validated against official
-`v0.2.0` (`b10566`) and main/nightly `0.2.0-dev` (`b10572`). The following
+Build/version probing, complete profile-command matrices, and real server
+launches are validated through exact stock **b10590** (with a local b10591
+binary whose only post-tag change is Web UI code). The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
 
@@ -927,12 +940,12 @@ Build/version probing and real server launches are validated against official
 | `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
 | `-md` external drafter | ✅ Without `--spec-type` — the presence of `-md` enables the draft path automatically in mainline (verified b9442) |
 | `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.) |
-| `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. DSpark is emitted on b10164+; older binaries lose the entire DSpark path rather than mis-running it as DFlash |
+| `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. DSpark is emitted on b10164+; older binaries lose the entire DSpark path rather than mis-running it as DFlash. DFlash2 reuses `draft-dflash` but is preflight-gated to PR #27342 because stock b10590 lacks its graph. |
 | `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Selectable via `ngram_method`; only the type token is emitted, sub-parameters are left to the llama.cpp defaults |
-| `--spec-draft-n-max` | ✅ Via `draft_max` in the YAML profile; overridable per model in the Expert panel ("Speculative decoding" → draft n-max, 0 = profile default) since v4.9.6 |
-| `--spec-draft-p-min` | ✅ Via `draft_p_min` in the YAML profile — the mainline default has been **0.0** since PR #23269; AutoTuner still emits an explicit **0.75** in **both** spec paths (external + integrated) so MTP only fires on confident steps |
+| `--spec-draft-n-max` | ✅ Expert overrides remain authoritative. DFlash derives block-size minus its anchor (Qwen3.8 DFlash2: 8 → 7); performance tuning then increases depth one token at a time until decode speed regresses instead of stopping at a fixed list. |
+| `--spec-draft-p-min` | ✅ Via `draft_p_min` for ordinary external/integrated MTP (explicit 0.75). Qwen3.8 DFlash2 keeps its PR #27342/model-card value 0.0 because its candidate selector performs the lattice pruning. |
 | `--spec-ngram-map-k4v-size-n/-size-m/-min-hits` | ✅ Via `ngram_k4v_size_n` / `ngram_k4v_size_m` / `ngram_k4v_min_hits` in the YAML (defaults 16/24/1 from PR #23269) |
 | `--spec-draft-ngl` | ✅ Always 99 (keep the MTP head on GPU) |
 | `--n-cpu-moe` / `--override-tensor` | ✅ `--n-cpu-moe` active; `-ot` prepared for targeted expert placement |
@@ -943,6 +956,27 @@ Build/version probing and real server launches are validated against official
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+
+### Review b10549 → b10590
+
+Reviewed all **41 upstream commits** from exact tag **b10549** (`b2e5e9b2`)
+through **b10590** (`6657ded4`). Full command-matrix, source, and real-model
+evidence is in [`docs/llama-b10590-audit.md`](docs/llama-b10590-audit.md).
+
+- **No emitted server option broke:** every normal profile and representative
+  Vision, OCR, MTP, DFlash, ngram, tools, and diffusion command survived the
+  b10590 `--help` capability pass without one removed flag/value.
+- **Transparent rebuild benefits:** MTP+embedding context initialization,
+  BailingMoE3 DSpark rollback, Dots3-Note language/vision/audio, WebP MTMD,
+  stream-aware fit accounting, and Vulkan/CUDA/OpenCL/SYCL fixes require no
+  changed AutoTuner command.
+- **DFlash2 is not in stock b10590:** Qwen3.8's 81-tensor DFlash2 sidecars need
+  open PR #27342; stock b10590 creates the old 58-tensor DFlash graph and was
+  reproduced failing with `expected 81, got 58`. v5.2.6 detects this before
+  launch, automatically uses a compatible sibling PR build when present,
+  selects trained n-max 7/p-min 0.0, accepts the reviewed PR build, and
+  includes [`dflash2_llama_build.txt`](building%20llama.cpp/dflash2_llama_build.txt).
+  A real PR-build request loaded and generated successfully.
 
 ### Review b10441 → b10549
 

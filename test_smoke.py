@@ -1341,7 +1341,7 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     window.close()
 
 
-def test_performance_analysis_keeps_quick_and_normal_tiles_separate() -> None:
+def test_performance_analysis_keeps_standard_custom_and_legacy_tiles_separate() -> None:
     global _QT_TEST_APP
 
     qt_launcher = pytest.importorskip("qt_launcher")
@@ -1351,13 +1351,16 @@ def test_performance_analysis_keeps_quick_and_normal_tiles_separate() -> None:
     setup = qt_launcher._PerformanceTuneSetupDialog(
         "Example", 32768, 131072, 2
     )
-    assert setup.benchmark_type() == "normal"
-    assert setup.prompt_context_fraction() == pytest.approx(0.25)
-    setup.test_length_combo.setCurrentIndex(
-        setup.test_length_combo.findData("quick")
-    )
     assert setup.benchmark_type() == "quick"
-    assert setup.prompt_context_fraction() == pytest.approx(0.12)
+    assert setup.prompt_context_fraction() == pytest.approx(0.125)
+    assert not setup.custom_percent_spin.isEnabled()
+    setup.test_length_combo.setCurrentIndex(
+        setup.test_length_combo.findData("custom")
+    )
+    setup.custom_percent_spin.setValue(87.65)
+    assert setup.benchmark_type() == "custom"
+    assert setup.custom_percent_spin.isEnabled()
+    assert setup.prompt_context_fraction() == pytest.approx(0.8765)
     setup.close()
 
     def record(name: str, test_type: str, value: float) -> dict:
@@ -1382,14 +1385,17 @@ def test_performance_analysis_keeps_quick_and_normal_tiles_separate() -> None:
 
     dialog = qt_launcher._PerformanceAnalysisDialog(
         {
-            "quick": [record("QuickModel", "quick", 10.0)],
-            "normal": [record("NormalModel", "normal", 100.0)],
+            "quick": [record("StandardModel", "quick", 10.0)],
+            "custom": [record("CustomModel", "custom", 50.0)],
+            "normal": [record("LegacyModel", "normal", 100.0)],
         }
     )
-    assert dialog.record_count_by_test == {"quick": 1, "normal": 1}
-    assert dialog.model_names_by_test["quick"] == ["QuickModel"]
-    assert dialog.model_names_by_test["normal"] == ["NormalModel"]
+    assert dialog.record_count_by_test == {"quick": 1, "custom": 1, "normal": 1}
+    assert dialog.model_names_by_test["quick"] == ["StandardModel"]
+    assert dialog.model_names_by_test["custom"] == ["CustomModel"]
+    assert dialog.model_names_by_test["normal"] == ["LegacyModel"]
     assert dialog.test_tiles["quick"].property("benchmarkType") == "quick"
+    assert dialog.test_tiles["custom"].property("benchmarkType") == "custom"
     assert dialog.test_tiles["normal"].property("benchmarkType") == "normal"
     # Each tile normalizes its own PP/decode/end-to-end scales. With one model
     # in each tile every non-zero bar reaches that tile's maximum.
@@ -1404,6 +1410,40 @@ def test_performance_analysis_keeps_quick_and_normal_tiles_separate() -> None:
     assert "n_decode" in text
     assert "End-to-end" in text
     dialog.close()
+
+
+def test_performance_dialog_exposes_graceful_stop_controls() -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    requested: list[str] = []
+    dialog = qt_launcher._PerformanceTuneDialog(
+        "All-model suite", 8, allow_model_stop=True
+    )
+    dialog.stop_after_model_requested.connect(lambda: requested.append("model"))
+    dialog.stop_after_mode_requested.connect(lambda: requested.append("mode"))
+    assert dialog.stop_after_model_button.text() == "Stop after Model"
+    assert dialog.stop_after_model_button.isEnabled()
+    assert dialog.stop_after_mode_button.text() == "Stop after Performance Mode"
+
+    dialog.stop_after_model_button.click()
+    assert requested == ["model"]
+    assert "current model" in dialog.status_label.text()
+    dialog.stop_after_mode_button.click()
+    assert requested == ["model", "mode"]
+    assert "performance mode" in dialog.status_label.text()
+    dialog.mark_finished()
+    dialog.close()
+
+    single = qt_launcher._PerformanceTuneDialog(
+        "Single-model suite", 4, allow_model_stop=False
+    )
+    assert not single.stop_after_model_button.isEnabled()
+    assert single.stop_after_mode_button.isEnabled()
+    single.mark_finished()
+    single.close()
 
 
 def test_model_expert_settings_copy_and_paste_is_target_scoped(
@@ -2230,6 +2270,93 @@ def test_external_qwen_mtp_head_emits_draft_mtp_with_and_without_mmproj(
     )
     assert "--mmproj" in cmd and "-md" in cmd
     assert "draft-mtp" in _spec_tokens(cmd).split(",")
+
+
+def test_qwen38_dflash2_uses_trained_depth_and_requires_capable_build(
+    tmp_path, monkeypatch
+) -> None:
+    """DFlash2 reuses draft-dflash but stock b10590 lacks its 81-tensor graph."""
+    import tuner
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Qwen3.8-27B-Q4_K_M", size_gb=15.0)
+    model.metadata = {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 65,
+        "qwen35.nextn_predict_layers": 1,
+        "__mtp_scan__": "found",
+    }
+    draft = _fake_model(tmp_path, "Qwen3.8-27B-DFlash2-Q4_K_M", size_gb=1.1)
+    draft.metadata = {
+        "general.architecture": "dflash",
+        "dflash.block_count": 5,
+        "dflash.block_size": 8,
+        "dflash.conv_kernel_size": 2,
+        "dflash.conv_group_size": 16,
+        "dflash.selector_rank": 256,
+        "dflash.selector_top_k": 16,
+    }
+    assert draft.is_dflash2_drafter
+    assert draft.drafter_spec_type == "dflash"
+
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile, draft_model=draft)
+    cmd = build_command(model, cfg, profile, draft_model=draft)
+    assert "draft-dflash" in _spec_tokens(cmd).split(",")
+    depth_index = cmd.index("--spec-draft-n-max")
+    assert cmd[depth_index + 1] == "7"
+    p_min_index = cmd.index("--spec-draft-p-min")
+    assert cmd[p_min_index + 1] == "0.0"
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10590)
+    monkeypatch.setattr(
+        tuner,
+        "_probe_binary_version_output",
+        lambda _binary: "version: 0.2.0-dev (build 10590, commit 6657ded4f)",
+    )
+    allowed, message, detected = tuner.check_draft_model_build(draft, "server")
+    assert not allowed
+    assert detected == 10590
+    assert "PR #27342" in message
+    assert "expected" not in message  # actionable preflight, not raw loader jargon
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10499)
+    monkeypatch.setattr(
+        tuner,
+        "_probe_binary_version_output",
+        lambda _binary: "version: 0.2.0-dev (build 10499, commit 1deefcca3)",
+    )
+    allowed, message, detected = tuner.check_draft_model_build(draft, "server")
+    assert allowed
+    assert message == ""
+    assert detected == 10499
+
+    # A larger numeric build alone is not proof while PR #27342 is still open.
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10600)
+    monkeypatch.setattr(
+        tuner,
+        "_probe_binary_version_output",
+        lambda _binary: "version: 0.2.0-dev (build 10600, commit deadbeef0)",
+    )
+    allowed, message, detected = tuner.check_draft_model_build(draft, "server")
+    assert not allowed
+    assert detected == 10600
+    assert "reviewed DFlash2" in message
+
+
+def test_plain_dflash_uses_block_size_minus_anchor(tmp_path) -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Qwen3.6-27B-Q4_K_M", size_gb=15.0)
+    draft = _fake_model(tmp_path, "Qwen3.6-27B-DFlash-Q4_K_M", size_gb=1.0)
+    draft.metadata = {
+        "general.architecture": "dflash",
+        "dflash.block_size": 16,
+    }
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile, draft_model=draft)
+    cmd = build_command(model, cfg, profile, draft_model=draft)
+    depth_index = cmd.index("--spec-draft-n-max")
+    assert cmd[depth_index + 1] == "15"
 
 
 def test_ngram_disabled_by_default(tmp_path) -> None:
@@ -3082,6 +3209,21 @@ def test_semver_release_build_recipe_resolves_latest_and_preserves_build_number(
     assert "reportedBuild -ne $expectedBuild" in recipe
 
 
+def test_dflash2_build_recipe_pins_reviewed_pr_and_separate_folder() -> None:
+    recipe = (
+        ROOT / "building llama.cpp" / "dflash2_llama_build.txt"
+    ).read_text(encoding="utf-8-sig")
+
+    assert "pull/27342/head" in recipe
+    assert "1deefcca395743049c3820ab8f9b15043f3e9446" in recipe
+    assert "pr27342_dflash2_llama.cpp" in recipe
+    assert "-DGGML_VULKAN=ON" in recipe
+    assert "--target llama-server" in recipe
+    assert "--spec-draft-n-max 7" in recipe
+    assert "git rev-list --count HEAD" in recipe
+    assert "reviewed commit" in recipe.lower()
+
+
 def test_cuda_setup_never_updates_a_stale_versioned_folder_in_place() -> None:
     recipe = (ROOT / "building llama.cpp" / "setup_llamacpp_cuda.ps1").read_text(
         encoding="utf-8-sig"
@@ -3191,6 +3333,42 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
         for name, path in gui_found
     )
     assert all(name != "ocr_cli_only_llama.cpp" for name, _path in gui_found)
+
+
+def test_dflash2_launch_finds_compatible_sibling_build(
+    tmp_path, monkeypatch
+) -> None:
+    import auto_tuner
+
+    regular_root = tmp_path / "b10590_llama.cpp"
+    dflash_root = tmp_path / "pr27342_dflash2_llama.cpp"
+    regular = _fake_llama_server_path(regular_root)
+    dflash = _fake_llama_server_path(dflash_root)
+    _write_fake_server(regular)
+    _write_fake_server(dflash)
+    draft = _fake_model(tmp_path, "Qwen3.8-27B-DFlash2-Q4_K_M", 1.1)
+    draft.metadata = {
+        "general.architecture": "dflash",
+        "dflash.conv_kernel_size": 2,
+        "dflash.conv_group_size": 16,
+        "dflash.selector_rank": 256,
+        "dflash.selector_top_k": 16,
+    }
+
+    monkeypatch.setattr(
+        auto_tuner,
+        "_discover_llama_forks",
+        lambda: [(regular_root.name, regular_root), (dflash_root.name, dflash_root)],
+    )
+
+    def compatibility(_draft, binary):
+        supported = Path(binary).resolve() == dflash.resolve()
+        return supported, "" if supported else "requires PR #27342", 10499
+
+    monkeypatch.setattr(auto_tuner, "check_draft_model_build", compatibility)
+    selected = auto_tuner._find_compatible_draft_server(draft, str(regular))
+    assert selected is not None
+    assert Path(selected).resolve() == dflash.resolve()
 
 
 def test_resolver_distinguishes_between_llama_and_1b_llama(

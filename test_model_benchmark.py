@@ -80,21 +80,77 @@ def test_candidate_generation_is_deterministic_and_valid() -> None:
     assert all(item.batch == batches[0].batch for item in drafts)
 
 
-def test_measurement_payload_is_long_and_decode_heavy_enough() -> None:
+def test_standard_measurement_uses_twelve_and_a_half_percent() -> None:
     runner = _runner()
-    assert runner._target_prompt_tokens(110592) == 27648
+    assert runner._target_prompt_tokens(110592) == 13824
     payload = runner._measurement_payload(110592)
     assert payload["n_predict"] == 256
     assert len(payload["prompt"]) > 20_000
     assert payload["cache_prompt"] is False
 
 
-def test_quick_measurement_uses_twelve_percent_of_context() -> None:
+def test_legacy_quick_measurement_still_accepts_twelve_percent() -> None:
     runner = _runner(BenchmarkLimits(prompt_context_fraction=0.12))
     assert runner._target_prompt_tokens(110592) == 13271
     payload = runner._measurement_payload(110592)
     assert payload["n_predict"] == 256
     assert len(payload["prompt"]) < len(_runner()._measurement_payload(110592)["prompt"])
+
+
+def test_custom_context_fraction_ignores_65k_cap_and_4k_floor() -> None:
+    full = _runner(
+        BenchmarkLimits(
+            prompt_context_fraction=1.0,
+            min_prompt_tokens=1,
+            max_prompt_tokens=None,
+        )
+    )
+    assert full._target_prompt_tokens(110592) == 110208
+    assert full._target_prompt_tokens(110592) > 65536
+
+    tiny = _runner(
+        BenchmarkLimits(
+            prompt_context_fraction=0.0001,
+            min_prompt_tokens=1,
+            max_prompt_tokens=None,
+        )
+    )
+    assert tiny._target_prompt_tokens(110592) == 11
+    assert len(tiny._measurement_payload(110592)["prompt"]) < 1000
+
+
+def test_prompt_is_calibrated_to_real_tokenizer_cap(monkeypatch) -> None:
+    runner = _runner(
+        BenchmarkLimits(
+            prompt_context_fraction=1.0,
+            min_prompt_tokens=1,
+            max_prompt_tokens=1000,
+        )
+    )
+    tokenize_calls = 0
+
+    def fake_request(_port, _method, path, payload=None, **_kwargs):
+        nonlocal tokenize_calls
+        assert path == "/tokenize"
+        tokenize_calls += 1
+        # Deliberately model a tokenizer whose output differs from the text
+        # builder's estimate; calibration must still stay under the real cap.
+        count = max(1, len(str(payload["content"]).split()))
+        return 200, {"tokens": list(range(count))}
+
+    monkeypatch.setattr(runner, "_request_json", fake_request)
+    payload = runner._measurement_payload(32768, port=12345)
+    actual = len(payload["prompt"].split())
+    assert 980 <= actual <= 1000
+    assert tokenize_calls >= 2
+    # Every candidate in the same runner gets byte-identical cached text and
+    # does not repeat the potentially large /tokenize response.
+    again = runner._measurement_payload(32768, port=23456)
+    assert again["prompt"] == payload["prompt"]
+    assert tokenize_calls >= 2
+    cached_calls = tokenize_calls
+    runner._measurement_payload(32768, port=34567)
+    assert tokenize_calls == cached_calls
 
 
 def test_parse_timing_payload_supports_current_llama_fields() -> None:
@@ -161,6 +217,50 @@ def test_staged_search_is_bounded_and_combines_best_axes(monkeypatch) -> None:
     )
     assert result.runtime_build == 10572
     assert result.score(result.winner) > 1.03
+
+
+def test_draft_depth_sweep_continues_until_first_decode_regression(
+    monkeypatch,
+) -> None:
+    limits = BenchmarkLimits(
+        max_candidates=1,
+        confirmation_runs=0,
+        samples_per_candidate=2,
+        total_timeout_s=60,
+        max_draft_tokens=10,
+    )
+    runner = BenchmarkRunner(
+        model=SimpleNamespace(path=Path("model.gguf")),
+        profile=SimpleNamespace(draft_max=2),
+        base_config=_config(),
+        runtime_binary="llama-server",
+        physical_cores=8,
+        logical_cores=16,
+        enable_speculative=True,
+        tune_draft_n_max=True,
+        limits=limits,
+    )
+    calls: list[int] = []
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        depth = candidate.draft_n_max
+        calls.append(depth)
+        decode = float(depth * 10 if depth <= 7 else 60 - (depth - 8) * 10)
+        return _measured(candidate, 100.0, decode)
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: 10590
+    )
+    result = runner.run()
+
+    # Baseline/profile depth 2 is reused; every increasing value is measured,
+    # including the user-reported 5 -> 6 -> 7 progression. Depth 8 regresses,
+    # so 9 and 10 must never launch.
+    assert calls == [2, 1, 3, 4, 5, 6, 7, 8]
+    assert 7 in [item.candidate.draft_n_max for item in result.candidates]
+    assert 8 in [item.candidate.draft_n_max for item in result.candidates]
+    assert 9 not in calls
 
 
 def test_search_keeps_baseline_for_immaterial_gain(monkeypatch) -> None:
@@ -234,6 +334,83 @@ def test_suite_continues_after_bounded_model_failure(monkeypatch) -> None:
     assert len(result.failed) == 1
     assert result.failed[0].error == "OOM"
     assert len(result.successful) == 1
+
+
+def test_suite_stop_after_mode_checkpoints_current_job(monkeypatch) -> None:
+    first = _runner()
+    second = _runner()
+    checkpointed: list[str] = []
+    suite = BenchmarkSuiteRunner(
+        [
+            BenchmarkSuiteJob(
+                "model-a::safe",
+                "A [safe]",
+                "safe",
+                first,
+                metadata={"model_key": "model-a"},
+            ),
+            BenchmarkSuiteJob(
+                "model-a::balanced",
+                "A [balanced]",
+                "balanced",
+                second,
+                metadata={"model_key": "model-a"},
+            ),
+        ],
+        checkpoint=lambda outcome: checkpointed.append(outcome.job.key),
+    )
+
+    def first_run():
+        suite.stop_after_performance_mode()
+        return SimpleNamespace(name="first")
+
+    monkeypatch.setattr(first, "run", first_run)
+    monkeypatch.setattr(second, "run", lambda: SimpleNamespace(name="second"))
+    result = suite.run()
+    assert [item.job.key for item in result.jobs] == ["model-a::safe"]
+    assert checkpointed == ["model-a::safe"]
+    assert result.stopped_early
+    assert "performance mode" in result.stop_reason
+
+
+def test_suite_stop_after_model_finishes_remaining_modes(monkeypatch) -> None:
+    first = _runner()
+    second = _runner()
+    third = _runner()
+    checkpointed: list[str] = []
+    suite = BenchmarkSuiteRunner(
+        [
+            BenchmarkSuiteJob(
+                "model-a::safe", "A [safe]", "safe", first,
+                metadata={"model_key": "model-a"},
+            ),
+            BenchmarkSuiteJob(
+                "model-a::throughput", "A [throughput]", "throughput", second,
+                metadata={"model_key": "model-a"},
+            ),
+            BenchmarkSuiteJob(
+                "model-b::safe", "B [safe]", "safe", third,
+                metadata={"model_key": "model-b"},
+            ),
+        ],
+        checkpoint=lambda outcome: checkpointed.append(outcome.job.key),
+    )
+
+    def first_run():
+        suite.stop_after_model()
+        return SimpleNamespace(name="first")
+
+    monkeypatch.setattr(first, "run", first_run)
+    monkeypatch.setattr(second, "run", lambda: SimpleNamespace(name="second"))
+    monkeypatch.setattr(third, "run", lambda: SimpleNamespace(name="third"))
+    result = suite.run()
+    assert [item.job.key for item in result.jobs] == [
+        "model-a::safe",
+        "model-a::throughput",
+    ]
+    assert checkpointed == ["model-a::safe", "model-a::throughput"]
+    assert result.stopped_early
+    assert "completed model" in result.stop_reason
 
 
 def test_benchmark_snapshot_reapplies_measured_runtime_values() -> None:
@@ -352,6 +529,47 @@ def test_quick_and_normal_results_are_retained_separately(
     assert app_settings.get_performance_tuning_result(
         model, "balanced", "quick"
     )["winner_id"] == "quick-winner"
+
+
+def test_custom_performance_result_round_trips_without_65k_cap(
+    tmp_path, monkeypatch
+) -> None:
+    active_settings = [tmp_path / "settings.json"]
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: active_settings[0])
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"custom-model")
+    snapshot = {"mode": "auto", "values": {"ctx": 262144}}
+    record = {
+        "model_name": "model",
+        "model_path": str(model),
+        "model_size": model.stat().st_size,
+        "performance_target": "throughput",
+        "benchmark_type": "custom",
+        "prompt_context_fraction": 0.875,
+        "prompt_token_cap": None,
+        "winner_id": "custom-winner",
+    }
+    assert app_settings.save_performance_tuning_result(
+        "model", model, record, snapshot, "throughput", "custom"
+    )
+    grouped = app_settings.list_performance_run_results()
+    assert grouped["custom"][0]["winner_id"] == "custom-winner"
+    assert grouped["custom"][0]["prompt_token_cap"] is None
+
+    bundle = tmp_path / "profiles.json"
+    ok, message, count = app_settings.export_performance_profiles(bundle)
+    assert ok, message
+    assert count == 1
+    active_settings[0] = tmp_path / "imported.json"
+    ok, message, count = app_settings.import_performance_profiles(bundle, [model])
+    assert ok, message
+    assert count == 1
+    restored = app_settings.get_performance_tuning_result(
+        model, "throughput", "custom"
+    )
+    assert restored is not None
+    assert restored["prompt_context_fraction"] == pytest.approx(0.875)
+    assert restored["prompt_token_cap"] is None
 
 
 def test_performance_profile_export_import_maps_moved_model(

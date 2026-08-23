@@ -348,6 +348,12 @@ _MIN_DISTINCT_MLOCK_BUILD = 10151
 # DSpark landed in b10164. Older binaries advertise --spec-type but reject
 # the new enum value, so ordinary flag-name probing cannot catch this case.
 _MIN_DSPARK_BUILD = 10164
+# DFlash2 is still supplied by upstream PR #27342 at stock llama.cpp b10590.
+# These are the reviewed support commits currently published by that PR.
+# Unknown stock commits stay blocked until upstream actually merges the graph;
+# guessing from a newer build number would recreate the opaque 81-vs-58 crash.
+_DFLASH2_PR_COMMITS = ("5ecbe1ac", "1deefcca")
+_MAX_AUDITED_STOCK_BUILD_WITHOUT_DFLASH2 = 10591
 
 
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
@@ -366,11 +372,23 @@ def _parse_llama_build_number(version_output: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _parse_llama_commit(version_output: str) -> Optional[str]:
+    """Return the hexadecimal commit token from current/legacy banners."""
+    output = version_output or ""
+    match = re.search(r"(?i)\bcommit\s+([0-9a-f]{7,40})\b", output)
+    if match is None:
+        # Legacy banners used ``version: N (abcdef123)`` without the word
+        # "commit". Anchor this fallback to the version line so compiler or
+        # backend hashes elsewhere in the output are never mistaken for it.
+        match = re.search(r"(?im)^\s*version:[^\r\n]*?\(([0-9a-f]{7,40})\)\s*$", output)
+    return match.group(1).lower() if match else None
+
+
 @lru_cache(maxsize=32)
-def _probe_build_number_cached(
+def _probe_version_output_cached(
     binary_path: str, mtime_ns: int, size: int
-) -> Optional[int]:
-    """Return the numeric llama.cpp build reported by ``--version``."""
+) -> Optional[str]:
+    """Return the selected binary's bounded ``--version`` output."""
     del mtime_ns, size  # cache key only; values are intentionally unused
     kwargs: Dict[str, Any] = {}
     if os.name == "nt":
@@ -387,7 +405,28 @@ def _probe_build_number_cached(
         )
     except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
         return None
-    return _parse_llama_build_number(cp.stdout or "")
+    return (cp.stdout or "")[:4096]
+
+
+@lru_cache(maxsize=32)
+def _probe_build_number_cached(
+    binary_path: str, mtime_ns: int, size: int
+) -> Optional[int]:
+    """Return the numeric llama.cpp build reported by ``--version``."""
+    return _parse_llama_build_number(
+        _probe_version_output_cached(binary_path, mtime_ns, size) or ""
+    )
+
+
+def _probe_binary_version_output(binary: str) -> Optional[str]:
+    resolved = _resolve_probe_binary(binary)
+    if not resolved:
+        return None
+    try:
+        st = Path(resolved).stat()
+        return _probe_version_output_cached(resolved, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 def _probe_binary_build_number(binary: str) -> Optional[int]:
@@ -437,6 +476,81 @@ def check_profile_build(
             detected,
         )
     return True, "", detected
+
+
+def resolve_draft_n_max(
+    profile: ModelProfile,
+    draft_model: Optional[ModelEntry] = None,
+    forced: Optional[int] = None,
+) -> int:
+    """Resolve an effective speculative depth from override/model/profile.
+
+    DFlash checkpoints train a fixed noise block.  llama.cpp's documented
+    value is one less than ``dflash.block_size`` because the block includes
+    the anchor token (for Qwen3.8 DFlash2: 8 -> ``n-max 7``).  Falling back to
+    Qwen3.8's generic MTP profile value of 2 both wastes the DFlash2 head and
+    hits known early-PR loader paths.  Explicit Expert/benchmark overrides
+    remain authoritative.
+    """
+    if forced is not None and int(forced) > 0:
+        return max(1, int(forced))
+    if draft_model is not None and draft_model.drafter_spec_type == "dflash":
+        try:
+            block_size = int(
+                (draft_model.metadata or {}).get("dflash.block_size", 0) or 0
+            )
+        except (TypeError, ValueError):
+            block_size = 0
+        if block_size > 1:
+            return block_size - 1
+    return max(1, int(getattr(profile, "draft_max", 0) or 2))
+
+
+def check_draft_model_build(
+    draft_model: Optional[ModelEntry], binary: str
+) -> Tuple[bool, str, Optional[int]]:
+    """Preflight draft formats whose support is not visible in ``--help``.
+
+    DFlash2 intentionally reuses the ``dflash`` architecture and
+    ``draft-dflash`` enum, so stock b10590 advertises the right CLI while its
+    loader still instantiates the older 58-tensor graph.  The published
+    Qwen3.8 sidecar contains 81 tensors and then aborts with the otherwise
+    opaque ``expected 81, got 58`` error.  Accept the reviewed PR commits,
+    reject the known stock builds, and retain the normal warning-only policy
+    for wrappers whose version cannot be inspected.
+    """
+    if draft_model is None or not draft_model.is_dflash2_drafter:
+        return True, "", None
+
+    detected = probe_binary_build_number(binary)
+    version_output = _probe_binary_version_output(binary) or ""
+    commit = _parse_llama_commit(version_output)
+    if commit and any(commit.startswith(item) for item in _DFLASH2_PR_COMMITS):
+        return True, "", detected
+    if "dflash2" in version_output.casefold():
+        return True, "", detected
+    if detected is None:
+        return (
+            True,
+            "Could not verify DFlash2 support in the selected llama.cpp binary. "
+            "Qwen3.8 DFlash2 requires upstream PR #27342 (stock b10590 does "
+            "not contain its 81-tensor loader).",
+            None,
+        )
+    commit_label = f" ({commit})" if commit else ""
+    audited_label = (
+        "only creates the older 58-tensor DFlash graph"
+        if detected <= _MAX_AUDITED_STOCK_BUILD_WITHOUT_DFLASH2
+        else "does not advertise a reviewed DFlash2 implementation"
+    )
+    return (
+        False,
+        "Qwen3.8 DFlash2 requires llama.cpp PR #27342; selected "
+        f"b{detected}{commit_label} {audited_label} and cannot be trusted to "
+        "load this 81-tensor sidecar. Select a reviewed DFlash2/PR-27342 "
+        "build, or choose the model's embedded MTP head.",
+        detected,
+    )
 
 
 def _memlock_limit_gb() -> Optional[float]:
@@ -2276,11 +2390,7 @@ def compute_config(
     # common_params_speculative::need_n_rs_seq explicitly excludes n-gram
     # methods, so draftless n-gram does not reserve snapshots here.
     has_state_snapshots = bool(draft_model is not None or model.has_embedded_mtp)
-    resolved_draft_n_max = (
-        max(1, int(force_draft_n_max))
-        if force_draft_n_max is not None and int(force_draft_n_max) > 0
-        else max(1, int(getattr(profile, "draft_max", 0) or 2))
-    )
+    resolved_draft_n_max = resolve_draft_n_max(profile, draft_model, force_draft_n_max)
     snapshot_count = resolved_draft_n_max if has_state_snapshots else 0
     recurrent_state_total_gb = recurrent_state_gb_from_metadata(
         model.metadata,
@@ -4339,12 +4449,21 @@ def build_command(
     #   - n-gram (Path C) loads no model at all → always compatible.
     # Precedence for --spec-draft-n-max: Expert-panel override (config,
     # 0 = unset) → YAML profile draft_max → 2.
-    draft_val = (
-        int(getattr(config, "draft_n_max", 0) or 0)
-        or getattr(profile, "draft_max", 0)
-        or 2
+    draft_val = resolve_draft_n_max(
+        profile,
+        draft_model,
+        int(getattr(config, "draft_n_max", 0) or 0) or None,
     )
-    draft_p_min = getattr(profile, "draft_p_min", 0.75) or 0.75
+    # Qwen3.8's profile p-min=0.75 is calibrated for its embedded MTP head.
+    # DFlash2's candidate selector already performs its own lattice pruning;
+    # the model author's PR #27342 command intentionally uses the upstream
+    # p-min=0.0 default. Keep that path explicit so a shared target profile
+    # cannot accidentally apply MTP confidence tuning to the external drafter.
+    draft_p_min = (
+        0.0
+        if draft_model is not None and draft_model.is_dflash2_drafter
+        else float(getattr(profile, "draft_p_min", 0.75) or 0.75)
+    )
     vision_loaded = model.mmproj is not None
     # Path A gating with vision: allow -md alongside --mmproj only when the
     # selected binary advertises --spec-type (the new spec system, whose

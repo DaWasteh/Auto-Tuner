@@ -37,6 +37,7 @@ from tuner import (
     check_profile_build,
     prepare_command_for_binary,
     probe_binary_build_number,
+    resolve_draft_n_max,
 )
 
 
@@ -60,8 +61,15 @@ class BenchmarkLimits:
     total_timeout_s: float = 7200.0
     generated_tokens: int = 256
     min_prompt_tokens: int = 4096
-    max_prompt_tokens: int = 65536
-    prompt_context_fraction: float = 0.25
+    # ``None`` deliberately means uncapped. The standard 12.5% workload keeps
+    # the 65,536-token guard; a user-selected custom percentage is allowed to
+    # exercise the full requested fraction of context.
+    max_prompt_tokens: Optional[int] = 65536
+    prompt_context_fraction: float = 0.125
+    # Speculative depth is explored sequentially until decode speed regresses.
+    # This high safety ceiling replaces the old hard stop at n-max 8; trained
+    # fixed-block drafters (DFlash/DFlash2) tighten it from GGUF metadata.
+    max_draft_tokens: int = 64
     min_improvement: float = 0.03
     max_sample_spread: float = 0.35
 
@@ -327,17 +335,14 @@ def batch_candidates(seed: BenchmarkCandidate) -> List[BenchmarkCandidate]:
 
 
 def draft_candidates(
-    seed: BenchmarkCandidate, *, maximum: int
+    seed: BenchmarkCandidate, *, maximum: int, minimum: int = 1
 ) -> List[BenchmarkCandidate]:
-    """Return bounded speculative draft depths around the current winner."""
-    upper = max(1, min(8, int(maximum)))
-    values = list(range(1, min(4, upper) + 1))
-    for value in (6, 8):
-        if value <= upper:
-            values.append(value)
+    """Return every increasing draft depth in the requested safe interval."""
+    lower = max(1, int(minimum))
+    upper = max(lower, int(maximum))
     out: List[BenchmarkCandidate] = []
     seen = {_candidate_key(seed)}
-    for draft_n_max in values:
+    for draft_n_max in range(lower, upper + 1):
         item = BenchmarkCandidate(
             id=f"draft-{draft_n_max}-t{seed.threads}-b{seed.batch}-{seed.ubatch}",
             label=f"MTP/draft n-max {draft_n_max}",
@@ -433,10 +438,12 @@ def _fixed_prompt(target_tokens: int) -> str:
     # Numbered records keep tokenisation stable across BPE/SPM families while
     # avoiding the old 24-word loop that made n-gram speculation unrealistically
     # easy. The response's prompt_n remains the authoritative measured count.
+    # A single record is the practical floor for very small custom percentages;
+    # do not silently inflate those runs back to the old 4k-token minimum.
     lines: List[str] = []
     estimated = 0
     index = 0
-    while estimated < max(64, int(target_tokens)):
+    while estimated < max(1, int(target_tokens)):
         checksum = (index * 2654435761) & 0xFFFFFFFF
         lines.append(
             f"Record {index:05d}: validate worker_{index % 97}(input_{index % 53}) "
@@ -492,8 +499,43 @@ class BenchmarkRunner:
         self._active_connection: Optional[http.client.HTTPConnection] = None
         self._connection_lock = threading.Lock()
         self._completed_runs = 0
-        self._total_runs = self.limits.max_candidates + self.limits.confirmation_runs
+        self._calibrated_prompt: Optional[str] = None
+        self._calibrated_prompt_target = 0
+        self._calibrated_prompt_tokens = 0
+        self._draft_depth_min, self._draft_depth_max = self._draft_depth_bounds()
+        draft_runs = (
+            self._draft_depth_max - self._draft_depth_min + 1
+            if self.tune_draft_n_max
+            else 0
+        )
+        self._total_runs = (
+            self.limits.max_candidates
+            + self.limits.confirmation_runs
+            + max(0, draft_runs)
+        )
         self._deadline = 0.0
+
+    def _draft_depth_bounds(self) -> Tuple[int, int]:
+        """Return safe sequential sweep bounds for this drafter format."""
+        lower = 1
+        upper = max(1, int(self.limits.max_draft_tokens))
+        draft = self.draft_model
+        if draft is not None and draft.drafter_spec_type == "dflash":
+            try:
+                block_size = int(
+                    (draft.metadata or {}).get("dflash.block_size", 0) or 0
+                )
+            except (TypeError, ValueError):
+                block_size = 0
+            if block_size > 1:
+                # The anchor occupies one position in the trained block.
+                upper = min(upper, block_size - 1)
+            if draft.is_dflash2_drafter:
+                # PR #27342's Qwen3.8 lattice is valid/measured at 5, 6, 7;
+                # smaller values hit an early loader/shape path and cannot
+                # answer the user's requested 5 -> 6 -> 7 progression.
+                lower = min(upper, 5)
+        return lower, max(lower, upper)
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -606,17 +648,92 @@ class BenchmarkRunner:
         )
 
     def _target_prompt_tokens(self, context: int) -> int:
-        """Use a meaningful portion of context while keeping sweeps bounded."""
+        """Use the selected context fraction and only its applicable bounds."""
         generated = max(1, int(self.limits.generated_tokens))
-        available = max(128, int(context) - generated - 128)
-        proportional = int(max(0, context) * self.limits.prompt_context_fraction)
-        requested = max(self.limits.min_prompt_tokens, proportional)
-        return max(128, min(self.limits.max_prompt_tokens, requested, available))
+        available = max(1, int(context) - generated - 128)
+        proportional = max(
+            1, int(max(0, context) * self.limits.prompt_context_fraction)
+        )
+        requested = max(1, int(self.limits.min_prompt_tokens), proportional)
+        cap = self.limits.max_prompt_tokens
+        if cap is not None and int(cap) > 0:
+            requested = min(requested, int(cap))
+        return max(1, min(requested, available))
 
-    def _measurement_payload(self, context: int) -> dict:
+    def _prompt_for_server(self, port: int, target_tokens: int) -> str:
+        """Calibrate deterministic text against this model's real tokenizer.
+
+        The old fixed-text heuristic underestimated Qwen token counts by about
+        1.6x, so a nominal 65k cap could actually submit >100k tokens and a
+        Custom 100% run could overflow context. ``/tokenize`` is excluded from
+        timings and needed only once per runner; every later candidate reuses
+        the exact same calibrated prompt.
+        """
+        target = max(1, int(target_tokens))
+        if (
+            self._calibrated_prompt is not None
+            and self._calibrated_prompt_target == target
+        ):
+            return self._calibrated_prompt
+
+        estimate = target
+        best_prompt: Optional[str] = None
+        best_count = 0
+        last_prompt = _fixed_prompt(estimate)
+        try:
+            for _attempt in range(5):
+                last_prompt = _fixed_prompt(estimate)
+                _status, tokenized = self._request_json(
+                    port,
+                    "POST",
+                    "/tokenize",
+                    {
+                        "content": last_prompt,
+                        "add_special": False,
+                        "parse_special": True,
+                        "with_pieces": False,
+                    },
+                )
+                tokens = tokenized.get("tokens")
+                if not isinstance(tokens, list) or not tokens:
+                    raise BenchmarkFailure("llama-server /tokenize returned no tokens")
+                count = len(tokens)
+                if count <= target and count > best_count:
+                    best_prompt, best_count = last_prompt, count
+                if count <= target and count >= max(1, int(target * 0.98)):
+                    best_prompt, best_count = last_prompt, count
+                    break
+                scaled = max(1, int(estimate * target / max(1, count) * 0.99))
+                if scaled == estimate:
+                    scaled = max(1, estimate - 1 if count > target else estimate + 1)
+                estimate = scaled
+        except BenchmarkFailure as exc:
+            # Very old/forked servers may not expose /tokenize. Keep the test
+            # runnable with a conservative fallback rather than restoring the
+            # known 1.6x overshoot.
+            self._emit(f"Prompt tokenizer calibration unavailable ({exc}); using fallback")
+            best_prompt = _fixed_prompt(max(1, int(target * 0.55)))
+            best_count = 0
+
+        if best_prompt is None:
+            # Tiny percentages can be below one practical record. Use that
+            # minimum rather than failing preparation; the measured prompt_n
+            # remains authoritative in the saved result.
+            best_prompt = last_prompt
+        self._calibrated_prompt = best_prompt
+        self._calibrated_prompt_target = target
+        self._calibrated_prompt_tokens = best_count
+        return best_prompt
+
+    def _measurement_payload(self, context: int, *, port: Optional[int] = None) -> dict:
         target_prompt = self._target_prompt_tokens(context)
+        prompt = (
+            self._prompt_for_server(port, target_prompt)
+            if port is not None
+            else _fixed_prompt(target_prompt)
+        )
         return {
-            "prompt": _fixed_prompt(target_prompt),
+            "prompt": prompt,
             "n_predict": self.limits.generated_tokens,
             "temperature": 0.0,
             "top_k": 1,
@@ -678,7 +795,7 @@ class BenchmarkRunner:
                 },
             )
             target_prompt_tokens = self._target_prompt_tokens(cfg.ctx)
-            payload = self._measurement_payload(cfg.ctx)
+            payload = self._measurement_payload(cfg.ctx, port=port)
             for _index in range(self.limits.samples_per_candidate):
                 self._check_cancelled()
                 started = time.monotonic()
@@ -690,7 +807,7 @@ class BenchmarkRunner:
                     parse_timing_payload(
                         response,
                         elapsed,
-                        min_prompt_tokens=max(64, int(target_prompt_tokens * 0.50)),
+                        min_prompt_tokens=max(1, int(target_prompt_tokens * 0.50)),
                         min_generated_tokens=max(
                             32, int(self.limits.generated_tokens * 0.80)
                         ),
@@ -771,13 +888,10 @@ class BenchmarkRunner:
 
         effective_draft_n_max: Optional[int] = None
         if self.enable_speculative:
-            effective_draft_n_max = max(
-                1,
-                int(
-                    self.base_config.draft_n_max
-                    or getattr(self.profile, "draft_max", 0)
-                    or 2
-                ),
+            effective_draft_n_max = resolve_draft_n_max(
+                self.profile,
+                self.draft_model,
+                int(self.base_config.draft_n_max or 0) or None,
             )
         baseline_spec = baseline_candidate(
             self.base_config, effective_draft_n_max=effective_draft_n_max
@@ -832,37 +946,66 @@ class BenchmarkRunner:
             by_id[candidate.id] = measured
             seen.add(_candidate_key(candidate))
 
-        # Stage 3 (optional): retain the best runtime axes and measure actual
-        # speculative rollback depths. This is deliberately opt-in because it
-        # adds several full model reloads and is useful only with MTP/draft.
-        if self.tune_draft_n_max and len(results) < self.limits.max_candidates:
-            best_runtime = self._rank(results, baseline)[0].candidate
-            profile_depth = max(
-                1,
-                int(
-                    best_runtime.draft_n_max
-                    or getattr(self.profile, "draft_max", 0)
-                    or 2
-                ),
-            )
-            maximum_depth = min(8, max(4, profile_depth * 2))
-            for candidate in draft_candidates(
-                best_runtime, maximum=maximum_depth
-            ):
-                if len(results) >= self.limits.max_candidates:
-                    break
-                if _candidate_key(candidate) in seen:
-                    continue
+        # Stage 3 (optional): retain the best runtime axes and increase draft
+        # depth one token at a time until decode speed regresses. The old fixed
+        # [1, 3, 4, 6, 8] list could stop at 6 even when 7 was still faster.
+        # Draft exploration now has its own bounded budget instead of competing
+        # with CPU/batch candidates for ``max_candidates`` slots.
+        if self.tune_draft_n_max:
+            best_runtime_result = self._rank(results, baseline)[0]
+            best_runtime = best_runtime_result.candidate
+            depth_candidates = {
+                item.draft_n_max: item
+                for item in draft_candidates(
+                    best_runtime,
+                    minimum=self._draft_depth_min,
+                    maximum=self._draft_depth_max,
+                )
+            }
+            previous_depth_result: Optional[CandidateResult] = None
+            for depth in range(self._draft_depth_min, self._draft_depth_max + 1):
                 self._check_cancelled()
-                try:
-                    measured = self._run_candidate(candidate)
-                except BenchmarkCancelled:
-                    raise
-                except BenchmarkFailure as exc:
-                    measured = CandidateResult(candidate=candidate, error=str(exc))
-                results.append(measured)
-                by_id[candidate.id] = measured
-                seen.add(_candidate_key(candidate))
+                if depth == best_runtime.draft_n_max:
+                    measured = best_runtime_result
+                else:
+                    candidate = depth_candidates[depth]
+                    if _candidate_key(candidate) in seen:
+                        measured = next(
+                            item
+                            for item in results
+                            if _candidate_key(item.candidate)
+                            == _candidate_key(candidate)
+                        )
+                    else:
+                        try:
+                            measured = self._run_candidate(candidate)
+                        except BenchmarkCancelled:
+                            raise
+                        except BenchmarkFailure as exc:
+                            measured = CandidateResult(
+                                candidate=candidate, error=str(exc)
+                            )
+                        results.append(measured)
+                        by_id[candidate.id] = measured
+                        seen.add(_candidate_key(candidate))
+
+                if not measured.valid:
+                    # A depth the backend cannot run is a hard boundary; larger
+                    # depths are not useful/safe to probe automatically.
+                    break
+                if (
+                    previous_depth_result is not None
+                    and measured.generation_tps
+                    < previous_depth_result.generation_tps
+                ):
+                    self._emit(
+                        "Draft-depth regression: "
+                        f"n-max {depth} ({measured.generation_tps:.2f} tok/s) < "
+                        f"n-max {previous_depth_result.candidate.draft_n_max} "
+                        f"({previous_depth_result.generation_tps:.2f} tok/s); stopping"
+                    )
+                    break
+                previous_depth_result = measured
 
         ranked = self._rank(results, baseline)
         finalists = ranked[: min(2, self.limits.confirmation_runs, len(ranked))]
@@ -950,6 +1093,12 @@ class BenchmarkSuiteJobResult:
 class BenchmarkSuiteResult:
     jobs: List[BenchmarkSuiteJobResult]
     elapsed_s: float
+    planned_jobs: int = 0
+    stop_reason: str = ""
+
+    @property
+    def stopped_early(self) -> bool:
+        return bool(self.stop_reason)
 
     @property
     def successful(self) -> List[BenchmarkSuiteJobResult]:
@@ -968,16 +1117,36 @@ class BenchmarkSuiteRunner:
         jobs: Sequence[BenchmarkSuiteJob],
         *,
         progress: Optional[ProgressCallback] = None,
+        checkpoint: Optional[Callable[[BenchmarkSuiteJobResult], None]] = None,
     ) -> None:
         self.jobs = list(jobs)
         self.progress = progress or (lambda _done, _total, _message: None)
+        self.checkpoint = checkpoint
         self._cancel = threading.Event()
+        self._stop_after_mode = threading.Event()
+        self._stop_after_model = threading.Event()
         self._active: Optional[BenchmarkRunner] = None
 
     def cancel(self) -> None:
         self._cancel.set()
         if self._active is not None:
             self._active.cancel()
+
+    def stop_after_performance_mode(self) -> None:
+        """Finish the active model/mode job, then return partial results."""
+        self._stop_after_mode.set()
+
+    def stop_after_model(self) -> None:
+        """Finish every remaining mode for the active model, then stop."""
+        self._stop_after_model.set()
+
+    @staticmethod
+    def _job_model_key(job: BenchmarkSuiteJob) -> str:
+        value = job.metadata.get("model_key") or job.metadata.get("model_path")
+        if value:
+            return str(value)
+        # Backward-compatible fallback for callers that predate model metadata.
+        return str(job.key).rsplit("::", 1)[0]
 
     def run(self) -> BenchmarkSuiteResult:
         if not self.jobs:
@@ -986,9 +1155,21 @@ class BenchmarkSuiteRunner:
         total = sum(max(1, job.runner._total_runs) for job in self.jobs)
         completed = 0
         outcomes: List[BenchmarkSuiteJobResult] = []
+        stop_reason = ""
         for index, job in enumerate(self.jobs, start=1):
             if self._cancel.is_set():
                 raise BenchmarkCancelled("Performance tuning cancelled")
+            if outcomes and self._stop_after_mode.is_set():
+                stop_reason = "Stopped after the completed performance mode."
+                break
+            if (
+                outcomes
+                and self._stop_after_model.is_set()
+                and self._job_model_key(job)
+                != self._job_model_key(outcomes[-1].job)
+            ):
+                stop_reason = "Stopped after all modes for the completed model."
+                break
             allocation = max(1, job.runner._total_runs)
             prefix = f"[{index}/{len(self.jobs)}] {job.label}"
 
@@ -1002,13 +1183,16 @@ class BenchmarkSuiteRunner:
             job.runner.progress = relay
             self.progress(completed, total, f"{prefix}: preparing")
             self._active = job.runner
+            outcome: Optional[BenchmarkSuiteJobResult] = None
             try:
                 result = job.runner.run()
-                outcomes.append(BenchmarkSuiteJobResult(job=job, result=result))
+                outcome = BenchmarkSuiteJobResult(job=job, result=result)
+                outcomes.append(outcome)
             except BenchmarkCancelled:
                 raise
             except BenchmarkFailure as exc:
-                outcomes.append(BenchmarkSuiteJobResult(job=job, error=str(exc)))
+                outcome = BenchmarkSuiteJobResult(job=job, error=str(exc))
+                outcomes.append(outcome)
             finally:
                 self._active = None
                 completed += allocation
@@ -1017,7 +1201,13 @@ class BenchmarkSuiteRunner:
                     total,
                     f"{prefix}: complete",
                 )
+            # Persist synchronously before another model/mode can start. This
+            # is the crash/power-loss boundary promised by the GUI.
+            if outcome is not None and self.checkpoint is not None:
+                self.checkpoint(outcome)
         return BenchmarkSuiteResult(
             jobs=outcomes,
             elapsed_s=time.monotonic() - started,
+            planned_jobs=len(self.jobs),
+            stop_reason=stop_reason,
         )
