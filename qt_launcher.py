@@ -53,6 +53,7 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QIcon,
     QMouseEvent,
+    QStandardItemModel,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -141,6 +142,7 @@ from ocr_workflow import (
 from autotuner_version import VERSION, GITHUB_REPO, USER_AGENT
 from model_benchmark import (
     BenchmarkCancelled,
+    BenchmarkCandidate,
     BenchmarkFailure,
     BenchmarkLimits,
     BenchmarkResult,
@@ -149,7 +151,10 @@ from model_benchmark import (
     BenchmarkSuiteJobResult,
     BenchmarkSuiteResult,
     BenchmarkSuiteRunner,
+    baseline_candidate,
+    shortlist_candidates_from_record,
 )
+from performance_report import write_performance_report
 from theme_dialog import ThemeEditorDialog
 from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
 
@@ -1149,10 +1154,10 @@ class _PerformanceTuneSetupDialog(QDialog):
 
         intro = QLabel(
             f"Tune <b>{escape(model_name)}</b>. Every selected performance mode "
-            "gets its own saved profile. The standard workload uses 12.5% of "
-            "context (capped at 65,536 prompt tokens); Custom accepts 0.01–100% "
-            "without that cap. Both use a 256-token n_decode window and report "
-            "native llama.cpp timings."
+            "gets its own saved Perform profile. Quick pass uses at most 3.125% "
+            "context and a 128-token decode window with a shared 20-minute-per-model "
+            "budget. Standard uses 12.5% (capped at 65,536 prompt tokens); Custom "
+            "accepts 0.01–100% without that cap."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1168,13 +1173,17 @@ class _PerformanceTuneSetupDialog(QDialog):
         context_layout.addWidget(self.context_spin, 0, 1)
         context_layout.addWidget(QLabel("Test workload:"), 1, 0)
         self.test_length_combo = QComboBox()
+        self.test_length_combo.addItem(
+            "Quick pass — ≤3.125% context (recommended)", "fast"
+        )
         self.test_length_combo.addItem("Standard test — 12.5% context", "quick")
         self.test_length_combo.addItem("Custom context percentage", "custom")
         self.test_length_combo.setToolTip(
             _setting_tooltip(
-                "Standard uses 12.5%; Custom uses the exact percentage below.",
-                "Both variants run the same candidate search and request 256 decode "
-                "tokens. The 65,536 prompt-token cap applies only to Standard. "
+                "Quick pass is the default short search; Standard validates the "
+                "12.5% workload; Custom uses the exact percentage below.",
+                "Quick pass uses at most 16,384 prompt tokens, 128 decode tokens, "
+                "and a 20-minute model budget. Standard uses a 65,536 prompt cap. "
                 "Custom values from 0.01% through 100% deliberately ignore it.",
             )
         )
@@ -1193,9 +1202,7 @@ class _PerformanceTuneSetupDialog(QDialog):
         )
         context_layout.addWidget(self.custom_percent_spin, 2, 1)
         self.test_length_combo.currentIndexChanged.connect(
-            lambda _index: self.custom_percent_spin.setEnabled(
-                self.benchmark_type() == "custom"
-            )
+            self._update_test_option_states
         )
         self.real_validation = QCheckBox(
             "Try the exact requested context in the isolated test server"
@@ -1228,11 +1235,34 @@ class _PerformanceTuneSetupDialog(QDialog):
         self.tune_mtp = QCheckBox("Tune MTP/draft n-max (adds draft-depth runs)")
         self.tune_mtp.setChecked(False)
         scope_layout.addWidget(self.tune_mtp)
+        self.test_external_drafters = QCheckBox(
+            "Test every compatible external drafter (Q4/Q8/BF16 etc.)"
+        )
+        self.test_external_drafters.setChecked(False)
+        self.test_external_drafters.setEnabled(False)
+        self.tune_mtp.toggled.connect(self.test_external_drafters.setEnabled)
+        scope_layout.addWidget(self.test_external_drafters)
+        self.try_best_settings = QCheckBox(
+            "Try only best Settings from a stable Quick pass"
+        )
+        self.try_best_settings.setChecked(False)
+        self.try_best_settings.setEnabled(False)
+        self.try_best_settings.setToolTip(
+            "Opt-in conservative shortlist: baseline, top finalists, and thread/batch "
+            "representatives are remeasured at the full workload. Missing, noisy, or "
+            "single-sample Quick evidence automatically falls back to the full search."
+        )
+        scope_layout.addWidget(self.try_best_settings)
         self.all_models = QCheckBox(
             f"Run all benchmarkable scanned models ({max(1, model_count)} found)"
         )
         self.all_models.setChecked(False)
         scope_layout.addWidget(self.all_models)
+        self.rerun_all_models = QCheckBox("Rerun all Models (including completed runs)")
+        self.rerun_all_models.setChecked(False)
+        self.rerun_all_models.setEnabled(False)
+        self.all_models.toggled.connect(self.rerun_all_models.setEnabled)
+        scope_layout.addWidget(self.rerun_all_models)
         warning = QLabel(
             "All modes or all models can require many model reloads. Runs are "
             "strictly sequential; every completed mode is saved immediately, while "
@@ -1241,6 +1271,7 @@ class _PerformanceTuneSetupDialog(QDialog):
         warning.setWordWrap(True)
         scope_layout.addWidget(warning)
         layout.addWidget(scope_group)
+        self._update_test_option_states()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -1256,13 +1287,22 @@ class _PerformanceTuneSetupDialog(QDialog):
     def selected_targets(self) -> List[str]:
         return [name for name, check in self.mode_checks.items() if check.isChecked()]
 
+    def _update_test_option_states(self, _index: int = -1) -> None:
+        benchmark_type = self.benchmark_type()
+        self.custom_percent_spin.setEnabled(benchmark_type == "custom")
+        self.try_best_settings.setEnabled(benchmark_type in ("quick", "custom"))
+        if benchmark_type == "fast":
+            self.try_best_settings.setChecked(False)
+
     def benchmark_type(self) -> str:
-        value = str(self.test_length_combo.currentData() or "quick")
-        return value if value in ("quick", "custom") else "quick"
+        value = str(self.test_length_combo.currentData() or "fast")
+        return value if value in ("fast", "quick", "custom") else "fast"
 
     def prompt_context_fraction(self) -> float:
         if self.benchmark_type() == "custom":
             return max(0.0001, min(1.0, self.custom_percent_spin.value() / 100.0))
+        if self.benchmark_type() == "fast":
+            return 0.03125
         return 0.125
 
     def accept(self) -> None:
@@ -1277,11 +1317,11 @@ class _PerformanceTuneSetupDialog(QDialog):
 class _PerformanceAnalysisDialog(QDialog):
     """Graphical, test-type-isolated view of persisted benchmark evidence."""
 
-    _TEST_ORDER = ("quick", "custom", "normal")
+    _TEST_ORDER = ("fast", "quick", "custom")
     _TEST_TITLES = {
-        "quick": "⚡ Standard performance test · 12.5% context",
+        "fast": "⚡ Quick pass · ≤3.125% context",
+        "quick": "✅ Standard performance test · 12.5% context",
         "custom": "🧪 Custom context performance test",
-        "normal": "🗃 Legacy Normal test · 25% context",
     }
     _METRIC_HELP = {
         "prompt": (
@@ -1308,6 +1348,8 @@ class _PerformanceAnalysisDialog(QDialog):
         self,
         records_by_test: Dict[str, List[dict]],
         parent: Optional[QWidget] = None,
+        *,
+        html_path: Optional[Path] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Performance analysis")
@@ -1319,9 +1361,10 @@ class _PerformanceAnalysisDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Standard, Custom, and legacy Normal runs are shown in separate tiles. "
-            "Their models, scales, maxima, and fastest-mode markers are calculated "
-            "independently, so unlike workloads are never compared together."
+            "Quick pass, Standard 12.5%, and Custom runs are shown separately. "
+            "Legacy 25% evidence is included under Custom. Use the detailed HTML "
+            "report for every candidate setting, sample, graph, drafter, and drafted-token "
+            "acceptance value."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1343,6 +1386,15 @@ class _PerformanceAnalysisDialog(QDialog):
         layout.addWidget(scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        if html_path is not None:
+            report_button = QPushButton("Open detailed HTML report")
+            report_button.setObjectName("openPerformanceHtmlReport")
+            report_button.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(html_path)))
+            )
+            buttons.addButton(
+                report_button, QDialogButtonBox.ButtonRole.ActionRole
+            )
         buttons.rejected.connect(self.reject)
         close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
         if close_button is not None:
@@ -1530,6 +1582,7 @@ class _PerformanceAnalysisDialog(QDialog):
                 for row, record in enumerate(model_records, start=1):
                     prompt_tps, decode_tps, overall_tps = metrics[id(record)]
                     target = str(record.get("performance_target", "unknown"))
+                    drafter = str(record.get("drafter_label", "No drafter") or "No drafter")
                     context = self._nonnegative_int(record.get("desired_context", 0))
                     prompt_tokens, generated_tokens, sample_count = (
                         self._winner_workload(record)
@@ -1546,7 +1599,8 @@ class _PerformanceAnalysisDialog(QDialog):
                             f" · prompt {prompt_tokens:,} + decode {generated_tokens:,}"
                         )
                     mode_label = QLabel(
-                        f"{marker}{escape(target)}<br><small>{workload}</small>"
+                        f"{marker}{escape(target)} · {escape(drafter)}"
+                        f"<br><small>{workload}</small>"
                     )
                     detail = self._winner_settings_text(record)
                     if sample_count:
@@ -1863,8 +1917,9 @@ class _UpdateWorker(QObject):
         # den Ordner als GitHub-Archiv/Release-ZIP und aktualisieren per
         # heruntergeladenem Source-ZIP statt per git pull.
         self._repo_root = self._find_git_root(self._script_dir)
-        # App files/settings live next to qt_launcher.py. Git commands still run
-        # from _repo_root, but archive updates must never target an unrelated
+        # App code lives next to qt_launcher.py; user settings live centrally
+        # under ~/.autotuner. Git commands still run from _repo_root, while
+        # archive updates must never target an unrelated
         # parent repo that happens to contain a .git directory.
         self._app_root = self._script_dir
         # Git-Executable plattformübergreifend auflösen. `shutil.which` reicht
@@ -2017,10 +2072,10 @@ class _UpdateWorker(QObject):
                 data = p.read_bytes() if p.exists() else None
                 backups[p] = data
                 if p == self._app_root / self._SETTINGS_NAME and data is not None:
-                    # Crash-safe belt-and-braces backup: the in-memory copy is
-                    # enough for normal operation, but this file lets a user
-                    # recover settings even if the app/PC dies mid-update.
-                    (self._app_root / self._SETTINGS_BACKUP_NAME).write_bytes(data)
+                    # Crash-safe legacy backup stays in the shared user-data
+                    # directory; updates must not create fresh state in source.
+                    backup = app_settings.app_data_dir() / self._SETTINGS_BACKUP_NAME
+                    backup.write_bytes(data)
             except OSError:
                 backups[p] = None
         return backups
@@ -2034,10 +2089,14 @@ class _UpdateWorker(QObject):
                 p.write_bytes(data)
             except OSError as exc:
                 self.progress.emit(f"[Update] Warning: could not restore {p}: {exc}")
-        try:
-            (self._app_root / self._SETTINGS_BACKUP_NAME).unlink(missing_ok=True)
-        except OSError:
-            pass
+        for backup in (
+            app_settings.app_data_dir() / self._SETTINGS_BACKUP_NAME,
+            self._app_root / self._SETTINGS_BACKUP_NAME,
+        ):
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _read_bytes(path: Path) -> Optional[bytes]:
@@ -2110,7 +2169,7 @@ class _UpdateWorker(QObject):
         return branch, sha, archive_url
 
     def _read_update_state(self) -> Dict[str, str]:
-        state_path = self._app_root / self._UPDATE_STATE_NAME
+        state_path = app_settings.app_data_dir() / self._UPDATE_STATE_NAME
         try:
             parsed = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2130,7 +2189,7 @@ class _UpdateWorker(QObject):
         if sha:
             state["sha"] = sha
         try:
-            (self._app_root / self._UPDATE_STATE_NAME).write_text(
+            (app_settings.app_data_dir() / self._UPDATE_STATE_NAME).write_text(
                 json.dumps(state, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
@@ -2396,9 +2455,8 @@ class _BinaryUpdateWorker(QObject):
       6. launches the shim detached, then emits ``finished``. The GUI
          quits immediately afterwards so the shim can complete the swap.
 
-    User state (``autotuner_settings.json``) survives untouched — it lives
-    in ``app_settings.app_data_dir()``, which is the EXE folder, not the
-    replaced binary.
+    User state survives untouched in the shared ``~/.autotuner`` directory,
+    independently of where the replaced binary is installed.
     """
 
     progress = pyqtSignal(str)
@@ -2793,6 +2851,26 @@ def _find_draft_model(
     if entry.draft is None:
         return None
     return _make_draft_entry(entry.draft, entry.group)
+
+
+def _drafter_profile_key(value: object) -> str:
+    """Return the stable profile axis for none, embedded, or external heads."""
+    if value is None:
+        return app_settings.NO_DRAFTER_PROFILE_KEY
+    if isinstance(value, ModelEntry):
+        path = value.path
+    else:
+        text = str(value or "").strip()
+        if not text or text == app_settings.DRAFT_NONE_SENTINEL:
+            return app_settings.NO_DRAFTER_PROFILE_KEY
+        if text == app_settings.DRAFT_EMBEDDED_SENTINEL:
+            return app_settings.EMBEDDED_DRAFTER_PROFILE_KEY
+        path = Path(text)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return f"external:{path.name.casefold()}|{max(0, int(size))}"
 
 
 # Capability markers shown next to the model name in the list. Keep
@@ -4738,9 +4816,12 @@ class MainWindow(QMainWindow):
         # benchmark worker before it starts the next performance mode.
         self._benchmark_checkpoints: Dict[str, dict] = {}
         self._benchmark_locked_states: Dict[QWidget, bool] = {}
-        # Expert autosave belongs to the target loaded into the panel, even if
-        # the toolbar combo changes before the debounce timer fires.
+        # Expert autosave belongs to the exact target/profile/drafter loaded
+        # into the panel, even if a selector changes before debounce fires.
         self._expert_loaded_performance_target = self._current_performance_target_name()
+        self._expert_loaded_profile_slot = app_settings.PROFILE_AUTO
+        self._expert_loaded_drafter_key = app_settings.NO_DRAFTER_PROFILE_KEY
+        self._setting_profile_refreshing = False
         self._sysinfo_busy = False
         # Persisted font size — falls back to 10pt on first launch.
         self._font_size = app_settings.get_font_size()
@@ -4824,8 +4905,8 @@ class MainWindow(QMainWindow):
                 self._open_application_settings,
                 _setting_tooltip(
                     "Opens application-wide startup and window behaviour options.",
-                    "These opt-in preferences are stored for this AutoTuner "
-                    "installation. They do not change model tuning, generated "
+                    "These opt-in preferences are shared by source and frozen "
+                    "builds through ~/.autotuner. They do not change model tuning, generated "
                     "llama-server arguments, or per-model Expert overrides.",
                 ),
             ),
@@ -5098,6 +5179,42 @@ class MainWindow(QMainWindow):
         self._config_stack.addWidget(self._expert_panel)  # index 1 — expert
         self._config_stack.setCurrentIndex(0)
 
+        # ── Fast setting-profile bank (model × performance mode × drafter) ─
+        self._setting_profile_row = QWidget()
+        profile_layout = QHBoxLayout(self._setting_profile_row)
+        profile_layout.setContentsMargins(4, 2, 4, 2)
+        profile_layout.addWidget(QLabel("Settings profile:"))
+        self._setting_profile_combo = QComboBox()
+        self._setting_profile_combo.setMinimumWidth(180)
+        self._setting_profile_combo.addItem("Auto", app_settings.PROFILE_AUTO)
+        self._setting_profile_combo.addItem("Perform", app_settings.PROFILE_PERFORM)
+        for index, slot in enumerate(app_settings.CUSTOM_PROFILE_SLOTS, start=1):
+            self._setting_profile_combo.addItem(f"Custom {index}", slot)
+        self._setting_profile_combo.setToolTip(
+            _setting_tooltip(
+                "Switches instantly between untouched Auto tuning, the measured "
+                "performance winner, and four personal setting profiles.",
+                "Profiles are isolated by model, performance mode, and selected "
+                "draft head. Perform stays disabled until that exact drafter has a "
+                "saved benchmark. Editing Auto or Perform in Expert settings forks "
+                "the change into a Custom slot instead of overwriting either source.",
+            )
+        )
+        self._setting_profile_combo.currentIndexChanged.connect(
+            self._on_setting_profile_changed
+        )
+        profile_layout.addWidget(self._setting_profile_combo, 1)
+        self._btn_rename_setting_profile = QPushButton("Rename")
+        self._btn_rename_setting_profile.setEnabled(False)
+        self._btn_rename_setting_profile.setToolTip(
+            "Rename the selected Custom profile for this model and performance mode."
+        )
+        self._btn_rename_setting_profile.clicked.connect(
+            self._rename_setting_profile
+        )
+        profile_layout.addWidget(self._btn_rename_setting_profile)
+        self._setting_profile_row.setEnabled(False)
+
         # ── Expert button row (sits between preview and Launch options) ─
         # In normal mode this row shows a "🔧 Expert" button plus a
         # "🔍 Diagnose" button. When Expert mode is active the Expert
@@ -5147,14 +5264,14 @@ class MainWindow(QMainWindow):
             )
         )
         self._btn_benchmark.clicked.connect(self._start_performance_tuning)
-        self._btn_performance_analysis = QPushButton("📊 Performance analysis")
+        self._btn_performance_analysis = QPushButton("📊 Performance report")
         self._btn_performance_analysis.setToolTip(
             _setting_tooltip(
-                "Shows graphical results for every model that has been tested.",
-                "Standard 12.5%, Custom, and legacy Normal 25% evidence is loaded "
-                "from separate stores and rendered in separate tiles. PP, n_decode, and "
-                "end-to-end bars retain raw tok/s labels and explain their native "
-                "llama.cpp timing sources.",
+                "Shows summaries in-app and opens a detailed browser report for every run.",
+                "Quick pass, Standard 12.5%, and Custom evidence is grouped separately; "
+                "legacy 25% records migrate to Custom. The self-contained HTML expands "
+                "every candidate's settings, samples, PP/decode/end-to-end charts, "
+                "drafter variant, and drafted-token acceptance without external assets.",
             )
         )
         self._btn_performance_analysis.clicked.connect(
@@ -5327,6 +5444,7 @@ class MainWindow(QMainWindow):
         rl2 = QVBoxLayout(right)
         rl2.setContentsMargins(0, 0, 0, 0)
         rl2.setSpacing(4)
+        rl2.addWidget(self._setting_profile_row)
         rl2.addWidget(self._config_stack, 1)
         rl2.addWidget(self._btn_expert_row)
         rl2.addWidget(opts)
@@ -6520,6 +6638,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"[Warning] Could not save performance target: {exc}")
         self._log(f"[Perf] → {name}")
+        self._refresh_setting_profile_selector()
         # Recompute the displayed config in-place, leaving every launch option
         # alone — `_update_config_text` reads the current state into the preview.
         entry = getattr(self, "_current_entry", None)
@@ -6663,6 +6782,124 @@ class MainWindow(QMainWindow):
             if name in PERFORMANCE_TARGETS:
                 return name
         return DEFAULT_TARGET_NAME
+
+    def _current_drafter_profile_key(self) -> str:
+        combo = getattr(self, "_cb_draft", None)
+        if combo is None or combo.currentIndex() < 0:
+            return app_settings.NO_DRAFTER_PROFILE_KEY
+        return _drafter_profile_key(combo.currentData())
+
+    def _current_setting_profile_slot(self) -> str:
+        combo = getattr(self, "_setting_profile_combo", None)
+        if combo is None or combo.currentIndex() < 0:
+            return app_settings.PROFILE_AUTO
+        slot = str(combo.currentData() or app_settings.PROFILE_AUTO)
+        return slot if slot in app_settings.PROFILE_SLOTS else app_settings.PROFILE_AUTO
+
+    def _refresh_setting_profile_selector(self) -> None:
+        combo = getattr(self, "_setting_profile_combo", None)
+        if combo is None:
+            return
+        entry = self._current_entry
+        if entry is None:
+            self._setting_profile_row.setEnabled(False)
+            return
+        target = self._current_performance_target_name()
+        drafter_key = self._current_drafter_profile_key()
+        bank = app_settings.get_setting_profile_bank(entry.name, entry.path, target)
+        names = bank.get("names") if isinstance(bank.get("names"), dict) else {}
+        selected = app_settings.get_selected_setting_profile(
+            entry.name, entry.path, target, drafter_key
+        )
+        perform_available = app_settings.has_setting_profile_snapshot(
+            entry.name,
+            entry.path,
+            target,
+            app_settings.PROFILE_PERFORM,
+            drafter_key,
+        )
+        if selected == app_settings.PROFILE_PERFORM and not perform_available:
+            selected = app_settings.PROFILE_AUTO
+
+        self._setting_profile_refreshing = True
+        combo.blockSignals(True)
+        try:
+            model = cast(QStandardItemModel, combo.model())
+            for index in range(combo.count()):
+                slot = str(combo.itemData(index) or app_settings.PROFILE_AUTO)
+                if slot in app_settings.CUSTOM_PROFILE_SLOTS:
+                    combo.setItemText(index, str(names.get(slot, combo.itemText(index))))
+                item = model.item(index)
+                if item is not None:
+                    item.setEnabled(
+                        slot != app_settings.PROFILE_PERFORM or perform_available
+                    )
+            selected_index = combo.findData(selected)
+            combo.setCurrentIndex(max(0, selected_index))
+        finally:
+            combo.blockSignals(False)
+            self._setting_profile_refreshing = False
+        current_slot = self._current_setting_profile_slot()
+        self._btn_rename_setting_profile.setEnabled(
+            current_slot in app_settings.CUSTOM_PROFILE_SLOTS
+        )
+        self._setting_profile_row.setEnabled(True)
+
+    def _on_setting_profile_changed(self, _index: int) -> None:
+        if self._setting_profile_refreshing or self._current_entry is None:
+            return
+        if self._config_stack.currentIndex() == 1:
+            self._expert_panel.flush_pending_save()
+        entry = self._current_entry
+        target = self._current_performance_target_name()
+        drafter_key = self._current_drafter_profile_key()
+        slot = self._current_setting_profile_slot()
+        if not app_settings.set_selected_setting_profile(
+            entry.name, entry.path, target, slot, drafter_key
+        ):
+            self._refresh_setting_profile_selector()
+            return
+        self._btn_rename_setting_profile.setEnabled(
+            slot in app_settings.CUSTOM_PROFILE_SLOTS
+        )
+        self._log(
+            f"[Profile] {entry.name} [{target}] {drafter_key} → "
+            f"{self._setting_profile_combo.currentText()}."
+        )
+        profile = match_profile(
+            entry.name, self._profiles, getattr(entry, "architecture", "")
+        )
+        if self._config_stack.currentIndex() == 1 and self._system is not None:
+            self._load_expert_panel(entry, profile)
+        else:
+            self._refresh_config_preview()
+
+    def _rename_setting_profile(self) -> None:
+        entry = self._current_entry
+        slot = self._current_setting_profile_slot()
+        if entry is None or slot not in app_settings.CUSTOM_PROFILE_SLOTS:
+            return
+        current_name = self._setting_profile_combo.currentText()
+        name, accepted = QInputDialog.getText(
+            self,
+            "Rename Custom profile",
+            "Profile name:",
+            text=current_name,
+        )
+        if not accepted or not name.strip():
+            return
+        if not app_settings.rename_custom_setting_profile(
+            entry.name,
+            entry.path,
+            self._current_performance_target_name(),
+            slot,
+            name,
+        ):
+            QMessageBox.warning(
+                self, "Rename profile", "The Custom profile name could not be saved."
+            )
+            return
+        self._refresh_setting_profile_selector()
 
     def _resolve_perf_target_for_profile(
         self, profile: ModelProfile, performance_target: Optional[str] = None
@@ -7332,8 +7569,10 @@ class MainWindow(QMainWindow):
         target_name = self._current_performance_target_name()
         if self._config_stack.currentIndex() == 1:
             self._expert_panel.flush_pending_save()
-        snapshot = app_settings.get_expert_override(
-            entry.name, entry.path, target_name
+        profile_slot = self._current_setting_profile_slot()
+        drafter_key = self._current_drafter_profile_key()
+        snapshot = app_settings.get_setting_profile_snapshot(
+            entry.name, entry.path, target_name, profile_slot, drafter_key
         )
         if snapshot is None and self._system is not None:
             profile = match_profile(
@@ -7360,6 +7599,8 @@ class MainWindow(QMainWindow):
             "source_model": entry.name,
             "source_path": str(entry.path),
             "performance_target": target_name,
+            "profile_slot": profile_slot,
+            "drafter_key": drafter_key,
         }
         self._status.showMessage(
             f"Expert Settings kopiert: {entry.name} [{target_name}]", 6000
@@ -7400,10 +7641,35 @@ class MainWindow(QMainWindow):
             "model": str(clipboard.get("source_model", "")),
             "performance_target": target_name,
         }
-        try:
-            app_settings.set_expert_override(
-                entry.name, pasted, entry.path, target_name
+        destination_drafter = self._current_drafter_profile_key()
+        destination_slot = self._current_setting_profile_slot()
+        if destination_slot not in app_settings.CUSTOM_PROFILE_SLOTS:
+            destination_slot = next(
+                (
+                    slot
+                    for slot in app_settings.CUSTOM_PROFILE_SLOTS
+                    if not app_settings.has_setting_profile_snapshot(
+                        entry.name,
+                        entry.path,
+                        target_name,
+                        slot,
+                        destination_drafter,
+                    )
+                ),
+                app_settings.CUSTOM_PROFILE_SLOTS[0],
             )
+        try:
+            saved = app_settings.set_setting_profile_snapshot(
+                entry.name,
+                entry.path,
+                target_name,
+                destination_slot,
+                pasted,
+                destination_drafter,
+                select=True,
+            )
+            if not saved:
+                raise OSError("profile settings write failed")
         except Exception as exc:
             QMessageBox.warning(
                 self,
@@ -7412,6 +7678,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._refresh_setting_profile_selector()
         target_index = self._perf_combo.findText(target_name)
         if target_index >= 0 and self._perf_combo.currentIndex() != target_index:
             self._perf_combo.setCurrentIndex(target_index)
@@ -7517,6 +7784,7 @@ class MainWindow(QMainWindow):
         self._current_draft = _find_draft_model(entry, self._all_entries)
         self._btn_diagnose.setEnabled(True)
         self._update_checkboxes(entry)
+        self._refresh_setting_profile_selector()
         profile = match_profile(
             entry.name, self._profiles, getattr(entry, "architecture", "")
         )
@@ -7931,6 +8199,7 @@ class MainWindow(QMainWindow):
         self._apply_draft_selection(self._current_entry, data)
         # Re-run dependent controls; the dropdown itself is the enable state.
         self._update_checkboxes(self._current_entry)
+        self._refresh_setting_profile_selector()
         self._refresh_config_preview()
 
     def _refresh_config_preview(self) -> None:
@@ -8029,8 +8298,10 @@ class MainWindow(QMainWindow):
         )
         if base is None:
             return None
-        override = app_settings.get_expert_override(
-            entry.name, entry.path, target_name
+        slot = self._current_setting_profile_slot()
+        drafter_key = self._current_drafter_profile_key()
+        override = app_settings.get_setting_profile_snapshot(
+            entry.name, entry.path, target_name, slot, drafter_key
         )
         if not override:
             return base
@@ -8069,6 +8340,8 @@ class MainWindow(QMainWindow):
         if cfg is None:
             return
         self._expert_loaded_performance_target = target_name
+        self._expert_loaded_profile_slot = self._current_setting_profile_slot()
+        self._expert_loaded_drafter_key = self._current_drafter_profile_key()
         self._expert_panel.configure_for_model(
             cfg=cfg,
             system=self._system,
@@ -8078,8 +8351,12 @@ class MainWindow(QMainWindow):
                 entry, profile, overrides, performance_target=target_name
             ),
         )
-        override = app_settings.get_expert_override(
-            entry.name, entry.path, target_name
+        override = app_settings.get_setting_profile_snapshot(
+            entry.name,
+            entry.path,
+            target_name,
+            self._expert_loaded_profile_slot,
+            self._expert_loaded_drafter_key,
         )
         if override:
             self._expert_panel.restore_from_snapshot(override)
@@ -8118,6 +8395,10 @@ class MainWindow(QMainWindow):
         bar = "─" * W
         lines = [bar]
         lines.append(f"Model   : {entry.name}")
+        lines.append(
+            f"Settings: {self._setting_profile_combo.currentText()} "
+            f"[{self._current_performance_target_name()}]"
+        )
         lines.append(
             f"Profile : {profile.display_name}"
             + (f"  ({profile.source_file})" if profile.source_file else "")
@@ -8329,16 +8610,24 @@ class MainWindow(QMainWindow):
         # Auto/Manual/Reset toggles inside the panel take its place at
         # the top of the same area).
         self._btn_expert_row.setVisible(False)
-        override = app_settings.get_expert_override(
-            entry.name, entry.path, self._current_performance_target_name()
+        slot = self._current_setting_profile_slot()
+        override = app_settings.get_setting_profile_snapshot(
+            entry.name,
+            entry.path,
+            self._current_performance_target_name(),
+            slot,
+            self._current_drafter_profile_key(),
         )
         if override:
             self._log(
-                f"[Expert] Entered Expert mode — restored saved "
-                f"{override.get('mode', 'auto')} settings for {entry.name}."
+                f"[Expert] Entered {self._setting_profile_combo.currentText()} — "
+                f"restored {override.get('mode', 'auto')} settings for {entry.name}."
             )
         else:
-            self._log("[Expert] Entered Expert mode (Auto).")
+            self._log(
+                f"[Expert] Entered {self._setting_profile_combo.currentText()} "
+                "from Auto defaults."
+            )
 
     def _exit_expert_mode(self) -> None:
         """Return to the read-only preview view."""
@@ -8379,34 +8668,62 @@ class MainWindow(QMainWindow):
         self._log(f"[Expert] Mode → {mode}.")
 
     def _on_expert_state_changed(self, snapshot: dict) -> None:
-        """Persist the live Expert state for the current model (debounced).
-
-        This is the autosave the low-VRAM workflow asked for: every edit
-        in either mode lands on disk keyed by model name, so the setup
-        is restored next time and applied at launch like the checkbox
-        overrides.
-        """
+        """Autosave only to Custom slots; Auto and Perform remain immutable."""
         entry = self._current_entry
         if entry is None or not isinstance(snapshot, dict):
             return
+        target_name = self._expert_loaded_performance_target
+        drafter_key = self._expert_loaded_drafter_key
+        slot = self._expert_loaded_profile_slot
         try:
-            target_name = (
-                self._expert_loaded_performance_target
-                if self._config_stack.currentIndex() == 1
-                else self._current_performance_target_name()
-            )
-            app_settings.set_expert_override(
+            if slot not in app_settings.CUSTOM_PROFILE_SLOTS:
+                slot = next(
+                    (
+                        candidate
+                        for candidate in app_settings.CUSTOM_PROFILE_SLOTS
+                        if not app_settings.has_setting_profile_snapshot(
+                            entry.name,
+                            entry.path,
+                            target_name,
+                            candidate,
+                            drafter_key,
+                        )
+                    ),
+                    "",
+                )
+                if not slot:
+                    self._status.showMessage(
+                        "All four Custom profiles contain settings. Select the "
+                        "Custom profile you want to edit first.",
+                        9000,
+                    )
+                    self._log(
+                        "[Profile] Auto/Perform edit was not saved because all "
+                        "Custom slots are occupied."
+                    )
+                    return
+                snapshot = copy.deepcopy(snapshot)
+                snapshot["source"] = (
+                    f"forked-from-{self._expert_loaded_profile_slot}"
+                )
+                self._expert_loaded_profile_slot = slot
+            saved = app_settings.set_setting_profile_snapshot(
                 entry.name,
-                snapshot,
                 entry.path,
                 target_name,
+                slot,
+                snapshot,
+                drafter_key,
+                select=True,
             )
+            if not saved:
+                raise OSError("profile settings write failed")
+            QTimer.singleShot(0, self._refresh_setting_profile_selector)
         except Exception as exc:
             self._log(f"[Warning] Could not save Expert settings: {exc}")
 
     def _on_expert_reset(self) -> None:
-        """Reset button: forget the saved Expert override for the current
-        model and reload the AutoTuner's automatically-best config."""
+        """Reset the current Custom variant; Auto/Perform reload unchanged."""
         entry = self._current_entry
         if entry is None or self._system is None:
             return
@@ -8415,21 +8732,34 @@ class MainWindow(QMainWindow):
             self._profiles,
             getattr(entry, "architecture", ""),
         )
-        # Make sure a pending save for the old state cannot land AFTER
-        # the clear (it would resurrect the override we just dropped).
         self._expert_panel._save_timer.stop()
+        slot = self._expert_loaded_profile_slot
         try:
-            app_settings.clear_expert_override(
-                entry.name, entry.path, self._current_performance_target_name()
-            )
+            if slot in app_settings.CUSTOM_PROFILE_SLOTS:
+                app_settings.clear_custom_setting_profile(
+                    entry.name,
+                    entry.path,
+                    self._expert_loaded_performance_target,
+                    slot,
+                    self._expert_loaded_drafter_key,
+                )
+                self._expert_loaded_profile_slot = app_settings.PROFILE_AUTO
+            else:
+                app_settings.set_selected_setting_profile(
+                    entry.name,
+                    entry.path,
+                    self._expert_loaded_performance_target,
+                    slot,
+                    self._expert_loaded_drafter_key,
+                )
         except Exception as exc:
-            self._log(f"[Warning] Could not clear Expert settings: {exc}")
-        # Reload pure Auto into the panel (no save) and refresh preview.
-        self._expert_panel.reset_to_auto()
+            self._log(f"[Warning] Could not reset profile settings: {exc}")
+        self._refresh_setting_profile_selector()
+        self._load_expert_panel(entry, profile)
         eff = self._effective_config(entry, profile)
         if eff is not None:
             self._render_cfg_to_preview(entry, profile, eff)
-        self._log(f"[Expert] Reset to Auto for {entry.name}.")
+        self._log(f"[Expert] Reset {self._setting_profile_combo.currentText()}.")
 
     # ------------------------------------------------------------------
     # Diagnostic report
@@ -8499,7 +8829,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _show_performance_analysis(self) -> None:
         records = app_settings.list_performance_run_results()
-        dialog = _PerformanceAnalysisDialog(records, self)
+        report_path: Optional[Path] = None
+        try:
+            report_path = write_performance_report(records)
+            self._log(f"[Performance] Detailed HTML report: {report_path}")
+        except Exception as exc:
+            self._log(f"[Warning] Could not write performance HTML report: {exc}")
+        dialog = _PerformanceAnalysisDialog(
+            records, self, html_path=report_path
+        )
         dialog.exec()
 
     @staticmethod
@@ -8516,7 +8854,11 @@ class MainWindow(QMainWindow):
         )
 
     def _benchmark_model_options(
-        self, entry: ModelEntry, *, tune_mtp: bool
+        self,
+        entry: ModelEntry,
+        *,
+        tune_mtp: bool,
+        drafter_selection: Optional[str] = None,
     ) -> Dict[str, object]:
         """Resolve persisted launch options without mutating another model's UI."""
         model = copy.copy(entry)
@@ -8537,7 +8879,11 @@ class MainWindow(QMainWindow):
                 model.mmproj,
             )
 
-        remembered_draft = app_settings.get_draft_selection(entry.name)
+        remembered_draft = (
+            drafter_selection
+            if drafter_selection is not None
+            else app_settings.get_draft_selection(entry.name)
+        )
         draft_model: Optional[ModelEntry] = None
         enable_speculative = False
         external_path: Optional[Path] = None
@@ -8581,14 +8927,31 @@ class MainWindow(QMainWindow):
 
         if not deliberate_draft_off and external_path is not None:
             draft_model = _make_draft_entry(external_path, entry.group)
-            enable_speculative = True
+            enable_speculative = draft_model is not None
         elif not deliberate_draft_off and embedded_selected and entry.has_embedded_mtp:
             enable_speculative = True
 
         prompt_cache = overrides.get("prompt_cache", True)
+        drafter_key = (
+            _drafter_profile_key(draft_model)
+            if draft_model is not None
+            else (
+                app_settings.EMBEDDED_DRAFTER_PROFILE_KEY
+                if enable_speculative and embedded_selected
+                else app_settings.NO_DRAFTER_PROFILE_KEY
+            )
+        )
         return {
             "model": model,
             "draft_model": draft_model,
+            "drafter_key": drafter_key,
+            "drafter_label": (
+                draft_model.path.name
+                if draft_model is not None
+                else "Embedded MTP"
+                if enable_speculative
+                else "No drafter"
+            ),
             "enable_speculative": enable_speculative,
             "use_thinking": bool(
                 entry.supports_thinking
@@ -8603,6 +8966,46 @@ class MainWindow(QMainWindow):
                 model.mmproj is not None and overrides.get("mmproj_cpu", False)
             ),
         }
+
+    def _benchmark_option_variants(
+        self,
+        entry: ModelEntry,
+        *,
+        tune_mtp: bool,
+        include_external_drafters: bool,
+    ) -> List[Dict[str, object]]:
+        """Return current options or every compatible embedded/external head."""
+        if not tune_mtp or not include_external_drafters:
+            return [self._benchmark_model_options(entry, tune_mtp=tune_mtp)]
+
+        selections: List[str] = []
+        if entry.has_embedded_mtp:
+            selections.append(app_settings.DRAFT_EMBEDDED_SENTINEL)
+        draft_paths = list(getattr(entry, "folder_drafts", []) or [])
+        if entry.draft is not None and entry.draft not in draft_paths:
+            draft_paths.append(entry.draft)
+        for path in draft_paths:
+            try:
+                metadata = read_gguf_metadata(path)
+            except Exception:
+                metadata = {}
+            if is_draft_compatible(entry.path, path, metadata):
+                selections.append(path.name)
+
+        variants: List[Dict[str, object]] = []
+        seen: set[str] = set()
+        for selection in selections:
+            options = self._benchmark_model_options(
+                entry, tune_mtp=True, drafter_selection=selection
+            )
+            key = str(options["drafter_key"])
+            if not bool(options["enable_speculative"]) or key in seen:
+                continue
+            seen.add(key)
+            variants.append(options)
+        if variants:
+            return variants
+        return [self._benchmark_model_options(entry, tune_mtp=tune_mtp)]
 
     def _benchmark_compute_config(
         self,
@@ -8646,8 +9049,18 @@ class MainWindow(QMainWindow):
         auto = self._benchmark_compute_config(
             entry, profile, system, performance_target, options
         )
-        saved = app_settings.get_expert_override(
-            entry.name, entry.path, performance_target
+        drafter_key = str(
+            options.get("drafter_key", app_settings.NO_DRAFTER_PROFILE_KEY)
+        )
+        seed_slot = app_settings.get_selected_setting_profile(
+            entry.name, entry.path, performance_target, drafter_key
+        )
+        saved = app_settings.get_setting_profile_snapshot(
+            entry.name,
+            entry.path,
+            performance_target,
+            seed_slot,
+            drafter_key,
         )
         effective = auto
         if saved:
@@ -8747,6 +9160,74 @@ class MainWindow(QMainWindow):
             )
         return safe, safe_context, try_exact
 
+    @staticmethod
+    def _completed_benchmark_matches(
+        record: Optional[dict],
+        entry: ModelEntry,
+        baseline: TunedConfig,
+        benchmark_type: str,
+        prompt_fraction: float,
+    ) -> bool:
+        if not isinstance(record, dict) or not isinstance(
+            record.get("candidates"), list
+        ):
+            return False
+        try:
+            stat = entry.path.stat()
+            stored_size = int(record.get("model_size", 0) or 0)
+            stored_mtime = int(record.get("model_mtime_ns", 0) or 0)
+            if stored_size > 0 and stored_size != stat.st_size:
+                return False
+            if stored_mtime > 0 and stored_mtime != stat.st_mtime_ns:
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+        try:
+            if int(record.get("desired_context", 0) or 0) != int(baseline.ctx):
+                return False
+            stored_fraction = float(record.get("prompt_context_fraction", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if abs(stored_fraction - float(prompt_fraction)) > 1e-9:
+            return False
+        return str(record.get("benchmark_type", "")) == benchmark_type
+
+    def _shortlist_for_full_benchmark(
+        self,
+        entry: ModelEntry,
+        performance_target: str,
+        drafter_key: str,
+        baseline: TunedConfig,
+    ) -> List[BenchmarkCandidate]:
+        short_record = app_settings.get_performance_tuning_result(
+            entry.path,
+            performance_target,
+            "fast",
+            drafter_key,
+        )
+        if not isinstance(short_record, dict):
+            return []
+        try:
+            if int(short_record.get("desired_context", 0) or 0) != int(baseline.ctx):
+                return []
+            stat = entry.path.stat()
+            if int(short_record.get("model_size", 0) or 0) not in (0, stat.st_size):
+                return []
+            if int(short_record.get("model_mtime_ns", 0) or 0) not in (
+                0,
+                stat.st_mtime_ns,
+            ):
+                return []
+        except (OSError, TypeError, ValueError):
+            return []
+        return list(
+            shortlist_candidates_from_record(
+                short_record,
+                baseline_candidate(baseline),
+                maximum=6,
+            )
+        )
+
     def _update_benchmark_button(
         self, profile: Optional[ModelProfile] = None
     ) -> None:
@@ -8792,6 +9273,8 @@ class MainWindow(QMainWindow):
             self._chk_thinking,
             self._cb_mmproj,
             self._cb_draft,
+            self._setting_profile_combo,
+            self._btn_rename_setting_profile,
             self._btn_expert,
             self._btn_diagnose,
             self._btn_benchmark,
@@ -8994,11 +9477,16 @@ class MainWindow(QMainWindow):
         benchmark_type = setup.benchmark_type()
         prompt_context_fraction = setup.prompt_context_fraction()
         tune_mtp = setup.tune_mtp.isChecked()
+        include_external_drafters = setup.test_external_drafters.isChecked()
         enable_yarn = setup.enable_yarn.isChecked()
         real_validation = setup.real_validation.isChecked()
+        all_models_selected = setup.all_models.isChecked()
+        rerun_completed = setup.rerun_all_models.isChecked()
+        try_best_only = setup.try_best_settings.isChecked()
 
         jobs: List[BenchmarkSuiteJob] = []
         skipped: List[str] = []
+        planning_notes: List[str] = []
         system_cache: Dict[str, SystemInfo] = {}
         for candidate in source_entries:
             candidate_profile = match_profile(
@@ -9006,104 +9494,187 @@ class MainWindow(QMainWindow):
                 self._profiles,
                 getattr(candidate, "architecture", ""),
             )
-            options = self._benchmark_model_options(candidate, tune_mtp=tune_mtp)
-            use_draft = bool(options["enable_speculative"])
-            try:
-                runtime_binary = self._resolve_binary(
-                    candidate_profile, use_draft, candidate.name
-                )
-                if not self._is_runnable_binary(
-                    Path(runtime_binary)
-                ) and not shutil.which(runtime_binary):
-                    raise FileNotFoundError(runtime_binary)
-                from auto_tuner import _find_compatible_draft_server
-
-                compatible_draft_binary = _find_compatible_draft_server(
-                    cast(Optional[ModelEntry], options["draft_model"]),
-                    runtime_binary,
-                )
-                if compatible_draft_binary is not None:
-                    runtime_binary = compatible_draft_binary
-                draft_allowed, draft_message, _draft_build = check_draft_model_build(
-                    cast(Optional[ModelEntry], options["draft_model"]),
-                    runtime_binary,
-                )
-                if draft_message:
-                    self._log(f"[Draft compatibility] {draft_message}")
-                if not draft_allowed:
-                    skipped.append(f"{candidate.name}: {draft_message}")
-                    continue
-                runtime_key = os.path.normcase(str(Path(runtime_binary)))
-                exact_system = system_cache.get(runtime_key)
-                if exact_system is None:
-                    exact_system = detect_system(runtime_binary)
-                    system_cache[runtime_key] = exact_system
-                if candidate.path == entry.path:
-                    self._update_sysinfo_labels(exact_system)
-            except Exception as exc:
-                skipped.append(f"{candidate.name}: runtime unavailable ({exc})")
-                continue
-
-            for target_name in selected_targets:
+            option_variants = self._benchmark_option_variants(
+                candidate,
+                tune_mtp=tune_mtp,
+                include_external_drafters=include_external_drafters,
+            )
+            for options in option_variants:
+                use_draft = bool(options["enable_speculative"])
+                drafter_key = str(options["drafter_key"])
+                drafter_label = str(options["drafter_label"])
                 try:
-                    baseline, safe_context, exact_trial = (
-                        self._benchmark_config_for_target(
-                            candidate,
-                            candidate_profile,
-                            exact_system,
-                            target_name,
-                            options,
-                            desired_context=desired_context,
-                            enable_yarn=enable_yarn,
-                            real_validation=real_validation,
+                    runtime_binary = self._resolve_binary(
+                        candidate_profile, use_draft, candidate.name
+                    )
+                    if not self._is_runnable_binary(
+                        Path(runtime_binary)
+                    ) and not shutil.which(runtime_binary):
+                        raise FileNotFoundError(runtime_binary)
+                    from auto_tuner import _find_compatible_draft_server
+
+                    compatible_draft_binary = _find_compatible_draft_server(
+                        cast(Optional[ModelEntry], options["draft_model"]),
+                        runtime_binary,
+                    )
+                    if compatible_draft_binary is not None:
+                        runtime_binary = compatible_draft_binary
+                    draft_allowed, draft_message, _draft_build = (
+                        check_draft_model_build(
+                            cast(Optional[ModelEntry], options["draft_model"]),
+                            runtime_binary,
                         )
                     )
+                    if draft_message:
+                        self._log(f"[Draft compatibility] {draft_message}")
+                    if not draft_allowed:
+                        skipped.append(
+                            f"{candidate.name} [{drafter_label}]: {draft_message}"
+                        )
+                        continue
+                    runtime_key = os.path.normcase(str(Path(runtime_binary)))
+                    exact_system = system_cache.get(runtime_key)
+                    if exact_system is None:
+                        exact_system = detect_system(runtime_binary)
+                        system_cache[runtime_key] = exact_system
+                    if candidate.path == entry.path:
+                        self._update_sysinfo_labels(exact_system)
                 except Exception as exc:
-                    skipped.append(f"{candidate.name} [{target_name}]: {exc}")
-                    continue
-                runner = BenchmarkRunner(
-                    model=cast(ModelEntry, options["model"]),
-                    profile=candidate_profile,
-                    base_config=baseline,
-                    runtime_binary=runtime_binary,
-                    physical_cores=exact_system.cpu_cores_physical,
-                    logical_cores=exact_system.cpu_cores_logical,
-                    draft_model=cast(Optional[ModelEntry], options["draft_model"]),
-                    use_thinking=bool(options["use_thinking"]),
-                    enable_speculative=use_draft,
-                    enable_ngram=bool(options["enable_ngram"]),
-                    tune_draft_n_max=bool(tune_mtp and use_draft),
-                    enable_prompt_cache=bool(options["enable_prompt_cache"]),
-                    prompt_cache_ram_mib=cast(
-                        int, options["prompt_cache_ram_mib"]
-                    ),
-                    limits=BenchmarkLimits(
-                        prompt_context_fraction=prompt_context_fraction,
-                        min_prompt_tokens=(1 if benchmark_type == "custom" else 4096),
-                        max_prompt_tokens=(
-                            None if benchmark_type == "custom" else 65536
-                        ),
-                    ),
-                )
-                key = f"{app_settings.favorite_model_key(candidate.path)}::{target_name}"
-                jobs.append(
-                    BenchmarkSuiteJob(
-                        key=key,
-                        label=f"{candidate.name} [{target_name}] ctx {baseline.ctx:,}",
-                        performance_target=target_name,
-                        runner=runner,
-                        metadata={
-                            "system": exact_system,
-                            "model_key": app_settings.favorite_model_key(candidate.path),
-                            "model_path": str(candidate.path.resolve(strict=False)),
-                            "safe_context": safe_context,
-                            "exact_trial": exact_trial,
-                            "requested_context": desired_context,
-                            "benchmark_type": benchmark_type,
-                            "prompt_context_fraction": prompt_context_fraction,
-                        },
+                    skipped.append(
+                        f"{candidate.name} [{drafter_label}]: runtime unavailable ({exc})"
                     )
-                )
+                    continue
+
+                for target_name in selected_targets:
+                    try:
+                        baseline, safe_context, exact_trial = (
+                            self._benchmark_config_for_target(
+                                candidate,
+                                candidate_profile,
+                                exact_system,
+                                target_name,
+                                options,
+                                desired_context=desired_context,
+                                enable_yarn=enable_yarn,
+                                real_validation=real_validation,
+                            )
+                        )
+                    except Exception as exc:
+                        skipped.append(
+                            f"{candidate.name} [{target_name}, {drafter_label}]: {exc}"
+                        )
+                        continue
+
+                    if all_models_selected and not rerun_completed:
+                        completed_record = app_settings.get_performance_tuning_result(
+                            candidate.path,
+                            target_name,
+                            benchmark_type,
+                            drafter_key,
+                        )
+                        if self._completed_benchmark_matches(
+                            completed_record,
+                            candidate,
+                            baseline,
+                            benchmark_type,
+                            prompt_context_fraction,
+                        ):
+                            skipped.append(
+                                f"{candidate.name} [{target_name}, {drafter_label}]: "
+                                "already completed"
+                            )
+                            continue
+
+                    candidate_plan: List[BenchmarkCandidate] = []
+                    if try_best_only and benchmark_type != "fast":
+                        candidate_plan = self._shortlist_for_full_benchmark(
+                            candidate, target_name, drafter_key, baseline
+                        )
+                        if candidate_plan:
+                            planning_notes.append(
+                                f"{candidate.name} [{target_name}, {drafter_label}]: "
+                                f"remeasuring {len(candidate_plan)} stable Quick finalists"
+                            )
+                        else:
+                            planning_notes.append(
+                                f"{candidate.name} [{target_name}, {drafter_label}]: "
+                                "Quick evidence missing/noisy; full search retained"
+                            )
+
+                    if benchmark_type == "fast":
+                        limits = BenchmarkLimits(
+                            max_candidates=7,
+                            confirmation_runs=1,
+                            samples_per_candidate=2,
+                            total_timeout_s=1200.0,
+                            generated_tokens=128,
+                            min_prompt_tokens=1024,
+                            max_prompt_tokens=16384,
+                            prompt_context_fraction=prompt_context_fraction,
+                            max_draft_tokens=8,
+                        )
+                    else:
+                        limits = BenchmarkLimits(
+                            prompt_context_fraction=prompt_context_fraction,
+                            min_prompt_tokens=(
+                                1 if benchmark_type == "custom" else 4096
+                            ),
+                            max_prompt_tokens=(
+                                None if benchmark_type == "custom" else 65536
+                            ),
+                        )
+                    runner = BenchmarkRunner(
+                        model=cast(ModelEntry, options["model"]),
+                        profile=candidate_profile,
+                        base_config=baseline,
+                        runtime_binary=runtime_binary,
+                        physical_cores=exact_system.cpu_cores_physical,
+                        logical_cores=exact_system.cpu_cores_logical,
+                        draft_model=cast(
+                            Optional[ModelEntry], options["draft_model"]
+                        ),
+                        use_thinking=bool(options["use_thinking"]),
+                        enable_speculative=use_draft,
+                        enable_ngram=bool(options["enable_ngram"]),
+                        tune_draft_n_max=bool(tune_mtp and use_draft),
+                        enable_prompt_cache=bool(options["enable_prompt_cache"]),
+                        prompt_cache_ram_mib=cast(
+                            int, options["prompt_cache_ram_mib"]
+                        ),
+                        limits=limits,
+                        candidate_plan=candidate_plan,
+                    )
+                    model_key = app_settings.favorite_model_key(candidate.path)
+                    key = f"{model_key}::{target_name}::{drafter_key}"
+                    jobs.append(
+                        BenchmarkSuiteJob(
+                            key=key,
+                            label=(
+                                f"{candidate.name} [{target_name}] · {drafter_label} "
+                                f"· ctx {baseline.ctx:,}"
+                            ),
+                            performance_target=target_name,
+                            runner=runner,
+                            metadata={
+                                "system": exact_system,
+                                "model_key": model_key,
+                                "model_path": str(
+                                    candidate.path.resolve(strict=False)
+                                ),
+                                "safe_context": safe_context,
+                                "exact_trial": exact_trial,
+                                "requested_context": desired_context,
+                                "benchmark_type": benchmark_type,
+                                "prompt_context_fraction": prompt_context_fraction,
+                                "drafter_key": drafter_key,
+                                "drafter_label": drafter_label,
+                                "try_best_only": bool(candidate_plan),
+                                "model_time_budget_s": (
+                                    1200.0 if benchmark_type == "fast" else 0.0
+                                ),
+                            },
+                        )
+                    )
 
         if not jobs:
             detail = "\n".join(skipped[:12]) or "No eligible model/mode profiles."
@@ -9125,21 +9696,31 @@ class MainWindow(QMainWindow):
                 "profile; existing settings stay untouched."
             )
         if skipped:
-            warning_lines += f"\n\n{len(skipped)} model/profile item(s) were skipped."
-        test_label = (
-            "Standard test (12.5% context, 65,536-token prompt cap)"
-            if benchmark_type == "quick"
-            else (
+            warning_lines += f"\n\n{len(skipped)} completed/ineligible item(s) were skipped."
+        if planning_notes:
+            warning_lines += (
+                f"\n\nTry-only-best used a stable shortlist for "
+                f"{sum('remeasuring' in note for note in planning_notes)} item(s); "
+                "other items fall back to the full search."
+            )
+        if benchmark_type == "fast":
+            test_label = (
+                "Quick pass (≤3.125% context, 16,384-token cap, 128 decode tokens, "
+                "20-minute budget per model)"
+            )
+        elif benchmark_type == "quick":
+            test_label = "Standard test (12.5% context, 65,536-token prompt cap)"
+        else:
+            test_label = (
                 f"Custom test ({prompt_context_fraction * 100:.2f}% context, "
                 "no 65,536-token cap)"
             )
-        )
         confirmation = QMessageBox.question(
             self,
             "Start real performance test?",
             f"Prepared {len(jobs)} independent model/mode profile(s) at "
             f"{context_label}, with up to {candidate_runs} fresh server launches.\n\n"
-            f"{test_label} measures a deterministic prompt plus 256 n_decode tokens and "
+            f"{test_label} measures a deterministic prompt plus the stated n_decode window and "
             "stores separate settings for every performance mode. Runs are "
             "sequential and may take hours for all models. Hardware clocks, "
             f"voltages, and power limits are never changed.{warning_lines}\n\nStart now?",
@@ -9157,8 +9738,8 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         summary = (
-            f"{test_label}: testing {len(source_entries)} model(s) across "
-            f"{len(selected_targets)} selected performance mode(s)."
+            f"{test_label}: testing {len(source_entries)} model(s) in "
+            f"{len(jobs)} model/mode/drafter run(s)."
         )
         distinct_models = {
             str(job.metadata.get("model_key", "")) for job in jobs
@@ -9210,8 +9791,13 @@ class MainWindow(QMainWindow):
             f"[Performance] Starting realistic suite with {len(jobs)} profiles, "
             f"targets={selected_targets}, desired_ctx={desired_context or 'auto'}, "
             f"test={benchmark_type} ({prompt_context_fraction:.2%} context), "
-            f"YaRN={enable_yarn}, MTP-sweep={tune_mtp}, all-models={setup.all_models.isChecked()}."
+            f"YaRN={enable_yarn}, MTP-sweep={tune_mtp}, "
+            f"external-drafters={include_external_drafters}, "
+            f"try-best={try_best_only}, all-models={all_models_selected}, "
+            f"rerun-completed={rerun_completed}."
         )
+        for note in planning_notes[:12]:
+            self._log(f"[Performance] Plan: {note}")
         for message in skipped[:12]:
             self._log(f"[Performance] Skipped: {message}")
         dialog.show()
@@ -9289,17 +9875,39 @@ class MainWindow(QMainWindow):
                     model_mtime_ns=0,
                 )
             benchmark_type = str(job.metadata.get("benchmark_type", "quick"))
-            if benchmark_type not in ("quick", "custom", "normal"):
-                benchmark_type = "quick"
+            if benchmark_type not in ("fast", "quick", "custom"):
+                benchmark_type = "custom"
+            if benchmark_type == "fast":
+                snapshot["source"] = "measured-quick-pass"
+                snapshot["confidence"] = "provisional"
             prompt_fraction = float(
                 job.metadata.get(
                     "prompt_context_fraction",
                     job.runner.limits.prompt_context_fraction,
                 )
             )
+            drafter_key = str(
+                job.metadata.get(
+                    "drafter_key", app_settings.NO_DRAFTER_PROFILE_KEY
+                )
+            )
             record["model_name"] = entry.name
             record["performance_target"] = job.performance_target
             record["benchmark_type"] = benchmark_type
+            record["drafter_key"] = drafter_key
+            record["drafter_label"] = str(
+                job.metadata.get("drafter_label", "No drafter")
+            )
+            record["search_strategy"] = (
+                "quick-pass"
+                if benchmark_type == "fast"
+                else "quick-shortlist-validation"
+                if bool(job.metadata.get("try_best_only"))
+                else "full-staged-search"
+            )
+            record["profile_confidence"] = (
+                "provisional" if benchmark_type == "fast" else "validated"
+            )
             record["prompt_context_fraction"] = prompt_fraction
             record["prompt_token_cap"] = job.runner.limits.max_prompt_tokens
             record["generated_token_target"] = int(
@@ -9343,6 +9951,7 @@ class MainWindow(QMainWindow):
                 snapshot,
                 job.performance_target,
                 benchmark_type,
+                drafter_key,
             )
         except Exception as exc:
             payload["error"] = f"settings checkpoint failed: {exc}"
@@ -9519,6 +10128,7 @@ class MainWindow(QMainWindow):
                     f"({current_fastest[4]:.2f} end-to-end tok/s); selected automatically."
                 )
         if refresh_current:
+            self._refresh_setting_profile_selector()
             self._refresh_config_preview()
 
         if not saved_rows:
@@ -10078,6 +10688,8 @@ class MainWindow(QMainWindow):
             self._chk_thinking,
             self._cb_mmproj,
             self._cb_draft,
+            self._setting_profile_combo,
+            self._btn_rename_setting_profile,
             self._btn_expert,
             self._btn_launch,
             self._host_edit,

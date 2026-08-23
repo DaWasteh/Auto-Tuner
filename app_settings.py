@@ -1,8 +1,8 @@
 """Persistent app settings for the AutoTuner GUI.
 
 Stores last-used paths so that a manually picked models folder or
-llama.cpp fork is remembered across launches. JSON file lives next to
-the script when writable (portable), otherwise in the user's home dir.
+llama.cpp fork is remembered across launches. Source and frozen builds share
+``~/.autotuner/autotuner_settings.json``; legacy portable files are merged once.
 
 Public API:
     load_settings()        -> dict
@@ -61,53 +61,194 @@ Public API:
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 _FILENAME = "autotuner_settings.json"
+_DATA_DIR_ENV = "AUTOTUNER_DATA_DIR"
+_MIGRATE_OVERRIDE_ENV = "AUTOTUNER_MIGRATE_LEGACY"
+_MIGRATION_STATE_FILENAME = ".migration-state.json"
+_MIGRATION_SCHEMA = 1
 
 
 def app_data_dir() -> Path:
-    r"""Persistent, user-writable directory for settings / logs / update state.
+    r"""Return AutoTuner's one cross-build, cross-platform user-data folder.
 
-    Two regimes:
-      * **Source install** — the script directory (portable, same folder the
-        user runs ``qt_launcher.py`` from).
-      * **Frozen build** (PyInstaller onefile) — the directory that contains
-        the compiled ``AutoTuner.exe`` / Linux binary. The bundled code runs
-        from a throw-away ``_MEIPASS`` temp folder that is DELETED on exit, so
-        any user state written there (``autotuner_settings.json``, logs, …)
-        would silently vanish between launches. Routing all user-writable
-        state through the EXE folder keeps it stable across runs.
-
-    If the resolved directory is read-only (e.g. the EXE sits in
-    ``C:\Program Files``), fall back to the user's home directory so the
-    app never crashes trying to persist state. Works on Windows and Linux.
+    Source runs and PyInstaller builds deliberately share ``~/.autotuner``.
+    On Windows this resolves to e.g. ``C:\Users\Sebas\.autotuner``; Linux and
+    macOS use the corresponding user's home directory. ``AUTOTUNER_DATA_DIR``
+    is an explicit test/portable override, never selected implicitly.
     """
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent
-    else:
-        base = Path(__file__).resolve().parent
+    override = os.environ.get(_DATA_DIR_ENV, "").strip()
+    base = Path(override).expanduser() if override else Path.home() / ".autotuner"
     try:
-        probe = base / ".autotuner_write_probe"
-        probe.write_text("x", encoding="utf-8")
-        probe.unlink()
-        return base
-    except (OSError, PermissionError):
-        return Path.home()
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Keep the deterministic path. Callers already handle write failures;
+        # silently falling back would split source and frozen state again.
+        pass
+    return base
+
+
+def _legacy_settings_candidates() -> List[Path]:
+    """Return prior source/frozen settings locations in deterministic order."""
+    if os.environ.get(_DATA_DIR_ENV, "").strip() and os.environ.get(
+        _MIGRATE_OVERRIDE_ENV, ""
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        return []
+    roots: List[Path] = [Path.home()]
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        roots.append(executable_dir)
+        # Developer/repository builds historically wrote to ``dist/`` while
+        # source runs wrote one directory above it.
+        if executable_dir.name.casefold() == "dist":
+            roots.append(executable_dir.parent)
+    else:
+        source_dir = Path(__file__).resolve().parent
+        roots.extend((source_dir, source_dir / "dist"))
+
+    target = app_data_dir().resolve(strict=False)
+    candidates: List[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            path = (root / _FILENAME).resolve(strict=False)
+        except (OSError, RuntimeError):
+            path = root / _FILENAME
+        key = os.path.normcase(str(path))
+        if key in seen or path.parent == target:
+            continue
+        seen.add(key)
+        candidates.append(path)
+    return candidates
+
+
+def _read_json_dict(path: Path) -> Dict[str, Any]:
+    try:
+        if path.stat().st_size > 64 * 1024 * 1024:
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _deep_merge_dicts(older: Dict[str, Any], newer: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge settings maps recursively, preferring scalar/list values in newer."""
+    merged: Dict[str, Any] = dict(older)
+    for key, value in newer.items():
+        previous = merged.get(key)
+        if isinstance(previous, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_dicts(previous, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> bool:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _legacy_signature(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    identity = f"{os.path.normcase(str(path.resolve(strict=False)))}|{stat.st_size}|{stat.st_mtime_ns}"
+    return hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _copy_legacy_backup(source: Path, signature: str, target_dir: Path) -> None:
+    """Retain exact pre-merge bytes under ~/.autotuner/migrations."""
+    if not signature:
+        return
+    backup_dir = target_dir / "migrations"
+    backup = backup_dir / f"{source.parent.name or 'home'}-{signature[:12]}.json"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            shutil.copy2(source, backup)
+    except OSError:
+        pass
+
+
+def _migrate_legacy_settings(target: Path) -> None:
+    """Merge every newly discovered legacy settings file exactly once.
+
+    Nested maps (benchmark evidence, profiles, per-model choices) are unioned.
+    For conflicting scalar/list leaves, the newer whole settings file wins.
+    Originals are never moved or deleted and exact backups are retained.
+    """
+    state_path = target.parent / _MIGRATION_STATE_FILENAME
+    state = _read_json_dict(state_path)
+    if state.get("schema") != _MIGRATION_SCHEMA:
+        state = {"schema": _MIGRATION_SCHEMA, "sources": {}}
+    sources = state.get("sources")
+    if not isinstance(sources, dict):
+        sources = {}
+        state["sources"] = sources
+
+    current = _read_json_dict(target)
+    try:
+        current_mtime = target.stat().st_mtime_ns
+    except OSError:
+        current_mtime = -1
+    imported = False
+    candidates: List[Tuple[int, Path, str, Dict[str, Any]]] = []
+    for source in _legacy_settings_candidates():
+        signature = _legacy_signature(source)
+        if not signature or sources.get(os.path.normcase(str(source))) == signature:
+            continue
+        incoming = _read_json_dict(source)
+        if not incoming:
+            continue
+        try:
+            mtime = source.stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        candidates.append((mtime, source, signature, incoming))
+
+    for mtime, source, signature, incoming in sorted(
+        candidates, key=lambda item: (item[0], os.path.normcase(str(item[1])))
+    ):
+        _copy_legacy_backup(source, signature, target.parent)
+        if mtime >= current_mtime:
+            current = _deep_merge_dicts(current, incoming)
+            current_mtime = mtime
+        else:
+            current = _deep_merge_dicts(incoming, current)
+        sources[os.path.normcase(str(source))] = signature
+        imported = True
+
+    if imported and _atomic_write_json(target, current):
+        _atomic_write_json(state_path, state)
 
 
 def _settings_file() -> Path:
-    """Resolve the settings file location.
-
-    Preference: a portable install (alongside the script when running from
-    source, or next to the .exe when frozen). Fallback: the user's home
-    directory if that location is read-only (e.g. Program Files).
-    """
-    return app_data_dir() / _FILENAME
+    """Resolve and lazily migrate the shared ~/.autotuner settings file."""
+    target = app_data_dir() / _FILENAME
+    _migrate_legacy_settings(target)
+    return target
 
 
 def load_settings() -> Dict[str, Any]:
@@ -125,23 +266,8 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(data: Dict[str, Any]) -> bool:
-    """Atomically save settings; return True on success, False otherwise.
-
-    Writes to a temp file in the same directory then renames, so a
-    crash mid-write never leaves a half-written settings file.
-    """
-    f = _settings_file()
-    tmp = f.with_suffix(f.suffix + ".tmp")
-    try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, f)
-        return True
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return False
+    """Atomically save settings; return True on success, False otherwise."""
+    return _atomic_write_json(_settings_file(), data)
 
 
 def _update(key: str, value: Any) -> None:
@@ -153,10 +279,9 @@ def _update(key: str, value: Any) -> None:
 # ---------------------------------------------------------------------------
 # Convenience accessors
 
-# OS-namespaced path keys. The settings JSON is portable and on dual-boot
-# machines SHARED between the Windows and the Linux boot (it lives next to
-# the script on the data partition). An absolute path saved on one OS is
-# invalid on the other, so a single key ping-ponged: every boot the "other"
+# OS-namespaced path keys. Imported/profile-backup settings can move between
+# Windows, Linux, and macOS, while absolute paths are OS-specific. A single
+# plain key previously ping-ponged: every boot the "other"
 # OS lost its models/fork selection ("/run/media/…" read on Windows, "L:\…"
 # read on Ubuntu) and overwrote the entry when the user re-picked it.
 # Path-valued settings are therefore stored per-OS ("models_path.windows" /
@@ -510,10 +635,10 @@ def set_model_favorite(model_path: Path, favorite: bool) -> None:
 
 
 _VALID_PERFORMANCE_TARGETS = ("safe", "balanced", "throughput", "low_vram")
-# ``quick`` is the backward-compatible storage id for the standard 12.5%
-# workload. ``normal`` remains readable/importable for legacy fixed-25% runs;
-# new UI runs use ``custom`` instead.
-_VALID_BENCHMARK_TYPES = ("quick", "custom", "normal")
+# ``quick`` remains the backward-compatible storage id for the full 12.5%
+# workload; ``fast`` is the advisory short pass. Legacy fixed-25% ``normal``
+# records are classified as Custom and never get a separate UI/report tile.
+_VALID_BENCHMARK_TYPES = ("fast", "quick", "custom")
 
 
 def _normalise_performance_target(value: Optional[str]) -> str:
@@ -523,7 +648,20 @@ def _normalise_performance_target(value: Optional[str]) -> str:
 
 def _normalise_benchmark_type(value: Optional[str]) -> str:
     benchmark_type = str(value or "").lower().strip()
+    if benchmark_type == "normal":
+        return "custom"
+    if benchmark_type == "standard":
+        return "quick"
     return benchmark_type if benchmark_type in _VALID_BENCHMARK_TYPES else ""
+
+
+def _benchmark_storage_keys(benchmark_type: str) -> Tuple[str, ...]:
+    canonical = _normalise_benchmark_type(benchmark_type)
+    if canonical == "custom":
+        return ("custom", "normal")
+    if canonical == "quick":
+        return ("quick", "standard")
+    return (canonical,) if canonical else ()
 
 
 def _valid_expert_snapshot(snapshot: Any) -> bool:
@@ -599,6 +737,56 @@ def _set_benchmark_result_value(
     per_model[benchmark_type] = per_test
     outer[identity] = per_model
     settings[storage_key] = outer
+
+
+def _set_drafter_benchmark_result_value(
+    settings: Dict[str, Any],
+    storage_key: str,
+    identity: str,
+    benchmark_type: str,
+    target: str,
+    drafter_key: str,
+    value: Any,
+) -> None:
+    outer = _target_map(settings, storage_key)
+    per_model = outer.get(identity)
+    if not isinstance(per_model, dict):
+        per_model = {}
+    per_test = per_model.get(benchmark_type)
+    if not isinstance(per_test, dict):
+        per_test = {}
+    per_target = per_test.get(target)
+    if not isinstance(per_target, dict):
+        per_target = {}
+    per_target[_normalise_drafter_profile_key(drafter_key)] = value
+    per_test[target] = per_target
+    per_model[benchmark_type] = per_test
+    outer[identity] = per_model
+    settings[storage_key] = outer
+
+
+def _get_drafter_benchmark_result_value(
+    settings: Dict[str, Any],
+    storage_key: str,
+    identity: str,
+    benchmark_type: str,
+    target: str,
+    drafter_key: str,
+) -> Tuple[bool, Any]:
+    outer = settings.get(storage_key)
+    if not identity or not isinstance(outer, dict):
+        return False, None
+    per_model = outer.get(identity)
+    if not isinstance(per_model, dict):
+        return False, None
+    per_test = per_model.get(benchmark_type)
+    if not isinstance(per_test, dict):
+        return False, None
+    per_target = per_test.get(target)
+    if not isinstance(per_target, dict):
+        return False, None
+    key = _normalise_drafter_profile_key(drafter_key)
+    return key in per_target, per_target.get(key)
 
 
 def _get_benchmark_result_value(
@@ -790,10 +978,397 @@ def clear_expert_override(
         save_settings(settings)
 
 
+# ---------------------------------------------------------------------------
+# Per-model / performance-mode setting profile bank
+#
+# Auto is computed and never persisted as a snapshot. Perform is populated by
+# benchmarks and Custom 1..4 are user-owned. Every non-Auto slot keeps a
+# separate snapshot for each selected draft head so draft_n_max and related
+# runtime axes switch together with embedded/external drafters.
+
+PROFILE_AUTO = "auto"
+PROFILE_PERFORM = "perform"
+CUSTOM_PROFILE_SLOTS = ("custom1", "custom2", "custom3", "custom4")
+PROFILE_SLOTS = (PROFILE_AUTO, PROFILE_PERFORM, *CUSTOM_PROFILE_SLOTS)
+DEFAULT_DRAFTER_PROFILE_KEY = "<default>"
+NO_DRAFTER_PROFILE_KEY = "<none>"
+EMBEDDED_DRAFTER_PROFILE_KEY = "<embedded-mtp>"
+
+
+def _normalise_profile_slot(value: object) -> str:
+    slot = str(value or "").strip().lower()
+    return slot if slot in PROFILE_SLOTS else PROFILE_AUTO
+
+
+def _normalise_drafter_profile_key(value: object) -> str:
+    key = str(value or "").strip()
+    return key[:1024] if key else NO_DRAFTER_PROFILE_KEY
+
+
+def _default_profile_bank() -> Dict[str, Any]:
+    return {
+        "schema": 1,
+        "selected": PROFILE_AUTO,
+        "selected_by_drafter": {},
+        "names": {
+            slot: f"Custom {index}"
+            for index, slot in enumerate(CUSTOM_PROFILE_SLOTS, start=1)
+        },
+        "snapshots": {PROFILE_PERFORM: {}},
+    }
+
+
+def _normalise_profile_bank(raw: object) -> Dict[str, Any]:
+    bank = _default_profile_bank()
+    if not isinstance(raw, dict):
+        return bank
+    bank["selected"] = _normalise_profile_slot(raw.get("selected"))
+    selected_by_drafter = raw.get("selected_by_drafter")
+    if isinstance(selected_by_drafter, dict):
+        bank["selected_by_drafter"] = {
+            _normalise_drafter_profile_key(key): _normalise_profile_slot(value)
+            for key, value in selected_by_drafter.items()
+        }
+    names = raw.get("names")
+    if isinstance(names, dict):
+        for index, slot in enumerate(CUSTOM_PROFILE_SLOTS, start=1):
+            name = str(names.get(slot, "") or "").strip()
+            bank["names"][slot] = name[:64] if name else f"Custom {index}"
+    snapshots = raw.get("snapshots")
+    if isinstance(snapshots, dict):
+        for slot in (PROFILE_PERFORM, *CUSTOM_PROFILE_SLOTS):
+            per_drafter = snapshots.get(slot)
+            if not isinstance(per_drafter, dict):
+                continue
+            clean: Dict[str, Dict[str, Any]] = {}
+            for drafter_key, snapshot in per_drafter.items():
+                if _valid_expert_snapshot(snapshot):
+                    clean[_normalise_drafter_profile_key(drafter_key)] = snapshot
+            if clean or slot == PROFILE_PERFORM:
+                bank["snapshots"][slot] = clean
+    return bank
+
+
+def _profile_bank_has_user_data(bank: Dict[str, Any]) -> bool:
+    snapshots = bank.get("snapshots")
+    if isinstance(snapshots, dict) and any(
+        isinstance(value, dict) and bool(value) for value in snapshots.values()
+    ):
+        return True
+    names = bank.get("names")
+    if isinstance(names, dict):
+        for index, slot in enumerate(CUSTOM_PROFILE_SLOTS, start=1):
+            if str(names.get(slot, "") or "") != f"Custom {index}":
+                return True
+    return False
+
+
+def _profile_bank_locations(model_path: Path) -> List[Tuple[str, str]]:
+    locations: List[Tuple[str, str]] = []
+    exact = favorite_model_key(model_path)
+    if exact:
+        locations.append((_os_path_key("setting_profile_banks"), exact))
+    portable = portable_model_key(model_path)
+    if portable:
+        locations.append(
+            (_os_path_key("setting_profile_banks_portable"), portable)
+        )
+    return locations
+
+
+def _read_profile_bank(
+    settings: Dict[str, Any], model_path: Path, performance_target: str
+) -> Optional[Dict[str, Any]]:
+    target = _normalise_performance_target(performance_target)
+    if not target:
+        return None
+    for storage_key, identity in _profile_bank_locations(model_path):
+        outer = settings.get(storage_key)
+        if not isinstance(outer, dict):
+            continue
+        per_model = outer.get(identity)
+        if not isinstance(per_model, dict):
+            continue
+        raw = per_model.get(target)
+        if isinstance(raw, dict):
+            return _normalise_profile_bank(raw)
+    return None
+
+
+def _write_profile_bank(
+    settings: Dict[str, Any],
+    model_path: Path,
+    performance_target: str,
+    bank: Dict[str, Any],
+) -> None:
+    target = _normalise_performance_target(performance_target)
+    if not target:
+        return
+    clean = _normalise_profile_bank(bank)
+    for storage_key, identity in _profile_bank_locations(model_path):
+        _set_target_value(settings, storage_key, identity, target, copy.deepcopy(clean))
+
+
+def _legacy_profile_bank(
+    settings: Dict[str, Any], model_name: str, model_path: Path, target: str
+) -> Dict[str, Any]:
+    """Seed the new bank without losing a v5.2.6 measured/manual snapshot."""
+    bank = _default_profile_bank()
+    snapshot: Optional[Dict[str, Any]] = None
+    exact = favorite_model_key(model_path)
+    if exact:
+        found, raw = _get_target_value(
+            settings,
+            _os_path_key("expert_overrides_by_performance"),
+            exact,
+            target,
+        )
+        if found and _valid_expert_snapshot(raw):
+            snapshot = raw
+    if snapshot is None:
+        portable = portable_model_key(model_path)
+        if portable:
+            found, raw = _get_target_value(
+                settings,
+                _os_path_key("expert_overrides_portable_by_performance"),
+                portable,
+                target,
+            )
+            if found and _valid_expert_snapshot(raw):
+                snapshot = raw
+    if snapshot is None and model_name:
+        found, raw = _get_target_value(
+            settings,
+            "expert_overrides_by_name_by_performance",
+            model_name,
+            target,
+        )
+        if found and _valid_expert_snapshot(raw):
+            snapshot = raw
+
+    measured = False
+    if exact:
+        found, record = _get_target_value(
+            settings,
+            _os_path_key("performance_tuning_results_by_performance"),
+            exact,
+            target,
+        )
+        measured = bool(found and isinstance(record, dict))
+    if snapshot is None:
+        return bank
+
+    source = str(snapshot.get("source", "") or "").lower()
+    if measured:
+        bank["snapshots"][PROFILE_PERFORM] = {
+            DEFAULT_DRAFTER_PROFILE_KEY: copy.deepcopy(snapshot)
+        }
+    if not measured or not source.startswith("measured-"):
+        bank["snapshots"][CUSTOM_PROFILE_SLOTS[0]] = {
+            DEFAULT_DRAFTER_PROFILE_KEY: copy.deepcopy(snapshot)
+        }
+        bank["selected"] = CUSTOM_PROFILE_SLOTS[0]
+    elif measured:
+        bank["selected"] = PROFILE_PERFORM
+    return bank
+
+
+def get_setting_profile_bank(
+    model_name: str, model_path: Path, performance_target: str
+) -> Dict[str, Any]:
+    """Return the normalized profile bank, lazily migrating legacy state."""
+    settings = load_settings()
+    target = _normalise_performance_target(performance_target)
+    if not target:
+        return _default_profile_bank()
+    bank = _read_profile_bank(settings, model_path, target)
+    if bank is None:
+        bank = _legacy_profile_bank(settings, model_name, model_path, target)
+        _write_profile_bank(settings, model_path, target, bank)
+        save_settings(settings)
+    return copy.deepcopy(bank)
+
+
+def get_selected_setting_profile(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    drafter_key: str = NO_DRAFTER_PROFILE_KEY,
+) -> str:
+    bank = get_setting_profile_bank(model_name, model_path, performance_target)
+    key = _normalise_drafter_profile_key(drafter_key)
+    selected_by_drafter = bank.get("selected_by_drafter")
+    if isinstance(selected_by_drafter, dict) and key in selected_by_drafter:
+        return _normalise_profile_slot(selected_by_drafter[key])
+    return _normalise_profile_slot(bank.get("selected"))
+
+
+def get_setting_profile_snapshot(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    slot: str,
+    drafter_key: str = NO_DRAFTER_PROFILE_KEY,
+) -> Optional[Dict[str, Any]]:
+    selected = _normalise_profile_slot(slot)
+    if selected == PROFILE_AUTO:
+        return None
+    bank = get_setting_profile_bank(model_name, model_path, performance_target)
+    snapshots = bank.get("snapshots")
+    per_drafter = snapshots.get(selected) if isinstance(snapshots, dict) else None
+    if not isinstance(per_drafter, dict):
+        return None
+    key = _normalise_drafter_profile_key(drafter_key)
+    snapshot = per_drafter.get(key)
+    if not _valid_expert_snapshot(snapshot):
+        snapshot = per_drafter.get(DEFAULT_DRAFTER_PROFILE_KEY)
+    return copy.deepcopy(snapshot) if _valid_expert_snapshot(snapshot) else None
+
+
+def has_setting_profile_snapshot(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    slot: str,
+    drafter_key: str = NO_DRAFTER_PROFILE_KEY,
+) -> bool:
+    return get_setting_profile_snapshot(
+        model_name, model_path, performance_target, slot, drafter_key
+    ) is not None
+
+
+def set_selected_setting_profile(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    slot: str,
+    drafter_key: str = NO_DRAFTER_PROFILE_KEY,
+) -> bool:
+    selected = _normalise_profile_slot(slot)
+    if selected == PROFILE_PERFORM and not has_setting_profile_snapshot(
+        model_name, model_path, performance_target, selected, drafter_key
+    ):
+        return False
+    settings = load_settings()
+    bank = _read_profile_bank(settings, model_path, performance_target)
+    if bank is None:
+        bank = _legacy_profile_bank(
+            settings,
+            model_name,
+            model_path,
+            _normalise_performance_target(performance_target),
+        )
+    key = _normalise_drafter_profile_key(drafter_key)
+    bank["selected"] = selected
+    selected_by_drafter = bank.setdefault("selected_by_drafter", {})
+    selected_by_drafter[key] = selected
+    _write_profile_bank(settings, model_path, performance_target, bank)
+    return save_settings(settings)
+
+
+def set_setting_profile_snapshot(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    slot: str,
+    snapshot: Dict[str, Any],
+    drafter_key: str = NO_DRAFTER_PROFILE_KEY,
+    *,
+    select: bool = False,
+) -> bool:
+    selected = _normalise_profile_slot(slot)
+    if selected not in (PROFILE_PERFORM, *CUSTOM_PROFILE_SLOTS) or not _valid_expert_snapshot(
+        snapshot
+    ):
+        return False
+    settings = load_settings()
+    bank = _read_profile_bank(settings, model_path, performance_target)
+    if bank is None:
+        bank = _legacy_profile_bank(
+            settings,
+            model_name,
+            model_path,
+            _normalise_performance_target(performance_target),
+        )
+    snapshots = bank.setdefault("snapshots", {})
+    per_drafter = snapshots.get(selected)
+    if not isinstance(per_drafter, dict):
+        per_drafter = {}
+    per_drafter[_normalise_drafter_profile_key(drafter_key)] = copy.deepcopy(snapshot)
+    snapshots[selected] = per_drafter
+    if select:
+        key = _normalise_drafter_profile_key(drafter_key)
+        bank["selected"] = selected
+        selected_by_drafter = bank.setdefault("selected_by_drafter", {})
+        selected_by_drafter[key] = selected
+    _write_profile_bank(settings, model_path, performance_target, bank)
+    return save_settings(settings)
+
+
+def clear_custom_setting_profile(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    slot: str,
+    drafter_key: str = NO_DRAFTER_PROFILE_KEY,
+) -> bool:
+    selected = _normalise_profile_slot(slot)
+    if selected not in CUSTOM_PROFILE_SLOTS:
+        return False
+    settings = load_settings()
+    bank = _read_profile_bank(settings, model_path, performance_target)
+    if bank is None:
+        bank = _legacy_profile_bank(
+            settings,
+            model_name,
+            model_path,
+            _normalise_performance_target(performance_target),
+        )
+    snapshots = bank.get("snapshots")
+    per_drafter = snapshots.get(selected) if isinstance(snapshots, dict) else None
+    if isinstance(snapshots, dict) and isinstance(per_drafter, dict):
+        per_drafter.pop(_normalise_drafter_profile_key(drafter_key), None)
+        per_drafter.pop(DEFAULT_DRAFTER_PROFILE_KEY, None)
+        if not per_drafter:
+            snapshots.pop(selected, None)
+    bank["selected"] = PROFILE_AUTO
+    selected_by_drafter = bank.setdefault("selected_by_drafter", {})
+    selected_by_drafter[_normalise_drafter_profile_key(drafter_key)] = PROFILE_AUTO
+    _write_profile_bank(settings, model_path, performance_target, bank)
+    return save_settings(settings)
+
+
+def rename_custom_setting_profile(
+    model_name: str,
+    model_path: Path,
+    performance_target: str,
+    slot: str,
+    name: str,
+) -> bool:
+    selected = _normalise_profile_slot(slot)
+    clean_name = " ".join(str(name or "").split()).strip()
+    if selected not in CUSTOM_PROFILE_SLOTS or not clean_name:
+        return False
+    settings = load_settings()
+    bank = _read_profile_bank(settings, model_path, performance_target)
+    if bank is None:
+        bank = _legacy_profile_bank(
+            settings,
+            model_name,
+            model_path,
+            _normalise_performance_target(performance_target),
+        )
+    names = bank.setdefault("names", {})
+    names[selected] = clean_name[:64]
+    _write_profile_bank(settings, model_path, performance_target, bank)
+    return save_settings(settings)
+
+
 def get_performance_tuning_result(
     model_path: Path,
     performance_target: Optional[str] = None,
     benchmark_type: Optional[str] = None,
+    drafter_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return measured evidence for one exact model/target/test-type tuple.
 
@@ -805,31 +1380,62 @@ def get_performance_tuning_result(
     key = favorite_model_key(model_path)
     target = _normalise_performance_target(performance_target)
     test_type = _normalise_benchmark_type(benchmark_type)
-    if target and key and test_type:
-        found, record = _get_benchmark_result_value(
-            settings,
-            _os_path_key("performance_run_results_by_test"),
-            key,
-            test_type,
-            target,
-        )
-        if found:
-            return record if isinstance(record, dict) else None
+    storage_types = _benchmark_storage_keys(test_type)
+    if target and key and storage_types and drafter_key is not None:
         portable = portable_model_key(model_path)
-        found, record = _get_benchmark_result_value(
-            settings,
-            _os_path_key("performance_run_results_portable_by_test"),
-            portable,
-            test_type,
-            target,
-        )
-        if found:
-            return record if isinstance(record, dict) else None
+        for stored_type in storage_types:
+            found, record = _get_drafter_benchmark_result_value(
+                settings,
+                _os_path_key("performance_run_results_by_drafter"),
+                key,
+                stored_type,
+                target,
+                drafter_key,
+            )
+            if found:
+                return record if isinstance(record, dict) else None
+            found, record = _get_drafter_benchmark_result_value(
+                settings,
+                _os_path_key("performance_run_results_portable_by_drafter"),
+                portable,
+                stored_type,
+                target,
+                drafter_key,
+            )
+            if found:
+                return record if isinstance(record, dict) else None
+        if _normalise_drafter_profile_key(drafter_key) not in (
+            NO_DRAFTER_PROFILE_KEY,
+            DEFAULT_DRAFTER_PROFILE_KEY,
+        ):
+            return None
 
-    record: Any = None
+    if target and key and storage_types:
+        portable = portable_model_key(model_path)
+        for stored_type in storage_types:
+            found, record = _get_benchmark_result_value(
+                settings,
+                _os_path_key("performance_run_results_by_test"),
+                key,
+                stored_type,
+                target,
+            )
+            if found:
+                return record if isinstance(record, dict) else None
+            found, record = _get_benchmark_result_value(
+                settings,
+                _os_path_key("performance_run_results_portable_by_test"),
+                portable,
+                stored_type,
+                target,
+            )
+            if found:
+                return record if isinstance(record, dict) else None
+
+    latest_record: Any = None
     found_current = False
     if target and key:
-        found_current, record = _get_target_value(
+        found_current, latest_record = _get_target_value(
             settings,
             _os_path_key("performance_tuning_results_by_performance"),
             key,
@@ -837,7 +1443,7 @@ def get_performance_tuning_result(
         )
         if not found_current:
             portable = portable_model_key(model_path)
-            found_current, record = _get_target_value(
+            found_current, latest_record = _get_target_value(
                 settings,
                 _os_path_key("performance_tuning_results_portable_by_performance"),
                 portable,
@@ -846,31 +1452,107 @@ def get_performance_tuning_result(
     if not found_current:
         records = settings.get(_os_path_key("performance_tuning_results")) or {}
         if key and isinstance(records, dict):
-            record = records.get(key)
+            latest_record = records.get(key)
 
-    if not isinstance(record, dict):
+    if not isinstance(latest_record, dict):
         return None
     if test_type:
-        stored_type = _normalise_benchmark_type(record.get("benchmark_type")) or "normal"
-        return record if stored_type == test_type else None
-    return record
+        stored_type = (
+            _normalise_benchmark_type(latest_record.get("benchmark_type"))
+            or "custom"
+        )
+        return latest_record if stored_type == test_type else None
+    return latest_record
 
 
 def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
-    """List standard, custom, and legacy evidence for every tested model/mode.
+    """List Quick-pass, Standard, and Custom evidence for every model/mode/head.
 
-    The test-specific store is authoritative. Legacy v5.2.4 evidence is
-    classified as ``normal`` because that release always used 25% context.
+    Drafter-specific stores are authoritative. Legacy v5.2.4 fixed-25%
+    ``normal`` evidence is classified under ``custom`` without a legacy tile.
     Portable mirror entries are listed only when no exact-path result represents
     the same filename+size identity, preserving unmapped imports without duplicates.
     """
     settings = load_settings()
     grouped: Dict[str, List[Dict[str, Any]]] = {
+        "fast": [],
         "quick": [],
         "custom": [],
-        "normal": [],
     }
     seen: set[Tuple[str, str, str]] = set()
+    represented_new_portable: set[str] = set()
+
+    exact_drafters = settings.get(
+        _os_path_key("performance_run_results_by_drafter")
+    )
+    if isinstance(exact_drafters, dict):
+        for identity, per_model in exact_drafters.items():
+            if not isinstance(identity, str) or not isinstance(per_model, dict):
+                continue
+            for raw_type, per_test in per_model.items():
+                test_type = _normalise_benchmark_type(str(raw_type))
+                if not test_type or not isinstance(per_test, dict):
+                    continue
+                for raw_target, per_drafter in per_test.items():
+                    target = _normalise_performance_target(str(raw_target))
+                    if not target or not isinstance(per_drafter, dict):
+                        continue
+                    for drafter_key, raw_record in per_drafter.items():
+                        if not isinstance(raw_record, dict):
+                            continue
+                        item = dict(raw_record)
+                        item.setdefault("model_path", identity)
+                        item["performance_target"] = target
+                        item["benchmark_type"] = test_type
+                        item["drafter_key"] = _normalise_drafter_profile_key(
+                            drafter_key
+                        )
+                        grouped[test_type].append(item)
+                    seen.add((identity, test_type, target))
+                    try:
+                        size = int(
+                            next(
+                                record.get("model_size", 0)
+                                for record in per_drafter.values()
+                                if isinstance(record, dict)
+                            )
+                            or 0
+                        )
+                    except (StopIteration, TypeError, ValueError):
+                        size = 0
+                    portable = portable_model_key(Path(identity), size)
+                    if portable:
+                        represented_new_portable.add(portable)
+
+    portable_drafters = settings.get(
+        _os_path_key("performance_run_results_portable_by_drafter")
+    )
+    if isinstance(portable_drafters, dict):
+        for portable, per_model in portable_drafters.items():
+            if portable in represented_new_portable or not isinstance(per_model, dict):
+                continue
+            filename = str(portable).rpartition("|")[0]
+            for raw_type, per_test in per_model.items():
+                test_type = _normalise_benchmark_type(str(raw_type))
+                if not test_type or not isinstance(per_test, dict):
+                    continue
+                for raw_target, per_drafter in per_test.items():
+                    target = _normalise_performance_target(str(raw_target))
+                    if not target or not isinstance(per_drafter, dict):
+                        continue
+                    for drafter_key, raw_record in per_drafter.items():
+                        if not isinstance(raw_record, dict):
+                            continue
+                        item = dict(raw_record)
+                        item.setdefault("model_name", Path(filename).stem)
+                        item["performance_target"] = target
+                        item["benchmark_type"] = test_type
+                        item["drafter_key"] = _normalise_drafter_profile_key(
+                            drafter_key
+                        )
+                        grouped[test_type].append(item)
+                    seen.add((f"portable:{portable}", test_type, target))
+            represented_new_portable.add(str(portable))
 
     exact = settings.get(_os_path_key("performance_run_results_by_test"))
     if isinstance(exact, dict):
@@ -885,12 +1567,15 @@ def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
                     target = _normalise_performance_target(str(raw_target))
                     if not target or not isinstance(raw_record, dict):
                         continue
+                    marker = (identity, test_type, target)
+                    if marker in seen:
+                        continue
                     item = dict(raw_record)
                     item.setdefault("model_path", identity)
                     item["performance_target"] = target
                     item["benchmark_type"] = test_type
                     grouped[test_type].append(item)
-                    seen.add((identity, test_type, target))
+                    seen.add(marker)
 
     legacy = settings.get(_os_path_key("performance_tuning_results_by_performance"))
     if isinstance(legacy, dict):
@@ -903,7 +1588,7 @@ def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
                     continue
                 test_type = (
                     _normalise_benchmark_type(raw_record.get("benchmark_type"))
-                    or "normal"
+                    or "custom"
                 )
                 marker = (identity, test_type, target)
                 if marker in seen:
@@ -924,7 +1609,7 @@ def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
             if not target:
                 continue
             test_type = (
-                _normalise_benchmark_type(raw_record.get("benchmark_type")) or "normal"
+                _normalise_benchmark_type(raw_record.get("benchmark_type")) or "custom"
             )
             marker = (identity, test_type, target)
             if marker in seen:
@@ -992,7 +1677,7 @@ def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
                     continue
                 test_type = (
                     _normalise_benchmark_type(raw_record.get("benchmark_type"))
-                    or "normal"
+                    or "custom"
                 )
                 marker = (f"portable:{portable}", test_type, target)
                 if marker in seen:
@@ -1013,6 +1698,7 @@ def save_performance_tuning_result(
     snapshot: Dict[str, Any],
     performance_target: Optional[str] = None,
     benchmark_type: Optional[str] = None,
+    drafter_key: Optional[str] = None,
 ) -> bool:
     """Atomically save the active profile and test-type-isolated evidence."""
     key = favorite_model_key(model_path)
@@ -1031,10 +1717,21 @@ def save_performance_tuning_result(
         _normalise_benchmark_type(
             benchmark_type or str(result.get("benchmark_type", ""))
         )
-        or "normal"
+        or "custom"
     )
     history_record = dict(result)
     history_record.setdefault("benchmark_type", test_type)
+    profile_drafter = _normalise_drafter_profile_key(
+        drafter_key or result.get("drafter_key")
+    )
+    history_record.setdefault("drafter_key", profile_drafter)
+    bank: Optional[Dict[str, Any]] = None
+    if target:
+        # Capture/migrate the pre-benchmark bank before legacy compatibility
+        # mirrors below receive the new measured snapshot.
+        bank = _read_profile_bank(settings, model_path, target)
+        if bank is None:
+            bank = _legacy_profile_bank(settings, model_name, model_path, target)
     if target:
         _set_target_value(
             settings,
@@ -1056,6 +1753,15 @@ def save_performance_tuning_result(
             key,
             test_type,
             target,
+            history_record,
+        )
+        _set_drafter_benchmark_result_value(
+            settings,
+            _os_path_key("performance_run_results_by_drafter"),
+            key,
+            test_type,
+            target,
+            profile_drafter,
             history_record,
         )
         portable = portable_model_key(model_path, result.get("model_size"))
@@ -1082,6 +1788,31 @@ def save_performance_tuning_result(
                 target,
                 history_record,
             )
+            _set_drafter_benchmark_result_value(
+                settings,
+                _os_path_key("performance_run_results_portable_by_drafter"),
+                portable,
+                test_type,
+                target,
+                profile_drafter,
+                history_record,
+            )
+
+        # The measured snapshot belongs to the immutable Perform slot rather
+        # than replacing a user's Custom profile. Draft heads have independent
+        # variants so changing embedded/Q4/Q8/BF16 drafters restores the exact
+        # runtime winner measured for that head.
+        assert bank is not None
+        snapshots = bank.setdefault("snapshots", {})
+        per_drafter = snapshots.get(PROFILE_PERFORM)
+        if not isinstance(per_drafter, dict):
+            per_drafter = {}
+        per_drafter[profile_drafter] = copy.deepcopy(snapshot)
+        snapshots[PROFILE_PERFORM] = per_drafter
+        bank["selected"] = PROFILE_PERFORM
+        selected_by_drafter = bank.setdefault("selected_by_drafter", {})
+        selected_by_drafter[profile_drafter] = PROFILE_PERFORM
+        _write_profile_bank(settings, model_path, target, bank)
     else:
         result_key = _os_path_key("performance_tuning_results")
         results = settings.get(result_key)
@@ -1099,7 +1830,7 @@ def save_performance_tuning_result(
 
 
 _PROFILE_BUNDLE_FORMAT = "autotuner-performance-profiles"
-_PROFILE_BUNDLE_SCHEMA = 1
+_PROFILE_BUNDLE_SCHEMA = 2
 _PROFILE_BUNDLE_MAX_BYTES = 32 * 1024 * 1024
 
 
@@ -1119,7 +1850,13 @@ def _profile_bundle_entry(
             continue
         snapshot = payload.get("snapshot")
         result = payload.get("result")
-        if not _valid_expert_snapshot(snapshot):
+        raw_bank = payload.get("profile_bank")
+        profile_bank = (
+            _normalise_profile_bank(raw_bank) if isinstance(raw_bank, dict) else None
+        )
+        if profile_bank is not None and not _profile_bank_has_user_data(profile_bank):
+            profile_bank = None
+        if not _valid_expert_snapshot(snapshot) and profile_bank is None:
             continue
         clean_runs: Dict[str, Dict[str, Any]] = {}
         raw_runs = payload.get("runs")
@@ -1128,12 +1865,31 @@ def _profile_bundle_entry(
                 test_type = _normalise_benchmark_type(str(raw_type))
                 if test_type and isinstance(raw_record, dict):
                     clean_runs[test_type] = raw_record
-        clean_mode = {
-            "snapshot": snapshot,
+        clean_drafter_runs: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        raw_drafter_runs = payload.get("runs_by_drafter")
+        if isinstance(raw_drafter_runs, dict):
+            for raw_type, per_drafter in raw_drafter_runs.items():
+                test_type = _normalise_benchmark_type(str(raw_type))
+                if not test_type or not isinstance(per_drafter, dict):
+                    continue
+                clean_per_drafter = {
+                    _normalise_drafter_profile_key(key): record
+                    for key, record in per_drafter.items()
+                    if isinstance(record, dict)
+                }
+                if clean_per_drafter:
+                    clean_drafter_runs[test_type] = clean_per_drafter
+        clean_mode: Dict[str, Any] = {
             "result": result if isinstance(result, dict) else {},
         }
+        if _valid_expert_snapshot(snapshot):
+            clean_mode["snapshot"] = snapshot
+        if profile_bank is not None:
+            clean_mode["profile_bank"] = profile_bank
         if clean_runs:
             clean_mode["runs"] = clean_runs
+        if clean_drafter_runs:
+            clean_mode["runs_by_drafter"] = clean_drafter_runs
         clean_modes[target_name] = clean_mode
     clean_filename = Path(str(filename or "")).name
     if not clean_filename or not clean_modes:
@@ -1160,6 +1916,10 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
     runs_by_path = _target_map(
         settings, _os_path_key("performance_run_results_by_test")
     )
+    drafter_runs_by_path = _target_map(
+        settings, _os_path_key("performance_run_results_by_drafter")
+    )
+    banks_by_path = _target_map(settings, _os_path_key("setting_profile_banks"))
     legacy_experts = settings.get(_os_path_key("expert_overrides_by_path"))
     legacy_results = settings.get(_os_path_key("performance_tuning_results"))
     preferred_by_path = settings.get(_os_path_key("model_performance_targets"))
@@ -1183,12 +1943,36 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
                 collected[test_type] = record
         return collected
 
+    def drafter_runs_for_target(
+        per_model: Any, target: str
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        collected: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        if not isinstance(per_model, dict):
+            return collected
+        for raw_type, per_test in per_model.items():
+            test_type = _normalise_benchmark_type(str(raw_type))
+            if not test_type or not isinstance(per_test, dict):
+                continue
+            per_drafter = per_test.get(target)
+            if not isinstance(per_drafter, dict):
+                continue
+            clean = {
+                _normalise_drafter_profile_key(key): record
+                for key, record in per_drafter.items()
+                if isinstance(record, dict)
+            }
+            if clean:
+                collected[test_type] = clean
+        return collected
+
     entries: List[Dict[str, Any]] = []
     represented_portable: set[str] = set()
     path_keys = (
         set(experts_by_path)
         | set(results_by_path)
         | set(runs_by_path)
+        | set(drafter_runs_by_path)
+        | set(banks_by_path)
         | set(legacy_experts)
     )
     for path_key in sorted(path_keys, key=str.casefold):
@@ -1196,15 +1980,26 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
         per_expert = experts_by_path.get(path_key)
         per_result = results_by_path.get(path_key)
         per_runs = runs_by_path.get(path_key)
+        per_drafter_runs = drafter_runs_by_path.get(path_key)
+        per_banks = banks_by_path.get(path_key)
         modes: Dict[str, Any] = {}
-        if isinstance(per_expert, dict):
-            for target, snapshot in per_expert.items():
-                result = per_result.get(target) if isinstance(per_result, dict) else {}
-                modes[target] = {
-                    "snapshot": snapshot,
-                    "result": result,
-                    "runs": runs_for_target(per_runs, str(target)),
-                }
+        target_names: set[str] = set()
+        for collection in (per_expert, per_result, per_banks):
+            if isinstance(collection, dict):
+                target_names.update(str(target) for target in collection)
+        for target in target_names:
+            snapshot = per_expert.get(target) if isinstance(per_expert, dict) else None
+            result = per_result.get(target) if isinstance(per_result, dict) else {}
+            profile_bank = per_banks.get(target) if isinstance(per_banks, dict) else None
+            modes[target] = {
+                "snapshot": snapshot,
+                "result": result,
+                "runs": runs_for_target(per_runs, str(target)),
+                "runs_by_drafter": drafter_runs_for_target(
+                    per_drafter_runs, str(target)
+                ),
+                "profile_bank": profile_bank,
+            }
         legacy_snapshot = legacy_experts.get(path_key)
         if _valid_expert_snapshot(legacy_snapshot):
             legacy_record = legacy_results.get(path_key)
@@ -1219,6 +2014,9 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
                     "snapshot": legacy_snapshot,
                     "result": legacy_record if isinstance(legacy_record, dict) else {},
                     "runs": runs_for_target(per_runs, inferred),
+                    "runs_by_drafter": drafter_runs_for_target(
+                        per_drafter_runs, inferred
+                    ),
                 },
             )
         size = 0
@@ -1265,13 +2063,23 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
     portable_runs = _target_map(
         settings, _os_path_key("performance_run_results_portable_by_test")
     )
+    portable_drafter_runs = _target_map(
+        settings, _os_path_key("performance_run_results_portable_by_drafter")
+    )
+    portable_banks = _target_map(
+        settings, _os_path_key("setting_profile_banks_portable")
+    )
     preferred_portable = settings.get(
         _os_path_key("model_performance_targets_portable")
     )
     if not isinstance(preferred_portable, dict):
         preferred_portable = {}
     for portable in sorted(
-        set(portable_experts) | set(portable_results) | set(portable_runs),
+        set(portable_experts)
+        | set(portable_results)
+        | set(portable_runs)
+        | set(portable_drafter_runs)
+        | set(portable_banks),
         key=str.casefold,
     ):
         if portable in represented_portable:
@@ -1286,15 +2094,29 @@ def export_performance_profiles(destination: Path) -> Tuple[bool, str, int]:
         per_expert = portable_experts.get(portable)
         per_result = portable_results.get(portable)
         per_runs = portable_runs.get(portable)
-        if not isinstance(per_expert, dict):
-            continue
+        per_drafter_runs = portable_drafter_runs.get(portable)
+        per_banks = portable_banks.get(portable)
+        portable_target_names: set[str] = set()
+        for collection in (per_expert, per_result, per_banks):
+            if isinstance(collection, dict):
+                portable_target_names.update(str(target) for target in collection)
         modes = {
             target: {
-                "snapshot": snapshot,
-                "result": per_result.get(target) if isinstance(per_result, dict) else {},
+                "snapshot": (
+                    per_expert.get(target) if isinstance(per_expert, dict) else None
+                ),
+                "result": (
+                    per_result.get(target) if isinstance(per_result, dict) else {}
+                ),
                 "runs": runs_for_target(per_runs, str(target)),
+                "runs_by_drafter": drafter_runs_for_target(
+                    per_drafter_runs, str(target)
+                ),
+                "profile_bank": (
+                    per_banks.get(target) if isinstance(per_banks, dict) else None
+                ),
             }
-            for target, snapshot in per_expert.items()
+            for target in portable_target_names
         }
         item = _profile_bundle_entry(
             filename=filename,
@@ -1350,7 +2172,7 @@ def import_performance_profiles(
         return False, "Profile bundle root must be a JSON object.", 0
     if payload.get("format") != _PROFILE_BUNDLE_FORMAT:
         return False, "This is not an AutoTuner performance-profile bundle.", 0
-    if payload.get("schema") != _PROFILE_BUNDLE_SCHEMA:
+    if payload.get("schema") not in (1, _PROFILE_BUNDLE_SCHEMA):
         return False, f"Unsupported profile bundle schema: {payload.get('schema')!r}.", 0
     models = payload.get("models")
     if not isinstance(models, list) or len(models) > 10_000:
@@ -1433,7 +2255,14 @@ def import_performance_profiles(
                 continue
             snapshot = mode_payload.get("snapshot")
             result = mode_payload.get("result")
-            if not _valid_expert_snapshot(snapshot):
+            raw_bank = mode_payload.get("profile_bank")
+            valid_snapshot = _valid_expert_snapshot(snapshot)
+            profile_bank = (
+                _normalise_profile_bank(raw_bank)
+                if isinstance(raw_bank, dict)
+                else None
+            )
+            if not valid_snapshot and profile_bank is None:
                 continue
             record = result if isinstance(result, dict) else {}
             imported_runs: Dict[str, Dict[str, Any]] = {}
@@ -1446,16 +2275,39 @@ def import_performance_profiles(
             if not imported_runs and record:
                 test_type = (
                     _normalise_benchmark_type(record.get("benchmark_type"))
-                    or "normal"
+                    or "custom"
                 )
                 imported_runs[test_type] = record
-            _set_target_value(
-                settings,
-                _os_path_key("expert_overrides_portable_by_performance"),
-                portable,
-                target_name,
-                snapshot,
-            )
+            imported_drafter_runs: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            raw_drafter_runs = mode_payload.get("runs_by_drafter")
+            if isinstance(raw_drafter_runs, dict):
+                for raw_type, per_drafter in raw_drafter_runs.items():
+                    test_type = _normalise_benchmark_type(str(raw_type))
+                    if not test_type or not isinstance(per_drafter, dict):
+                        continue
+                    clean = {
+                        _normalise_drafter_profile_key(key): run_record
+                        for key, run_record in per_drafter.items()
+                        if isinstance(run_record, dict)
+                    }
+                    if clean:
+                        imported_drafter_runs[test_type] = clean
+            if valid_snapshot:
+                _set_target_value(
+                    settings,
+                    _os_path_key("expert_overrides_portable_by_performance"),
+                    portable,
+                    target_name,
+                    snapshot,
+                )
+            if profile_bank is not None:
+                _set_target_value(
+                    settings,
+                    _os_path_key("setting_profile_banks_portable"),
+                    portable,
+                    target_name,
+                    profile_bank,
+                )
             _set_target_value(
                 settings,
                 _os_path_key("performance_tuning_results_portable_by_performance"),
@@ -1472,16 +2324,32 @@ def import_performance_profiles(
                     target_name,
                     run_record,
                 )
+            for test_type, per_drafter in imported_drafter_runs.items():
+                for drafter_key, run_record in per_drafter.items():
+                    _set_drafter_benchmark_result_value(
+                        settings,
+                        _os_path_key("performance_run_results_portable_by_drafter"),
+                        portable,
+                        test_type,
+                        target_name,
+                        drafter_key,
+                        run_record,
+                    )
             if local_path is not None:
                 local_key = favorite_model_key(local_path)
                 if local_key:
-                    _set_target_value(
-                        settings,
-                        _os_path_key("expert_overrides_by_performance"),
-                        local_key,
-                        target_name,
-                        snapshot,
-                    )
+                    if valid_snapshot:
+                        _set_target_value(
+                            settings,
+                            _os_path_key("expert_overrides_by_performance"),
+                            local_key,
+                            target_name,
+                            snapshot,
+                        )
+                    if profile_bank is not None:
+                        _write_profile_bank(
+                            settings, local_path, target_name, profile_bank
+                        )
                     _set_target_value(
                         settings,
                         _os_path_key("performance_tuning_results_by_performance"),
@@ -1498,7 +2366,18 @@ def import_performance_profiles(
                             target_name,
                             run_record,
                         )
-            elif model_name:
+                    for test_type, per_drafter in imported_drafter_runs.items():
+                        for drafter_key, run_record in per_drafter.items():
+                            _set_drafter_benchmark_result_value(
+                                settings,
+                                _os_path_key("performance_run_results_by_drafter"),
+                                local_key,
+                                test_type,
+                                target_name,
+                                drafter_key,
+                                run_record,
+                            )
+            elif model_name and valid_snapshot:
                 # Name fallback is only used until a matching filename+size is
                 # scanned; portable identity remains the authoritative mapping.
                 _set_target_value(

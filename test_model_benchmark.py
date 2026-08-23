@@ -19,6 +19,7 @@ from model_benchmark import (
     baseline_candidate,
     draft_candidates,
     parse_timing_payload,
+    shortlist_candidates_from_record,
     thread_candidates,
 )
 from tuner import TunedConfig
@@ -152,6 +153,18 @@ def test_prompt_is_calibrated_to_real_tokenizer_cap(monkeypatch) -> None:
     runner._measurement_payload(32768, port=34567)
     assert tokenize_calls == cached_calls
 
+    # Repeated samples use distinct deterministic corpora so persistent n-gram
+    # state cannot make sample 2 an artificial exact-prompt cache hit.
+    variant = runner._measurement_payload(32768, port=45678, variant=1)
+    assert variant["prompt"] != payload["prompt"]
+    assert tokenize_calls > cached_calls
+    variant_calls = tokenize_calls
+    assert (
+        runner._measurement_payload(32768, port=56789, variant=1)["prompt"]
+        == variant["prompt"]
+    )
+    assert tokenize_calls == variant_calls
+
 
 def test_parse_timing_payload_supports_current_llama_fields() -> None:
     sample = parse_timing_payload(
@@ -161,12 +174,17 @@ def test_parse_timing_payload_supports_current_llama_fields() -> None:
                 "prompt_ms": 512.0,
                 "predicted_n": 64,
                 "predicted_ms": 1280.0,
+                "draft_n": 80,
+                "draft_n_accepted": 52,
             }
         },
         1.8,
     )
     assert sample.prompt_tps == pytest.approx(2000.0)
     assert sample.generation_tps == pytest.approx(50.0)
+    assert sample.draft_tokens == 80
+    assert sample.draft_tokens_accepted == 52
+    assert sample.draft_acceptance == pytest.approx(0.65)
 
     with pytest.raises(Exception, match="too early"):
         parse_timing_payload(
@@ -180,6 +198,51 @@ def test_parse_timing_payload_supports_current_llama_fields() -> None:
             },
             1.0,
         )
+
+
+def test_short_pass_shortlist_requires_stable_samples_and_keeps_coverage() -> None:
+    seed = baseline_candidate(_config())
+
+    def candidate(
+        identifier: str, threads: int, batch: int, ubatch: int, score: float
+    ) -> dict:
+        return {
+            "id": identifier,
+            "label": identifier,
+            "settings": {
+                "threads": threads,
+                "batch_threads": threads,
+                "batch": batch,
+                "ubatch": ubatch,
+                "draft_n_max": 0,
+            },
+            "overall_tps": score,
+            "samples": [
+                {"prompt_tps": score * 2.0, "generation_tps": score},
+                {"prompt_tps": score * 2.02, "generation_tps": score * 1.01},
+            ],
+            "error": "",
+        }
+
+    record = {
+        "candidates": [
+            candidate("baseline", 6, 512, 256, 100.0),
+            candidate("winner", 8, 1024, 512, 140.0),
+            candidate("runner-up", 8, 2048, 512, 135.0),
+            candidate("thread-representative", 4, 1024, 512, 120.0),
+            candidate("batch-representative", 8, 512, 512, 118.0),
+        ]
+    }
+    shortlist = shortlist_candidates_from_record(record, seed)
+    assert shortlist
+    assert any(item.threads == 4 for item in shortlist)
+    assert len({(item.batch, item.ubatch) for item in shortlist}) >= 2
+    assert len({item.threads for item in shortlist}) >= 2
+
+    noisy = __import__("copy").deepcopy(record)
+    for item in noisy["candidates"]:
+        item["samples"][1]["generation_tps"] *= 0.5
+    assert shortlist_candidates_from_record(noisy, seed) == []
 
 
 def test_staged_search_is_bounded_and_combines_best_axes(monkeypatch) -> None:
@@ -217,6 +280,22 @@ def test_staged_search_is_bounded_and_combines_best_axes(monkeypatch) -> None:
     )
     assert result.runtime_build == 10572
     assert result.score(result.winner) > 1.03
+
+
+def test_speculative_runs_allow_expected_cross_prompt_acceptance_variance() -> None:
+    regular = _runner(BenchmarkLimits(max_sample_spread=0.35))
+    speculative = BenchmarkRunner(
+        model=SimpleNamespace(path=Path("model.gguf")),
+        profile=SimpleNamespace(draft_max=2),
+        base_config=_config(),
+        runtime_binary="llama-server",
+        physical_cores=8,
+        logical_cores=16,
+        enable_speculative=True,
+        limits=BenchmarkLimits(max_sample_spread=0.35),
+    )
+    assert regular._sample_spread_limit() == pytest.approx(0.35)
+    assert speculative._sample_spread_limit() == pytest.approx(0.65)
 
 
 def test_draft_depth_sweep_continues_until_first_decode_regression(
@@ -431,6 +510,59 @@ def test_benchmark_snapshot_reapplies_measured_runtime_values() -> None:
     assert restored.n_parallel == 1
 
 
+def test_explicit_data_dir_override_is_isolated_from_legacy_locations(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AUTOTUNER_DATA_DIR", str(tmp_path / "isolated"))
+    monkeypatch.delenv("AUTOTUNER_MIGRATE_LEGACY", raising=False)
+    assert app_settings._legacy_settings_candidates() == []
+
+
+def test_source_and_frozen_settings_merge_into_shared_user_data(
+    tmp_path, monkeypatch
+) -> None:
+    data_dir = tmp_path / "home" / ".autotuner"
+    source_settings = tmp_path / "source" / "autotuner_settings.json"
+    frozen_settings = tmp_path / "dist" / "autotuner_settings.json"
+    source_settings.parent.mkdir()
+    frozen_settings.parent.mkdir()
+    source_settings.write_text(
+        '{"models_path": "source-models", "nested": {"source": 1, "same": "old"}}',
+        encoding="utf-8",
+    )
+    frozen_settings.write_text(
+        '{"fork_path": "frozen-fork", "nested": {"frozen": 2, "same": "new"}}',
+        encoding="utf-8",
+    )
+    # Deterministically make the frozen file the newer conflict winner.
+    source_stat = source_settings.stat()
+    frozen_mtime = source_stat.st_mtime_ns + 10_000_000
+    source_settings.touch()
+    import os
+
+    os.utime(frozen_settings, ns=(frozen_mtime, frozen_mtime))
+    monkeypatch.setenv("AUTOTUNER_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(
+        app_settings,
+        "_legacy_settings_candidates",
+        lambda: [source_settings, frozen_settings],
+    )
+
+    target = app_settings._settings_file()
+    assert target == data_dir / "autotuner_settings.json"
+    merged = app_settings.load_settings()
+    assert merged["models_path"] == "source-models"
+    assert merged["fork_path"] == "frozen-fork"
+    assert merged["nested"] == {"source": 1, "frozen": 2, "same": "new"}
+    assert len(list((data_dir / "migrations").glob("*.json"))) == 2
+
+    # Exact source signatures are imported once; later shared writes remain
+    # authoritative instead of being overwritten on every startup.
+    merged["nested"]["same"] = "shared"
+    assert app_settings.save_settings(merged)
+    assert app_settings.load_settings()["nested"]["same"] == "shared"
+
+
 def test_performance_profiles_are_isolated_per_target(tmp_path, monkeypatch) -> None:
     settings_file = tmp_path / "settings.json"
     monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
@@ -454,6 +586,105 @@ def test_performance_profiles_are_isolated_per_target(tmp_path, monkeypatch) -> 
     assert app_settings.get_expert_override("model", model, "balanced") == balanced
 
 
+def test_profile_bank_keeps_auto_perform_and_custom_drafter_variants(
+    tmp_path, monkeypatch
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"profile-bank-model")
+    custom = {"mode": "manual", "values": {"ctx": 16384, "draft_n_max": 3}}
+    q4_perform = {"mode": "auto", "values": {"ctx": 32768, "draft_n_max": 7}}
+    q8_perform = {"mode": "auto", "values": {"ctx": 32768, "draft_n_max": 5}}
+
+    bank = app_settings.get_setting_profile_bank("model", model, "balanced")
+    assert bank["selected"] == "auto"
+    assert not app_settings.has_setting_profile_snapshot(
+        "model", model, "balanced", "perform", "external:q4"
+    )
+    assert app_settings.set_setting_profile_snapshot(
+        "model",
+        model,
+        "balanced",
+        "custom1",
+        custom,
+        "external:q4",
+        select=True,
+    )
+    assert app_settings.rename_custom_setting_profile(
+        "model", model, "balanced", "custom1", "  My Q4 experiment  "
+    )
+    bank = app_settings.get_setting_profile_bank("model", model, "balanced")
+    assert bank["selected"] == "custom1"
+    assert bank["names"]["custom1"] == "My Q4 experiment"
+    assert app_settings.get_setting_profile_snapshot(
+        "model", model, "balanced", "custom1", "external:q4"
+    ) == custom
+    assert app_settings.get_setting_profile_snapshot(
+        "model", model, "balanced", "custom1", "external:q8"
+    ) is None
+
+    for drafter, snapshot in (("external:q4", q4_perform), ("external:q8", q8_perform)):
+        record = {
+            "performance_target": "balanced",
+            "model_size": model.stat().st_size,
+            "winner_id": drafter,
+            "drafter_key": drafter,
+        }
+        assert app_settings.save_performance_tuning_result(
+            "model", model, record, snapshot, "balanced", "quick", drafter
+        )
+    assert app_settings.get_setting_profile_snapshot(
+        "model", model, "balanced", "perform", "external:q4"
+    ) == q4_perform
+    assert app_settings.get_setting_profile_snapshot(
+        "model", model, "balanced", "perform", "external:q8"
+    ) == q8_perform
+    grouped = app_settings.list_performance_run_results()
+    assert {item["drafter_key"] for item in grouped["quick"]} == {
+        "external:q4",
+        "external:q8",
+    }
+    # Benchmark writes never replace the independent user-owned profile.
+    assert app_settings.get_setting_profile_snapshot(
+        "model", model, "balanced", "custom1", "external:q4"
+    ) == custom
+
+
+def test_custom_profile_bank_export_import_round_trip(tmp_path, monkeypatch) -> None:
+    active_settings = [tmp_path / "source-settings.json"]
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: active_settings[0])
+    model = tmp_path / "portable.gguf"
+    model.write_bytes(b"portable-profile-model")
+    snapshot = {"mode": "manual", "values": {"ctx": 49152, "draft_n_max": 6}}
+    drafter = "external:portable-dflash-q4.gguf|123"
+    assert app_settings.set_setting_profile_snapshot(
+        "portable", model, "throughput", "custom2", snapshot, drafter, select=True
+    )
+    assert app_settings.rename_custom_setting_profile(
+        "portable", model, "throughput", "custom2", "DFlash Q4 lab"
+    )
+
+    bundle = tmp_path / "profiles.json"
+    ok, message, count = app_settings.export_performance_profiles(bundle)
+    assert ok, message
+    assert count == 1
+    assert __import__("json").loads(bundle.read_text(encoding="utf-8"))["schema"] == 2
+
+    active_settings[0] = tmp_path / "imported-settings.json"
+    ok, message, count = app_settings.import_performance_profiles(bundle, [model])
+    assert ok, message
+    assert count == 1
+    restored = app_settings.get_setting_profile_bank(
+        "portable", model, "throughput"
+    )
+    assert restored["names"]["custom2"] == "DFlash Q4 lab"
+    assert restored["selected_by_drafter"][drafter] == "custom2"
+    assert app_settings.get_setting_profile_snapshot(
+        "portable", model, "throughput", "custom2", drafter
+    ) == snapshot
+
+
 def test_mode_scoped_measured_result_round_trip(tmp_path, monkeypatch) -> None:
     settings_file = tmp_path / "settings.json"
     monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
@@ -473,7 +704,7 @@ def test_mode_scoped_measured_result_round_trip(tmp_path, monkeypatch) -> None:
     assert app_settings.get_expert_override("model", model, "low_vram") == snapshot
 
 
-def test_quick_and_normal_results_are_retained_separately(
+def test_quick_and_legacy_normal_results_map_to_standard_and_custom(
     tmp_path, monkeypatch
 ) -> None:
     active_settings = [tmp_path / "settings.json"]
@@ -512,8 +743,9 @@ def test_quick_and_normal_results_are_retained_separately(
         model, "balanced"
     )["winner_id"] == "quick-winner"
     grouped = app_settings.list_performance_run_results()
-    assert [item["winner_id"] for item in grouped["normal"]] == ["normal-winner"]
+    assert [item["winner_id"] for item in grouped["custom"]] == ["normal-winner"]
     assert [item["winner_id"] for item in grouped["quick"]] == ["quick-winner"]
+    assert "normal" not in grouped
 
     bundle = tmp_path / "profiles.json"
     ok, message, count = app_settings.export_performance_profiles(bundle)

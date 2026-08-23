@@ -24,9 +24,9 @@ Usage
 
 The script cleans ``build/`` and ``dist/`` first and refuses to run if
 PyInstaller is missing. Settings profiles (``settings/*.yaml``) and the
-application icon are bundled as read-only data; user state stays in
-``app_settings.app_data_dir`` (next to the binary) and is preserved across
-updates.
+application icon are bundled as read-only data; source and frozen builds share
+user state in ``app_settings.app_data_dir`` (``~/.autotuner``), preserved across
+updates and binary locations.
 """
 
 from __future__ import annotations
@@ -145,6 +145,7 @@ def main() -> int:
         "theme_dialog",
         "ocr_workflow",
         "model_benchmark",
+        "performance_report",
         "pymupdf",
         "PIL.Image",
         "PIL.ImageOps",

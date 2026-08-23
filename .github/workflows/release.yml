@@ -132,8 +132,8 @@ jobs:
           1. Entpacke diese ZIP an einen beliebigen Ort.
           2. Doppelklicke AutoTuner.exe.
           3. Updates holst du später einfach oben in der Toolbar ueber den
-             Update-Button. Deine Einstellungen (autotuner_settings.json)
-             bleiben erhalten.
+             Update-Button. Einstellungen, Benchmarks und Profile unter
+             %USERPROFILE%\.autotuner bleiben erhalten.
           "@ | Set-Content -Encoding UTF8 "$stage/LiesMich - AutoTuner.txt"
           Compress-Archive -Path "stage/AutoTuner/*" -DestinationPath ${{ matrix.artifact }} -Force
 
@@ -297,8 +297,8 @@ jobs:
 
             In der kompilierten Version funktioniert der **Update-Button**:
             er lädt automatisch das zum OS passende Release-ZIP und tauscht
-            das Binary nach Neustart aus. Deine Einstellungen
-            (`autotuner_settings.json`) bleiben erhalten.
+            das Binary nach Neustart aus. Einstellungen, Benchmarks, Profile
+            und Reports unter `~/.autotuner` bleiben erhalten.
 
             ---
             Änderungen siehe unten (auto-generierte Release Notes).

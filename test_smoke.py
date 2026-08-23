@@ -10,6 +10,7 @@ runner. They cover:
 
 from __future__ import annotations
 
+import copy
 import os
 import struct
 import sys
@@ -1341,7 +1342,86 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     window.close()
 
 
-def test_performance_analysis_keeps_standard_custom_and_legacy_tiles_separate() -> None:
+def test_performance_test_enumerates_external_drafter_quantizations(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+    monkeypatch.setattr(qt_launcher, "is_draft_compatible", lambda *_args: True)
+
+    model = _fake_model(tmp_path, "Qwen3.8-27B-Q4", 1.0)
+    drafts = []
+    for quant in ("Q4_K_M", "Q8_0", "BF16"):
+        path = tmp_path / f"dflash2-Qwen3.8-27B-{quant}.gguf"
+        _write_minimal_gguf(path)
+        drafts.append(path)
+    model.folder_drafts = drafts
+    model.draft = drafts[0]
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    variants = window._benchmark_option_variants(
+        model, tune_mtp=True, include_external_drafters=True
+    )
+    assert [Path(str(item["drafter_label"])).name for item in variants] == [
+        path.name for path in drafts
+    ]
+    assert len({str(item["drafter_key"]) for item in variants}) == 3
+    assert all(item["enable_speculative"] for item in variants)
+    window.close()
+
+
+def test_completed_benchmark_matching_is_exact_to_workload_and_model(
+    tmp_path,
+) -> None:
+    qt_launcher = pytest.importorskip("qt_launcher")
+    model = _fake_model(tmp_path, "CompletedModel", 1.0)
+    cfg = TunedConfig(
+        ctx=32768,
+        ngl=99,
+        threads=6,
+        batch_threads=6,
+        batch=512,
+        ubatch=256,
+        cache_k="q8_0",
+        cache_v="q8_0",
+        flash_attn=True,
+        sampling={},
+    )
+    stat = model.path.stat()
+    record = {
+        "model_size": stat.st_size,
+        "model_mtime_ns": stat.st_mtime_ns,
+        "desired_context": cfg.ctx,
+        "benchmark_type": "quick",
+        "prompt_context_fraction": 0.125,
+        "candidates": [{"id": "baseline"}],
+    }
+    assert qt_launcher.MainWindow._completed_benchmark_matches(
+        record, model, cfg, "quick", 0.125
+    )
+    assert not qt_launcher.MainWindow._completed_benchmark_matches(
+        record, model, cfg, "fast", 0.03125
+    )
+    changed = dict(record, desired_context=65536)
+    assert not qt_launcher.MainWindow._completed_benchmark_matches(
+        changed, model, cfg, "quick", 0.125
+    )
+
+
+def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
+    tmp_path,
+) -> None:
     global _QT_TEST_APP
 
     qt_launcher = pytest.importorskip("qt_launcher")
@@ -1351,9 +1431,21 @@ def test_performance_analysis_keeps_standard_custom_and_legacy_tiles_separate() 
     setup = qt_launcher._PerformanceTuneSetupDialog(
         "Example", 32768, 131072, 2
     )
-    assert setup.benchmark_type() == "quick"
-    assert setup.prompt_context_fraction() == pytest.approx(0.125)
+    assert setup.benchmark_type() == "fast"
+    assert setup.prompt_context_fraction() == pytest.approx(0.03125)
     assert not setup.custom_percent_spin.isEnabled()
+    assert not setup.try_best_settings.isEnabled()
+    assert not setup.rerun_all_models.isEnabled()
+    setup.all_models.setChecked(True)
+    assert setup.rerun_all_models.isEnabled()
+    assert not setup.test_external_drafters.isEnabled()
+    setup.tune_mtp.setChecked(True)
+    assert setup.test_external_drafters.isEnabled()
+    setup.test_length_combo.setCurrentIndex(
+        setup.test_length_combo.findData("quick")
+    )
+    assert setup.prompt_context_fraction() == pytest.approx(0.125)
+    assert setup.try_best_settings.isEnabled()
     setup.test_length_combo.setCurrentIndex(
         setup.test_length_combo.findData("custom")
     )
@@ -1383,20 +1475,26 @@ def test_performance_analysis_keeps_standard_custom_and_legacy_tiles_separate() 
             ],
         }
 
+    html_path = tmp_path / "report.html"
+    html_path.write_text("<!doctype html>", encoding="utf-8")
     dialog = qt_launcher._PerformanceAnalysisDialog(
         {
+            "fast": [record("QuickModel", "fast", 8.0)],
             "quick": [record("StandardModel", "quick", 10.0)],
             "custom": [record("CustomModel", "custom", 50.0)],
-            "normal": [record("LegacyModel", "normal", 100.0)],
-        }
+        },
+        html_path=html_path,
     )
-    assert dialog.record_count_by_test == {"quick": 1, "custom": 1, "normal": 1}
+    assert dialog.record_count_by_test == {"fast": 1, "quick": 1, "custom": 1}
+    assert dialog.model_names_by_test["fast"] == ["QuickModel"]
     assert dialog.model_names_by_test["quick"] == ["StandardModel"]
     assert dialog.model_names_by_test["custom"] == ["CustomModel"]
-    assert dialog.model_names_by_test["normal"] == ["LegacyModel"]
+    assert dialog.test_tiles["fast"].property("benchmarkType") == "fast"
     assert dialog.test_tiles["quick"].property("benchmarkType") == "quick"
     assert dialog.test_tiles["custom"].property("benchmarkType") == "custom"
-    assert dialog.test_tiles["normal"].property("benchmarkType") == "normal"
+    assert dialog.findChild(
+        qt_widgets.QPushButton, "openPerformanceHtmlReport"
+    ) is not None
     # Each tile normalizes its own PP/decode/end-to-end scales. With one model
     # in each tile every non-zero bar reaches that tile's maximum.
     for tile in dialog.test_tiles.values():
@@ -1485,8 +1583,12 @@ def test_model_expert_settings_copy_and_paste_is_target_scoped(
 
     window._show_config(target)
     window._paste_expert_settings(target)
-    pasted = qt_launcher.app_settings.get_expert_override(
-        target.name, target.path, "balanced"
+    pasted = qt_launcher.app_settings.get_setting_profile_snapshot(
+        target.name,
+        target.path,
+        "balanced",
+        "custom1",
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
     )
     assert pasted is not None
     assert pasted["mode"] == "manual"
@@ -1498,8 +1600,12 @@ def test_model_expert_settings_copy_and_paste_is_target_scoped(
         "performance_target": "balanced",
     }
     # Provenance changes apply only to the pasted deep copy.
-    assert "copied_from" not in qt_launcher.app_settings.get_expert_override(
-        source.name, source.path, "balanced"
+    assert "copied_from" not in qt_launcher.app_settings.get_setting_profile_snapshot(
+        source.name,
+        source.path,
+        "balanced",
+        "custom1",
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
     )
 
     # A right-click/model switch must flush a pending edit while the source is
@@ -1510,12 +1616,110 @@ def test_model_expert_settings_copy_and_paste_is_target_scoped(
     window._expert_panel._sp_threads.setValue(7)
     assert window._expert_panel._save_timer.isActive()
     window._show_config(target)
-    assert qt_launcher.app_settings.get_expert_override(
-        source.name, source.path, "balanced"
+    assert qt_launcher.app_settings.get_setting_profile_snapshot(
+        source.name,
+        source.path,
+        "balanced",
+        "custom1",
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
     )["values"]["threads"] == 7
-    assert qt_launcher.app_settings.get_expert_override(
-        target.name, target.path, "balanced"
+    assert qt_launcher.app_settings.get_setting_profile_snapshot(
+        target.name,
+        target.path,
+        "balanced",
+        "custom1",
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
     )["values"]["threads"] == 6
+    window.close()
+
+
+def test_settings_profile_selector_preserves_auto_perform_and_custom(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+
+    model = _fake_model(tmp_path, "ProfileModel", 1.0)
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._system = _fake_system()
+    window._all_entries = [model]
+    window._show_config(model)
+
+    combo = window._setting_profile_combo
+    assert combo.count() == 6
+    assert combo.currentData() == qt_launcher.app_settings.PROFILE_AUTO
+    perform_index = combo.findData(qt_launcher.app_settings.PROFILE_PERFORM)
+    assert not combo.model().item(perform_index).isEnabled()
+
+    # Editing immutable Auto transparently forks into the first free Custom.
+    window._enter_expert_mode()
+    window._expert_panel._sp_threads.setValue(7)
+    window._expert_panel.flush_pending_save()
+    _QT_TEST_APP.processEvents()
+    assert combo.currentData() == "custom1"
+    custom = qt_launcher.app_settings.get_setting_profile_snapshot(
+        model.name,
+        model.path,
+        "balanced",
+        "custom1",
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+    )
+    assert custom is not None
+    assert custom["values"]["threads"] == 7
+    assert (
+        qt_launcher.app_settings.get_setting_profile_snapshot(
+            model.name,
+            model.path,
+            "balanced",
+            "auto",
+            qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+        )
+        is None
+    )
+
+    monkeypatch.setattr(
+        qt_launcher.QInputDialog,
+        "getText",
+        lambda *_args, **_kwargs: ("Latency lab", True),
+    )
+    window._rename_setting_profile()
+    assert combo.currentText() == "Latency lab"
+
+    perform = copy.deepcopy(custom)
+    perform["values"]["threads"] = 11
+    assert qt_launcher.app_settings.set_setting_profile_snapshot(
+        model.name,
+        model.path,
+        "balanced",
+        qt_launcher.app_settings.PROFILE_PERFORM,
+        perform,
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+        select=True,
+    )
+    window._refresh_setting_profile_selector()
+    assert combo.model().item(perform_index).isEnabled()
+    assert combo.currentData() == qt_launcher.app_settings.PROFILE_PERFORM
+    profile = match_profile(model.name, window._profiles, model.architecture)
+    assert window._effective_config(model, profile).threads == 11
+    # The measured slot did not overwrite the custom experiment.
+    assert qt_launcher.app_settings.get_setting_profile_snapshot(
+        model.name,
+        model.path,
+        "balanced",
+        "custom1",
+        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+    )["values"]["threads"] == 7
     window.close()
 
 
@@ -7616,10 +7820,15 @@ def test_update_worker_archive_overlay_preserves_settings(
         for path in source_root.rglob("*"):
             zf.write(path, path.relative_to(tmp_path / "src"))
 
+    shared_data = tmp_path / ".autotuner"
+    shared_data.mkdir()
     monkeypatch.setattr(
         qt_launcher.app_settings,
         "_settings_file",
         lambda: app / "autotuner_settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "app_data_dir", lambda: shared_data
     )
     worker = qt_launcher._UpdateWorker(app)
     # Force the release-ZIP path regardless of where pytest's tmpdir lives.
@@ -7653,7 +7862,7 @@ def test_update_worker_archive_overlay_preserves_settings(
     assert (app / "qt_launcher.py").read_text(encoding="utf-8") == "NEW"
     assert (app / "settings" / "profile.yaml").read_text(encoding="utf-8") == "profile"
     assert (app / "autotuner_settings.json").read_text(encoding="utf-8") == "USER"
-    assert (app / ".autotuner_update.json").exists()
+    assert (shared_data / ".autotuner_update.json").exists()
     assert pip_calls, "requirements.txt change should reinstall dependencies"
 
 

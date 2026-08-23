@@ -111,36 +111,40 @@ Performance Test Result:
   the generic `temp 0.7 / top_k 40`) now runs on its intended samplers —
   a frequent cause of repetition loops and broken tool-calls on models
   tuned for a low `top_k` with a non-zero `min_p`.
-- **Measured performance profiles for every mode** — select a normal text/chat
-  GGUF and click **🚀 Performance test**. The setup dialog can test any or all
-  of `safe`, `balanced`, `throughput`, and `low_vram`, optionally enable YaRN,
-  tune MTP/draft `n-max`, or queue every benchmarkable scanned model. Each mode
-  gets its own persistent Expert snapshot. **Standard** uses 12.5% of context
-  with the 65,536 prompt-token cap; **Custom** accepts 0.01–100% and deliberately
-  ignores that cap. The prompt is calibrated once through the model's real
-  `/tokenize` endpoint, so these are actual token limits rather than a text-size
-  estimate. Every candidate starts a fresh private `llama-server`, uses
-  an excluded warm-up, and requests **256 n_decode tokens**. During a suite,
-  **Stop after Model** finishes/saves all modes for the active model and
-  **Stop after Performance Mode** finishes/saves only the active mode. Every
-  completed mode is atomically checkpointed before the next starts, so cancel,
-  a crash, or power loss cannot erase earlier results. MTP/draft depth increases
-  one token at a time until decode speed first regresses (for example 5 → 6 → 7),
-  instead of stopping at a fixed list. The **📊 Performance analysis** button
-  opens separate Standard, Custom, and legacy Normal tiles, graphs native
-  prompt-processing, n_decode, and measured end-to-end throughput, and explains
-  exactly how each metric is collected. Unlike workloads have independent
-  storage and chart scales. Winner ranking uses real workload time rather than
-  the old geometric score that could exaggerate prompt-only gains. The best mode
-  for each model is marked, remembered, and automatically selected. A
-  requested context above the conservative static estimate can be tried in the
-  isolated server; only a successful load + inference run is saved (for example,
-  a backend-proven 110,592-token profile is no longer rejected merely because
-  static headroom estimated ~78k). `low_vram` remains the explicit, safe way to
-  place KV in abundant system RAM via `--no-kv-offload`; spare RAM is never added
-  to a full-offload VRAM budget implicitly. Settings → **Performance profiles**
-  exports/imports a portable JSON backup matched by GGUF filename and byte size.
-  AutoTuner never changes clocks, voltage, fan curves, or power limits.
+- **Six fast setting profiles per model and performance mode** — the top of the
+  right configuration tile now switches between untouched **Auto**, benchmarked
+  **Perform**, and four renameable **Custom** profiles. Perform is disabled until
+  evidence exists. Editing Auto/Perform forks safely into a free Custom slot,
+  so neither source is overwritten. Every non-Auto slot also stores an independent
+  variant for no drafter, embedded MTP, and each external draft GGUF; switching a
+  Q4/Q8/BF16/DFlash head therefore restores that head's measured `draft_n_max`,
+  threads, and batch settings immediately.
+- **Measured performance suite with resumable short and full searches** — select a
+  normal text/chat GGUF and click **🚀 Performance test**. The default **Quick
+  pass** uses at most 3.125% context, 16,384 prompt tokens, 128 decode tokens, and
+  a shared 20-minute execution budget per model. **Standard** validates 12.5% with
+  a 65,536 prompt cap; **Custom** accepts 0.01–100% uncapped. Optional **Try only
+  best Settings** remeasures a conservative shortlist from stable two-sample Quick
+  evidence and falls back to the full search when evidence is missing or noisy.
+  All-model suites skip exact completed model/mode/drafter workloads by default;
+  **Rerun all Models** opts back into them. The MTP option can enumerate every
+  compatible external drafter/quantization as well as embedded MTP and saves each
+  winner separately. Prompts are calibrated through the real `/tokenize` endpoint,
+  candidates use fresh private `llama-server` processes and an excluded warm-up,
+  and every completed mode/head is atomically checkpointed. **Stop after Model**
+  and **Stop after Performance Mode** remain graceful resume boundaries.
+- **Detailed graphical performance report** — **📊 Performance report** keeps a
+  compact in-app Quick/Standard/Custom comparison and writes a self-contained HTML
+  report under `~/.autotuner/reports`. It expands every candidate and sample with
+  complete runtime settings, PP/decode/end-to-end speeds, errors, drafter identity,
+  and native llama.cpp drafted/accepted token counters, plus inline throughput and
+  acceptance graphics. Legacy fixed-25% results are classified as Custom; the old
+  legacy tile is gone. Winner ranking still uses measured workload time, the fastest
+  performance mode is remembered, and exact contexts above the static estimate are
+  saved only after a real isolated inference succeeds. `low_vram` remains the safe
+  explicit RAM-KV path. Settings → **Performance profiles** exports/imports the
+  complete portable profile bank and drafter evidence. AutoTuner never changes
+  clocks, voltage, fan curves, or power limits.
 - **Multi-server (run several models at once)** — Launch no longer
   refuses while a server is running. Each new model gets the **next free
   port**: 0 servers → `1234`, 1 → `1235`, 2 → `1236`, … When a server is
@@ -303,7 +307,8 @@ Danke für die Update-Button-Idee an [nextscript](https://github.com/nextscript)
 
 Wenn du AutoTuner per `git clone` installiert hast, kannst du neue Versionen
 weiterhin über das Terminal holen. Deine persönlichen Einstellungen bleiben
-auch dabei erhalten, solange `autotuner_settings.json` lokal ignoriert ist.
+auch dabei erhalten: Python-Start und kompilierte App verwenden gemeinsam
+`~/.autotuner/autotuner_settings.json`.
 
 **1. In den App-Ordner wechseln** (dorthin, wo du geklont hast):
 
@@ -406,8 +411,10 @@ python build_exe.py
 
 `build_exe.py` bündelt `settings/*.yaml` und das App-Icon aus `assets/` als
 read-only Daten mit; unter Windows wird `assets/AutoTuner.ico` zusätzlich in
-die `.exe` eingebettet. Nutzer-State (`autotuner_settings.json`, Logs) liegt
-persistent neben dem Binary und bleibt bei Updates erhalten.
+die `.exe` eingebettet. Python- und Frozen-Starts teilen Einstellungen,
+Benchmarkdaten, Themes, Reports und Logs unter `~/.autotuner` (Windows z. B.
+`C:\Users\Name\.autotuner`). Beim ersten v5.2.7-Start werden ältere Dateien
+aus Source- und EXE-Ordnern zusammengeführt und unverändert gesichert.
 
 ### Release / Auto-Update
 
