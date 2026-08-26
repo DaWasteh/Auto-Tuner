@@ -30,11 +30,19 @@ Design notes:
 
 from __future__ import annotations
 
+import os
+import platform
+import re
+import sys
 from dataclasses import dataclass
-from typing import List
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
+from autotuner_version import VERSION
 from scanner import (
     ModelEntry,
+    metadata_cache_stats,
     metadata_layer_count,
     metadata_attention_layer_count,
     metadata_is_hybrid_architecture,
@@ -111,6 +119,8 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
       but the GGUF metadata declares no expert count. The tuner routes
       it through the MoE placement path but cannot reason about expert
       counts precisely.
+    * ``RUNTIME-EXPERIMENTAL-ARCH`` — metadata uses a preview architecture
+      whose stock llama.cpp loader availability must be verified explicitly.
     """
     warnings: List[DiagnosticWarning] = []
     md = model.metadata or {}
@@ -128,6 +138,18 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
 
     arch = md.get("general.architecture", "")
     block_count = metadata_layer_count(md)
+    arch_l = str(arch or "").lower()
+
+    if arch_l == "qwen4exp":
+        warnings.append(
+            DiagnosticWarning(
+                "RUNTIME-EXPERIMENTAL-ARCH",
+                f"{model.name}: qwen4exp is the experimental Qwen3.8 Flash Next "
+                "architecture. The profile can size and configure it, but the "
+                "selected llama.cpp build/fork must explicitly provide its loader "
+                "(upstream support was tracked in issue #27741).",
+            )
+        )
 
     # --- KV-HEAD-COUNT-MISSING --------------------------------------------
     # head_count_kv = 0 is the single most-impactful metadata bug. Without
@@ -170,7 +192,6 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
 
     # --- MOE-ARCH/FILENAME-FALLBACK ---------------------------------------
     expert_count = _moe_expert_count(model)
-    arch_l = str(arch or "").lower()
     has_expert_key = any(str(key).lower().endswith(_MOE_ALT_KEY_SUFFIXES) for key in md)
     if arch_l in _KNOWN_MOE_ARCHS and expert_count == 2 and not has_expert_key:
         warnings.append(
@@ -334,3 +355,194 @@ def find_model_by_substring(models: List[ModelEntry], needle: str) -> List[Model
         return list(models)
     n = needle.lower()
     return [m for m in models if n in m.name.lower()]
+
+
+# ---------------------------------------------------------------------------
+# Privacy-conscious support report
+
+
+def _tail_text(path: Optional[Path], *, max_bytes: int = 512 * 1024) -> str:
+    if path is None:
+        return ""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            raw = handle.read(max_bytes)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _redact_support_text(text: str, roots: Iterable[Path]) -> str:
+    replacements: List[Tuple[str, str]] = []
+    try:
+        replacements.append((str(Path.home().resolve(strict=False)), "~"))
+    except (OSError, RuntimeError):
+        pass
+    for index, raw_root in enumerate(roots, start=1):
+        try:
+            root = str(Path(raw_root).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        replacements.append((root, f"<MODEL_ROOT_{index}>"))
+    try:
+        app_root = str(Path(__file__).resolve().parent)
+        replacements.append((app_root, "<AUTOTUNER_APP>"))
+    except (OSError, RuntimeError):
+        pass
+    out = text
+    for source, replacement in sorted(
+        replacements, key=lambda item: len(item[0]), reverse=True
+    ):
+        if not source:
+            continue
+        variants = {
+            source,
+            source.replace("\\", "/"),
+            source.replace("/", "\\"),
+        }
+        for variant in variants:
+            out = re.sub(
+                re.escape(variant),
+                lambda _match, value=replacement: value,
+                out,
+                flags=re.IGNORECASE if os.name == "nt" else 0,
+            )
+    # Defensive second boundary: application logs should never contain secrets,
+    # but redact common accidental key/value and Bearer-token spellings before a
+    # user shares the report.
+    out = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", out)
+    out = re.sub(
+        r"(?i)\b(api[_-]?key|access[_-]?token|authorization|password|secret)"
+        r"\s*[:=]\s*[^\r\n,;]+",
+        r"\1=<redacted>",
+        out,
+    )
+    return out
+
+
+def _format_system_support(system: Any) -> List[str]:
+    if system is None:
+        return ["Hardware snapshot: unavailable"]
+    lines = [
+        f"OS snapshot: {getattr(system, 'os_name', '?')}",
+        f"CPU: {getattr(system, 'cpu_name', '?')}",
+        (
+            "CPU cores: "
+            f"{getattr(system, 'cpu_cores_physical', '?')} physical / "
+            f"{getattr(system, 'cpu_cores_logical', '?')} logical"
+        ),
+        (
+            f"RAM: {float(getattr(system, 'free_ram_gb', 0.0)):.1f} GiB free / "
+            f"{float(getattr(system, 'total_ram_gb', 0.0)):.1f} GiB total"
+        ),
+    ]
+    gpus = list(getattr(system, "gpus", []) or [])
+    if not gpus:
+        lines.append("GPUs: none selected/detected")
+    for index, gpu in enumerate(gpus):
+        lines.append(
+            f"GPU {index}: {getattr(gpu, 'name', '?')} · "
+            f"{float(getattr(gpu, 'free_vram_gb', 0.0)):.1f}/"
+            f"{float(getattr(gpu, 'total_vram_gb', 0.0)):.1f} GiB free/total · "
+            f"backend={getattr(gpu, 'runtime_backend', None) or '?'} · "
+            f"device={getattr(gpu, 'runtime_device', None) or '?'}"
+        )
+    return lines
+
+
+def format_support_report(
+    models: Sequence[ModelEntry],
+    *,
+    system: Any = None,
+    forks: Sequence[Tuple[str, Path]] = (),
+    active_fork: Optional[Path] = None,
+    model_roots: Sequence[Path] = (),
+    app_log_path: Optional[Path] = None,
+    debug_enabled: bool = False,
+) -> str:
+    """Return a shareable report without settings contents or server prompts."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cache = metadata_cache_stats()
+    lines = [
+        "AutoTuner support report",
+        "=" * 80,
+        f"Generated (UTC): {now}",
+        f"AutoTuner: v{VERSION}",
+        f"Python: {platform.python_version()} ({sys.executable and Path(sys.executable).name})",
+        f"Runtime: {'frozen binary' if getattr(sys, 'frozen', False) else 'source'}",
+        f"Platform: {platform.platform()}",
+        f"Machine: {platform.machine() or '?'}",
+        f"Debug mode: {'on' if debug_enabled else 'off'}",
+        "",
+        "Privacy boundary",
+        "-" * 80,
+        "No prompts, API payloads, credentials, environment-variable values, raw settings,",
+        "or llama-server output are included. Known home/model paths are redacted in the",
+        "bounded AutoTuner application-log tail below.",
+        "",
+        "Hardware",
+        "-" * 80,
+        *_format_system_support(system),
+        "",
+        "llama.cpp builds",
+        "-" * 80,
+        f"Discovered builds: {len(forks)}",
+    ]
+    active_name = active_fork.name if active_fork is not None else "none"
+    lines.append(f"Active build folder: {active_name}")
+    lines.extend(f"- {name}" for name, _path in forks[:128])
+    lines.extend(
+        [
+            "",
+            "Scanner",
+            "-" * 80,
+            f"Models: {len(models)}",
+            f"Configured active roots: {len(model_roots)}",
+            (
+                f"Metadata cache: {cache['entries']} entries, {cache['hits']} hit(s), "
+                f"{cache['misses']} miss(es), up to {cache['workers']} worker(s)"
+            ),
+            "",
+            "Model diagnostics",
+            "-" * 80,
+        ]
+    )
+    if not models:
+        lines.append("No scanned models were available.")
+    for model in models:
+        lines.extend([format_diagnostic_report(model), ""])
+
+    app_log = _tail_text(app_log_path)
+    lines.extend(["Application log tail (redacted)", "-" * 80])
+    if app_log:
+        redaction_roots = [*model_roots, *(path for _name, path in forks)]
+        redacted = _redact_support_text(app_log, redaction_roots)
+        lines.extend(redacted.splitlines()[-400:])
+    else:
+        lines.append("No application log was available.")
+    lines.extend(["", "End of report", ""])
+    return "\n".join(lines)
+
+
+def write_support_report(
+    models: Sequence[ModelEntry],
+    *,
+    output_dir: Optional[Path] = None,
+    **kwargs: Any,
+) -> Path:
+    """Atomically write :func:`format_support_report` under reports/."""
+    if output_dir is None:
+        import app_settings
+
+        output_dir = app_settings.app_data_dir() / "reports"
+    directory = Path(output_dir).expanduser().resolve(strict=False)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    output = directory / f"AutoTuner-support-{stamp}.txt"
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    tmp.write_text(format_support_report(models, **kwargs), encoding="utf-8")
+    os.replace(tmp, output)
+    return output

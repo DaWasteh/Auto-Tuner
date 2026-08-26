@@ -127,7 +127,8 @@ Performance Test Result:
   best Settings** remeasures a conservative shortlist from stable two-sample Quick
   evidence and falls back to the full search when evidence is missing or noisy.
   All-model suites skip exact completed model/mode/drafter workloads by default;
-  **Rerun all Models** opts back into them. The MTP option can enumerate every
+  **Rerun completed model / mode / drafter runs** opts back into them. The MTP
+  option can enumerate every
   compatible external drafter/quantization as well as embedded MTP and saves each
   winner separately. Prompts are calibrated through the real `/tokenize` endpoint,
   candidates use fresh private `llama-server` processes and an excluded warm-up,
@@ -145,6 +146,23 @@ Performance Test Result:
   explicit RAM-KV path. Settings → **Performance profiles** exports/imports the
   complete portable profile bank and drafter evidence. AutoTuner never changes
   clocks, voltage, fan curves, or power limits.
+- **Faster startup and suite preparation** — model metadata headers are read by a
+  bounded worker pool and cached under `~/.autotuner/cache` using path/size/mtime
+  signatures, so unchanged GGUFs do not repeat the tensor-name scan after every
+  restart. Model discovery now runs in parallel with hardware probing instead of
+  waiting behind WMI/vendor tools. Settings JSON is parsed only when its file
+  signature changes, default profile-bank reads no longer cause disk writes, and
+  all-model performance preparation reuses the already-probed active runtime plus
+  cached binary/drafter resolution. Model benchmarks remain sequential so VRAM,
+  thermals, and measurements stay isolated.
+- **Diagnostics, debug mode, and shareable reports** — **🔍 Diagnose** still shows
+  the selected model's KV/MoE/hybrid analysis. It can also create a redacted
+  support report for all scanned models or, after an explicit confirmation, scan
+  every GGUF header into a detailed Markdown inventory in
+  `~/.autotuner/reports`. Settings offers an opt-in **Debug mode** for additional
+  AutoTuner discovery/config logging; it does not enable server prompt logging.
+  Support reports exclude prompts, API payloads, credentials, raw settings, and
+  llama-server output and redact known home/model paths.
 - **Multi-server (run several models at once)** — Launch no longer
   refuses while a server is running. Each new model gets the **next free
   port**: 0 servers → `1234`, 1 → `1235`, 2 → `1236`, … When a server is
@@ -178,9 +196,9 @@ Performance Test Result:
 - **Fork-folder memory** — if you point the GUI at a parent folder
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
   the next launch re-expands the same set of builds in the dropdown. Both
-  build-number names such as `b10566_llama.cpp` and semantic-release names
-  such as `v0.2.0_llama.cpp` are recognized. No more re-navigating one folder
-  up after every restart.
+  pre-release names such as `b10566_llama.cpp` and stable names such as
+  `0.2.0_llama.cpp` (plus legacy `v0.2.0_llama.cpp`) are recognized. No more
+  re-navigating one folder up after every restart.
 - **Window geometry, state & inner layout** — QMainWindow
   `saveGeometry()` (size, position, maximize-state) and `saveState()`
   (toolbars/docks) are persisted as base64 in the settings JSON. **In
@@ -275,8 +293,8 @@ AutoTuner's OCR workflow uses the persistent OpenAI-compatible HTTP server, not
 only after it contains `build/bin/Release/llama-server.exe` (or the native
 Linux/macOS binary). `building llama.cpp/ocr_llama_build.txt` fixes the legacy
 PR #17400 recipe by building both `llama-server` and `llama-mtmd-cli`; that old
-fork remains for DeepSeek-OCR v1. Unlimited-OCR should use the current mainline
-build from `building llama.cpp/llama_build.txt`.
+fork remains for DeepSeek-OCR v1. Unlimited-OCR should use the current
+pre-release build from `building llama.cpp/llama_prerelease_build.txt`.
 
 ## Installation
 
@@ -413,7 +431,7 @@ python build_exe.py
 read-only Daten mit; unter Windows wird `assets/AutoTuner.ico` zusätzlich in
 die `.exe` eingebettet. Python- und Frozen-Starts teilen Einstellungen,
 Benchmarkdaten, Themes, Reports und Logs unter `~/.autotuner` (Windows z. B.
-`C:\Users\Name\.autotuner`). Beim ersten v5.2.7-Start werden ältere Dateien
+`C:\Users\Name\.autotuner`). Beim ersten v5.2.8-Start werden ältere Dateien
 aus Source- und EXE-Ordnern zusammengeführt und unverändert gesichert.
 
 ### Release / Auto-Update
@@ -890,8 +908,8 @@ repo keeps the build recipes in separate scripts so this README stays short:
 
 | File | Purpose |
 |------|---------|
-| [`llama_build.txt`](building%20llama.cpp/llama_build.txt) | Mainline/nightly llama.cpp Vulkan build (Windows/AMD-friendly; exact nightly tags use `bNNNN_llama.cpp`, untagged master uses `bNNNN_dev_COMMIT_llama.cpp`; runtime also verifies the current `X.Y.Z-dev` line). |
-| [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Official semantic release build (historical filename; resolves the newest published stable `vX.Y.Z` automatically, currently `v0.2.0`, and verifies its corresponding nightly `bNNNN` identity). |
+| [`llama_stable_build.txt`](building%20llama.cpp/llama_stable_build.txt) | Stable llama.cpp Vulkan build. Resolves the newest published `X.Y.Z` release (accepting upstream's optional `v` tag prefix), writes `X.Y.Z_llama.cpp`, disables dev versioning, and verifies the corresponding compatibility build. |
+| [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Mainline/pre-release llama.cpp Vulkan build (Windows/AMD-friendly; exact `bNNNN` tags use `bNNNN_llama.cpp`, untagged master uses `bNNNN_dev_COMMIT_llama.cpp`; runtime also verifies the current `X.Y.Z-dev` line). |
 | [`turboquant_llama_build.txt`](building%20llama.cpp/turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
 | [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
 | [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
@@ -904,18 +922,18 @@ The `*.txt` build recipes are PowerShell commands for the documented local
 workspace (`L:/LAB/ai-local` on the documented Pandaking setup). They handle both llama.cpp UI
 layouts automatically (`tools/ui` since b9174, `tools/server/webui` on older
 forks) and fall back to the prebuilt UI if the fork does not ship UI sources.
-Both mainline recipes deliberately keep full Git history (so the embedded
-numeric compatibility build is not incorrectly reported as `b1`). The normal
-master/nightly recipe now distinguishes an exact b-tag from an unreleased HEAD,
+Both upstream recipes deliberately keep full Git history (so the embedded
+numeric compatibility build is not incorrectly reported as `b1`). The
+pre-release recipe distinguishes an exact `bNNNN` tag from an untagged HEAD,
 reads the semantic base from upstream CMake, and checks the compiled binary's
 `X.Y.Z-dev` plus build number against `git rev-list --count HEAD`; it never
-labels a development build with the previous release tag. The semantic release
-recipe resolves the newest published stable `vX.Y.Z`, verifies the matching
-nightly `bNNNN` commit, and sets `LLAMA_BUILD_IS_DEV=OFF`, making
-`llama-server --version` report the exact semantic version plus its real build
-number for AutoTuner's feature gates. The CUDA setup helper likewise creates a
-fresh truthful folder instead of pulling newer source into an older `bNNNN`
-folder.
+labels a development snapshot as a published pre-release. The stable recipe
+resolves the newest published `X.Y.Z` release, verifies the matching `bNNNN`
+compatibility commit, writes an unambiguous `X.Y.Z_llama.cpp` folder, and sets
+`LLAMA_BUILD_IS_DEV=OFF`, making `llama-server --version` report the exact
+stable semantic version plus its real build number for AutoTuner's feature
+gates. The CUDA setup helper likewise creates a fresh truthful folder instead
+of pulling newer source into an older `bNNNN` folder.
 
 Ubuntu/Linux users can either build upstream llama.cpp normally or adapt the
 same CMake flags from the recipes. The only AutoTuner requirement is that the
@@ -984,6 +1002,13 @@ evidence is in [`docs/llama-b10590-audit.md`](docs/llama-b10590-audit.md).
   selects trained n-max 7/p-min 0.0, accepts the reviewed PR build, and
   includes [`dflash2_llama_build.txt`](building%20llama.cpp/dflash2_llama_build.txt).
   A real PR-build request loaded and generated successfully.
+- **Qwen3.8 Flash Next preview:** `settings/qwen3_8_flash_next.yaml` matches the
+  supplied `qwen4exp` metadata (48 hybrid blocks, full attention every fourth
+  block, 512/10 experts, 262,144 native context, official 1.0/0.95/top-k-20
+  sampling, and PLE metadata). The profile deliberately does not pretend that
+  PLE is generic MTP or that YAML can add a missing model loader: use a
+  llama.cpp build/fork that explicitly supports `qwen4exp`; upstream support
+  was tracked in issue #27741.
 
 ### Review b10441 → b10549
 
@@ -1502,9 +1527,12 @@ as the inference API (there is **no** separate metrics port):
   # llama_metrics("http://127.0.0.1:1234")["llamacpp:predicted_tokens_seconds"]
   ```
 
-- **get_metadata.py** — drop it into the folder with your models
-  (`pip install gguf`) to read and save the metadata of every model. For
-  debugging!
+- **`get_metadata.py`** — standalone counterpart to the confirmed GUI action.
+  Run `python get_metadata.py /path/to/models output.md`; it uses AutoTuner's
+  dependency-free bounded header reader, parallel scan, and metadata cache (no
+  separate `gguf` package and no tensor-payload reads). CLI users can also use
+  `python auto_tuner.py --diagnose [name-substring]`; bare `--diagnose` reports
+  all scanned runnable models.
 
 ## License
 

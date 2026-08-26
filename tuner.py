@@ -1330,6 +1330,7 @@ _KNOWN_MOE_ARCHS = frozenset(
         "qwen3moe",
         "qwen3vlmoe",
         "qwen35moe",
+        "qwen4exp",
         "step35",
     }
 )

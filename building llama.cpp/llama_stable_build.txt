@@ -1,0 +1,228 @@
+# PowerShell build recipe for stable llama.cpp semantic-version releases.
+#
+# Default: resolve the newest published stable X.Y.Z release automatically.
+# Upstream Git tags may retain a leading "v" (for example v0.2.0), but the
+# runtime and output folder use the stable X.Y.Z identity:
+#   L:\LAB\ai-local\0.2.0_llama.cpp
+#
+# llama.cpp has two complementary release channels:
+#   * stable releases: X.Y.Z, built with LLAMA_BUILD_IS_DEV=OFF;
+#   * pre-releases:    bNNNN, built with LLAMA_BUILD_IS_DEV=ON.
+# A stable release also points at a corresponding bNNNN compatibility tag. This
+# recipe verifies both identities without labeling the stable folder as a b-build.
+#
+# IMPORTANT: This intentionally performs a full-history clone. llama.cpp derives
+# its numeric compatibility build from `git rev-list --count HEAD`; a shallow
+# clone would report build 1 and make AutoTuner reject profiles requiring a
+# current b-number even though the source itself is current.
+
+param(
+    [ValidateScript({ $_ -eq "latest" -or $_ -match '^v?\d+\.\d+\.\d+$' })]
+    [string]$Tag = "latest",
+    [string]$Workspace = "L:\LAB\ai-local",
+    [string]$Generator = "Visual Studio 18 2026",
+    [ValidateRange(1, 256)]
+    [int]$Parallel = 20
+)
+
+$ErrorActionPreference = "Stop"
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][scriptblock]$Command
+    )
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Get-LatestStableSemanticTag {
+    $headers = @{
+        "Accept" = "application/vnd.github+json"
+        "User-Agent" = "AutoTuner-llama-build"
+        "X-GitHub-Api-Version" = "2022-11-28"
+    }
+    try {
+        $releases = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100" `
+            -Headers $headers
+        $stable = @(
+            $releases |
+                Where-Object {
+                    -not $_.draft -and -not $_.prerelease -and
+                    $_.tag_name -match '^v?\d+\.\d+\.\d+$'
+                } |
+                ForEach-Object {
+                    $rawTag = [string]$_.tag_name
+                    [PSCustomObject]@{
+                        Tag = $rawTag
+                        Version = [version]($rawTag -replace '^v', '')
+                    }
+                } |
+                Sort-Object Version -Descending
+        )
+        if ($stable.Count -gt 0) { return $stable[0].Tag }
+    } catch {
+        Write-Warning "GitHub release API lookup failed: $($_.Exception.Message)"
+    }
+
+    # API fallback: inspect semantic tags directly. This keeps the recipe usable
+    # during a transient API outage while still ignoring bNNNN pre-release tags.
+    $rows = git ls-remote --refs --tags https://github.com/ggml-org/llama.cpp.git 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not resolve the latest official llama.cpp release"
+    }
+    $tags = @(
+        $rows |
+            ForEach-Object {
+                if ($_ -match 'refs/tags/(v?\d+\.\d+\.\d+)$') {
+                    $rawTag = $Matches[1]
+                    [PSCustomObject]@{
+                        Tag = $rawTag
+                        Version = [version]($rawTag -replace '^v', '')
+                    }
+                }
+            } |
+            Sort-Object Version -Descending
+    )
+    if ($tags.Count -eq 0) {
+        throw "No stable X.Y.Z llama.cpp tag was found"
+    }
+    return $tags[0].Tag
+}
+
+if ($Tag -eq "latest") {
+    $Tag = Get-LatestStableSemanticTag
+    Write-Host "==> Latest stable llama.cpp release: $Tag"
+}
+
+if (-not (Test-Path $Workspace -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
+}
+Set-Location (Resolve-Path $Workspace)
+
+# Stable runtime/folder identity deliberately omits a Git tag's optional "v".
+$version = $Tag -replace '^v', ''
+$dir = "${version}_llama.cpp"
+$repo = Join-Path (Get-Location) $dir
+if (Test-Path $repo) {
+    throw "Build directory already exists; nothing was removed: $repo"
+}
+
+# Keep the Vulkan shader headers independent from the versioned llama.cpp tree.
+$spirv = Join-Path (Get-Location) "SPIRV-Headers"
+if (-not (Test-Path "$spirv\.git")) {
+    Invoke-NativeChecked "SPIRV-Headers clone" {
+        git clone https://github.com/KhronosGroup/SPIRV-Headers.git $spirv
+    }
+} else {
+    Invoke-NativeChecked "SPIRV-Headers update" { git -C $spirv pull --ff-only }
+}
+
+$spirvInstall = (Join-Path $spirv "install").Replace('\', '/')
+Invoke-NativeChecked "SPIRV-Headers configure" {
+    cmake -S $spirv -B "$spirv\build" `
+        -G $Generator `
+        -A x64 `
+        "-DCMAKE_INSTALL_PREFIX=$spirvInstall"
+}
+Invoke-NativeChecked "SPIRV-Headers build" {
+    cmake --build "$spirv\build" --config Release --parallel $Parallel
+}
+Invoke-NativeChecked "SPIRV-Headers install" {
+    cmake --install "$spirv\build" --config Release
+}
+
+# Clone the exact semantic release tag. Do NOT add --depth: the commit count is
+# embedded in `llama-server --version` and AutoTuner uses it for feature gates.
+$tmp = Join-Path (Get-Location) "_tmp_${Tag}_llama_$PID"
+if (Test-Path $tmp) {
+    throw "Staging directory already exists: $tmp"
+}
+Invoke-NativeChecked "llama.cpp $Tag clone" {
+    git clone --branch $Tag --single-branch https://github.com/ggml-org/llama.cpp.git $tmp
+}
+
+$resolvedTag = (git -C $tmp describe --tags --exact-match HEAD 2>$null).Trim()
+if ($LASTEXITCODE -ne 0 -or $resolvedTag -ne $Tag) {
+    throw "Checkout is not the requested exact tag $Tag (found '$resolvedTag')"
+}
+$commit = (git -C $tmp rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $commit) {
+    throw "Could not determine the llama.cpp commit"
+}
+$expectedBuild = [int](git -C $tmp rev-list --count HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $expectedBuild -lt 1000) {
+    throw "History is incomplete; refusing to embed suspicious build number $expectedBuild"
+}
+$prereleaseTag = "b$expectedBuild"
+$prereleaseRef = git ls-remote --refs --tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$prereleaseTag" 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $prereleaseRef) {
+    throw "Stable release $Tag has no corresponding pre-release tag $prereleaseTag"
+}
+$prereleaseSha = (($prereleaseRef | Select-Object -First 1) -split '\s+')[0]
+if ($prereleaseSha -ne $commit) {
+    throw "Stable/pre-release mismatch: $Tag is $commit but $prereleaseTag is $prereleaseSha"
+}
+
+Rename-Item $tmp $dir
+Write-Host "==> Build directory: $repo ($version stable / $prereleaseTag, commit $commit)"
+
+Push-Location "$repo\tools\ui"
+try {
+    Invoke-NativeChecked "Web UI dependency install" { npm ci }
+    Invoke-NativeChecked "Web UI build" { npm run build }
+} finally {
+    Pop-Location
+}
+
+Invoke-NativeChecked "llama.cpp configure" {
+    cmake -S $repo -B "$repo\build" `
+        -G $Generator `
+        -A x64 `
+        -DLLAMA_BUILD_IS_DEV=OFF `
+        -DGGML_VULKAN=ON `
+        -DGGML_NATIVE=OFF `
+        -DGGML_AVX2=ON `
+        -DGGML_FMA=ON `
+        -DGGML_F16C=ON `
+        -DBUILD_SHARED_LIBS=OFF `
+        -DCMAKE_POLICY_DEFAULT_CMP0194=OLD `
+        -DLLAMA_BUILD_SERVER=ON `
+        -DLLAMA_BUILD_UI=ON `
+        -DLLAMA_USE_PREBUILT_UI=OFF `
+        -DLLAMA_CURL=OFF `
+        -DGGML_CCACHE=OFF `
+        -DGGML_VULKAN_CHECK_RESULTS=OFF `
+        "-DCMAKE_PREFIX_PATH=$spirvInstall"
+}
+Invoke-NativeChecked "llama.cpp build" {
+    cmake --build "$repo\build" --config Release --parallel $Parallel
+}
+
+$server = "$repo\build\bin\Release\llama-server.exe"
+# llama-server writes --version to stderr. Route both streams through cmd.exe
+# so PowerShell's ErrorActionPreference=Stop does not turn valid output into a
+# terminating NativeCommandError before we can inspect the exit code.
+$versionOutput = (& $env:ComSpec /d /s /c "`"$server`" --version 2>&1" | Out-String).Trim()
+$versionExit = $LASTEXITCODE
+if ($versionExit -ne 0) {
+    throw "llama-server smoke test failed with exit code $versionExit"
+}
+Write-Host $versionOutput
+$versionPattern = "(?im)^\s*version:\s*$([regex]::Escape($version))\s+\(build\s+(\d+),"
+$versionMatch = [regex]::Match($versionOutput, $versionPattern)
+if (-not $versionMatch.Success) {
+    throw "Expected semantic version $version with an explicit numeric build in --version output"
+}
+$reportedBuild = [int]$versionMatch.Groups[1].Value
+if ($reportedBuild -ne $expectedBuild) {
+    throw "History/build mismatch: git count $expectedBuild, llama-server reports $reportedBuild"
+}
+
+Write-Host ""
+Write-Host "Success: $server"
+Write-Host "Stable version: $version; corresponding pre-release/compatibility build: $prereleaseTag."
+Write-Host "AutoTuner discovers this build as '$dir' and reads compatibility build b$reportedBuild."

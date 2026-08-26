@@ -33,6 +33,8 @@ Public API:
     set_theme_id(str)
     get_minimize_on_close() -> bool
     set_minimize_on_close(bool)
+    get_debug_mode() -> bool
+    set_debug_mode(bool)
     get_base_port()        -> int
     set_base_port(int)
     get_port_offset()      -> int
@@ -67,6 +69,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -75,6 +78,12 @@ _DATA_DIR_ENV = "AUTOTUNER_DATA_DIR"
 _MIGRATE_OVERRIDE_ENV = "AUTOTUNER_MIGRATE_LEGACY"
 _MIGRATION_STATE_FILENAME = ".migration-state.json"
 _MIGRATION_SCHEMA = 1
+
+_SETTINGS_LOCK = threading.RLock()
+_MIGRATED_TARGETS: set[str] = set()
+_SETTINGS_CACHE_PATH = ""
+_SETTINGS_CACHE_SIGNATURE: Tuple[int, int] = (-1, -1)
+_SETTINGS_CACHE_DATA: Dict[str, Any] = {}
 
 
 def app_data_dir() -> Path:
@@ -245,29 +254,74 @@ def _migrate_legacy_settings(target: Path) -> None:
 
 
 def _settings_file() -> Path:
-    """Resolve and lazily migrate the shared ~/.autotuner settings file."""
+    """Resolve and migrate the shared settings file once per process/path."""
     target = app_data_dir() / _FILENAME
-    _migrate_legacy_settings(target)
+    key = os.path.normcase(str(target.resolve(strict=False)))
+    with _SETTINGS_LOCK:
+        if key not in _MIGRATED_TARGETS:
+            _migrate_legacy_settings(target)
+            _MIGRATED_TARGETS.add(key)
     return target
 
 
-def load_settings() -> Dict[str, Any]:
-    """Load settings from disk; return {} on missing file or parse error."""
-    f = _settings_file()
-    if not f.exists():
-        return {}
+def _settings_signature(path: Path) -> Tuple[int, int]:
     try:
-        data = json.loads(f.read_text(encoding="utf-8"))
-        # A valid JSON scalar/list is not a settings document.  Treat it like
-        # corrupt data so all accessors remain safe.
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+        stat = path.stat()
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return 0, 0
+
+
+def _read_settings_shared() -> Dict[str, Any]:
+    """Return the process cache for read-only accessors.
+
+    The file signature is checked on every call, so manual edits and updates
+    remain visible. JSON parsing happens only when the file actually changed.
+    Callers must not mutate the returned dictionary.
+    """
+    global _SETTINGS_CACHE_PATH, _SETTINGS_CACHE_SIGNATURE, _SETTINGS_CACHE_DATA
+    path = _settings_file()
+    path_key = os.path.normcase(str(path.resolve(strict=False)))
+    signature = _settings_signature(path)
+    with _SETTINGS_LOCK:
+        if (
+            path_key == _SETTINGS_CACHE_PATH
+            and signature == _SETTINGS_CACHE_SIGNATURE
+        ):
+            return _SETTINGS_CACHE_DATA
+    if signature == (0, 0):
+        data: Dict[str, Any] = {}
+    else:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            data = parsed if isinstance(parsed, dict) else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            data = {}
+    with _SETTINGS_LOCK:
+        _SETTINGS_CACHE_PATH = path_key
+        _SETTINGS_CACHE_SIGNATURE = signature
+        _SETTINGS_CACHE_DATA = data
+        return _SETTINGS_CACHE_DATA
+
+
+def load_settings() -> Dict[str, Any]:
+    """Load a mutable settings snapshot; return {} on missing/corrupt data."""
+    return copy.deepcopy(_read_settings_shared())
 
 
 def save_settings(data: Dict[str, Any]) -> bool:
-    """Atomically save settings; return True on success, False otherwise."""
-    return _atomic_write_json(_settings_file(), data)
+    """Atomically save settings and refresh the process cache."""
+    global _SETTINGS_CACHE_PATH, _SETTINGS_CACHE_SIGNATURE, _SETTINGS_CACHE_DATA
+    path = _settings_file()
+    if not _atomic_write_json(path, data):
+        return False
+    path_key = os.path.normcase(str(path.resolve(strict=False)))
+    signature = _settings_signature(path)
+    with _SETTINGS_LOCK:
+        _SETTINGS_CACHE_PATH = path_key
+        _SETTINGS_CACHE_SIGNATURE = signature
+        _SETTINGS_CACHE_DATA = copy.deepcopy(data)
+    return True
 
 
 def _update(key: str, value: Any) -> None:
@@ -505,7 +559,7 @@ def get_model_overrides(model_name: str) -> Dict[str, bool]:
     """Return the per-model checkbox overrides, or {} when nothing stored."""
     if not model_name:
         return {}
-    overrides = load_settings().get("model_overrides") or {}
+    overrides = _read_settings_shared().get("model_overrides") or {}
     raw = overrides.get(model_name) or {}
     if not isinstance(raw, dict):
         return {}
@@ -1177,15 +1231,20 @@ def get_setting_profile_bank(
     model_name: str, model_path: Path, performance_target: str
 ) -> Dict[str, Any]:
     """Return the normalized profile bank, lazily migrating legacy state."""
-    settings = load_settings()
+    settings = _read_settings_shared()
     target = _normalise_performance_target(performance_target)
     if not target:
         return _default_profile_bank()
     bank = _read_profile_bank(settings, model_path, target)
     if bank is None:
         bank = _legacy_profile_bank(settings, model_name, model_path, target)
-        _write_profile_bank(settings, model_path, target, bank)
-        save_settings(settings)
+        # Pure defaults do not need a disk entry. Persist only real legacy
+        # measured/manual data, avoiding hundreds of atomic writes while an
+        # all-model benchmark suite is merely being prepared.
+        if _profile_bank_has_user_data(bank):
+            mutable = load_settings()
+            _write_profile_bank(mutable, model_path, target, bank)
+            save_settings(mutable)
     return copy.deepcopy(bank)
 
 
@@ -1376,7 +1435,7 @@ def get_performance_tuning_result(
     latest profile evidence. Supplying ``quick`` (standard 12.5%), ``custom``,
     or legacy ``normal`` reads independently retained analysis evidence.
     """
-    settings = load_settings()
+    settings = _read_settings_shared()
     key = favorite_model_key(model_path)
     target = _normalise_performance_target(performance_target)
     test_type = _normalise_benchmark_type(benchmark_type)
@@ -1393,7 +1452,7 @@ def get_performance_tuning_result(
                 drafter_key,
             )
             if found:
-                return record if isinstance(record, dict) else None
+                return copy.deepcopy(record) if isinstance(record, dict) else None
             found, record = _get_drafter_benchmark_result_value(
                 settings,
                 _os_path_key("performance_run_results_portable_by_drafter"),
@@ -1403,7 +1462,7 @@ def get_performance_tuning_result(
                 drafter_key,
             )
             if found:
-                return record if isinstance(record, dict) else None
+                return copy.deepcopy(record) if isinstance(record, dict) else None
         if _normalise_drafter_profile_key(drafter_key) not in (
             NO_DRAFTER_PROFILE_KEY,
             DEFAULT_DRAFTER_PROFILE_KEY,
@@ -1421,7 +1480,7 @@ def get_performance_tuning_result(
                 target,
             )
             if found:
-                return record if isinstance(record, dict) else None
+                return copy.deepcopy(record) if isinstance(record, dict) else None
             found, record = _get_benchmark_result_value(
                 settings,
                 _os_path_key("performance_run_results_portable_by_test"),
@@ -1430,7 +1489,7 @@ def get_performance_tuning_result(
                 target,
             )
             if found:
-                return record if isinstance(record, dict) else None
+                return copy.deepcopy(record) if isinstance(record, dict) else None
 
     latest_record: Any = None
     found_current = False
@@ -1461,8 +1520,8 @@ def get_performance_tuning_result(
             _normalise_benchmark_type(latest_record.get("benchmark_type"))
             or "custom"
         )
-        return latest_record if stored_type == test_type else None
-    return latest_record
+        return copy.deepcopy(latest_record) if stored_type == test_type else None
+    return copy.deepcopy(latest_record)
 
 
 def list_performance_run_results() -> Dict[str, List[Dict[str, Any]]]:
@@ -2665,7 +2724,7 @@ def get_mmproj_selection(model_name: str) -> Optional[str]:
     """
     if not model_name:
         return None
-    bucket = load_settings().get("mmproj_selection")
+    bucket = _read_settings_shared().get("mmproj_selection")
     if not isinstance(bucket, dict):
         return None
     val = bucket.get(model_name)
@@ -2720,7 +2779,7 @@ def get_draft_selection(model_name: str) -> Optional[str]:
     """
     if not model_name:
         return None
-    bucket = load_settings().get("draft_selection")
+    bucket = _read_settings_shared().get("draft_selection")
     if not isinstance(bucket, dict):
         return None
     val = bucket.get(model_name)
@@ -2828,7 +2887,7 @@ def get_prompt_cache_ram_mib() -> int:
     ``-1`` preserves llama.cpp's unlimited mode, while ``0`` disables the
     cache. The launch checkbox remains the authoritative on/off control.
     """
-    val = load_settings().get("prompt_cache_ram_mib")
+    val = _read_settings_shared().get("prompt_cache_ram_mib")
     try:
         n = int(val) if val is not None else _PROMPT_CACHE_RAM_MIB_DEFAULT
     except (TypeError, ValueError):
@@ -2904,12 +2963,22 @@ def get_minimize_on_close() -> bool:
     This is deliberately opt-in: missing settings and non-boolean legacy
     values both resolve to ``False``.
     """
-    return load_settings().get("minimize_on_close") is True
+    return _read_settings_shared().get("minimize_on_close") is True
 
 
 def set_minimize_on_close(enabled: bool) -> None:
     """Persist the opt-in X-to-notification-area behaviour."""
     _update("minimize_on_close", bool(enabled))
+
+
+def get_debug_mode() -> bool:
+    """Return the opt-in AutoTuner-internal verbose logging preference."""
+    return _read_settings_shared().get("debug_mode") is True
+
+
+def set_debug_mode(enabled: bool) -> None:
+    """Persist internal debug logging; server prompts remain excluded."""
+    _update("debug_mode", bool(enabled))
 
 
 # ---------------------------------------------------------------------------
@@ -2997,7 +3066,7 @@ def get_gpu_priorities() -> Dict[str, int]:
     """Return a mapping of GPU name → user-assigned priority for all GPUs
     that have a priority entry in gpu_overrides.  Missing keys default to 1.
     """
-    overrides = load_settings().get("gpu_overrides") or {}
+    overrides = _read_settings_shared().get("gpu_overrides") or {}
     if not isinstance(overrides, dict):
         return {}
     result: Dict[str, int] = {}
@@ -3015,7 +3084,7 @@ def get_gpu_priority(gpu_name: str) -> int:
     """Return the user-assigned priority for *gpu_name* (default 1)."""
     if not gpu_name:
         return 1
-    overrides = load_settings().get("gpu_overrides") or {}
+    overrides = _read_settings_shared().get("gpu_overrides") or {}
     entry = overrides.get(gpu_name) if isinstance(overrides, dict) else None
     if not isinstance(entry, dict):
         return 1
@@ -3062,7 +3131,7 @@ def set_gpu_priority(gpu_name: str, priority: int) -> None:
 
 def get_forced_gpu() -> Optional[str]:
     """Return the GPU name the next launch is pinned to, or None for auto."""
-    val = load_settings().get("forced_gpu")
+    val = _read_settings_shared().get("forced_gpu")
     if isinstance(val, str) and val.strip():
         return val.strip()
     return None

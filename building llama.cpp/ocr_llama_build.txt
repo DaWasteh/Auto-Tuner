@@ -2,7 +2,8 @@
 # AutoTuner is server-based, so llama-server MUST be built. A build that only
 # contains llama-mtmd-cli is intentionally not listed in the fork picker.
 #
-# Unlimited-OCR should use the current mainline build from llama_build.txt
+# Unlimited-OCR should use the current bNNNN pre-release build from
+# llama_prerelease_build.txt
 # instead: max_tiles=32 is projector GGUF metadata, not a CMake option.
 
 $ErrorActionPreference = "Stop"

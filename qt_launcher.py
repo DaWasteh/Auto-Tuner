@@ -102,6 +102,7 @@ from scanner import (
     group_entries,
     ModelEntry,
     read_gguf_metadata,
+    metadata_cache_stats,
     is_mmproj_compatible,
     is_draft_compatible,
 )
@@ -225,6 +226,32 @@ def _open_local_folder(path: Path) -> bool:
     """Open *path* in the platform's file manager via Qt."""
     folder = path.expanduser().resolve(strict=False)
     return QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+
+def _prepare_application_log() -> Optional[Path]:
+    """Return a bounded persistent GUI log, avoiding home writes in tests."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+        "AUTOTUNER_DATA_DIR"
+    ):
+        return None
+    path = app_settings.app_data_dir() / "logs" / "autotuner-app.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 4 * 1024 * 1024:
+            previous = path.with_suffix(path.suffix + ".1")
+            try:
+                previous.unlink()
+            except FileNotFoundError:
+                pass
+            path.replace(previous)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n=== AutoTuner v{VERSION} GUI "
+                f"{datetime.now().isoformat(timespec='seconds')} ===\n"
+            )
+        return path
+    except OSError:
+        return None
 
 
 _NATIVE_ICON_HANDLES: List[Tuple[int, int, int]] = []
@@ -804,6 +831,18 @@ class _ApplicationSettingsDialog(QDialog):
             )
         layout.addWidget(self.minimize_checkbox)
 
+        self.debug_checkbox = QCheckBox("Debug mode (verbose AutoTuner log)")
+        self.debug_checkbox.setChecked(app_settings.get_debug_mode())
+        self.debug_checkbox.setToolTip(
+            _setting_tooltip(
+                "Records extra AutoTuner discovery and configuration details for support.",
+                "This affects AutoTuner's own debug categories and rotating application "
+                "log only. It does not enable llama-server --verbose, capture prompts or "
+                "API payloads, or include credentials. A restart is not required.",
+            )
+        )
+        layout.addWidget(self.debug_checkbox)
+
         profiles = QGroupBox("Performance profiles")
         profiles.setMaximumWidth(760)
         profile_layout = QVBoxLayout(profiles)
@@ -1258,15 +1297,23 @@ class _PerformanceTuneSetupDialog(QDialog):
         )
         self.all_models.setChecked(False)
         scope_layout.addWidget(self.all_models)
-        self.rerun_all_models = QCheckBox("Rerun all Models (including completed runs)")
+        self.rerun_all_models = QCheckBox(
+            "Rerun completed model / mode / drafter runs"
+        )
         self.rerun_all_models.setChecked(False)
         self.rerun_all_models.setEnabled(False)
+        self.rerun_all_models.setToolTip(
+            "Off keeps every matching completed result, including embedded MTP and "
+            "each external Q4/Q8/BF16 drafter. Only missing or changed combinations "
+            "are prepared. Turn this on to deliberately measure them again."
+        )
         self.all_models.toggled.connect(self.rerun_all_models.setEnabled)
         scope_layout.addWidget(self.rerun_all_models)
         warning = QLabel(
             "All modes or all models can require many model reloads. Runs are "
-            "strictly sequential; every completed mode is saved immediately, while "
-            "cancel discards only the active incomplete run."
+            "strictly sequential; every completed model/mode/drafter combination is "
+            "saved immediately and skipped next time unless Rerun is enabled. Cancel "
+            "discards only the active incomplete run."
         )
         warning.setWordWrap(True)
         scope_layout.addWidget(warning)
@@ -1850,8 +1897,11 @@ class _ScanWorker(QObject):
     def __init__(self, roots: List[Path]) -> None:
         super().__init__()
         self._roots = roots
+        self.stats: Dict[str, object] = {}
 
     def run(self) -> None:
+        started = time.monotonic()
+        cache_before = metadata_cache_stats()
         try:
             entries: List[ModelEntry] = []
             seen: set[str] = set()
@@ -1865,7 +1915,43 @@ class _ScanWorker(QObject):
                         continue
                     seen.add(key)
                     entries.append(entry)
+            cache_after = metadata_cache_stats()
+            self.stats = {
+                "elapsed_s": time.monotonic() - started,
+                "entries": cache_after["entries"],
+                "hits": max(0, cache_after["hits"] - cache_before["hits"]),
+                "misses": max(0, cache_after["misses"] - cache_before["misses"]),
+                "workers": cache_after["workers"],
+            }
             self.finished.emit(entries)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Full metadata diagnostic export worker
+
+
+class _MetadataDiagnosticWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(str, int)
+    error = pyqtSignal(str)
+
+    def __init__(self, roots: List[Path], output_path: Path) -> None:
+        super().__init__()
+        self._roots = list(roots)
+        self._output_path = output_path
+
+    def run(self) -> None:
+        try:
+            from get_metadata import write_metadata_report
+
+            output, count = write_metadata_report(
+                self._roots,
+                self._output_path,
+                progress=self.progress.emit,
+            )
+            self.finished.emit(str(output), count)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -4794,6 +4880,8 @@ class MainWindow(QMainWindow):
 
         self._scan_thread: Optional[QThread] = None
         self._scan_worker: Optional[_ScanWorker] = None
+        self._diagnostic_thread: Optional[QThread] = None
+        self._diagnostic_worker: Optional[_MetadataDiagnosticWorker] = None
         self._update_thread: Optional[QThread] = None
         # Either the source-based updater (dev/source installs) or the
         # binary-swap updater (frozen builds); both are QObjects moved to
@@ -4825,6 +4913,9 @@ class MainWindow(QMainWindow):
         self._sysinfo_busy = False
         # Persisted font size — falls back to 10pt on first launch.
         self._font_size = app_settings.get_font_size()
+        self._debug_mode = app_settings.get_debug_mode()
+        self._app_log_path = _prepare_application_log()
+        self._set_internal_debug_mode(self._debug_mode)
         # Explicit Quit bypasses the optional X→minimize behaviour. The flag
         # remains False for ordinary title-bar close requests.
         self._force_quit = False
@@ -5854,6 +5945,9 @@ class MainWindow(QMainWindow):
 
         minimize_to_tray = dialog.minimize_checkbox.isChecked()
         app_settings.set_minimize_on_close(minimize_to_tray)
+        debug_enabled = dialog.debug_checkbox.isChecked()
+        app_settings.set_debug_mode(debug_enabled)
+        self._set_internal_debug_mode(debug_enabled)
         selected_theme = str(dialog.theme_combo.currentData())
         if selected_theme in self._theme_manager.themes:
             app_settings.set_theme_id(selected_theme)
@@ -6379,6 +6473,12 @@ class MainWindow(QMainWindow):
     def _active_llama_binary(self) -> Optional[str]:
         """Resolve the selected fork's server for backend-aware detection."""
         try:
+            if self._fork_path is not None:
+                from auto_tuner import _server_binary_in_fork
+
+                direct = _server_binary_in_fork(self._fork_path)
+                if direct:
+                    return direct
             _, resolve_server, _ = _get_fork_tools()
             binary = resolve_server("llama-server")
             return binary or None
@@ -6418,12 +6518,16 @@ class MainWindow(QMainWindow):
             else f"[Warning] No profiles found in {self.settings_path}"
         )
 
-        try:
-            discover, _, _ = _get_fork_tools()
-            self._forks = discover()
-        except Exception as exc:
-            self._log(f"[Warning] Fork discovery failed: {exc}")
-            self._forks = []
+        # Explicitly configured llama paths are authoritative and much cheaper
+        # to inspect than the broad fallback discovery across drive ancestors.
+        # Do not perform both scans only to discard the first result.
+        if not self._fork_roots:
+            try:
+                discover, _, _ = _get_fork_tools()
+                self._forks = discover()
+            except Exception as exc:
+                self._log(f"[Warning] Fork discovery failed: {exc}")
+                self._forks = []
 
         if self._fork_roots:
             active_roots = self._active_llama_roots()
@@ -6438,6 +6542,10 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self._log("[Warning] No llama.cpp builds found in active llama paths.")
+            # Model discovery and hardware probing are independent. Starting
+            # both now removes the former 30-second serial wait on slow WMI/
+            # driver probes while keeping all widget updates signal-driven.
+            self._start_scan()
             self._start_hardware_detection()
             return
 
@@ -6571,6 +6679,7 @@ class MainWindow(QMainWindow):
         self._fork_combo.blockSignals(False)
         self._refresh_fork_combo_width()
 
+        self._start_scan()
         self._start_hardware_detection()
 
     # ------------------------------------------------------------------
@@ -6922,8 +7031,11 @@ class MainWindow(QMainWindow):
             )
         else:
             self._log(f"[Warning] Hardware detection failed: {err}")
-            # Still allow model selection even without sysinfo
-        self._start_scan()
+            # Model discovery already runs independently; selection remains
+            # visible even if no system snapshot is available.
+        pending = self._current_entry
+        if pending is not None and self._system is not None:
+            self._show_config(pending)
 
     def _browse_fork_folder(self) -> None:
         """Open the multi-path llama.cpp builds manager."""
@@ -7130,10 +7242,20 @@ class MainWindow(QMainWindow):
         self._populate_list(entries)
         self._enable_launch_when_ocr_idle()
         roots = getattr(self, "_last_scan_roots", [])
+        stats = getattr(self._scan_worker, "stats", {})
+        elapsed = float(stats.get("elapsed_s", 0.0) or 0.0)
+        hits = int(stats.get("hits", 0) or 0)
+        misses = int(stats.get("misses", 0) or 0)
+        workers = int(stats.get("workers", 1) or 1)
         self._status.showMessage(
-            f"{len(entries)} model(s) loaded from {len(roots)} folder(s)."
+            f"{len(entries)} model(s) loaded from {len(roots)} folder(s) "
+            f"in {elapsed:.1f}s."
         )
-        self._log(f"Found {len(entries)} model(s) from {len(roots)} active folder(s).")
+        self._log(
+            f"Found {len(entries)} model(s) from {len(roots)} active folder(s) "
+            f"in {elapsed:.2f}s (metadata cache {hits} hit(s), {misses} miss(es), "
+            f"up to {workers} worker(s))."
+        )
 
     def _on_scan_error(self, msg: str) -> None:
         self._btn_refresh.setEnabled(True)
@@ -7753,6 +7875,11 @@ class MainWindow(QMainWindow):
         finishes.
         """
         if self._system is None:
+            # Retain the requested entry so the initial hardware worker can
+            # finish the preview automatically. Previously this early return
+            # forgot the click when scanning completed before WMI/driver probes.
+            self._current_entry = entry
+            self._btn_diagnose.setEnabled(True)
             self._config_preview.setPlainText(
                 "Hardware-Erkennung laeuft noch...\n\n"
                 "Bitte warten Sie, bis die Systeminformationen geladen sind.\n"
@@ -8807,22 +8934,159 @@ class MainWindow(QMainWindow):
         self._apply_mono_font(view)
         layout.addWidget(view, 1)
 
-        # Single OK button — this is a read-only inspector, no actions.
+        hint = QLabel(
+            "Support report creates a redacted, shareable system/model summary. "
+            "Full metadata scans every GGUF header (including drafters/projectors) "
+            "only after confirmation and never reads tensor payloads."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        support_button = QPushButton("Save support report")
+        metadata_button = QPushButton("Scan all model metadata…")
+        bb.addButton(support_button, QDialogButtonBox.ButtonRole.ActionRole)
+        bb.addButton(metadata_button, QDialogButtonBox.ButtonRole.ActionRole)
+        support_button.clicked.connect(self._save_support_report)
+
+        def start_metadata_export() -> None:
+            if self._start_metadata_diagnostic_export():
+                metadata_button.setEnabled(False)
+                metadata_button.setText("Metadata scan running…")
+
+        metadata_button.clicked.connect(start_metadata_export)
         bb.rejected.connect(dlg.reject)
         bb.accepted.connect(dlg.accept)
-        # QDialogButtonBox.Close emits the `rejected` signal by default;
-        # wire both so either path closes cleanly.
         close_btn: QPushButton | None = bb.button(QDialogButtonBox.StandardButton.Close)
         if close_btn is not None:
             close_btn.clicked.connect(dlg.accept)
         layout.addWidget(bb)
 
         dlg.exec()
-        # Also mirror a short notice into the main log so the user has
-        # a record that they consulted the diagnostic (helpful when
-        # debugging support tickets later).
         self._log(f"[Diagnose] Inspected metadata for {self._current_entry.name}")
+
+    def _save_support_report(self) -> None:
+        try:
+            from diagnostics import write_support_report
+
+            output = write_support_report(
+                self._all_entries,
+                system=self._system,
+                forks=self._forks,
+                active_fork=self._fork_path,
+                model_roots=self._active_model_paths(),
+                app_log_path=self._app_log_path,
+                debug_enabled=self._debug_mode,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Support report failed", f"Could not create the report:\n{exc}"
+            )
+            self._log(f"[Diagnose] Support report failed: {exc}")
+            return
+        self._log(f"[Diagnose] Redacted support report: {output}")
+        answer = QMessageBox.question(
+            self,
+            "Support report saved",
+            f"Saved a redacted report with {len(self._all_entries)} model(s):\n"
+            f"{output}\n\nPrompts, credentials, raw settings, and server output are excluded. "
+            "Open it now?",
+            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Close,
+            QMessageBox.StandardButton.Open,
+        )
+        if answer == QMessageBox.StandardButton.Open:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(output)))
+
+    def _start_metadata_diagnostic_export(self) -> bool:
+        try:
+            if (
+                self._diagnostic_thread is not None
+                and self._diagnostic_thread.isRunning()
+            ):
+                QMessageBox.information(
+                    self, "Metadata scan", "A full metadata scan is already running."
+                )
+                return False
+        except RuntimeError:
+            self._diagnostic_thread = None
+            self._diagnostic_worker = None
+
+        roots = self._active_model_paths()
+        if not roots:
+            QMessageBox.information(
+                self, "Metadata scan", "No active model folders are configured."
+            )
+            return False
+        answer = QMessageBox.question(
+            self,
+            "Scan every GGUF header?",
+            f"Scan all GGUF files below {len(roots)} active model folder(s) and "
+            "write a detailed Markdown inventory?\n\nThis reads metadata and tensor "
+            "names only—not model weights or prompts. GGUF metadata may contain "
+            "converter provenance strings, so review the file before sharing it. "
+            "Unchanged files use the local metadata cache, but a large first scan can "
+            "still take several minutes.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        reports = app_settings.app_data_dir() / "reports"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        output = reports / f"AutoTuner-model-metadata-{stamp}.md"
+        worker = _MetadataDiagnosticWorker(roots, output)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_metadata_diagnostic_progress)
+        worker.finished.connect(self._on_metadata_diagnostic_finished)
+        worker.error.connect(self._on_metadata_diagnostic_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(
+            lambda: self._clear_metadata_diagnostic_references(thread)
+        )
+        thread.finished.connect(thread.deleteLater)
+        self._diagnostic_worker = worker
+        self._diagnostic_thread = thread
+        self._status.showMessage("Scanning all GGUF metadata…")
+        self._log(
+            f"[Diagnose] Confirmed full metadata scan across {len(roots)} root(s)."
+        )
+        thread.start()
+        return True
+
+    def _on_metadata_diagnostic_progress(
+        self, completed: int, total: int, name: str
+    ) -> None:
+        self._status.showMessage(
+            f"Metadata scan {completed}/{max(1, total)}: {name}"
+        )
+
+    def _on_metadata_diagnostic_finished(self, path: str, count: int) -> None:
+        self._status.showMessage(f"Metadata report complete — {count} GGUF file(s)")
+        self._log(f"[Diagnose] Full metadata report ({count} files): {path}")
+        answer = QMessageBox.question(
+            self,
+            "Metadata report complete",
+            f"Scanned {count} GGUF file(s) and saved:\n{path}\n\nOpen it now?",
+            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Close,
+            QMessageBox.StandardButton.Open,
+        )
+        if answer == QMessageBox.StandardButton.Open:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _on_metadata_diagnostic_error(self, message: str) -> None:
+        self._status.showMessage("Metadata scan failed")
+        self._log(f"[Diagnose] Full metadata scan failed: {message}")
+        QMessageBox.warning(self, "Metadata scan failed", message)
+
+    def _clear_metadata_diagnostic_references(self, thread: QThread) -> None:
+        if self._diagnostic_thread is thread:
+            self._diagnostic_thread = None
+            self._diagnostic_worker = None
 
     # ------------------------------------------------------------------
     # Deterministic real-model performance tuning
@@ -9488,6 +9752,32 @@ class MainWindow(QMainWindow):
         skipped: List[str] = []
         planning_notes: List[str] = []
         system_cache: Dict[str, SystemInfo] = {}
+        runtime_resolution_cache: Dict[Tuple[str, bool], str] = {}
+        draft_runtime_cache: Dict[Tuple[str, str], Optional[str]] = {}
+        updated_system_keys: set[str] = set()
+        discovered_draft_forks: Optional[List[Tuple[str, Path]]] = None
+        planning_started = time.monotonic()
+        self._status.showMessage(
+            f"Preparing performance suite for {len(source_entries)} model(s)…"
+        )
+        QApplication.processEvents()
+
+        from auto_tuner import (
+            _discover_llama_forks,
+            _find_compatible_draft_server,
+        )
+
+        def runtime_identity(value: str) -> str:
+            resolved = shutil.which(value) or value
+            try:
+                path = Path(resolved).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                return os.path.normcase(str(resolved))
+            return os.path.normcase(str(path))
+
+        active_runtime = self._active_llama_binary()
+        active_runtime_key = runtime_identity(active_runtime) if active_runtime else ""
+
         for candidate in source_entries:
             candidate_profile = match_profile(
                 candidate.name,
@@ -9504,19 +9794,52 @@ class MainWindow(QMainWindow):
                 drafter_key = str(options["drafter_key"])
                 drafter_label = str(options["drafter_label"])
                 try:
-                    runtime_binary = self._resolve_binary(
-                        candidate_profile, use_draft, candidate.name
+                    gemma_draft = bool(
+                        use_draft
+                        and (
+                            "gemma-4" in candidate.name.lower()
+                            or "gemma4" in candidate.name.lower()
+                        )
                     )
+                    resolve_key = (
+                        str(candidate_profile.server_binary or "llama-server"),
+                        gemma_draft,
+                    )
+                    runtime_binary = runtime_resolution_cache.get(resolve_key, "")
+                    if not runtime_binary:
+                        runtime_binary = self._resolve_binary(
+                            candidate_profile, use_draft, candidate.name
+                        )
+                        runtime_resolution_cache[resolve_key] = runtime_binary
                     if not self._is_runnable_binary(
                         Path(runtime_binary)
                     ) and not shutil.which(runtime_binary):
                         raise FileNotFoundError(runtime_binary)
-                    from auto_tuner import _find_compatible_draft_server
 
-                    compatible_draft_binary = _find_compatible_draft_server(
-                        cast(Optional[ModelEntry], options["draft_model"]),
-                        runtime_binary,
-                    )
+                    preferred_key = runtime_identity(runtime_binary)
+                    compatibility_key = (drafter_key, preferred_key)
+                    if compatibility_key in draft_runtime_cache:
+                        compatible_draft_binary = draft_runtime_cache[
+                            compatibility_key
+                        ]
+                    else:
+                        draft_entry = cast(
+                            Optional[ModelEntry], options["draft_model"]
+                        )
+                        if (
+                            draft_entry is not None
+                            and draft_entry.is_dflash2_drafter
+                            and discovered_draft_forks is None
+                        ):
+                            discovered_draft_forks = _discover_llama_forks()
+                        compatible_draft_binary = _find_compatible_draft_server(
+                            draft_entry,
+                            runtime_binary,
+                            discovered_forks=discovered_draft_forks,
+                        )
+                        draft_runtime_cache[compatibility_key] = (
+                            compatible_draft_binary
+                        )
                     if compatible_draft_binary is not None:
                         runtime_binary = compatible_draft_binary
                     draft_allowed, draft_message, _draft_build = (
@@ -9532,12 +9855,29 @@ class MainWindow(QMainWindow):
                             f"{candidate.name} [{drafter_label}]: {draft_message}"
                         )
                         continue
-                    runtime_key = os.path.normcase(str(Path(runtime_binary)))
+                    runtime_key = runtime_identity(runtime_binary)
                     exact_system = system_cache.get(runtime_key)
                     if exact_system is None:
-                        exact_system = detect_system(runtime_binary)
+                        if (
+                            self._system is not None
+                            and active_runtime_key
+                            and runtime_key == active_runtime_key
+                        ):
+                            # Startup already probed this exact binary. Reuse
+                            # the uncontaminated snapshot instead of repeating
+                            # slow WMI/vendor subprocesses for suite planning.
+                            exact_system = copy.deepcopy(self._system)
+                            planning_notes.append(
+                                f"{candidate.name}: reused startup hardware snapshot"
+                            )
+                        else:
+                            exact_system = detect_system(runtime_binary)
                         system_cache[runtime_key] = exact_system
-                    if candidate.path == entry.path:
+                    if (
+                        candidate.path == entry.path
+                        and runtime_key not in updated_system_keys
+                    ):
+                        updated_system_keys.add(runtime_key)
                         self._update_sysinfo_labels(exact_system)
                 except Exception as exc:
                     skipped.append(
@@ -9676,9 +10016,28 @@ class MainWindow(QMainWindow):
                         )
                     )
 
+        planning_elapsed = time.monotonic() - planning_started
+        self._log(
+            f"[Performance] Prepared {len(jobs)} job(s) in {planning_elapsed:.2f}s; "
+            f"resolved {len(runtime_resolution_cache)} runtime family/families and "
+            f"probed {len(system_cache)} hardware backend(s)."
+        )
+
         if not jobs:
+            completed_only = bool(skipped) and all(
+                message.endswith("already completed") for message in skipped
+            )
             detail = "\n".join(skipped[:12]) or "No eligible model/mode profiles."
-            QMessageBox.warning(self, "No performance tests prepared", detail)
+            if completed_only:
+                QMessageBox.information(
+                    self,
+                    "Performance results are up to date",
+                    f"All {len(skipped)} matching model/mode/drafter run(s) are "
+                    "already completed. Nothing will be re-tested while Rerun is "
+                    f"off.\n\n{detail}",
+                )
+            else:
+                QMessageBox.warning(self, "No performance tests prepared", detail)
             return
 
         exact_trials = sum(bool(job.metadata.get("exact_trial")) for job in jobs)
@@ -9731,6 +10090,9 @@ class MainWindow(QMainWindow):
             return
 
         suite = BenchmarkSuiteRunner(jobs)
+        planned_model_count = len(
+            {str(job.metadata.get("model_key", "")) for job in jobs}
+        )
         worker = _PerformanceTuneWorker(
             suite,
             checkpoint_callback=self._save_performance_job_outcome,
@@ -9738,8 +10100,8 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         summary = (
-            f"{test_label}: testing {len(source_entries)} model(s) in "
-            f"{len(jobs)} model/mode/drafter run(s)."
+            f"{test_label}: testing {planned_model_count} model(s) in "
+            f"{len(jobs)} model/mode/drafter run(s); completed heads stay skipped."
         )
         distinct_models = {
             str(job.metadata.get("model_key", "")) for job in jobs
@@ -12007,8 +12369,37 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Log helper
     # ------------------------------------------------------------------
+    def _set_internal_debug_mode(self, enabled: bool) -> None:
+        self._debug_mode = bool(enabled)
+        if self._debug_mode:
+            os.environ["AUTOTUNER_DEBUG"] = "1"
+        else:
+            os.environ.pop("AUTOTUNER_DEBUG", None)
+        try:
+            module = sys.modules.get("auto_tuner")
+            if module is None and self._debug_mode:
+                import auto_tuner as module
+            if module is not None:
+                module.set_debug_sink(self._bg_log.emit)
+                module.set_debug_mode(self._debug_mode)
+        except Exception:
+            pass
+        if hasattr(self, "_log_panel"):
+            self._log(
+                f"[Debug] AutoTuner internal logging "
+                f"{'enabled' if self._debug_mode else 'disabled'}."
+            )
+
     def _log(self, msg: str) -> None:
-        self._log_panel.append(msg.rstrip("\n"))
+        clean = msg.rstrip("\n")
+        self._log_panel.append(clean)
+        if self._app_log_path is not None:
+            try:
+                with self._app_log_path.open("a", encoding="utf-8") as handle:
+                    stamp = datetime.now().isoformat(timespec="seconds")
+                    handle.write(f"{stamp} {clean}\n")
+            except OSError:
+                self._app_log_path = None
         sb = self._log_panel.verticalScrollBar()
         if sb is not None:
             sb.setValue(sb.maximum())
@@ -12043,6 +12434,27 @@ class MainWindow(QMainWindow):
                 self,
                 "Update in progress",
                 "AutoTuner is still updating. Please wait until the update finishes before closing the application.",
+            )
+            if a0 is not None:
+                a0.ignore()
+            return
+
+        try:
+            diagnostic_running = (
+                self._diagnostic_thread is not None
+                and self._diagnostic_thread.isRunning()
+            )
+        except RuntimeError:
+            self._diagnostic_thread = None
+            self._diagnostic_worker = None
+            diagnostic_running = False
+        if diagnostic_running:
+            self._force_quit = False
+            QMessageBox.information(
+                self,
+                "Metadata scan in progress",
+                "AutoTuner is still writing the confirmed all-model metadata "
+                "report. Please wait for it to finish before closing.",
             )
             if a0 is not None:
                 a0.ignore()
@@ -12219,6 +12631,12 @@ class MainWindow(QMainWindow):
             self._stop_all_servers()
 
         self._destroy_tray_icon()
+        try:
+            module = sys.modules.get("auto_tuner")
+            if module is not None:
+                module.set_debug_sink(None)
+        except Exception:
+            pass
         _release_windows_native_icons()
         if a0 is not None:
             a0.accept()

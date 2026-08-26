@@ -29,7 +29,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from autotuner_version import VERSION
 
@@ -72,8 +72,14 @@ from ocr_workflow import (
 # ---------------------------------------------------------------------------
 # Terminal presentation helpers
 
-_DEBUG_MODE = False
+_DEBUG_MODE = os.environ.get("AUTOTUNER_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 _DEBUG_CATEGORIES: set[str] = set()
+_DEBUG_SINK: Optional[Callable[[str], None]] = None
 _BAR = "─" * 64
 
 
@@ -227,9 +233,32 @@ def _effective_prompt_cache_mib(args: argparse.Namespace) -> int:
     )
 
 
+def set_debug_mode(enabled: bool, sink: Optional[Callable[[str], None]] = None) -> None:
+    """Enable internal diagnostics without changing llama-server verbosity."""
+    global _DEBUG_MODE, _DEBUG_SINK
+    _DEBUG_MODE = bool(enabled)
+    if sink is not None:
+        _DEBUG_SINK = sink
+
+
+def set_debug_sink(sink: Optional[Callable[[str], None]]) -> None:
+    global _DEBUG_SINK
+    _DEBUG_SINK = sink
+
+
+def _emit_debug(prefix: str, *args, **kwargs) -> None:
+    message = " ".join(str(arg) for arg in args)
+    print(prefix, *args, **kwargs)
+    if _DEBUG_SINK is not None:
+        try:
+            _DEBUG_SINK(f"{prefix} {message}".rstrip())
+        except Exception:
+            pass
+
+
 def _debug_print(*args, **kwargs) -> None:
     if _DEBUG_MODE:
-        print("[DEBUG]", *args, **kwargs)
+        _emit_debug("[DEBUG]", *args, **kwargs)
 
 
 def enable_debug_category(category: str) -> None:
@@ -238,7 +267,7 @@ def enable_debug_category(category: str) -> None:
 
 def debug_cat(category: str, *args, **kwargs) -> None:
     if _DEBUG_MODE or category in _DEBUG_CATEGORIES:
-        print(f"[DEBUG:{category.upper()}]", *args, **kwargs)
+        _emit_debug(f"[DEBUG:{category.upper()}]", *args, **kwargs)
 
 
 def _print_banner() -> None:
@@ -910,24 +939,26 @@ def _candidate_search_roots() -> List[Path]:
     return roots
 
 
-# Fork dir naming convention: '{prefix}_llama.cpp', '{prefix}_b{NUM}_llama.cpp',
-# semantic-release '{prefix}_vX.Y.Z_llama.cpp', or bare versioned/mainline
-# names such as 'b10485_llama.cpp', 'v0.1.2_llama.cpp', and 'llama.cpp'. A
-# master checkout without an exact release tag uses the truthful form
-# 'b10548_dev_a298422da_llama.cpp'. To match a profile's fork hint (e.g.
-# "2b_llama") against the versioned dir actually on disk, normalize both to
-# a family form by stripping '.cpp' and the complete build/version segment:
+# Fork dir naming convention: '{prefix}_llama.cpp', pre-release
+# '{prefix}_b{NUM}_llama.cpp', stable '{prefix}_X.Y.Z_llama.cpp' (plus legacy
+# '{prefix}_vX.Y.Z_llama.cpp'), or bare names such as 'b10485_llama.cpp',
+# '0.2.0_llama.cpp', and 'llama.cpp'. A master checkout without an exact b-tag
+# uses the truthful form 'b10548_dev_a298422da_llama.cpp'. To match a profile's
+# fork hint (e.g. "2b_llama") against the versioned dir actually on disk,
+# normalize both to a family form by stripping '.cpp' and the complete
+# build/version segment:
 #     '2b_b8840_llama.cpp'              -> '2b_llama'
 #     '2b_llama.cpp'                    -> '2b_llama'
 #     'b9840_llama.cpp'                 -> 'llama'
 #     'b10548_dev_a298422da_llama.cpp'  -> 'llama'
-#     'v0.1.2_llama.cpp'                -> 'llama'
-#     'tq_v0.1.2_llama.cpp'             -> 'tq_llama'
+#     '0.2.0_llama.cpp'                 -> 'llama'
+#     'v0.1.2_llama.cpp'                -> 'llama'  (legacy folder)
+#     'tq_0.2.0_llama.cpp'              -> 'tq_llama'
 #     '1b_llama.cpp'                    -> '1b_llama'
 # This keeps the 1-bit ('1b_') and 2-bit/Ternary ('2b_') families distinct
-# while tolerating release, development, semantic-versioned, and bare names.
+# while tolerating stable, pre-release, development, and legacy names.
 _FORK_VERSION_RE = re.compile(
-    r"(?:^|_)(?:b\d+(?:_dev)?(?:_[0-9a-f]{7,40})?|v\d+\.\d+\.\d+)(?=_|$)",
+    r"(?:^|_)(?:b\d+(?:_dev)?(?:_[0-9a-f]{7,40})?|v?\d+\.\d+\.\d+)(?=_|$)",
     re.IGNORECASE,
 )
 
@@ -1050,7 +1081,10 @@ def _server_binary_in_fork(root: Path) -> Optional[str]:
 
 
 def _find_compatible_draft_server(
-    draft_model: Optional[ModelEntry], preferred_binary: str
+    draft_model: Optional[ModelEntry],
+    preferred_binary: str,
+    *,
+    discovered_forks: Optional[List[Tuple[str, Path]]] = None,
 ) -> Optional[str]:
     """Find a DFlash2-capable sibling build without changing global selection.
 
@@ -1060,9 +1094,7 @@ def _find_compatible_draft_server(
     This keeps b10590 selected for ordinary models while transparently routing
     only the DFlash2 launch through its required PR runtime.
     """
-    allowed, message, _build = check_draft_model_build(
-        draft_model, preferred_binary
-    )
+    allowed, message, _build = check_draft_model_build(draft_model, preferred_binary)
     needs_capability_search = bool(
         draft_model is not None
         and draft_model.is_dflash2_drafter
@@ -1072,7 +1104,10 @@ def _find_compatible_draft_server(
         return preferred_binary
 
     preferred_key = os.path.normcase(str(Path(preferred_binary)))
-    for _name, root in _discover_llama_forks():
+    forks = (
+        discovered_forks if discovered_forks is not None else _discover_llama_forks()
+    )
+    for _name, root in forks:
         candidate = _server_binary_in_fork(root)
         if not candidate or os.path.normcase(candidate) == preferred_key:
             continue

@@ -8,12 +8,18 @@ for 100+ GB files.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
 import re
 import struct
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +68,16 @@ def _read_value(f, vtype: int, want_array_elements: bool = True) -> Any:
     if vtype == _GT_ARRAY:
         atype = struct.unpack("<I", f.read(4))[0]
         n = struct.unpack("<Q", f.read(8))[0]
-        # Token vocab arrays can be huge — skip them silently.
+        # Token vocab arrays can be huge — skip them silently. Fixed-width
+        # scalar arrays can be skipped in one seek instead of one Python call
+        # per element (important for metadata-heavy model collections).
         if not want_array_elements or n > 256:
-            for _ in range(n):
-                _read_value(f, atype, want_array_elements=False)
+            scalar = _SCALAR_FMT.get(atype)
+            if scalar is not None:
+                f.seek(scalar[1] * n, os.SEEK_CUR)
+            else:
+                for _ in range(n):
+                    _read_value(f, atype, want_array_elements=False)
             return None
         return [_read_value(f, atype, True) for _ in range(n)]
     raise ValueError(f"Unknown GGUF value type {vtype}")
@@ -75,7 +87,7 @@ def _read_value(f, vtype: int, want_array_elements: bool = True) -> Any:
 _BLK_IDX_RE = re.compile(r"^blk\.(\d+)\.")
 
 
-def read_gguf_metadata(path: Path) -> Dict[str, Any]:
+def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
     """Read GGUF header KV pairs and scan tensor info for MTP detection.
 
     In addition to the standard KV pairs this function reads the tensor
@@ -233,6 +245,227 @@ def read_gguf_metadata(path: Path) -> Dict[str, Any]:
             return md
     except (OSError, struct.error, EOFError, ValueError, UnicodeDecodeError):
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Metadata cache + bounded parallel reader
+
+_METADATA_CACHE_SCHEMA = 2
+_METADATA_CACHE_MAX_ENTRIES = 2048
+_METADATA_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_METADATA_CACHE_LOCK = threading.RLock()
+_METADATA_CACHE_LOADED = False
+_METADATA_CACHE_DIRTY = False
+_METADATA_CACHE_ENTRIES: Dict[str, Dict[str, Any]] = {}
+_METADATA_CACHE_HITS = 0
+_METADATA_CACHE_MISSES = 0
+
+
+def _metadata_cache_path() -> Optional[Path]:
+    """Return the private persistent cache path, or ``None`` when disabled."""
+    explicit = os.environ.get("AUTOTUNER_METADATA_CACHE", "").strip()
+    if explicit.lower() in {"0", "off", "false", "none"}:
+        return None
+    if explicit:
+        return Path(explicit).expanduser()
+    # Pytest scans many temporary fixtures. Keep those in memory unless a test
+    # explicitly supplies its own cache path, never in the developer's home.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    override = os.environ.get("AUTOTUNER_DATA_DIR", "").strip()
+    base = Path(override).expanduser() if override else Path.home() / ".autotuner"
+    return base / "cache" / "model-metadata-v2.json"
+
+
+def _metadata_cache_key(path: Path) -> Optional[str]:
+    try:
+        stat = path.stat()
+        resolved = path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    identity = (
+        f"{os.path.normcase(str(resolved))}\0{stat.st_size}\0{stat.st_mtime_ns}"
+        f"\0parser-{_METADATA_CACHE_SCHEMA}"
+    )
+    return hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _load_metadata_cache() -> None:
+    global _METADATA_CACHE_LOADED, _METADATA_CACHE_ENTRIES
+    with _METADATA_CACHE_LOCK:
+        if _METADATA_CACHE_LOADED:
+            return
+        _METADATA_CACHE_LOADED = True
+        path = _metadata_cache_path()
+        if path is None:
+            return
+        try:
+            if path.stat().st_size > _METADATA_CACHE_MAX_BYTES:
+                return
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != _METADATA_CACHE_SCHEMA
+        ):
+            return
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, dict):
+            return
+        valid: Dict[str, Dict[str, Any]] = {}
+        for key, value in raw_entries.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            metadata = value.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            valid[key] = {
+                "metadata": metadata,
+                "cached_at": int(value.get("cached_at", 0) or 0),
+            }
+        if len(valid) > _METADATA_CACHE_MAX_ENTRIES:
+            ordered = sorted(
+                valid.items(),
+                key=lambda item: int(item[1].get("cached_at", 0)),
+                reverse=True,
+            )
+            valid = dict(ordered[:_METADATA_CACHE_MAX_ENTRIES])
+        _METADATA_CACHE_ENTRIES = valid
+
+
+def read_gguf_metadata(path: Path) -> Dict[str, Any]:
+    """Read metadata with stat-based in-memory and persistent caching.
+
+    The signature includes normalized path, byte size, nanosecond mtime, and
+    parser schema. Replacing or editing a GGUF therefore invalidates the entry;
+    unchanged models avoid repeating the expensive tensor-name scan on every
+    application start and performance-suite preparation.
+    """
+    global _METADATA_CACHE_DIRTY, _METADATA_CACHE_HITS, _METADATA_CACHE_MISSES
+    model_path = Path(path)
+    key = _metadata_cache_key(model_path)
+    if key is None:
+        return {}
+    _load_metadata_cache()
+    with _METADATA_CACHE_LOCK:
+        cached = _METADATA_CACHE_ENTRIES.get(key)
+        if cached is not None:
+            metadata = cached.get("metadata")
+            if isinstance(metadata, dict):
+                _METADATA_CACHE_HITS += 1
+                return dict(metadata)
+        _METADATA_CACHE_MISSES += 1
+
+    metadata = _read_gguf_metadata_uncached(model_path)
+    with _METADATA_CACHE_LOCK:
+        # Another scan thread may have completed the same path meanwhile; the
+        # deterministic parse result is equivalent, so replacing is harmless.
+        _METADATA_CACHE_ENTRIES[key] = {
+            "metadata": dict(metadata),
+            "cached_at": int(time.time()),
+        }
+        _METADATA_CACHE_DIRTY = True
+    return dict(metadata)
+
+
+def _metadata_worker_count(item_count: int) -> int:
+    if item_count <= 1:
+        return 1
+    raw = os.environ.get("AUTOTUNER_SCAN_WORKERS", "").strip()
+    try:
+        requested = int(raw) if raw else 0
+    except ValueError:
+        requested = 0
+    if requested <= 0:
+        requested = min(8, max(2, os.cpu_count() or 2))
+    return max(1, min(item_count, requested, 32))
+
+
+def _read_metadata_many(paths: Iterable[Path]) -> Dict[Path, Dict[str, Any]]:
+    ordered = list(dict.fromkeys(Path(path) for path in paths))
+    if not ordered:
+        return {}
+    workers = _metadata_worker_count(len(ordered))
+    if workers <= 1:
+        return {path: read_gguf_metadata(path) for path in ordered}
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="autotuner-metadata"
+    ) as executor:
+        values = list(executor.map(read_gguf_metadata, ordered))
+    return dict(zip(ordered, values))
+
+
+def read_gguf_metadata_many(paths: Iterable[Path]) -> Dict[Path, Dict[str, Any]]:
+    """Read independent GGUF headers concurrently with deterministic results."""
+    return _read_metadata_many(paths)
+
+
+def flush_gguf_metadata_cache() -> None:
+    """Atomically persist bounded cache entries after a completed scan."""
+    global _METADATA_CACHE_DIRTY, _METADATA_CACHE_ENTRIES
+    _load_metadata_cache()
+    path = _metadata_cache_path()
+    with _METADATA_CACHE_LOCK:
+        if not _METADATA_CACHE_DIRTY:
+            return
+        if path is None:
+            _METADATA_CACHE_DIRTY = False
+            return
+        ordered = sorted(
+            _METADATA_CACHE_ENTRIES.items(),
+            key=lambda item: int(item[1].get("cached_at", 0)),
+            reverse=True,
+        )[:_METADATA_CACHE_MAX_ENTRIES]
+        entries = dict(ordered)
+
+    payload = {"schema": _METADATA_CACHE_SCHEMA, "entries": entries}
+    try:
+        encoded = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+        # A few unusually large chat templates must not let a cache grow without
+        # bound. Retain the newest half repeatedly until it fits the hard cap.
+        while (
+            len(encoded.encode("utf-8")) > _METADATA_CACHE_MAX_BYTES
+            and len(entries) > 1
+        ):
+            entries = dict(list(entries.items())[: max(1, len(entries) // 2)])
+            payload["entries"] = entries
+            encoded = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(encoded, encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return
+    with _METADATA_CACHE_LOCK:
+        _METADATA_CACHE_ENTRIES = entries
+        _METADATA_CACHE_DIRTY = False
+
+
+def metadata_cache_stats() -> Dict[str, int]:
+    """Return process-local cache counters for diagnostics and tests."""
+    with _METADATA_CACHE_LOCK:
+        return {
+            "entries": len(_METADATA_CACHE_ENTRIES),
+            "hits": _METADATA_CACHE_HITS,
+            "misses": _METADATA_CACHE_MISSES,
+            "workers": _metadata_worker_count(max(1, len(_METADATA_CACHE_ENTRIES))),
+        }
+
+
+def _reset_metadata_cache_for_tests() -> None:
+    global _METADATA_CACHE_LOADED, _METADATA_CACHE_DIRTY
+    global _METADATA_CACHE_ENTRIES, _METADATA_CACHE_HITS, _METADATA_CACHE_MISSES
+    with _METADATA_CACHE_LOCK:
+        _METADATA_CACHE_LOADED = False
+        _METADATA_CACHE_DIRTY = False
+        _METADATA_CACHE_ENTRIES = {}
+        _METADATA_CACHE_HITS = 0
+        _METADATA_CACHE_MISSES = 0
 
 
 def metadata_is_standalone_drafter(md: Dict[str, Any]) -> bool:
@@ -565,6 +798,7 @@ _HYBRID_ARCHS = frozenset(
         "kimi_k3",
         "qwen35",  # Qwen3.5–3.8 dense: linear + full attention
         "qwen35moe",  # Qwen3.5–3.8 MoE: linear + full attention
+        "qwen4exp",  # Qwen3.8 Flash Next preview: GDN + 1-in-4 attention
         "minimax-01",  # MiniMax-Text-01: lightning + full attention (b10441)
         "minimax_01",
         "rwkv6",  # RWKV — pure SSM, but treated similarly for KV
@@ -686,6 +920,19 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
 
     if not metadata_is_hybrid_architecture(md):
         return total  # pure full-attention Transformer
+
+    # Some preview converters describe the interleave directly instead of
+    # serializing a recurrent-layer list. Qwen3.8 Flash Next's qwen4exp GGUF,
+    # for example, declares full_attention_interval=4: exactly one of every
+    # four blocks carries context-growing KV (48 blocks -> 12 attention layers).
+    interval_value = md.get(f"{arch}.full_attention_interval")
+    if interval_value is not None:
+        try:
+            interval = int(interval_value)
+        except (TypeError, ValueError):
+            interval = 0
+        if interval > 1:
+            return max(1, math.ceil(total / interval))
 
     # Highest priority: the authoritative recurrent-layer count.
     #
@@ -973,6 +1220,13 @@ _QUANT_PATTERN = re.compile(
 # Matches llama.cpp split-GGUF naming: "model-00002-of-00003.gguf"
 # llama-gguf-split always zero-pads to 5 digits on both sides.
 _SPLIT_PART_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+
+
+def _coerce_positive_int(value: Any) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _split_gguf_key(filename: str) -> Optional[Tuple[str, int, int]]:
@@ -1674,6 +1928,7 @@ def scan_models(
     mmprojs: List[Path] = list(all_mmproj_ext)
     drafts: List[Path] = []
     models: List[Path] = []
+    file_sizes: Dict[Path, int] = {}
     for f in all_gguf:
         if _is_mmproj_filename(f.name):
             mmprojs.append(f)
@@ -1684,6 +1939,7 @@ def scan_models(
             # back to the size-agnostic check so the file is not lost.
             try:
                 f_size = f.stat().st_size
+                file_sizes[f] = f_size
             except OSError:
                 f_size = None
             if _is_draft_filename(f.name, f_size):
@@ -1706,6 +1962,19 @@ def scan_models(
             base, part_idx, _total = info
             split_key = (str(m.parent), base)
             split_parts.setdefault(split_key, {})[part_idx] = m
+
+    # Metadata/tensor-name parsing is independent per file. Read single models,
+    # filename-classified draft heads, and each split model's first shard in a
+    # bounded pool. Executor.map preserves deterministic path/result ordering;
+    # the persistent stat-signature cache makes later starts mostly cache hits.
+    split_primary_paths = [
+        parts.get(1) or parts[min(parts)] for parts in split_parts.values()
+    ]
+    metadata_by_path = (
+        _read_metadata_many([*single_models, *drafts, *split_primary_paths])
+        if read_metadata
+        else {}
+    )
 
     def _group_for(path: Path) -> str:
         """Return the group label (relative sub-directory) for *path*."""
@@ -1743,11 +2012,13 @@ def scan_models(
     # real targets in the same folder can bind them in phase 2.
     single_meta: List[Tuple[Path, int, Dict[str, Any]]] = []
     for m in sorted(single_models):
-        try:
-            size = m.stat().st_size
-        except OSError:
-            continue
-        md = read_gguf_metadata(m) if read_metadata else {}
+        size = file_sizes.get(m)
+        if size is None:
+            try:
+                size = m.stat().st_size
+            except OSError:
+                continue
+        md = dict(metadata_by_path.get(m, {})) if read_metadata else {}
         if md and metadata_is_drafter_file(md):
             # Standalone drafter (Gemma 4 MTP assistant head, EAGLE-3,
             # DFlash, or DSpark) — reclassify into the draft pool so phase 2 pairs it
@@ -1763,35 +2034,65 @@ def scan_models(
     draft_by_parent = _by_parent(drafts)
     for m, size, md in single_meta:
         parent = str(m.parent)
+        local_mmprojs = list(mmproj_by_parent.get(parent, []))
+        local_drafts = list(draft_by_parent.get(parent, []))
         entries.append(
             ModelEntry(
                 path=m,
                 name=m.stem,
                 group=_group_for(m),
                 size_bytes=size,
-                mmproj=_find_mmproj(m, mmprojs),
-                mmproj_candidates=_find_mmproj_candidates(m, mmprojs),
-                draft=_find_draft(m, drafts),
-                folder_mmprojs=list(mmproj_by_parent.get(parent, [])),
-                folder_drafts=list(draft_by_parent.get(parent, [])),
+                mmproj=_find_mmproj(m, local_mmprojs),
+                mmproj_candidates=_find_mmproj_candidates(m, local_mmprojs),
+                draft=_find_draft(m, local_drafts),
+                folder_mmprojs=local_mmprojs,
+                folder_drafts=local_drafts,
                 metadata=md,
                 part_paths=[m],
             )
         )
 
     # --- Multi-part (sharded) models ----------------------------------
-    for (parent_str, base), parts_dict in sorted(
+    # Identify every split model whose primary metadata declares MTP, then read
+    # all required remaining shards in one bounded pool instead of serially per
+    # model. Models without nextn metadata retain the cheap shard-1-only path.
+    extra_shards: List[Path] = []
+    if read_metadata:
+        for parts_dict in split_parts.values():
+            ordered = [parts_dict[i] for i in sorted(parts_dict)]
+            if len(ordered) <= 1:
+                continue
+            part1 = parts_dict.get(1) or ordered[0]
+            primary_md = metadata_by_path.get(part1, {})
+            declares_nextn = False
+            for key, value in primary_md.items():
+                if "nextn_predict" not in key.lower():
+                    continue
+                try:
+                    declares_nextn = int(value) > 0
+                except (TypeError, ValueError):
+                    declares_nextn = False
+                if declares_nextn:
+                    break
+            if declares_nextn:
+                extra_shards.extend(part for part in ordered if part != part1)
+        metadata_by_path.update(_read_metadata_many(extra_shards))
+
+    for (_parent_str, base), parts_dict in sorted(
         split_parts.items(), key=lambda kv: kv[0][1].lower()
     ):
         # Use shard 1 as the primary path (llama.cpp auto-discovers the rest).
         # Fall back to the lowest-indexed shard if shard 1 is missing.
         part1 = parts_dict.get(1) or parts_dict[min(parts_dict)]
         total_size = 0
-        for p in parts_dict.values():
-            try:
-                total_size += p.stat().st_size
-            except OSError:
-                pass
+        for part in parts_dict.values():
+            size = file_sizes.get(part)
+            if size is None:
+                try:
+                    size = part.stat().st_size
+                except OSError:
+                    size = 0
+            total_size += size
         if total_size == 0:
             continue
         ordered_parts = [parts_dict[i] for i in sorted(parts_dict)]
@@ -1799,27 +2100,21 @@ def scan_models(
         # mmproj / draft pairing functions get the correct base stem.
         pairing_path = part1.parent / (base + ".gguf")
         parent = str(part1.parent)
-        md = read_gguf_metadata(part1) if read_metadata else {}
+        md = dict(metadata_by_path.get(part1, {})) if read_metadata else {}
         if read_metadata and len(ordered_parts) > 1:
             # Some quantizers preserve ``nextn_predict_layers`` after dropping
             # the actual MTP tensors. A primary-shard scan is inconclusive by
             # design, so verify every shard header before advertising internal
-            # MTP in the GUI. Only models declaring nextn need this extra work.
-            declares_nextn = False
-            for key, value in md.items():
-                if "nextn_predict" not in key.lower():
-                    continue
-                try:
-                    declares_nextn = int(value) > 0
-                except (TypeError, ValueError):
-                    pass
-                if declares_nextn:
-                    break
+            # MTP in the GUI. Only models declaring nextn reached the pooled
+            # extra-shard read above.
+            declares_nextn = any(
+                "nextn_predict" in key.lower() and _coerce_positive_int(value)
+                for key, value in md.items()
+            )
             if declares_nextn:
-                shard_metadata = [md]
-                shard_metadata.extend(
-                    read_gguf_metadata(part) for part in ordered_parts[1:]
-                )
+                shard_metadata = [
+                    dict(metadata_by_path.get(part, {})) for part in ordered_parts
+                ]
                 scans_complete = all(
                     item.get("__tensor_scan_complete__") is True
                     for item in shard_metadata
@@ -1841,22 +2136,26 @@ def scan_models(
                         )
                     )
                     md["__mtp_scan__"] = "found" if found else "absent"
+        local_mmprojs = list(mmproj_by_parent.get(parent, []))
+        local_drafts = list(draft_by_parent.get(parent, []))
         entries.append(
             ModelEntry(
                 path=part1,
                 name=base,
                 group=_group_for(part1),
                 size_bytes=total_size,
-                mmproj=_find_mmproj(pairing_path, mmprojs),
-                mmproj_candidates=_find_mmproj_candidates(pairing_path, mmprojs),
-                draft=_find_draft(pairing_path, drafts),
-                folder_mmprojs=list(mmproj_by_parent.get(parent, [])),
-                folder_drafts=list(draft_by_parent.get(parent, [])),
+                mmproj=_find_mmproj(pairing_path, local_mmprojs),
+                mmproj_candidates=_find_mmproj_candidates(pairing_path, local_mmprojs),
+                draft=_find_draft(pairing_path, local_drafts),
+                folder_mmprojs=local_mmprojs,
+                folder_drafts=local_drafts,
                 metadata=md,
                 part_paths=ordered_parts,
             )
         )
 
+    if read_metadata:
+        flush_gguf_metadata_cache()
     return entries
 
 

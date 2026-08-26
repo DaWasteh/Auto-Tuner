@@ -87,6 +87,10 @@ def test_all_profiles_load() -> None:
         ("Qwen3.6-35B-A3B-UD-IQ3_S", "Qwen3.5 / Qwen3.6 (Alibaba)"),
         ("Qwen3.8-27B-Q8_0", "Qwen3.8 (Alibaba)"),
         ("Qwen3.8-2.4T-A95B-UD-IQ2_XXS", "Qwen3.8 (Alibaba)"),
+        (
+            "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003",
+            "Qwen3.8 Flash Next (Qwen4 Experimental)",
+        ),
         ("Gemma-4-26B-A4B-IQ3_M", "Gemma 4 (Google)"),
         ("gemma-4-E2B-it-BF16", "Gemma 4 (Google)"),
         ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
@@ -126,6 +130,44 @@ def test_qwen38_profile_contract_and_precedence() -> None:
         "Opaque-Qwen-Community-Merge.gguf", profiles, arch="qwen35moe"
     )
     assert older_fallback.source_file == "qwen3_5-3_6.yaml"
+
+
+def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
+    from scanner import metadata_attention_layer_count
+    from tuner import _moe_expert_count
+
+    profiles = load_profiles(SETTINGS_DIR)
+    profile = match_profile(
+        "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003",
+        profiles,
+        arch="qwen4exp",
+    )
+    assert profile.source_file == "qwen3_8_flash_next.yaml"
+    assert profile.max_context == 262144
+    assert profile.rope_scale_enabled is False
+    assert profile.rope_scale_max_ctx == 262144
+    assert profile.sampling["chat"] == profile.sampling["coding"]
+    assert profile.ngram_method == "ngram-map-k4v"
+    assert match_profile("opaque-preview.gguf", profiles, "qwen4exp") is profile
+
+    model = ModelEntry(
+        path=Path("Qwen3.8-Flash-Next.gguf"),
+        name="Qwen3.8-Flash-Next",
+        group=".",
+        size_bytes=32 * 1024**3,
+        metadata={
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "qwen4exp.context_length": 262144,
+            "qwen4exp.expert_count": 512,
+            "qwen4exp.expert_used_count": 10,
+            "qwen4exp.ssm.state_size": 128,
+            "qwen4exp.full_attention_interval": 4,
+        },
+    )
+    assert model.is_hybrid
+    assert metadata_attention_layer_count(model.metadata) == 12
+    assert _moe_expert_count(model) == 512
 
 
 def test_ministral_does_not_collide_with_mistral_medium() -> None:
@@ -239,6 +281,72 @@ def test_scanner_hides_large_mtp_prefixed_draft(tmp_path, monkeypatch) -> None:
 
 def test_scanner_handles_empty_folder(tmp_path) -> None:
     assert scan_models(tmp_path) == []
+
+
+def test_scanner_persists_and_invalidates_metadata_cache(
+    tmp_path, monkeypatch
+) -> None:
+    import scanner
+
+    cache_path = tmp_path / "cache" / "metadata.json"
+    model = tmp_path / "CachedModel-Q4_K_M.gguf"
+    _write_minimal_gguf(model)
+    monkeypatch.setenv("AUTOTUNER_METADATA_CACHE", str(cache_path))
+    scanner._reset_metadata_cache_for_tests()
+    original = scanner._read_gguf_metadata_uncached
+    calls = 0
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(scanner, "_read_gguf_metadata_uncached", counted)
+    first = scanner.read_gguf_metadata(model)
+    second = scanner.read_gguf_metadata(model)
+    assert first == second
+    assert calls == 1
+    scanner.flush_gguf_metadata_cache()
+    assert cache_path.is_file()
+
+    # Simulate the next application process: unchanged metadata must come from
+    # disk, while a changed file signature must invoke the parser again.
+    scanner._reset_metadata_cache_for_tests()
+    assert scanner.read_gguf_metadata(model) == first
+    assert calls == 1
+    with model.open("ab") as handle:
+        handle.write(b"\0")
+    assert scanner.read_gguf_metadata(model) == first
+    assert calls == 2
+    scanner._reset_metadata_cache_for_tests()
+
+
+def test_scanner_reads_independent_headers_in_parallel(tmp_path, monkeypatch) -> None:
+    import threading
+    import time
+
+    import scanner
+
+    for index in range(8):
+        _write_minimal_gguf(tmp_path / f"Model-{index:02d}-Q4_K_M.gguf")
+    monkeypatch.setenv("AUTOTUNER_METADATA_CACHE", "off")
+    monkeypatch.setenv("AUTOTUNER_SCAN_WORKERS", "4")
+    scanner._reset_metadata_cache_for_tests()
+    original = scanner.read_gguf_metadata
+    worker_names: set[str] = set()
+
+    def delayed(path):
+        worker_names.add(threading.current_thread().name)
+        time.sleep(0.02)
+        return original(path)
+
+    monkeypatch.setattr(scanner, "read_gguf_metadata", delayed)
+    entries = scanner.scan_models(tmp_path)
+    assert [entry.name for entry in entries] == [
+        f"Model-{index:02d}-Q4_K_M" for index in range(8)
+    ]
+    assert len(worker_names) >= 2
+    scanner._reset_metadata_cache_for_tests()
 
 
 def test_group_entries_buckets_by_folder(tmp_path) -> None:
@@ -1417,6 +1525,86 @@ def test_completed_benchmark_matching_is_exact_to_workload_and_model(
     assert not qt_launcher.MainWindow._completed_benchmark_matches(
         changed, model, cfg, "quick", 0.125
     )
+
+
+def test_completed_external_drafters_are_reused_when_rerun_is_off(
+    tmp_path, monkeypatch
+) -> None:
+    """Every external head keeps an independent completed-run cache entry."""
+    import app_settings
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    monkeypatch.setattr(
+        app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+    model = _fake_model(tmp_path, "CachedDrafterModel", 1.0)
+    cfg = TunedConfig(
+        ctx=32768,
+        ngl=99,
+        threads=6,
+        batch_threads=6,
+        batch=512,
+        ubatch=256,
+        cache_k="q8_0",
+        cache_v="q8_0",
+        flash_attn=True,
+        sampling={},
+    )
+    stat = model.path.stat()
+    snapshot = {"mode": "auto", "values": {}}
+    drafter_keys = []
+    for index, quant in enumerate(("Q4_K_M", "Q8_0", "BF16"), start=1):
+        draft = tmp_path / f"draft-CachedDrafterModel-{quant}.gguf"
+        draft.write_bytes(bytes(index * 7))
+        key = qt_launcher._drafter_profile_key(draft)
+        drafter_keys.append(key)
+        record = {
+            "model_name": model.name,
+            "model_size": stat.st_size,
+            "model_mtime_ns": stat.st_mtime_ns,
+            "desired_context": cfg.ctx,
+            "benchmark_type": "quick",
+            "performance_target": "throughput",
+            "prompt_context_fraction": 0.125,
+            "drafter_key": key,
+            "drafter_label": draft.name,
+            "candidates": [{"id": "baseline"}],
+        }
+        assert app_settings.save_performance_tuning_result(
+            model.name,
+            model.path,
+            record,
+            snapshot,
+            "throughput",
+            "quick",
+            key,
+        )
+
+    assert len(set(drafter_keys)) == 3
+    for key in drafter_keys:
+        completed = app_settings.get_performance_tuning_result(
+            model.path, "throughput", "quick", key
+        )
+        assert completed is not None
+        assert completed["drafter_key"] == key
+        assert qt_launcher.MainWindow._completed_benchmark_matches(
+            completed, model, cfg, "quick", 0.125
+        )
+
+    # Read-only cache access must still return caller-owned records; mutating a
+    # retrieved dict cannot alter the process cache or on-disk evidence.
+    first = app_settings.get_performance_tuning_result(
+        model.path, "throughput", "quick", drafter_keys[0]
+    )
+    assert first is not None
+    first["desired_context"] = 1
+    unchanged = app_settings.get_performance_tuning_result(
+        model.path, "throughput", "quick", drafter_keys[0]
+    )
+    assert unchanged is not None
+    assert unchanged["desired_context"] == cfg.ctx
 
 
 def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
@@ -3374,26 +3562,26 @@ def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
 # llama-server resolver
 
 
-def test_mainline_build_recipe_never_mislabels_development_head() -> None:
-    recipe = (ROOT / "building llama.cpp" / "llama_build.txt").read_text(
-        encoding="utf-8"
-    )
+def test_prerelease_build_recipe_never_mislabels_development_head() -> None:
+    recipe = (
+        ROOT / "building llama.cpp" / "llama_prerelease_build.txt"
+    ).read_text(encoding="utf-8")
 
     assert "git rev-list --count HEAD" in recipe
-    assert "Get-ExactLlamaBuildTag" in recipe
+    assert "Get-ExactLlamaPrereleaseTag" in recipe
     assert '"${buildTag}_dev_${shortCommit}"' in recipe
-    assert "Get-LlamaBuildTag" not in recipe
+    assert "Get-ExactLlamaBuildTag" not in recipe
     assert 'return "bUNKNOWN"' not in recipe
     assert "-DLLAMA_BUILD_IS_DEV=ON" in recipe
     assert "$expectedRuntimeVersion = \"$semanticVersion-dev\"" in recipe
     assert "reportedVersion -ne $expectedRuntimeVersion" in recipe
     assert "reportedBuild -ne $expectedBuild" in recipe
     assert "$env:ComSpec" in recipe  # --version is emitted on stderr
-    assert "not yet an exact bNNNN release tag" in recipe
+    assert "not yet an exact bNNNN pre-release tag" in recipe
 
 
-def test_semver_release_build_recipe_resolves_latest_and_preserves_build_number() -> None:
-    recipe = (ROOT / "building llama.cpp" / "llama_prerelease_build.txt").read_text(
+def test_stable_build_recipe_resolves_latest_and_preserves_build_number() -> None:
+    recipe = (ROOT / "building llama.cpp" / "llama_stable_build.txt").read_text(
         encoding="utf-8"
     )
     clone_line = next(
@@ -3402,12 +3590,13 @@ def test_semver_release_build_recipe_resolves_latest_and_preserves_build_number(
 
     assert '[string]$Tag = "latest"' in recipe
     assert "Get-LatestStableSemanticTag" in recipe
-    assert "v0.2.0" in recipe
-    assert '$dir = "${Tag}_llama.cpp"' in recipe
+    assert "X.Y.Z" in recipe
+    assert "$version = $Tag -replace '^v', ''" in recipe
+    assert '$dir = "${version}_llama.cpp"' in recipe
     assert "-DLLAMA_BUILD_IS_DEV=OFF" in recipe
     assert "git rev-list --count HEAD" in recipe
-    assert '--tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$nightlyTag"' in recipe
-    assert "Release/nightly mismatch" in recipe
+    assert '--tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$prereleaseTag"' in recipe
+    assert "Stable/pre-release mismatch" in recipe
     assert "--depth" not in clone_line
     assert "$env:ComSpec" in recipe  # avoid NativeCommandError on valid stderr
     assert "reportedBuild -ne $expectedBuild" in recipe
@@ -3501,8 +3690,10 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
     container = tmp_path / "ai-local"
     runnable_root = container / "ocr_b17400_llama.cpp"
     _write_fake_server(_fake_llama_server_path(runnable_root))
-    semantic_root = container / "v0.1.2_llama.cpp"
-    _write_fake_server(_fake_llama_server_path(semantic_root))
+    stable_root = container / "0.2.0_llama.cpp"
+    _write_fake_server(_fake_llama_server_path(stable_root))
+    legacy_semantic_root = container / "v0.1.2_llama.cpp"
+    _write_fake_server(_fake_llama_server_path(legacy_semantic_root))
 
     cli_only_root = container / "ocr_cli_only_llama.cpp"
     mtmd_name = "llama-mtmd-cli.exe" if os.name == "nt" else "llama-mtmd-cli"
@@ -3518,7 +3709,12 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
         for name, path in found
     )
     assert any(
-        name == "v0.1.2_llama.cpp" and path.resolve() == semantic_root.resolve()
+        name == "0.2.0_llama.cpp" and path.resolve() == stable_root.resolve()
+        for name, path in found
+    )
+    assert any(
+        name == "v0.1.2_llama.cpp"
+        and path.resolve() == legacy_semantic_root.resolve()
         for name, path in found
     )
     assert all(name != "ocr_cli_only_llama.cpp" for name, _path in found)
@@ -3533,7 +3729,12 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
         for name, path in gui_found
     )
     assert any(
-        name == "v0.1.2_llama.cpp" and path.resolve() == semantic_root.resolve()
+        name == "0.2.0_llama.cpp" and path.resolve() == stable_root.resolve()
+        for name, path in gui_found
+    )
+    assert any(
+        name == "v0.1.2_llama.cpp"
+        and path.resolve() == legacy_semantic_root.resolve()
         for name, path in gui_found
     )
     assert all(name != "ocr_cli_only_llama.cpp" for name, _path in gui_found)
@@ -3645,7 +3846,9 @@ def test_resolver_matches_versioned_fork_dir(tmp_path, monkeypatch) -> None:
     assert _fork_family("b9840_llama.cpp") == "llama"
     assert _fork_family("b10548_dev_a298422da_llama.cpp") == "llama"
     assert _fork_family("b10545_a30273376_llama.cpp") == "llama"
-    assert _fork_family("v0.1.2_llama.cpp") == "llama"
+    assert _fork_family("0.2.0_llama.cpp") == "llama"
+    assert _fork_family("tq_0.2.0_llama.cpp") == "tq_llama"
+    assert _fork_family("v0.1.2_llama.cpp") == "llama"  # legacy
     assert _fork_family("tq_v0.1.2_llama.cpp") == "tq_llama"
 
     auto_dir = tmp_path / "Auto Tuner"
@@ -5079,6 +5282,86 @@ def test_moe_alias_diagnostic_is_not_called_filename_fallback(tmp_path) -> None:
     report = format_diagnostic_report(model)
     assert "expert_count (md)     : 8" in report
     assert "from filename fallback" not in report
+
+
+def test_metadata_inventory_and_support_report_are_bounded_and_redacted(
+    tmp_path, monkeypatch
+) -> None:
+    import scanner
+    from diagnostics import format_support_report
+    from get_metadata import write_metadata_report
+
+    root = tmp_path / "private-model-root"
+    model_path = root / "Vendor" / "SupportModel-Q4_K_M.gguf"
+    _write_minimal_gguf(model_path)
+    monkeypatch.setenv("AUTOTUNER_METADATA_CACHE", "off")
+    scanner._reset_metadata_cache_for_tests()
+    inventory_path, count = write_metadata_report(
+        [root], tmp_path / "reports" / "metadata.md"
+    )
+    inventory = inventory_path.read_text(encoding="utf-8")
+    assert count == 1
+    assert "SupportModel-Q4_K_M.gguf" in inventory
+    assert "Vendor" in inventory
+    assert str(root) not in inventory
+
+    app_log = tmp_path / "autotuner-app.log"
+    app_log.write_text(
+        f"Scanning {root}\\Vendor\nAuthorization: Bearer abc.def.secret\n"
+        "api_key=super-secret-value\n",
+        encoding="utf-8",
+    )
+    model = ModelEntry(
+        path=model_path,
+        name="SupportModel-Q4_K_M",
+        group="Vendor",
+        size_bytes=1024,
+        metadata={
+            "general.architecture": "future",
+            "future.block_count": 8,
+            "future.context_length": 8192,
+            "future.embedding_length": 1024,
+            "future.attention.head_count": 8,
+            "future.attention.head_count_kv": 2,
+        },
+    )
+    report = format_support_report(
+        [model],
+        system=_fake_system(),
+        model_roots=[root],
+        app_log_path=app_log,
+        debug_enabled=True,
+    )
+    assert "AutoTuner support report" in report
+    assert "SupportModel-Q4_K_M" in report
+    assert "Debug mode: on" in report
+    assert str(root) not in report
+    assert "super-secret-value" not in report
+    assert "abc.def.secret" not in report
+    assert "<redacted>" in report
+    scanner._reset_metadata_cache_for_tests()
+
+
+def test_qwen4exp_diagnostic_warns_about_runtime_loader() -> None:
+    from diagnostics import audit_model_metadata
+
+    model = ModelEntry(
+        path=Path("Qwen3.8-Flash-Next.gguf"),
+        name="Qwen3.8-Flash-Next",
+        group=".",
+        size_bytes=1,
+        metadata={
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "qwen4exp.attention.head_count": 24,
+            "qwen4exp.attention.head_count_kv": 2,
+            "qwen4exp.expert_count": 512,
+        },
+    )
+    warnings = audit_model_metadata(model)
+    runtime = next(w for w in warnings if w.id == "RUNTIME-EXPERIMENTAL-ARCH")
+    assert "#27741" in runtime.message
+    assert "qwen4exp" in runtime.message
 
 
 def test_moe_shared_tensors_that_do_not_fit_fall_back_to_cpu() -> None:
@@ -6573,6 +6856,7 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         ("opaque-d.gguf", "glm-dsa", "glm-5_2.yaml"),
         ("opaque-e.gguf", "deepseek4", "deepseek-v4.yaml"),
         ("opaque-f.gguf", "graniteswitch", "granite-switch-4_1.yaml"),
+        ("opaque-g.gguf", "qwen4exp", "qwen3_8_flash_next.yaml"),
     ):
         assert match_profile(opaque, profiles, arch).source_file == expected
 
@@ -6808,6 +7092,16 @@ def test_application_close_preference_is_opt_in(_isolated_settings) -> None:
     assert app_settings.get_minimize_on_close() is True
     app_settings.set_minimize_on_close(False)
     assert app_settings.get_minimize_on_close() is False
+
+
+def test_debug_mode_is_opt_in_and_persists(_isolated_settings) -> None:
+    import app_settings
+
+    assert app_settings.get_debug_mode() is False
+    app_settings.set_debug_mode(True)
+    assert app_settings.get_debug_mode() is True
+    app_settings.set_debug_mode(False)
+    assert app_settings.get_debug_mode() is False
 
 
 def test_prompt_cache_limit_and_mmproj_cpu_override_persist(
