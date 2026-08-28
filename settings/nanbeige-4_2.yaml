@@ -1,0 +1,46 @@
+display_name: "Nanbeige 4.2 3B"
+patterns:
+  - nanbeige4.2-3b
+  - nanbeige-4.2-3b
+  - nanbeige4_2-3b
+arch_fallback:
+  - nanbeige
+
+# Native Nanbeige4.2 support landed in b10153; b10644 fixed the model's
+# per-layer input exposure used by current graph/state tooling.
+min_llama_build: 10153
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    # The official agent/tool recipe uses temperature 1.0.
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+ngram_method: ngram-mod
+draft_max: 2
+draft_p_min: 0.75
+
+notes: >
+  Compact 3B non-embedding-parameter looped Transformer for reasoning, coding,
+  agents, and XML tool calls. The model card advertises 262,144 context and
+  recommends temp 0.6/top-p 0.95/top-k 20 for reasoning and temp 1.0 for agent
+  use. Preserved thinking is useful for multi-turn tools; disable it manually
+  when minimizing KV history matters more than continuity.

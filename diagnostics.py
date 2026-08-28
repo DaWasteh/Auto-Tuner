@@ -119,8 +119,6 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
       but the GGUF metadata declares no expert count. The tuner routes
       it through the MoE placement path but cannot reason about expert
       counts precisely.
-    * ``RUNTIME-EXPERIMENTAL-ARCH`` — metadata uses a preview architecture
-      whose stock llama.cpp loader availability must be verified explicitly.
     """
     warnings: List[DiagnosticWarning] = []
     md = model.metadata or {}
@@ -140,16 +138,10 @@ def audit_model_metadata(model: ModelEntry) -> List[DiagnosticWarning]:
     block_count = metadata_layer_count(md)
     arch_l = str(arch or "").lower()
 
-    if arch_l == "qwen4exp":
-        warnings.append(
-            DiagnosticWarning(
-                "RUNTIME-EXPERIMENTAL-ARCH",
-                f"{model.name}: qwen4exp is the experimental Qwen3.8 Flash Next "
-                "architecture. The profile can size and configure it, but the "
-                "selected llama.cpp build/fork must explicitly provide its loader "
-                "(upstream support was tracked in issue #27741).",
-            )
-        )
+    # qwen4exp is a normal mainline architecture from b10660. Runtime
+    # compatibility is enforced by the profile's numeric build gate, where the
+    # selected binary is available; a metadata-only diagnostic must not keep
+    # emitting the obsolete pre-merge issue #27741 warning.
 
     # --- KV-HEAD-COUNT-MISSING --------------------------------------------
     # head_count_kv = 0 is the single most-impactful metadata bug. Without

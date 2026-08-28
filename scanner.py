@@ -86,6 +86,39 @@ def _read_value(f, vtype: int, want_array_elements: bool = True) -> Any:
 # Pre-compiled: match "blk.{N}." tensor names — used by MTP tensor scan.
 _BLK_IDX_RE = re.compile(r"^blk\.(\d+)\.")
 
+# llama.cpp b10653+ can leave selected giant row-gather tensors mmap-backed and
+# read their rows on demand. qwen4exp and Gemma 4 currently mark this exact
+# tensor; ``auto`` applies only above 4 GiB. Its on-disk bytes must not be
+# mistaken for ordinary layer weights that can be split across GPUs/CPU.
+_READ_LAZY_TENSOR_NAMES = frozenset({"per_layer_token_embd.weight"})
+_READ_LAZY_AUTO_MIN_BYTES = 4 * 1024**3
+
+
+def _read_lazy_tensor_span_bytes(
+    tensor_offsets: List[Tuple[str, int]], data_start: int, file_size: int
+) -> int:
+    """Return storage bytes of llama.cpp auto-lazy tensors in one GGUF.
+
+    GGUF tensor offsets are relative to the aligned data section. Using the
+    next tensor offset (or EOF for the final tensor) gives an exact bounded
+    storage span without duplicating ggml's growing quant-type table here.
+    Alignment padding is at most a few bytes and is intentionally included.
+    """
+    ordered = sorted(
+        ((name.lower(), max(0, int(offset))) for name, offset in tensor_offsets),
+        key=lambda item: item[1],
+    )
+    total = 0
+    data_bytes = max(0, int(file_size) - max(0, int(data_start)))
+    for index, (name, offset) in enumerate(ordered):
+        if name not in _READ_LAZY_TENSOR_NAMES:
+            continue
+        next_offset = ordered[index + 1][1] if index + 1 < len(ordered) else data_bytes
+        span = max(0, min(data_bytes, next_offset) - min(data_bytes, offset))
+        if span > _READ_LAZY_AUTO_MIN_BYTES:
+            total += span
+    return total
+
 
 def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
     """Read GGUF header KV pairs and scan tensor info for MTP detection.
@@ -176,13 +209,19 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             has_dspark_tensors = False
             max_block_index = -1
             scan_complete = False
+            tensor_offsets: List[Tuple[str, int]] = []
             try:
                 for _ in range(n_tensors):
                     tname_len = struct.unpack("<Q", f.read(8))[0]
                     tname = f.read(tname_len).decode("utf-8", errors="replace")
                     n_dims = struct.unpack("<I", f.read(4))[0]
-                    # skip: dims (u64 * n_dims) + type (u32) + offset (u64)
-                    f.read(8 * n_dims + 4 + 8)
+                    # Dimensions/type are not needed for the metadata scan, but
+                    # retain each relative data offset so giant auto-lazy row
+                    # tables can be sized from the next tensor boundary.
+                    f.read(8 * n_dims)
+                    f.read(4)  # ggml type
+                    tensor_offset = struct.unpack("<Q", f.read(8))[0]
+                    tensor_offsets.append((tname, tensor_offset))
                     tl = tname.lower()
                     # DSpark uses the DFlash architecture plus an additional
                     # Markov/confidence head, so ``general.architecture`` alone
@@ -242,6 +281,20 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             md["__tensor_scan_complete__"] = scan_complete
             md["__max_block_index__"] = max_block_index
 
+            if scan_complete and tensor_offsets:
+                try:
+                    alignment = max(1, int(md.get("general.alignment", 32) or 32))
+                except (TypeError, ValueError):
+                    alignment = 32
+                data_start = ((f.tell() + alignment - 1) // alignment) * alignment
+                lazy_bytes = _read_lazy_tensor_span_bytes(
+                    tensor_offsets,
+                    data_start,
+                    os.fstat(f.fileno()).st_size,
+                )
+                if lazy_bytes > 0:
+                    md["__read_lazy_tensor_bytes__"] = lazy_bytes
+
             return md
     except (OSError, struct.error, EOFError, ValueError, UnicodeDecodeError):
         return {}
@@ -250,7 +303,7 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Metadata cache + bounded parallel reader
 
-_METADATA_CACHE_SCHEMA = 2
+_METADATA_CACHE_SCHEMA = 3
 _METADATA_CACHE_MAX_ENTRIES = 2048
 _METADATA_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _METADATA_CACHE_LOCK = threading.RLock()
@@ -274,7 +327,7 @@ def _metadata_cache_path() -> Optional[Path]:
         return None
     override = os.environ.get("AUTOTUNER_DATA_DIR", "").strip()
     base = Path(override).expanduser() if override else Path.home() / ".autotuner"
-    return base / "cache" / "model-metadata-v2.json"
+    return base / "cache" / "model-metadata-v3.json"
 
 
 def _metadata_cache_key(path: Path) -> Optional[str]:
@@ -921,19 +974,6 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
     if not metadata_is_hybrid_architecture(md):
         return total  # pure full-attention Transformer
 
-    # Some preview converters describe the interleave directly instead of
-    # serializing a recurrent-layer list. Qwen3.8 Flash Next's qwen4exp GGUF,
-    # for example, declares full_attention_interval=4: exactly one of every
-    # four blocks carries context-growing KV (48 blocks -> 12 attention layers).
-    interval_value = md.get(f"{arch}.full_attention_interval")
-    if interval_value is not None:
-        try:
-            interval = int(interval_value)
-        except (TypeError, ValueError):
-            interval = 0
-        if interval > 1:
-            return max(1, math.ceil(total / interval))
-
     # Highest priority: the authoritative recurrent-layer count.
     #
     # llama.cpp b9672 added ``LLM_KV_ATTENTION_RECURRENT_LAYERS`` =
@@ -972,6 +1012,21 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
                 return 1
         except (TypeError, ValueError):
             pass
+
+    # Some preview converters describe the interleave directly instead of
+    # serializing a recurrent-layer list. Qwen3.8 Flash Next's qwen4exp GGUF,
+    # for example, declares full_attention_interval=4: exactly one of every
+    # four blocks carries context-growing KV (48 blocks -> 12 attention layers).
+    # This remains a fallback because current llama.cpp gives the explicit
+    # recurrent-layer list precedence when both keys are present.
+    interval_value = md.get(f"{arch}.full_attention_interval")
+    if interval_value is not None:
+        try:
+            interval = int(interval_value)
+        except (TypeError, ValueError):
+            interval = 0
+        if interval > 1:
+            return max(1, math.ceil(total / interval))
 
     # Next: explicit attention-layer-count keys some converters emit.
     explicit_keys = (
@@ -1273,6 +1328,24 @@ class ModelEntry:
         return self.size_bytes / (1024**3)
 
     @property
+    def read_lazy_size_bytes(self) -> int:
+        """Bytes kept as an on-demand mmap row table by current llama.cpp."""
+        try:
+            value = int((self.metadata or {}).get("__read_lazy_tensor_bytes__", 0))
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(self.size_bytes, value))
+
+    @property
+    def read_lazy_size_gb(self) -> float:
+        return self.read_lazy_size_bytes / (1024**3)
+
+    @property
+    def placement_size_gb(self) -> float:
+        """Ordinary resident weights eligible for CPU/GPU placement."""
+        return max(0, self.size_bytes - self.read_lazy_size_bytes) / (1024**3)
+
+    @property
     def is_split(self) -> bool:
         """True when this entry represents a multi-part (sharded) GGUF."""
         return len(self.part_paths) > 1
@@ -1414,10 +1487,10 @@ class ModelEntry:
         DFlash2 deliberately keeps ``general.architecture=dflash`` and the
         ``draft-dflash`` CLI type used by first-generation DFlash.  The
         checkpoint is distinguished by its extra GGUF metadata: grouped local
-        convolution and the candidate selector.  Stock llama.cpp b10590 knows
-        DFlash v1 only and therefore creates 58 tensors for these 81-tensor
-        sidecars; launch preflight uses this property to report the required
-        DFlash2 build before a multi-gigabyte target starts loading.
+        convolution and the candidate selector. Pre-b10658 stock llama.cpp
+        creates the old 58-tensor graph for these 81-tensor sidecars; launch
+        preflight uses this property to require current mainline before a
+        multi-gigabyte target starts loading.
         """
         if self.architecture.lower().strip() != "dflash":
             return False
@@ -2074,7 +2147,12 @@ def scan_models(
                     declares_nextn = False
                 if declares_nextn:
                     break
-            if declares_nextn:
+            arch = str(primary_md.get("general.architecture", "") or "").lower()
+            declares_read_lazy_table = arch in {"qwen4exp", "gemma4"} or any(
+                str(key).endswith(".embedding_length_per_layer_input")
+                for key in primary_md
+            )
+            if declares_nextn or declares_read_lazy_table:
                 extra_shards.extend(part for part in ordered if part != part1)
         metadata_by_path.update(_read_metadata_many(extra_shards))
 
@@ -2102,6 +2180,16 @@ def scan_models(
         parent = str(part1.parent)
         md = dict(metadata_by_path.get(part1, {})) if read_metadata else {}
         if read_metadata and len(ordered_parts) > 1:
+            shard_metadata = [
+                dict(metadata_by_path.get(part, {})) for part in ordered_parts
+            ]
+            lazy_bytes = sum(
+                max(0, int(item.get("__read_lazy_tensor_bytes__", 0) or 0))
+                for item in shard_metadata
+            )
+            if lazy_bytes > 0:
+                md["__read_lazy_tensor_bytes__"] = lazy_bytes
+
             # Some quantizers preserve ``nextn_predict_layers`` after dropping
             # the actual MTP tensors. A primary-shard scan is inconclusive by
             # design, so verify every shard header before advertising internal
@@ -2112,9 +2200,6 @@ def scan_models(
                 for key, value in md.items()
             )
             if declares_nextn:
-                shard_metadata = [
-                    dict(metadata_by_path.get(part, {})) for part in ordered_parts
-                ]
                 scans_complete = all(
                     item.get("__tensor_scan_complete__") is True
                     for item in shard_metadata

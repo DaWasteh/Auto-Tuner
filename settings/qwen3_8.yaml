@@ -70,8 +70,8 @@ notes: >
   top_k 20, min_p 0.0, presence_penalty 1.5, and repeat_penalty 1.0. Avoid that
   high presence penalty for repetitive tool-call JSON if it causes loops. Vision
   requires a matching 27B mmproj once a GGUF conversion publishes one. External
-  Qwen3.8 DFlash2 sidecars currently require llama.cpp PR #27342; stock b10590
-  only has the older 58-tensor DFlash graph. AutoTuner detects that mismatch
-  before launch and derives n-max 7 from the sidecar's block_size=8 metadata.
+  Qwen3.8 DFlash2 sidecars require mainline b10658+ (older builds only have the
+  58-tensor DFlash graph). AutoTuner detects that mismatch before launch and
+  derives n-max 7 from the sidecar's block_size=8 metadata.
   The 2.4T checkpoint is datacenter-scale and not realistically runnable on a
   workstation, even with aggressive quantization and CPU expert offload.

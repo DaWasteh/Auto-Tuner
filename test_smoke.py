@@ -89,7 +89,7 @@ def test_all_profiles_load() -> None:
         ("Qwen3.8-2.4T-A95B-UD-IQ2_XXS", "Qwen3.8 (Alibaba)"),
         (
             "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003",
-            "Qwen3.8 Flash Next (Qwen4 Experimental)",
+            "Qwen3.8 Flash Next (Alibaba)",
         ),
         ("Gemma-4-26B-A4B-IQ3_M", "Gemma 4 (Google)"),
         ("gemma-4-E2B-it-BF16", "Gemma 4 (Google)"),
@@ -148,6 +148,7 @@ def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
     assert profile.rope_scale_max_ctx == 262144
     assert profile.sampling["chat"] == profile.sampling["coding"]
     assert profile.ngram_method == "ngram-map-k4v"
+    assert profile.min_llama_build == 10660
     assert match_profile("opaque-preview.gguf", profiles, "qwen4exp") is profile
 
     model = ModelEntry(
@@ -168,6 +169,72 @@ def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
     assert model.is_hybrid
     assert metadata_attention_layer_count(model.metadata) == 12
     assert _moe_expert_count(model) == 512
+
+
+def test_qwen4exp_kv_includes_qsa_indexer_and_metadata_precedence() -> None:
+    from scanner import metadata_attention_layer_count
+    from tuner import kv_per_token_parts_mb_from_metadata
+
+    metadata = {
+        "general.architecture": "qwen4exp",
+        "qwen4exp.block_count": 48,
+        "qwen4exp.embedding_length": 2560,
+        "qwen4exp.attention.head_count": 24,
+        "qwen4exp.attention.head_count_kv": 2,
+        "qwen4exp.attention.key_length": 256,
+        "qwen4exp.attention.value_length": 256,
+        "qwen4exp.attention.indexer.key_length": 128,
+        "qwen4exp.full_attention_interval": 4,
+    }
+    key_mb, value_mb = kv_per_token_parts_mb_from_metadata(metadata)
+    assert key_mb == pytest.approx(15_360 / 1024**2)
+    assert value_mb == pytest.approx(18_432 / 1024**2)
+
+    # b10666 gives the explicit recurrent list precedence over the interval.
+    metadata["qwen4exp.attention.recurrent_layers"] = [True] * 24 + [False] * 24
+    assert metadata_attention_layer_count(metadata) == 24
+
+
+def test_read_lazy_table_is_removed_from_weight_placement() -> None:
+    from scanner import _read_lazy_tensor_span_bytes
+
+    five_gib = 5 * 1024**3
+    assert (
+        _read_lazy_tensor_span_bytes(
+            [("per_layer_token_embd.weight", 64), ("next.weight", 64 + five_gib)],
+            data_start=4096,
+            file_size=4096 + 64 + five_gib + 1024,
+        )
+        == five_gib
+    )
+
+    model = ModelEntry(
+        path=Path("qwen4exp.gguf"),
+        name="qwen4exp",
+        group=".",
+        size_bytes=68 * 1024**3,
+        metadata={"__read_lazy_tensor_bytes__": 27 * 1024**3},
+    )
+    assert model.read_lazy_size_gb == pytest.approx(27.0)
+    assert model.placement_size_gb == pytest.approx(41.0)
+
+
+def test_new_b10666_model_profiles_are_present() -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+    nanbeige = match_profile("Nanbeige4.2-3B-Q8_0", profiles, "nanbeige")
+    nemotron = match_profile(
+        "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_K_M",
+        profiles,
+        "nemotron_h",
+    )
+    assert nanbeige.source_file == "nanbeige-4_2.yaml"
+    assert nanbeige.max_context == 262144
+    assert nanbeige.min_llama_build == 10153
+    assert nemotron.source_file == "nemotron-3_5.yaml"
+    assert nemotron.max_context == 1048576
+    assert nemotron.min_llama_build == 10665
+    assert nemotron.draft_max == 7
+    assert nemotron.draft_p_min == pytest.approx(0.0)
 
 
 def test_ministral_does_not_collide_with_mistral_medium() -> None:
@@ -2723,7 +2790,7 @@ def test_qwen38_dflash2_uses_trained_depth_and_requires_capable_build(
     assert message == ""
     assert detected == 10499
 
-    # A larger numeric build alone is not proof while PR #27342 is still open.
+    # Builds immediately before the b10658 mainline merge remain incompatible.
     monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10600)
     monkeypatch.setattr(
         tuner,
@@ -2733,7 +2800,18 @@ def test_qwen38_dflash2_uses_trained_depth_and_requires_capable_build(
     allowed, message, detected = tuner.check_draft_model_build(draft, "server")
     assert not allowed
     assert detected == 10600
-    assert "reviewed DFlash2" in message
+    assert "b10658+" in message
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10658)
+    monkeypatch.setattr(
+        tuner,
+        "_probe_binary_version_output",
+        lambda _binary: "version: 0.3.0-dev (build 10658, commit b10f9ca58)",
+    )
+    allowed, message, detected = tuner.check_draft_model_build(draft, "server")
+    assert allowed
+    assert message == ""
+    assert detected == 10658
 
 
 def test_plain_dflash_uses_block_size_minus_anchor(tmp_path) -> None:
@@ -3158,6 +3236,67 @@ def test_qwen38_dual_gpu_preserves_full_context_then_maximises_kv_quality(
     large_cap = _gpu_usable_cap_gb(system.gpus[0], True)
     assert footprint * parts[0] <= small_cap + 0.05
     assert footprint * parts[1] <= large_cap + 0.05
+
+
+def test_qwen4exp_plans_lazy_ple_qsa_and_90k_context(tmp_path, monkeypatch) -> None:
+    import tuner
+    from performance_target import PERFORMANCE_TARGETS
+
+    model = _fake_model_md(
+        tmp_path,
+        "Qwen3.8-Flash-Next-UD-IQ1_S",
+        67.564157158,
+        {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "qwen4exp.context_length": 262144,
+            "qwen4exp.embedding_length": 2560,
+            "qwen4exp.attention.head_count": 24,
+            "qwen4exp.attention.head_count_kv": 2,
+            "qwen4exp.attention.key_length": 256,
+            "qwen4exp.attention.value_length": 256,
+            "qwen4exp.attention.indexer.key_length": 128,
+            "qwen4exp.expert_count": 512,
+            "qwen4exp.expert_used_count": 10,
+            "qwen4exp.ssm.conv_kernel": 4,
+            "qwen4exp.ssm.state_size": 128,
+            "qwen4exp.ssm.group_count": 16,
+            "qwen4exp.ssm.time_step_rank": 48,
+            "qwen4exp.ssm.inner_size": 6144,
+            "qwen4exp.full_attention_interval": 4,
+            "__read_lazy_tensor_bytes__": 28_800_138_240,
+        },
+    )
+    monkeypatch.setattr(tuner.platform, "system", lambda: "Windows")
+    profile = match_profile(model.name, load_profiles(SETTINGS_DIR), model.architecture)
+    cfg = compute_config(
+        model,
+        _fake_dual_gpu_system_with_vk_order(
+            large_free=31,
+            small_free=16,
+            ram_total=48,
+            ram_free=47,
+        ),
+        profile,
+        user_ctx=90000,
+        perf_target=PERFORMANCE_TARGETS["safe"],
+        prompt_cache_ram_mib=0,
+    )
+
+    assert cfg.ctx == 90000
+    assert cfg.ubatch == 64
+    assert cfg.mapped_model_ram_gb == pytest.approx(model.read_lazy_size_gb)
+    assert cfg.estimated_model_vram_gb + cfg.estimated_model_ram_gb == pytest.approx(
+        model.placement_size_gb
+    )
+    assert (cfg.cache_k, cfg.cache_v) == ("f16", "q8_0")
+    assert cfg.estimated_kv_gb == pytest.approx(2.137, rel=0.03)
+    assert cfg.runtime_vram_overhead_gb == pytest.approx(0.386, rel=0.05)
+    assert cfg.runtime_ram_overhead_gb == pytest.approx(6.65, rel=0.05)
+
+    cmd = build_command(model, cfg, profile)
+    lazy_index = cmd.index("--tensor-read-lazy")
+    assert cmd[lazy_index + 1] == "auto"
 
 
 def test_dense_split_reserves_primary_only_mmproj_vram(tmp_path) -> None:
@@ -3602,19 +3741,10 @@ def test_stable_build_recipe_resolves_latest_and_preserves_build_number() -> Non
     assert "reportedBuild -ne $expectedBuild" in recipe
 
 
-def test_dflash2_build_recipe_pins_reviewed_pr_and_separate_folder() -> None:
-    recipe = (
-        ROOT / "building llama.cpp" / "dflash2_llama_build.txt"
-    ).read_text(encoding="utf-8-sig")
-
-    assert "pull/27342/head" in recipe
-    assert "1deefcca395743049c3820ab8f9b15043f3e9446" in recipe
-    assert "pr27342_dflash2_llama.cpp" in recipe
-    assert "-DGGML_VULKAN=ON" in recipe
-    assert "--target llama-server" in recipe
-    assert "--spec-draft-n-max 7" in recipe
-    assert "git rev-list --count HEAD" in recipe
-    assert "reviewed commit" in recipe.lower()
+def test_merged_qwen4exp_and_dflash2_pr_recipes_are_removed() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    assert not (build_dir / "qwen38_flash_next_llama_build.txt").exists()
+    assert not (build_dir / "dflash2_llama_build.txt").exists()
 
 
 def test_cuda_setup_never_updates_a_stale_versioned_folder_in_place() -> None:
@@ -5342,7 +5472,7 @@ def test_metadata_inventory_and_support_report_are_bounded_and_redacted(
     scanner._reset_metadata_cache_for_tests()
 
 
-def test_qwen4exp_diagnostic_warns_about_runtime_loader() -> None:
+def test_qwen4exp_diagnostic_no_longer_warns_about_merged_loader() -> None:
     from diagnostics import audit_model_metadata
 
     model = ModelEntry(
@@ -5358,10 +5488,8 @@ def test_qwen4exp_diagnostic_warns_about_runtime_loader() -> None:
             "qwen4exp.expert_count": 512,
         },
     )
-    warnings = audit_model_metadata(model)
-    runtime = next(w for w in warnings if w.id == "RUNTIME-EXPERIMENTAL-ARCH")
-    assert "#27741" in runtime.message
-    assert "qwen4exp" in runtime.message
+    warning_ids = {warning.id for warning in audit_model_metadata(model)}
+    assert "RUNTIME-EXPERIMENTAL-ARCH" not in warning_ids
 
 
 def test_moe_shared_tensors_that_do_not_fit_fall_back_to_cpu() -> None:

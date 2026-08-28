@@ -1,13 +1,19 @@
-display_name: "Qwen3.8 Flash Next (Qwen4 Experimental)"
+display_name: "Qwen3.8 Flash Next (Alibaba)"
 patterns:
   - qwen3.8-flash-next
   - qwen3_8_flash_next
   - qwen38-flash-next
   - qwen3.8 flash next
+  - qwen4-exp
+  - qwen4moe
 arch_fallback:
   - qwen4exp
 
-# The supplied GGUF metadata is authoritative for this preview checkpoint:
+# qwen4exp reached stock llama.cpp in b10660 (PR #27742). Unlike ordinary
+# option compatibility, model-loader support cannot be inferred from --help.
+min_llama_build: 10660
+
+# The supplied GGUF metadata is authoritative for this checkpoint:
 # qwen4exp.context_length=262144, 48 blocks, and full attention every fourth
 # block. Do not inherit the separate Qwen3.8 27B/2.4T profile's optional 1M
 # YaRN claim until the Flash-Next model/runtime publishes that contract.
@@ -42,20 +48,20 @@ extra_args:
   - --jinja
   - --reasoning-preserve
 
-# PLE is a model-native predictive head, not an ordinary external MTP GGUF.
-# Keep generic n-gram speculation compatible without pretending current stock
-# llama.cpp exposes PLE through --spec-type draft-mtp.
+# PLE is a model-native per-layer n-gram embedding table, not an ordinary MTP
+# head. Generic n-gram speculation remains optional and must not be mislabeled
+# as --spec-type draft-mtp.
 draft_max: 2
 draft_p_min: 0.75
 ngram_method: ngram-map-k4v
 
 notes: >
-  Dedicated profile for Qwen3.8-Flash-Next GGUFs declaring the experimental
-  qwen4exp architecture. The supplied metadata describes a 48-block hybrid MoE
-  with 512 experts, 10 active experts, full attention every fourth block (12
-  context-growing KV layers), 262,144 native context, and a model-native PLE
-  predictive head. Stock llama.cpp support was still tracked by upstream issue
-  #27741 when this profile was added; the YAML supplies correct sizing, sampler,
-  and template defaults but cannot add a missing qwen4exp loader. Select a
-  llama.cpp build/fork that explicitly supports qwen4exp. PLE is intentionally
-  not advertised as generic draft-mtp until upstream defines its runtime flags.
+  Dedicated profile for Qwen3.8-Flash-Next GGUFs declaring qwen4exp. Mainline
+  llama.cpp supports the loader from b10660. The model has 48 hybrid MoE blocks,
+  512 experts with 10 active, full attention every fourth block (12 normal KV
+  layers), an additional QSA indexer cache, and 262,144 native context. Its PLE
+  per-layer n-gram embedding table is a giant read-lazy host mapping rather than
+  splittable layer weight; AutoTuner sizes it separately and uses ubatch
+  64/128/256 for Safe/Balanced/Throughput because the QSA graph grows with
+  context x ubatch. PLE is not advertised as
+  generic draft-mtp.

@@ -358,7 +358,13 @@ def _print_config(
         print(f"Vision:   {model.mmproj.name}")
     print(_BAR)
 
-    if cfg.full_offload:
+    n_cpu_moe = getattr(cfg, "n_cpu_moe", None)
+    if n_cpu_moe is not None and n_cpu_moe > 0:
+        placement = (
+            f"MoE hybrid: {n_cpu_moe} expert layers on CPU, "
+            "remaining resident weights on GPU"
+        )
+    elif cfg.full_offload:
         placement = f"GPU full offload (ngl=all of {model.n_layers or '?'})"
     elif cfg.ngl > 0:
         placement = f"hybrid: {cfg.ngl} layers on GPU, rest on CPU"
@@ -392,16 +398,22 @@ def _print_config(
 
     print()
     print("  Memory estimate (with current options):")
+    mapped_model_ram_gb = float(getattr(cfg, "mapped_model_ram_gb", 0.0) or 0.0)
+    runtime_ram_overhead_gb = float(getattr(cfg, "runtime_ram_overhead_gb", 0.0) or 0.0)
     gpu_label = "accelerator" if cfg.unified_memory else "GPU"
     cpu_label = "host" if cfg.unified_memory else "CPU"
     print(f"    Model {gpu_label:<11}: ~ {cfg.estimated_model_vram_gb:5.1f} GB")
     print(f"    Model {cpu_label:<11}: ~ {cfg.estimated_model_ram_gb:5.1f} GB")
+    if mapped_model_ram_gb:
+        print(f"    Lazy mapped RAM  : ~ {mapped_model_ram_gb:5.1f} GB")
     if cfg.vision_vram_gb:
         print(f"    Vision GPU       : ~ {cfg.vision_vram_gb:5.1f} GB")
     if cfg.vision_ram_gb:
         print(f"    Vision RAM       : ~ {cfg.vision_ram_gb:5.1f} GB")
     if cfg.runtime_vram_overhead_gb:
         print(f"    Runtime GPU      : ~ {cfg.runtime_vram_overhead_gb:5.1f} GB")
+    if runtime_ram_overhead_gb:
+        print(f"    Runtime RAM      : ~ {runtime_ram_overhead_gb:5.1f} GB")
     if cfg.batch_vram_overhead_gb:
         print(f"    Batch workspace  : ~ {cfg.batch_vram_overhead_gb:5.1f} GB")
     print(f"    KV cache         : ~ {cfg.estimated_kv_gb:5.1f} GB")
@@ -414,6 +426,7 @@ def _print_config(
         total_unified = (
             cfg.estimated_model_vram_gb
             + cfg.estimated_model_ram_gb
+            + mapped_model_ram_gb
             + cfg.vision_vram_gb
             + cfg.vision_ram_gb
             + cfg.draft_vram_gb
@@ -421,6 +434,7 @@ def _print_config(
             + cfg.recurrent_state_vram_gb
             + cfg.recurrent_state_ram_gb
             + cfg.runtime_vram_overhead_gb
+            + runtime_ram_overhead_gb
             + cfg.batch_vram_overhead_gb
             + cfg.prompt_cache_ram_gb
         )
@@ -434,6 +448,9 @@ def _print_config(
             f"    Capacity         : {system.free_vram_gb:.1f} GB VRAM / "
             f"{system.free_ram_gb:.1f} GB RAM free before launch"
         )
+    warning = getattr(cfg, "warning", None)
+    if warning:
+        print(f"    Warning          : {warning}")
     print(_BAR)
 
 
@@ -1088,11 +1105,10 @@ def _find_compatible_draft_server(
 ) -> Optional[str]:
     """Find a DFlash2-capable sibling build without changing global selection.
 
-    Normal drafters immediately retain ``preferred_binary``. For a DFlash2
-    sidecar, a known-incompatible stock build triggers a scan of the user's
-    discovered sibling llama.cpp builds (notably ``pr27342_dflash2_llama.cpp``).
-    This keeps b10590 selected for ordinary models while transparently routing
-    only the DFlash2 launch through its required PR runtime.
+    Mainline b10658+ and normal drafters retain ``preferred_binary``. A
+    DFlash2 sidecar selected with an older identified build may still fall back
+    to a reviewed legacy PR #27342 sibling, preserving old installations while
+    current mainline needs no special fork.
     """
     allowed, message, _build = check_draft_model_build(draft_model, preferred_binary)
     needs_capability_search = bool(
@@ -2062,7 +2078,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         print(
             f"         full_offload={cfg.full_offload}  "
             f"vram={cfg.estimated_model_vram_gb:.1f}GB  "
-            f"ram={cfg.estimated_model_ram_gb:.1f}GB"
+            f"ram={cfg.estimated_model_ram_gb:.1f}GB  "
+            f"mapped={float(getattr(cfg, 'mapped_model_ram_gb', 0.0) or 0.0):.1f}GB  "
+            f"runtime_ram={float(getattr(cfg, 'runtime_ram_overhead_gb', 0.0) or 0.0):.1f}GB"
         )
         print(
             f"         sys: total_vram={system.total_vram_gb:.1f}GB  "

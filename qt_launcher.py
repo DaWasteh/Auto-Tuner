@@ -8626,9 +8626,11 @@ class MainWindow(QMainWindow):
         )
         total_cpu = (
             cfg.estimated_model_ram_gb
+            + cfg.mapped_model_ram_gb
             + cfg.vision_ram_gb
             + cfg.kv_ram_gb
             + cfg.recurrent_state_ram_gb
+            + cfg.runtime_ram_overhead_gb
             + cfg.prompt_cache_ram_gb
         )
         lines += [bar, "Memory estimate (with current options):"]
@@ -8659,9 +8661,13 @@ class MainWindow(QMainWindow):
             )
         if cfg.runtime_vram_overhead_gb > 0.05:
             lines.append(f"  Runtime GPU: ~{cfg.runtime_vram_overhead_gb:5.1f} GB")
+        if cfg.runtime_ram_overhead_gb > 0.05:
+            lines.append(f"  Runtime RAM: ~{cfg.runtime_ram_overhead_gb:5.1f} GB")
         if cfg.batch_vram_overhead_gb > 0.05:
             lines.append(f"  Batch GPU : ~{cfg.batch_vram_overhead_gb:5.1f} GB")
         lines.append(f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB")
+        if cfg.mapped_model_ram_gb > 0.05:
+            lines.append(f"  Lazy mmap : ~{cfg.mapped_model_ram_gb:5.1f} GB")
         if cfg.unified_memory:
             lines.append(
                 f"  Unified total: ~{total_gpu + total_cpu:5.1f} GB"

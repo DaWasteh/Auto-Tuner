@@ -100,8 +100,8 @@ AutoTuner now:
    rather than reusing Qwen3.8 MTP's unrelated profile default of 2;
 6. uses DFlash2's intended explicit p-min `0.0`; the Qwen MTP profile's `0.75`
    confidence threshold remains on the embedded-MTP path;
-7. ships a reproducible Windows/Vulkan recipe at
-   `building llama.cpp/dflash2_llama_build.txt`.
+7. originally shipped a reproducible Windows/Vulkan PR recipe; v5.2.9 removed
+   it after the implementation merged into mainline b10658.
 
 The pinned PR head is commit `1deefcca395743049c3820ab8f9b15043f3e9446`
 and reports b10499 because the PR is based on an older mainline revision. A

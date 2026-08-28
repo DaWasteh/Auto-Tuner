@@ -808,6 +808,9 @@ matches. See `settings/_default.yaml`.
 |--------------|--------|----------------|
 | `gemma-4.yaml` | Gemma 4 E2B/E4B/**12B**/26B-A4B/31B | `gemma4` |
 | `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
+| `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10660+) | `qwen4exp` |
+| `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
+| `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
 | `mellum.yaml` | JetBrains Mellum2-12B-A2.5B (Base/Instruct/Thinking), MoE | `mellum` |
 | `exaone-4_5.yaml` | LG EXAONE 4.5 33B VLM (dense, non-commercial license) | `exaone4` |
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
@@ -819,8 +822,8 @@ matches. See `settings/_default.yaml`.
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
-| `ling-3.yaml` | Ling 3.0 Flash (profile ready; compatible fork required) | not in mainline b10362 |
-| `kimi-k3.yaml` | Kimi-K3 (profile ready; compatible fork required) | proposed `kimi-k3` |
+| `ling-3.yaml` | Ling 3.0 Flash/Tiny (mainline b10460+) | `bailingmoe3` |
+| `kimi-k3.yaml` | Kimi-K3 text path (mainline b10448+) | `kimi-k3` |
 
 Notes on the new profiles:
 
@@ -831,6 +834,16 @@ Notes on the new profiles:
   and always thinks. Both retain the existing `qwen35`/`qwen35moe` GGUF
   architecture family, so filename patterns deliberately take precedence
   without claiming those ambiguous architecture fallbacks.
+- **Qwen3.8 Flash Next** is the separate `qwen4exp` architecture merged in
+  llama.cpp b10660. AutoTuner excludes its ~26.8 GiB read-lazy PLE n-gram
+  table from splittable layer weights, budgets the extra QSA indexer KV, and
+  uses ubatch 64/128/256 for Safe/Balanced/Throughput because its graph buffers
+  scale with context × ubatch.
+- **Nemotron 3.5 Lightning** uses NVIDIA's temp 1.0/top-p 0.95 contract and
+  b10665's DSpark variant. `draft_max: 7` plus `draft_p_min: 0.0` supports
+  checkpoints that deliberately omit the confidence head.
+- **Nanbeige 4.2 3B** uses its 256k context and separate official reasoning
+  (temp 0.6) versus agent/tool (temp 1.0) sampling defaults.
 - **Mellum 2** is a code-focused MoE (64 experts, 8 active; 12B total /
   2.5B active; 128k ctx). `ngram_method` is deliberately set to
   `ngram-map-k4v` (MTP-compatible) so it survives whether or not llama.cpp's
@@ -914,7 +927,6 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
 | [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
 | [`diffusion_hip_llama_build.txt`](building%20llama.cpp/diffusion_hip_llama_build.txt) | DiffusionGemma HIP/ROCm build for AMD when Vulkan hits the ~1 GiB single-allocation limit. |
-| [`dflash2_llama_build.txt`](building%20llama.cpp/dflash2_llama_build.txt) | Pinned llama.cpp PR #27342 Windows/Vulkan build required by Qwen3.8 DFlash2 until its 81-tensor loader reaches stock mainline. |
 | [`setup_llamacpp_cuda.ps1`](building%20llama.cpp/setup_llamacpp_cuda.ps1) | Windows NVIDIA/CUDA one-shot setup helper (PowerShell/Admin; freak288-style script). |
 | [`setup_llamacpp_turboquant_cuda.ps1`](building%20llama.cpp/setup_llamacpp_turboquant_cuda.ps1) | Windows NVIDIA/CUDA TurboQuant setup helper. |
 
@@ -940,11 +952,10 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10590)
+## Server features (compatible through llama.cpp b10666)
 
 Build/version probing, complete profile-command matrices, and real server
-launches are validated through exact stock **b10590** (with a local b10591
-binary whose only post-tag change is Web UI code). The following
+launches are validated through exact stock **b10666** (`4e97ac86e`). The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
 
@@ -953,6 +964,7 @@ binary whose only post-tag change is Web UI code). The following
 | `-fa [on\|off\|auto]` | ✅ Emits `-fa on` **or** `-fa off` explicitly; model profiles such as Unlimited-OCR can require the reference non-FA path |
 | `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ All in the dropdown |
 | `--fit off` | ✅ Always emitted so llama.cpp's own auto-fit pass (default `on`) doesn't silently re-adjust the computed values (AutoTuner is the authority) |
+| `--tensor-read-lazy auto` | ✅ Explicit for giant architecture-marked row tables (qwen4exp/Gemma 4); safely pruned on pre-b10653 builds. Lazy bytes are budgeted as host mappings, not GPU-splittable layer weights. |
 | `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s; users can append `--no-perf` |
 | `--metrics` | ✅ Prometheus endpoint `GET /metrics`, including b10282+ speculative draft/accept counters (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
@@ -965,12 +977,12 @@ binary whose only post-tag change is Web UI code). The following
 | `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
 | `-md` external drafter | ✅ Without `--spec-type` — the presence of `-md` enables the draft path automatically in mainline (verified b9442) |
 | `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.) |
-| `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. DSpark is emitted on b10164+; older binaries lose the entire DSpark path rather than mis-running it as DFlash. DFlash2 reuses `draft-dflash` but is preflight-gated to PR #27342 because stock b10590 lacks its graph. |
+| `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. Generic DSpark is emitted on b10164+; Nemotron3.5 uses its b10665 profile gate. DFlash2 reuses `draft-dflash` and accepts mainline b10658+ (reviewed PR #27342 builds remain a legacy fallback). |
 | `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Selectable via `ngram_method`; only the type token is emitted, sub-parameters are left to the llama.cpp defaults |
 | `--spec-draft-n-max` | ✅ Expert overrides remain authoritative. DFlash derives block-size minus its anchor (Qwen3.8 DFlash2: 8 → 7); performance tuning then increases depth one token at a time until decode speed regresses instead of stopping at a fixed list. |
-| `--spec-draft-p-min` | ✅ Via `draft_p_min` for ordinary external/integrated MTP (explicit 0.75). Qwen3.8 DFlash2 keeps its PR #27342/model-card value 0.0 because its candidate selector performs the lattice pruning. |
+| `--spec-draft-p-min` | ✅ Via `draft_p_min` for ordinary external/integrated MTP (explicit 0.75). Qwen3.8 DFlash2 keeps its model-card value 0.0 because its candidate selector performs the lattice pruning. |
 | `--spec-ngram-map-k4v-size-n/-size-m/-min-hits` | ✅ Via `ngram_k4v_size_n` / `ngram_k4v_size_m` / `ngram_k4v_min_hits` in the YAML (defaults 16/24/1 from PR #23269) |
 | `--spec-draft-ngl` | ✅ Always 99 (keep the MTP head on GPU) |
 | `--n-cpu-moe` / `--override-tensor` | ✅ `--n-cpu-moe` active; `-ot` prepared for targeted expert placement |
@@ -981,6 +993,31 @@ binary whose only post-tag change is Web UI code). The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+
+### Review b10590 → b10666
+
+Reviewed the exact upstream range from `b10590` (`6657ded4`) through `b10666`
+(`4e97ac86e`). Full source, command-matrix, model-load, and memory evidence is
+in [`docs/llama-b10666-audit.md`](docs/llama-b10666-audit.md).
+
+- **No emitted server option broke.** AutoTuner never used the removed CLI-only
+  `-no-cnv`, and b10666 accepts every generated normal-server option. Removed
+  legacy draft/ngram spellings are not emitted.
+- **Mainline promotions:** DFlash2 merged in b10658 and Qwen3.8 Flash Next
+  (`qwen4exp`) in b10660. Both dedicated PR build recipes were removed; the
+  qwen4exp profile now enforces b10660+. DFlash2 preflight accepts b10658+
+  while still recognizing an explicitly selected reviewed legacy PR binary.
+- **Qwen3.8 Flash Next memory corrected from real loads:** the 67.55 GiB IQ1_S
+  GGUF contains a 26.82 GiB `per_layer_token_embd.weight` PLE table that
+  llama.cpp keeps in `CPU_Mapped` read-lazy storage. The remaining ~40.74 GiB
+  are placement weights. AutoTuner now also includes the second QSA indexer KV
+  cache and measured context×ubatch graph buffers. Safe ubatch 64 reduced a 90k
+  graph from ~5.46 to ~0.39 GiB device compute and ~17.56 to ~1.10 GiB host
+  compute while decode remained above 31 tok/s.
+- **New profile coverage:** Qwen3.8 Flash Next is mainline-gated, Nemotron 3.5
+  Lightning carries b10665 DSpark settings, and Nanbeige 4.2 3B receives its
+  official 256k/sampling profile. No other new architecture was added in this
+  exact range.
 
 ### Review b10549 → b10590
 
@@ -1000,8 +1037,9 @@ evidence is in [`docs/llama-b10590-audit.md`](docs/llama-b10590-audit.md).
   reproduced failing with `expected 81, got 58`. v5.2.6 detects this before
   launch, automatically uses a compatible sibling PR build when present,
   selects trained n-max 7/p-min 0.0, accepts the reviewed PR build, and
-  includes [`dflash2_llama_build.txt`](building%20llama.cpp/dflash2_llama_build.txt).
-  A real PR-build request loaded and generated successfully.
+  originally included a pinned PR build recipe. That obsolete recipe was
+  removed in v5.2.9 after DFlash2 merged into b10658. A real PR-build request
+  loaded and generated successfully at the time.
 - **Qwen3.8 Flash Next preview:** `settings/qwen3_8_flash_next.yaml` matches the
   supplied `qwen4exp` metadata (48 hybrid blocks, full attention every fourth
   block, 512/10 experts, 262,144 native context, official 1.0/0.95/top-k-20

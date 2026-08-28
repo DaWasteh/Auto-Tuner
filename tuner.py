@@ -73,6 +73,39 @@ DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB = 1.5
 # where the overflow layers spill to CPU and the server runs fine.
 FULL_OFF_HEADROOM_GB = 0.5
 
+# Qwen3.8-Flash-Next (qwen4exp) uses a context×ubatch QSA graph that is much
+# larger than an ordinary FlashAttention workspace. Exact b10666 Windows/
+# Vulkan measurements at 90,112 context are linear across ubatch 256/1024:
+# ~64 B of device buffers and ~204 B of host buffers per ctx×ubatch element.
+# Round upward for allocator drift. ubatch 256 retained 98.7% of decode speed
+# and ~89.6% of prompt speed versus 1024; Safe/Balanced step down to 64/128
+# before sacrificing requested context because the scaling is linear.
+_QWEN4EXP_UBATCH = 256
+_QWEN4EXP_GPU_COMPUTE_BYTES = 72
+_QWEN4EXP_HOST_COMPUTE_BYTES = 215
+_QWEN4EXP_FIXED_HOST_RUNTIME_GB = 5.5
+
+
+def _qwen4exp_ubatch_for_target(target_name: str) -> int:
+    """Bound QSA graph memory by tier before sacrificing requested context."""
+    name = str(target_name or "").strip().lower()
+    if name in {"safe", "low_vram"}:
+        return 64
+    if name == "balanced":
+        return 128
+    return _QWEN4EXP_UBATCH
+
+
+def qwen4exp_compute_buffers_gb(
+    ctx: int, ubatch: int = _QWEN4EXP_UBATCH, n_parallel: int = 1
+) -> Tuple[float, float]:
+    """Return conservative b10666 qwen4exp ``(VRAM, RAM)`` graph buffers."""
+    elements = max(0, int(ctx)) * max(1, int(ubatch)) * max(1, int(n_parallel))
+    return (
+        elements * _QWEN4EXP_GPU_COMPUTE_BYTES / (1024.0**3),
+        elements * _QWEN4EXP_HOST_COMPUTE_BYTES / (1024.0**3),
+    )
+
 
 # ---------------------------------------------------------------------------
 # llama.cpp CLI compatibility helpers
@@ -172,6 +205,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--slot-prompt-similarity",
     "--split-mode",
     "--temp",
+    "--tensor-read-lazy",
     "--tensor-split",
     "--threads",
     "--threads-batch",
@@ -348,12 +382,10 @@ _MIN_DISTINCT_MLOCK_BUILD = 10151
 # DSpark landed in b10164. Older binaries advertise --spec-type but reject
 # the new enum value, so ordinary flag-name probing cannot catch this case.
 _MIN_DSPARK_BUILD = 10164
-# DFlash2 is still supplied by upstream PR #27342 at stock llama.cpp b10590.
-# These are the reviewed support commits currently published by that PR.
-# Unknown stock commits stay blocked until upstream actually merges the graph;
-# guessing from a newer build number would recreate the opaque 81-vs-58 crash.
+# DFlash2 reached stock mainline in b10658. Retain the reviewed PR commits as
+# compatible legacy fallbacks for users who deliberately keep an older fork.
 _DFLASH2_PR_COMMITS = ("5ecbe1ac", "1deefcca")
-_MAX_AUDITED_STOCK_BUILD_WITHOUT_DFLASH2 = 10591
+_MIN_MAINLINE_DFLASH2_BUILD = 10658
 
 
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
@@ -512,12 +544,12 @@ def check_draft_model_build(
     """Preflight draft formats whose support is not visible in ``--help``.
 
     DFlash2 intentionally reuses the ``dflash`` architecture and
-    ``draft-dflash`` enum, so stock b10590 advertises the right CLI while its
-    loader still instantiates the older 58-tensor graph.  The published
-    Qwen3.8 sidecar contains 81 tensors and then aborts with the otherwise
-    opaque ``expected 81, got 58`` error.  Accept the reviewed PR commits,
-    reject the known stock builds, and retain the normal warning-only policy
-    for wrappers whose version cannot be inspected.
+    ``draft-dflash`` enum, so pre-b10658 stock builds advertise the right CLI
+    while instantiating the older 58-tensor graph. The published Qwen3.8
+    sidecar contains 81 tensors and then aborts with the otherwise opaque
+    ``expected 81, got 58`` error. Accept b10658+ mainline and reviewed legacy
+    PR commits, reject older identified stock builds, and retain warning-only
+    behavior for wrappers whose version cannot be inspected.
     """
     if draft_model is None or not draft_model.is_dflash2_drafter:
         return True, "", None
@@ -529,26 +561,23 @@ def check_draft_model_build(
         return True, "", detected
     if "dflash2" in version_output.casefold():
         return True, "", detected
+    if detected is not None and detected >= _MIN_MAINLINE_DFLASH2_BUILD:
+        return True, "", detected
     if detected is None:
         return (
             True,
             "Could not verify DFlash2 support in the selected llama.cpp binary. "
-            "Qwen3.8 DFlash2 requires upstream PR #27342 (stock b10590 does "
-            "not contain its 81-tensor loader).",
+            f"Use mainline b{_MIN_MAINLINE_DFLASH2_BUILD}+ or a reviewed "
+            "PR #27342 build for this 81-tensor sidecar.",
             None,
         )
     commit_label = f" ({commit})" if commit else ""
-    audited_label = (
-        "only creates the older 58-tensor DFlash graph"
-        if detected <= _MAX_AUDITED_STOCK_BUILD_WITHOUT_DFLASH2
-        else "does not advertise a reviewed DFlash2 implementation"
-    )
     return (
         False,
-        "Qwen3.8 DFlash2 requires llama.cpp PR #27342; selected "
-        f"b{detected}{commit_label} {audited_label} and cannot be trusted to "
-        "load this 81-tensor sidecar. Select a reviewed DFlash2/PR-27342 "
-        "build, or choose the model's embedded MTP head.",
+        "Qwen3.8 DFlash2 requires mainline llama.cpp "
+        f"b{_MIN_MAINLINE_DFLASH2_BUILD}+ (or reviewed PR #27342); selected "
+        f"b{detected}{commit_label} only has the older DFlash graph. Update "
+        "llama.cpp or choose the model's embedded MTP head.",
         detected,
     )
 
@@ -1098,8 +1127,27 @@ def kv_per_token_parts_mb_from_metadata(
             value_length = value_length if value_length > 0 else head_size
     denom = key_length + value_length
     if denom <= 0:
-        return total / 2.0, total / 2.0
-    return total * key_length / denom, total * value_length / denom
+        key_mb, value_mb = total / 2.0, total / 2.0
+    else:
+        key_mb = total * key_length / denom
+        value_mb = total * value_length / denom
+
+    # qwen4exp's QSA path creates a second cache over the same full-attention
+    # layers. b10666 shapes it as one key head of indexer.key_length and one
+    # value head of the model's normal value length. It uses the selected K/V
+    # cache quants, so keep the additions split for asymmetric quant planning.
+    if arch.lower() == "qwen4exp":
+        from scanner import metadata_attention_layer_count
+
+        n_attention = metadata_attention_layer_count(md)
+        indexer_key_length = _metadata_arch_int(
+            md, arch, "attention.indexer.key_length"
+        )
+        if n_attention > 0 and indexer_key_length > 0 and value_length > 0:
+            key_mb += n_attention * indexer_key_length * 2 / (1024.0 * 1024.0)
+            value_mb += n_attention * value_length * 2 / (1024.0 * 1024.0)
+
+    return key_mb, value_mb
 
 
 def kv_per_token_mb_from_metadata(md: Dict[str, Any]) -> float:
@@ -1424,6 +1472,10 @@ class TunedConfig:
 
     estimated_model_vram_gb: float = 0.0
     estimated_model_ram_gb: float = 0.0
+    # Giant row-gather weights left mmap-backed by --tensor-read-lazy auto.
+    # They are fixed host mappings, not ordinary CPU-offloaded layers and not
+    # eligible for GPU tensor splitting (notably qwen4exp's ~26.8 GiB PLE table).
+    mapped_model_ram_gb: float = 0.0
     estimated_kv_gb: float = 0.0
     full_offload: bool = False
     # CPU and accelerator allocations share one physical pool (Apple
@@ -1469,6 +1521,9 @@ class TunedConfig:
     # preflight / registry add it to the total GPU footprint so the
     # displayed picture matches the real on-device allocation.
     runtime_vram_overhead_gb: float = 0.0
+    # Host-side architecture graph/runtime buffers beyond model mappings,
+    # CPU-offloaded weights, recurrent state, and prompt cache.
+    runtime_ram_overhead_gb: float = 0.0
     # Additional MoE op-offload batch workspace beyond the generic KV/FA
     # headroom. Included in GPU footprint/preflight reporting.
     batch_vram_overhead_gb: float = 0.0
@@ -2262,6 +2317,22 @@ def compute_config(
     unified_memory = bool(getattr(system, "has_unified_memory", False))
     free_vram = max(0.0, system.free_vram_gb)
     n_layers = model.n_layers
+    model_arch = str((model.metadata or {}).get("general.architecture") or "").lower()
+    placement_model_size_gb = model.placement_size_gb
+    read_lazy_table_gb = model.read_lazy_size_gb
+    # Windows cannot unmap unused fragments from a MapViewOfFile and the real
+    # b10666 load retained essentially the complete 26.8 GiB PLE mapping in
+    # the process working set. POSIX marks the lazy range random/on-demand;
+    # upstream measured ~4.4% resident, so reserve a conservative 5% there.
+    mapped_model_ram_gb = (
+        read_lazy_table_gb
+        if platform.system() == "Windows"
+        else min(read_lazy_table_gb, max(0.5, read_lazy_table_gb * 0.05))
+        if read_lazy_table_gb > 0
+        else 0.0
+    )
+    is_qwen4exp = model_arch == "qwen4exp"
+    qwen4exp_ubatch = _qwen4exp_ubatch_for_target(perf_target.name)
 
     # ---- (0) MoE detection
     expert_count = _moe_expert_count(model)
@@ -2359,7 +2430,7 @@ def compute_config(
             # conservative proxy: for a given quant the GPU-resident weights
             # are ≈ the file size, so a card that can't fit the file in its
             # free VRAM certainly can't host the model as primary.
-            need_gb = model.size_bytes / (1024**3) if model.size_bytes else 0.0
+            need_gb = placement_model_size_gb
             if need_gb > 0:
                 fit = next(
                     (g for g in ranked if (g.free_vram_mb / 1024.0) >= need_gb),
@@ -2441,6 +2512,7 @@ def compute_config(
     runtime_vram_overhead_gb = (
         DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB if is_diffusion_gemma else 0.0
     )
+    runtime_ram_overhead_gb = 0.0
 
     # ---- (0.5) Calculate VRAM reserved for Vision + Draft models
     # These MUST be on GPU for optimal performance — UNLESS the user asked
@@ -2483,11 +2555,52 @@ def compute_config(
     else:
         prompt_cache_ram_gb = 0.0
 
+    # qwen4exp's sparse-QSA graph scales with context × ubatch and its giant
+    # PLE row table is a fixed mmap host allocation. Plan against the user's
+    # exact pin; Auto uses the performance tier's intended MoE context target
+    # and receives a final physical RAM/VRAM clamp after KV precision is known.
+    qwen4exp_plan_ctx = 0
+    if is_qwen4exp:
+        qwen4exp_plan_ctx = max(
+            2048,
+            min(
+                int(target_ctx_for_placement),
+                int(
+                    target_ctx_for_placement
+                    if user_ctx is not None
+                    else perf_target.moe_placement_ctx_target
+                ),
+            ),
+        )
+        qwen_gpu_plan_gb, qwen_host_plan_gb = qwen4exp_compute_buffers_gb(
+            qwen4exp_plan_ctx, qwen4exp_ubatch, n_parallel
+        )
+        runtime_vram_overhead_gb += qwen_gpu_plan_gb
+        runtime_ram_overhead_gb = _QWEN4EXP_FIXED_HOST_RUNTIME_GB + qwen_host_plan_gb
+
+    # Host RAM genuinely available for ordinary CPU-offloaded weights. The
+    # PLE mapping and qwen4exp graph are not interchangeable with expert
+    # offload and therefore come out before placement.
+    effective_free_ram_for_weights = max(
+        0.0,
+        system.free_ram_gb
+        - ram_safety_gb
+        - mapped_model_ram_gb
+        - runtime_ram_overhead_gb
+        - vision_ram_gb
+        - prompt_cache_ram_gb,
+    )
+
     # Effective VRAM available for main model placement. Vision/draft that
     # live on the GPU AND the runner's runtime overhead are subtracted up
     # front so placement + KV sizing see the real headroom.
     shared_host_reserve_gb = (
-        vision_ram_gb + prompt_cache_ram_gb if unified_memory else 0.0
+        vision_ram_gb
+        + prompt_cache_ram_gb
+        + mapped_model_ram_gb
+        + runtime_ram_overhead_gb
+        if unified_memory
+        else 0.0
     )
     effective_free_vram = (
         free_vram
@@ -2588,9 +2701,9 @@ def compute_config(
     n_cpu_moe: Optional[int] = None
     if is_moe and has_gpu and n_layers > 0 and not disable_moe_placement:
         ngl, n_cpu_moe, model_vram, model_ram, full_off = _decide_moe_offload(
-            model_size_gb=model.size_gb,
+            model_size_gb=placement_model_size_gb,
             free_vram_gb=effective_moe_vram,
-            free_ram_gb=system.free_ram_gb,
+            free_ram_gb=effective_free_ram_for_weights,
             n_layers=n_layers,
             expert_count=expert_count,
             params_billion=params_b,
@@ -2620,9 +2733,9 @@ def compute_config(
         ):
             shrunk_target = max(16384, perf_target.moe_placement_ctx_target // 2)
             ngl_2, cpu_moe_2, vram_2, ram_2, full_2 = _decide_moe_offload(
-                model_size_gb=model.size_gb,
+                model_size_gb=placement_model_size_gb,
                 free_vram_gb=effective_moe_vram,
-                free_ram_gb=system.free_ram_gb,
+                free_ram_gb=effective_free_ram_for_weights,
                 n_layers=n_layers,
                 expert_count=expert_count,
                 params_billion=params_b,
@@ -2673,11 +2786,13 @@ def compute_config(
                 reserve_ctx * base_kv_mb * kv_quant_factor("q5_0")
             ) / 1024.0
         model_weights_fit_vram = (
-            model.size_gb + FULL_OFF_HEADROOM_GB + state_vram_reserve_for_placement
+            placement_model_size_gb
+            + FULL_OFF_HEADROOM_GB
+            + state_vram_reserve_for_placement
             <= effective_free_vram - dense_placement_safety_gb
         )
         model_and_kv_fit_vram = (
-            model.size_gb + FULL_OFF_HEADROOM_GB + desired_dense_kv_reserve_gb
+            placement_model_size_gb + FULL_OFF_HEADROOM_GB + desired_dense_kv_reserve_gb
             <= effective_free_vram - dense_placement_safety_gb
         )
         # Preserve established multi-GPU full-offload behavior when the model
@@ -2689,7 +2804,7 @@ def compute_config(
             0.0 if model_and_kv_fit_vram else desired_dense_kv_reserve_gb
         )
         ngl, model_vram, model_ram, full_off = _decide_offload(
-            model_size_gb=model.size_gb,
+            model_size_gb=placement_model_size_gb,
             free_vram_gb=effective_free_vram,
             n_layers=n_layers,
             has_gpu=has_gpu,
@@ -2713,9 +2828,9 @@ def compute_config(
         # Re-derive model_vram/ram from the new split, holding shared
         # overhead constant (it scales with model size, not layer
         # placement).
-        shared_overhead_gb = model.size_gb * 0.08
+        shared_overhead_gb = placement_model_size_gb * 0.08
         per_layer_expert_gb = max(
-            0.001, (model.size_gb - shared_overhead_gb) / n_layers
+            0.001, (placement_model_size_gb - shared_overhead_gb) / n_layers
         )
         layers_on_gpu = n_layers - new_cpu_moe
         model_vram = shared_overhead_gb + layers_on_gpu * per_layer_expert_gb
@@ -2730,15 +2845,15 @@ def compute_config(
         and not (is_moe and has_gpu and not disable_moe_placement)
     ):
         new_ngl = max(0, min(n_layers, int(force_ngl)))
-        per_layer_gb = model.size_gb / n_layers
+        per_layer_gb = placement_model_size_gb / n_layers
         ngl = new_ngl if new_ngl < n_layers else 999
         if new_ngl >= n_layers:
-            model_vram = model.size_gb
+            model_vram = placement_model_size_gb
             model_ram = 0.0
             full_off = True
         else:
             model_vram = new_ngl * per_layer_gb
-            residual_overhead = model.size_gb * 0.02
+            residual_overhead = placement_model_size_gb * 0.02
             model_ram = (n_layers - new_ngl) * per_layer_gb + residual_overhead
             full_off = False
 
@@ -2843,8 +2958,10 @@ def compute_config(
         system.free_ram_gb
         - ram_safety_gb
         - model_ram
+        - mapped_model_ram_gb
         - vision_ram_gb
         - prompt_cache_ram_gb
+        - runtime_ram_overhead_gb
         - recurrent_state_ram_gb,
     )
 
@@ -2859,10 +2976,12 @@ def compute_config(
             - max(effective_vram_safety, ram_safety_gb)
             - model_vram
             - model_ram
+            - mapped_model_ram_gb
             - vision_vram_gb
             - vision_ram_gb
             - draft_vram_gb
             - runtime_vram_overhead_gb
+            - runtime_ram_overhead_gb
             - prompt_cache_ram_gb
             - moe_batch_vram_reserve_gb
             - recurrent_state_vram_gb
@@ -3227,6 +3346,94 @@ def compute_config(
         # the "user_ctx wins" contract. llama-server accepts arbitrary
         # -c values, so no quantisation is needed here.
         ctx = max(2048, ctx)
+
+    # qwen4exp's QSA graph is not represented by ordinary KV bytes. Apply a
+    # final physical two-pool ceiling now that cache precision and placement
+    # are known. Coefficients are the conservative b10666 measurements above;
+    # this is what prevents a 90k/ubatch-1024 graph from silently reserving
+    # ~18 GiB host + ~5.6 GiB device compute buffers.
+    if is_qwen4exp:
+        base_runtime_vram_gb = (
+            DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB if is_diffusion_gemma else 0.0
+        )
+        kv_per_ctx_gb = actual_per_tok_mb * n_parallel / 1024.0
+        qwen_gpu_per_ctx_gb = (
+            _QWEN4EXP_GPU_COMPUTE_BYTES * qwen4exp_ubatch * n_parallel / (1024.0**3)
+        )
+        qwen_host_per_ctx_gb = (
+            _QWEN4EXP_HOST_COMPUTE_BYTES * qwen4exp_ubatch * n_parallel / (1024.0**3)
+        )
+
+        if unified_memory:
+            shared_fixed_gb = (
+                model_vram
+                + model_ram
+                + mapped_model_ram_gb
+                + vision_vram_gb
+                + vision_ram_gb
+                + draft_vram_gb
+                + base_runtime_vram_gb
+                + _QWEN4EXP_FIXED_HOST_RUNTIME_GB
+                + prompt_cache_ram_gb
+                + moe_batch_vram_reserve_gb
+                + recurrent_state_total_gb
+                + max(effective_vram_safety, ram_safety_gb)
+            )
+            shared_dynamic_per_ctx_gb = (
+                qwen_gpu_per_ctx_gb + qwen_host_per_ctx_gb + kv_per_ctx_gb
+            )
+            shared_cap_gb = min(free_vram, max(0.0, system.free_ram_gb))
+            qwen_physical_max_ctx = int(
+                max(0.0, shared_cap_gb - shared_fixed_gb)
+                / max(shared_dynamic_per_ctx_gb, 1e-12)
+            )
+        else:
+            gpu_fixed_gb = (
+                model_vram
+                + vision_vram_gb
+                + draft_vram_gb
+                + base_runtime_vram_gb
+                + moe_batch_vram_reserve_gb
+                + recurrent_state_vram_gb
+                + effective_vram_safety
+            )
+            host_fixed_gb = (
+                model_ram
+                + mapped_model_ram_gb
+                + vision_ram_gb
+                + prompt_cache_ram_gb
+                + recurrent_state_ram_gb
+                + _QWEN4EXP_FIXED_HOST_RUNTIME_GB
+                + ram_safety_gb
+            )
+            gpu_dynamic_per_ctx_gb = qwen_gpu_per_ctx_gb + (
+                0.0 if no_kv_offload else kv_per_ctx_gb
+            )
+            host_dynamic_per_ctx_gb = qwen_host_per_ctx_gb + (
+                kv_per_ctx_gb if no_kv_offload else 0.0
+            )
+            gpu_max_ctx = int(
+                max(0.0, gpu_budget_free_vram - gpu_fixed_gb)
+                / max(gpu_dynamic_per_ctx_gb, 1e-12)
+            )
+            host_max_ctx = int(
+                max(0.0, system.free_ram_gb - host_fixed_gb)
+                / max(host_dynamic_per_ctx_gb, 1e-12)
+            )
+            qwen_physical_max_ctx = min(gpu_max_ctx, host_max_ctx)
+
+        qwen_physical_max_ctx = max(2048, qwen_physical_max_ctx)
+        if ctx > qwen_physical_max_ctx:
+            if user_ctx is not None and pin_clamped_to_budget is None:
+                pin_clamped_to_budget = ctx
+            ctx = qwen_physical_max_ctx
+
+        qwen_gpu_actual_gb, qwen_host_actual_gb = qwen4exp_compute_buffers_gb(
+            ctx, qwen4exp_ubatch, n_parallel
+        )
+        runtime_vram_overhead_gb = base_runtime_vram_gb + qwen_gpu_actual_gb
+        runtime_ram_overhead_gb = _QWEN4EXP_FIXED_HOST_RUNTIME_GB + qwen_host_actual_gb
+
     # Total KV across ALL n_parallel slots — llama-server allocates one
     # full KV buffer per slot, so the real VRAM/RAM footprint is
     # n_parallel × per-slot. Previously this was per-slot only, which
@@ -3243,18 +3450,21 @@ def compute_config(
         # a "why isn't my 1 M pin honoured?" question answers itself.
         warning = (
             f"Requested context {pin_clamped_to_budget:,} exceeds the "
-            f"safe KV budget; clamped to {ctx:,} to avoid VRAM/RAM OOM."
+            f"safe KV/compute-memory budget; clamped to {ctx:,} to avoid "
+            "VRAM/RAM OOM."
         )
     if unified_memory:
         shared_total = (
             model_vram
             + model_ram
+            + mapped_model_ram_gb
             + estimated_kv_gb
             + recurrent_state_total_gb
             + vision_vram_gb
             + vision_ram_gb
             + draft_vram_gb
             + runtime_vram_overhead_gb
+            + runtime_ram_overhead_gb
             + prompt_cache_ram_gb
             + moe_batch_vram_reserve_gb
             + max(effective_vram_safety, ram_safety_gb)
@@ -3262,9 +3472,10 @@ def compute_config(
         shared_free = min(free_vram, max(0.0, system.free_ram_gb))
         if shared_total > shared_free * 0.98:
             tight = (
-                f"Unified-memory budget tight: model {model_vram + model_ram:.1f} "
+                f"Unified-memory budget tight: model "
+                f"{model_vram + model_ram + mapped_model_ram_gb:.1f} "
                 f"GB + KV {estimated_kv_gb:.1f} GB + overhead/reserves "
-                f"{shared_total - model_vram - model_ram - estimated_kv_gb:.1f} "
+                f"{shared_total - model_vram - model_ram - mapped_model_ram_gb - estimated_kv_gb:.1f} "
                 f"GB ≈ {shared_total:.1f} GB of {shared_free:.1f} GB available."
             )
             warning = f"{warning} {tight}" if warning else tight
@@ -3288,6 +3499,27 @@ def compute_config(
                 f"GB + recurrent state {recurrent_state_vram_gb:.1f} GB + "
                 f"safety {effective_vram_safety:.1f} GB ≈ "
                 f"{gpu_total:.1f} GB of {gpu_budget_free_vram:.1f} GB free."
+            )
+            warning = f"{warning} {tight}" if warning else tight
+
+    if not unified_memory:
+        host_total = (
+            model_ram
+            + mapped_model_ram_gb
+            + vision_ram_gb
+            + prompt_cache_ram_gb
+            + runtime_ram_overhead_gb
+            + recurrent_state_ram_gb
+            + (estimated_kv_gb if no_kv_offload else 0.0)
+            + ram_safety_gb
+        )
+        if host_total > system.free_ram_gb * 0.98:
+            tight = (
+                f"RAM budget tight: CPU weights {model_ram:.1f} GB + mapped "
+                f"weights {mapped_model_ram_gb:.1f} GB + runtime/cache/state "
+                f"{host_total - model_ram - mapped_model_ram_gb - ram_safety_gb:.1f} "
+                f"GB + safety {ram_safety_gb:.1f} GB ≈ {host_total:.1f} GB "
+                f"of {system.free_ram_gb:.1f} GB free."
             )
             warning = f"{warning} {tight}" if warning else tight
 
@@ -3328,7 +3560,12 @@ def compute_config(
     #
     #   3. Everything else (small-to-mid dense, short ctx): 2048/512 —
     #      the historical default that's optimal for pure GPU inference.
-    if n_cpu_moe is not None and n_cpu_moe > 0:
+    if is_qwen4exp:
+        # QSA's ctx×ubatch graph dominates both host and device memory. Use
+        # 64/128/256 for Safe/Balanced/Throughput so long requested contexts
+        # consume batch throughput before they consume the context window.
+        batch, ubatch = 1024, qwen4exp_ubatch
+    elif n_cpu_moe is not None and n_cpu_moe > 0:
         batch = perf_target.moe_hybrid_batch
         ubatch = perf_target.moe_hybrid_ubatch
         # When integrated MTP is active on a MoE model, the speculative hook
@@ -3339,7 +3576,7 @@ def compute_config(
         # Prompt processing (PP) is unaffected because PP fills full batches anyway.
         if model.has_embedded_mtp and ubatch > 512:
             ubatch = 512
-    elif model.size_gb > 30 or ctx > 32768 or model.size_gb > 10:
+    elif placement_model_size_gb > 30 or ctx > 32768 or placement_model_size_gb > 10:
         batch, ubatch = 1024, 1024
     else:
         batch, ubatch = 2048, 512
@@ -3393,6 +3630,12 @@ def compute_config(
                 and ram_resident_gb < (system.free_ram_gb - 8)
                 and (not is_windows or is_admin)
             )
+    # Auto-lazy row tables require mmap. Never let automatic mlock/no-mmap
+    # turn a 26+ GiB PLE table into an eager resident read; an explicit
+    # --force-mlock remains the user's deliberate override.
+    if mlock and read_lazy_table_gb > 0 and not force_mlock:
+        mlock = False
+
     # GPU-Gate: llama.cpp b9895 bricht mit --mlock IMMER ab, sobald das
     # Vulkan-Backend geladen ist — unabhängig von RLIMIT_MEMLOCK und auch
     # mit -ngl 0 (auf RDNA4 reproduziert). Ursache: CPU-Gewichte landen im
@@ -3614,8 +3857,10 @@ def compute_config(
             layer_gpu_bytes: List[float] = []
             if is_moe_cfg and n_layers > 0:
                 cpu_moe_layers = min(n_layers, n_cpu_moe or 0)
-                shared_gb = model.size_gb * 0.08
-                per_layer_expert = max(0.001, (model.size_gb - shared_gb) / n_layers)
+                shared_gb = placement_model_size_gb * 0.08
+                per_layer_expert = max(
+                    0.001, (placement_model_size_gb - shared_gb) / n_layers
+                )
                 light_gb = shared_gb / n_layers
                 kv_layer_gb = (
                     0.0 if no_kv_offload else max(0.0, estimated_kv_gb) / n_layers
@@ -3907,6 +4152,7 @@ def compute_config(
         expert_count=expert_count,
         estimated_model_vram_gb=model_vram,
         estimated_model_ram_gb=model_ram,
+        mapped_model_ram_gb=mapped_model_ram_gb,
         estimated_kv_gb=estimated_kv_gb,
         full_offload=full_off,
         unified_memory=unified_memory,
@@ -3917,6 +4163,7 @@ def compute_config(
         prompt_cache_ram_mib=prompt_cache_ram_mib,
         prompt_cache_ram_gb=prompt_cache_ram_gb,
         runtime_vram_overhead_gb=runtime_vram_overhead_gb,
+        runtime_ram_overhead_gb=runtime_ram_overhead_gb,
         batch_vram_overhead_gb=moe_batch_vram_reserve_gb,
         kv_vram_gb=kv_vram_gb,
         kv_ram_gb=kv_ram_gb,
@@ -4364,6 +4611,16 @@ def build_command(
     # b9334. If a server binary predates it, this will abort with
     # "unknown argument"; in that case drop the two tokens below.
     cmd += ["--fit", "off"]
+
+    # b10653+ reads giant architecture-marked row tables on demand. Assert
+    # Auto explicitly for reproducibility; compatibility pruning removes the
+    # complete flag/value pair on older builds. qwen4exp's 26.8 GiB PLE table
+    # is the motivating case and must never be treated as GPU layer weights.
+    if model.read_lazy_size_bytes > 0 or model.architecture.lower() in {
+        "qwen4exp",
+        "gemma4",
+    }:
+        cmd += ["--tensor-read-lazy", "auto"]
 
     # ---- Performance timings + optional diagnostics endpoints ----------
     # Performance timings are enabled by default in current llama.cpp.

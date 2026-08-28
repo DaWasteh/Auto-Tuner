@@ -1,0 +1,47 @@
+display_name: "Nemotron 3.5 Lightning 30B-A3B (NVIDIA)"
+patterns:
+  - nemotron-3.5-lightning
+  - nemotron3.5-lightning
+  - nemotron-3_5-lightning
+
+# b10665 adds the Nemotron3.5 DSpark variant (causal SWA, attention sinks,
+# optional confidence head). Earlier generic DSpark loaders are insufficient.
+min_llama_build: 10665
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# NVIDIA benchmarks DSpark with draft length 7. Some Nemotron3.5 DSpark
+# checkpoints intentionally omit the confidence head; b10665 requires p-min 0
+# for those files instead of AutoTuner's ordinary 0.75 confidence threshold.
+draft_max: 7
+draft_p_min: 0.0
+ngram_method: ngram-map-k4v
+
+notes: >
+  Text-only 30B-total/3B-active Mamba-2 + attention + MoE hybrid with one
+  integrated MTP layer and up to 1,048,576 context. NVIDIA's official sampling
+  is temp 1.0/top-p 0.95. Mainline b10665 adds its DSpark sidecar contract;
+  AutoTuner uses n-max 7 and p-min 0.0 so confidence-head-free releases do not
+  abort. The official local llama.cpp example starts around 40,960 context;
+  larger windows remain subject to measured KV/recurrent/runtime capacity.
