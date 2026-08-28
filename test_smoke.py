@@ -3701,44 +3701,111 @@ def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
 # llama-server resolver
 
 
-def test_prerelease_build_recipe_never_mislabels_development_head() -> None:
-    recipe = (
-        ROOT / "building llama.cpp" / "llama_prerelease_build.txt"
-    ).read_text(encoding="utf-8")
-
-    assert "git rev-list --count HEAD" in recipe
-    assert "Get-ExactLlamaPrereleaseTag" in recipe
-    assert '"${buildTag}_dev_${shortCommit}"' in recipe
-    assert "Get-ExactLlamaBuildTag" not in recipe
-    assert 'return "bUNKNOWN"' not in recipe
-    assert "-DLLAMA_BUILD_IS_DEV=ON" in recipe
-    assert "$expectedRuntimeVersion = \"$semanticVersion-dev\"" in recipe
-    assert "reportedVersion -ne $expectedRuntimeVersion" in recipe
-    assert "reportedBuild -ne $expectedBuild" in recipe
-    assert "$env:ComSpec" in recipe  # --version is emitted on stderr
-    assert "not yet an exact bNNNN pre-release tag" in recipe
-
-
-def test_stable_build_recipe_resolves_latest_and_preserves_build_number() -> None:
-    recipe = (ROOT / "building llama.cpp" / "llama_stable_build.txt").read_text(
+def test_prerelease_build_recipes_keep_truthful_backend_qualified_identity() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(
         encoding="utf-8"
     )
-    clone_line = next(
-        line for line in recipe.splitlines() if "git clone --branch" in line
+    vulkan = (build_dir / "llama_prerelease_vulkan_build.ps1").read_text(
+        encoding="utf-8"
+    )
+    hip = (build_dir / "llama_prerelease_hip_build.ps1").read_text(
+        encoding="utf-8"
     )
 
-    assert '[string]$Tag = "latest"' in recipe
-    assert "Get-LatestStableSemanticTag" in recipe
-    assert "X.Y.Z" in recipe
-    assert "$version = $Tag -replace '^v', ''" in recipe
-    assert '$dir = "${version}_llama.cpp"' in recipe
-    assert "-DLLAMA_BUILD_IS_DEV=OFF" in recipe
-    assert "git rev-list --count HEAD" in recipe
-    assert '--tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$prereleaseTag"' in recipe
-    assert "Stable/pre-release mismatch" in recipe
-    assert "--depth" not in clone_line
-    assert "$env:ComSpec" in recipe  # avoid NativeCommandError on valid stderr
-    assert "reportedBuild -ne $expectedBuild" in recipe
+    assert "Get-LatestLlamaPrereleaseTag" in common
+    assert "Get-ExactRemotePrereleaseTag" in common
+    assert '"${buildTag}_dev_${shortCommit}"' in common
+    assert '"${folderVersion}_${backendToken}_llama.cpp"' in common
+    assert 'return "bUNKNOWN"' not in common
+    assert '-BuildIsDev "ON"' in common
+    assert "$expectedRuntime = \"$semantic-dev\"" in common
+    assert "-ExpectedBuild $build" in common
+    assert "--single-branch" in common and "--depth" not in common
+    assert "-Backend Vulkan" in vulkan
+    assert "-Backend HIP" in hip
+    assert "bNNNN_vulkan_llama.cpp" in vulkan
+    assert "bNNNN_hip_llama.cpp" in hip
+
+
+def test_stable_build_recipes_resolve_latest_and_preserve_build_number() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(
+        encoding="utf-8"
+    )
+    vulkan = (build_dir / "llama_stable_vulkan_build.ps1").read_text(
+        encoding="utf-8"
+    )
+    hip = (build_dir / "llama_stable_hip_build.ps1").read_text(encoding="utf-8")
+
+    assert "Get-LatestStableSemanticTag" in common
+    assert "$version = $Tag -replace '^v', ''" in common
+    assert '"${version}_${backendToken}_llama.cpp"' in common
+    assert '-BuildIsDev "OFF"' in common
+    assert "Get-LlamaBuildCount" in common
+    assert "Stable/pre-release mismatch" in common
+    assert "--single-branch" in common and "--depth" not in common
+    assert "-ExpectedBuild $build" in common
+    assert "X.Y.Z_vulkan_llama.cpp" in vulkan
+    assert "X.Y.Z_hip_llama.cpp" in hip
+
+
+def test_windows_vulkan_and_hip_recipe_matrix_is_complete_and_pinned() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    pairs = [
+        ("llama_prerelease_vulkan_build.ps1", "llama_prerelease_hip_build.ps1"),
+        ("llama_stable_vulkan_build.ps1", "llama_stable_hip_build.ps1"),
+        ("diffusion_vulkan_llama_build.ps1", "diffusion_hip_llama_build.ps1"),
+        ("ocr_vulkan_llama_build.ps1", "ocr_hip_llama_build.ps1"),
+        (
+            "ternary_bonsai_vulkan_llama_build.ps1",
+            "ternary_bonsai_hip_llama_build.ps1",
+        ),
+        ("turboquant_vulkan_llama_build.ps1", "turboquant_hip_llama_build.ps1"),
+    ]
+    for vulkan_name, hip_name in pairs:
+        vulkan = (build_dir / vulkan_name).read_text(encoding="utf-8")
+        hip = (build_dir / hip_name).read_text(encoding="utf-8")
+        assert "-Backend Vulkan" in vulkan
+        assert "-Backend HIP" in hip
+        assert "_vulkan_llama.cpp" in vulkan
+        assert "_hip_llama.cpp" in hip
+        vulkan_commit = next(
+            (line for line in vulkan.splitlines() if "-ExpectedCommit" in line),
+            None,
+        )
+        hip_commit = next(
+            (line for line in hip.splitlines() if "-ExpectedCommit" in line),
+            None,
+        )
+        if vulkan_commit is not None:
+            assert vulkan_commit.replace("Vulkan", "HIP") == hip_commit
+
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert '"-DGGML_VULKAN=ON"' in common
+    assert '"-DGGML_HIP=OFF"' in common
+    assert '"-DGGML_HIP=ON"' in common
+    assert '"-DGGML_VULKAN=OFF"' in common
+    assert '"-DGPU_TARGETS=gfx1201"' in common
+    assert '"-DGGML_AVX_VNNI=ON"' in common
+    assert '"-DGGML_BMI2=ON"' in common
+    assert '"-G", "Ninja"' in common
+    assert '"-DCMAKE_CXX_COMPILER=$clangxx"' in common
+    assert '"-DCMAKE_HIP_COMPILER=$clang"' in common
+    assert "Get-HipCompatibilityResourceDir" in common
+    assert "llvm-pr201563" in common
+    assert "Copy-HipRuntimeDependencies" in common
+    assert 'New-Item -ItemType Junction' in common
+    for runtime_dll in (
+        "amdhip64_7.dll",
+        "amd_comgr_3.dll",
+        "hipblas.dll",
+        "rocblas.dll",
+        "hipblaslt.dll",
+    ):
+        assert runtime_dll in common
 
 
 def test_merged_qwen4exp_and_dflash2_pr_recipes_are_removed() -> None:
@@ -3806,24 +3873,24 @@ def test_resolver_finds_binary_in_sibling_llama_cpp(tmp_path, monkeypatch) -> No
     )
 
 
-def test_discovery_lists_ocr_fork_only_after_server_build(
+def test_discovery_lists_backend_twins_only_after_server_build(
     tmp_path, monkeypatch
 ) -> None:
-    """OCR forks are normal server builds to AutoTuner.
-
-    A source tree or llama-mtmd-cli-only build is intentionally skipped because
-    the OCR workflow uses /v1/chat/completions. Once llama-server exists in the
-    standard CMake output path, an ocr_b*_llama.cpp directory is discoverable.
-    """
+    """Vulkan/HIP siblings coexist; source-only or CLI-only trees are skipped."""
     from auto_tuner import _discover_llama_forks
 
     container = tmp_path / "ai-local"
-    runnable_root = container / "ocr_b17400_llama.cpp"
-    _write_fake_server(_fake_llama_server_path(runnable_root))
-    stable_root = container / "0.2.0_llama.cpp"
-    _write_fake_server(_fake_llama_server_path(stable_root))
-    legacy_semantic_root = container / "v0.1.2_llama.cpp"
-    _write_fake_server(_fake_llama_server_path(legacy_semantic_root))
+    # Use deliberately synthetic versions so a developer's real documented
+    # L:/LAB/ai-local builds cannot collide with this temp container scan.
+    runnable_roots = [
+        container / "ocr_b17499_vulkan_llama.cpp",
+        container / "ocr_b17499_hip_llama.cpp",
+        container / "9.9.9_vulkan_llama.cpp",
+        container / "9.9.9_hip_llama.cpp",
+        container / "v9.8.7_llama.cpp",  # legacy backend-neutral folder
+    ]
+    for root in runnable_roots:
+        _write_fake_server(_fake_llama_server_path(root))
 
     cli_only_root = container / "ocr_cli_only_llama.cpp"
     mtmd_name = "llama-mtmd-cli.exe" if os.name == "nt" else "llama-mtmd-cli"
@@ -3834,40 +3901,20 @@ def test_discovery_lists_ocr_fork_only_after_server_build(
     monkeypatch.chdir(tmp_path)
 
     found = _discover_llama_forks()
-    assert any(
-        name == "ocr_b17400_llama.cpp" and path.resolve() == runnable_root.resolve()
-        for name, path in found
-    )
-    assert any(
-        name == "0.2.0_llama.cpp" and path.resolve() == stable_root.resolve()
-        for name, path in found
-    )
-    assert any(
-        name == "v0.1.2_llama.cpp"
-        and path.resolve() == legacy_semantic_root.resolve()
-        for name, path in found
-    )
-    assert all(name != "ocr_cli_only_llama.cpp" for name, _path in found)
+    found_map = {name: path.resolve() for name, path in found}
+    for root in runnable_roots:
+        assert found_map.get(root.name) == root.resolve()
+    assert "ocr_cli_only_llama.cpp" not in found_map
 
     # GUI has a separate container scanner; keep its server-only contract in
     # lockstep with terminal discovery.
     from qt_launcher import MainWindow
 
     gui_found = MainWindow._expand_fork_container(container)
-    assert any(
-        name == "ocr_b17400_llama.cpp" and path.resolve() == runnable_root.resolve()
-        for name, path in gui_found
-    )
-    assert any(
-        name == "0.2.0_llama.cpp" and path.resolve() == stable_root.resolve()
-        for name, path in gui_found
-    )
-    assert any(
-        name == "v0.1.2_llama.cpp"
-        and path.resolve() == legacy_semantic_root.resolve()
-        for name, path in gui_found
-    )
-    assert all(name != "ocr_cli_only_llama.cpp" for name, _path in gui_found)
+    gui_map = {name: path.resolve() for name, path in gui_found}
+    for root in runnable_roots:
+        assert gui_map.get(root.name) == root.resolve()
+    assert "ocr_cli_only_llama.cpp" not in gui_map
 
 
 def test_dflash2_launch_finds_compatible_sibling_build(
@@ -3963,41 +4010,103 @@ def test_resolver_ignores_windows_exe_on_posix(tmp_path, monkeypatch) -> None:
     assert _resolve_server_binary("llama-server") == "llama-server"
 
 
-def test_resolver_matches_versioned_fork_dir(tmp_path, monkeypatch) -> None:
-    """A profile hint like '2b_llama/llama-server' must resolve to a
-    versioned on-disk dir like '2b_b8840_llama.cpp' after normalising the
-    '_b<NUM>' version segment — and must NOT cross-match the 1-bit family.
-    """
-    from auto_tuner import _resolve_server_binary, _fork_family
+def test_resolver_matches_backend_qualified_fork_twins(tmp_path, monkeypatch) -> None:
+    """Backend-neutral hints preserve the selected backend; explicit wins."""
+    from auto_tuner import _fork_backend, _fork_family, _resolve_server_binary
 
-    # Normalisation sanity
-    assert _fork_family("2b_b8840_llama.cpp") == "2b_llama"
-    assert _fork_family("1b_llama.cpp") == "1b_llama"
-    assert _fork_family("b9840_llama.cpp") == "llama"
-    assert _fork_family("b10548_dev_a298422da_llama.cpp") == "llama"
-    assert _fork_family("b10545_a30273376_llama.cpp") == "llama"
-    assert _fork_family("0.2.0_llama.cpp") == "llama"
-    assert _fork_family("tq_0.2.0_llama.cpp") == "tq_llama"
-    assert _fork_family("v0.1.2_llama.cpp") == "llama"  # legacy
-    assert _fork_family("tq_v0.1.2_llama.cpp") == "tq_llama"
+    expected_families = {
+        "2b_b9551_vulkan_llama.cpp": "2b_llama",
+        "2b_b9551_hip_llama.cpp": "2b_llama",
+        "b10678_vulkan_llama.cpp": "llama",
+        "b10678_hip_llama.cpp": "llama",
+        "d_b10000_hip_llama.cpp": "d_llama",
+        "ocr_b17400_vulkan_llama.cpp": "ocr_llama",
+        "tq_0.3.0_vulkan_llama.cpp": "tq_llama",
+        "b10548_dev_a298422da_llama.cpp": "llama",  # legacy
+        "1b_llama.cpp": "1b_llama",  # legacy
+    }
+    for name, family in expected_families.items():
+        assert _fork_family(name) == family
+    assert _fork_backend("2b_b9551_vulkan_llama.cpp") == "vulkan"
+    assert _fork_backend("2b_b9551_hip_llama.cpp") == "hip"
+    assert _fork_backend("2b_b9551_llama.cpp") is None
 
     auto_dir = tmp_path / "Auto Tuner"
     auto_dir.mkdir()
-    fork2b = _fake_llama_server_path(tmp_path / "ai-local" / "2b_b8840_llama.cpp")
-    fork1b = _fake_llama_server_path(tmp_path / "ai-local" / "1b_llama.cpp")
-    for s in (fork2b, fork1b):
-        _write_fake_server(s)
+    container = tmp_path / "ai-local"
+    mainline_hip = _fake_llama_server_path(container / "b10678_hip_llama.cpp")
+    fork2b_vulkan = _fake_llama_server_path(
+        container / "2b_b9551_vulkan_llama.cpp"
+    )
+    fork2b_hip = _fake_llama_server_path(container / "2b_b9551_hip_llama.cpp")
+    fork1b = _fake_llama_server_path(container / "1b_llama.cpp")
+    for server in (mainline_hip, fork2b_vulkan, fork2b_hip, fork1b):
+        _write_fake_server(server)
 
     monkeypatch.chdir(auto_dir)
-    monkeypatch.delenv("LLAMA_CPP_DIR", raising=False)
-    monkeypatch.setenv("LLAMA_CPP_DIR", str(tmp_path / "ai-local"))
+    # Point at the selected HIP build, not merely the container. A neutral
+    # profile switch must retain HIP even though Vulkan sorts first by default.
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(mainline_hip.parents[3]))
 
-    # Ternary profile hint -> versioned 2b_ fork on disk
-    res = _resolve_server_binary("2b_llama/llama-server")
-    assert Path(res).resolve() == fork2b.resolve()
-    # 1-bit hint must NOT match the 2b fork
-    res1 = _resolve_server_binary("1b_llama/llama-server")
-    assert Path(res1).resolve() == fork1b.resolve()
+    neutral = _resolve_server_binary("2b_llama/llama-server")
+    assert Path(neutral).resolve() == fork2b_hip.resolve()
+    explicit = _resolve_server_binary("2b_vulkan_llama/llama-server")
+    assert Path(explicit).resolve() == fork2b_vulkan.resolve()
+    one_bit = _resolve_server_binary("1b_llama/llama-server")
+    assert Path(one_bit).resolve() == fork1b.resolve()
+
+
+def test_gui_auto_select_preserves_backend_for_required_family() -> None:
+    from qt_launcher import MainWindow
+
+    class Combo:
+        def __init__(self) -> None:
+            self.items = [
+                "b10678_hip_llama.cpp",
+                "2b_b9551_vulkan_llama.cpp",
+                "2b_b9551_hip_llama.cpp",
+            ]
+            self.index = 0
+
+        def count(self) -> int:
+            return len(self.items)
+
+        def itemText(self, index: int) -> str:
+            return self.items[index]
+
+        def currentText(self) -> str:
+            return self.items[self.index]
+
+        def currentIndex(self) -> int:
+            return self.index
+
+        def setCurrentIndex(self, index: int) -> None:
+            self.index = index
+
+        def blockSignals(self, _blocked: bool) -> None:
+            pass
+
+    combo = Combo()
+    applied: list[int] = []
+    fake_window = types.SimpleNamespace(
+        _fork_combo=combo,
+        _fork_manual_override=False,
+        _apply_fork=lambda index: applied.append(index),
+        _log=lambda _message: None,
+    )
+
+    neutral = types.SimpleNamespace(server_binary="2b_llama/llama-server")
+    MainWindow._auto_select_fork(fake_window, neutral)
+    assert combo.index == 2  # selected mainline HIP -> required-family HIP
+    assert applied == [2]
+
+    combo.index = 0
+    explicit = types.SimpleNamespace(
+        server_binary="2b_vulkan_llama/llama-server"
+    )
+    MainWindow._auto_select_fork(fake_window, explicit)
+    assert combo.index == 1
+    assert applied[-1] == 1
 
 
 def test_eagle3_dflash_and_dspark_drafter_detection(tmp_path) -> None:

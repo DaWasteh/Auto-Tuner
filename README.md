@@ -44,8 +44,10 @@ Performance Test Result:
     priority-weighted behaviour for MoE, which stranded several GB on the
     secondary card and slowed the model down.
 
-  Device visibility is pinned via `HIP_VISIBLE_DEVICES` *and*
-  `GGML_VK_VISIBLE_DEVICES` so it works on both ROCm and Vulkan builds.
+  Device visibility is derived from the selected binary's own
+  `--list-devices` table. AutoTuner emits only that backend's selector
+  (`HIP_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`) when known, so HIP and
+  Vulkan's different physical-device order cannot silently select the wrong GPU.
 - **Free-memory aware** — context length and KV quant are picked to
   use the RAM/VRAM that's actually free *right now*, not a hard-coded
   cap. The original v1 cap of 16k context is gone.
@@ -195,10 +197,11 @@ Performance Test Result:
   restart, or change targets — the corresponding choices return.
 - **Fork-folder memory** — if you point the GUI at a parent folder
   that holds several `*_llama.cpp` builds (e.g. `C:\LAB\ai-local`),
-  the next launch re-expands the same set of builds in the dropdown. Both
-  pre-release names such as `b10566_llama.cpp` and stable names such as
-  `0.2.0_llama.cpp` (plus legacy `v0.2.0_llama.cpp`) are recognized. No more
-  re-navigating one folder up after every restart.
+  the next launch re-expands the same set of builds in the dropdown. Current
+  backend-qualified siblings such as `b10679_vulkan_llama.cpp` and
+  `b10679_hip_llama.cpp`, stable names such as `0.3.0_vulkan_llama.cpp`, and
+  legacy backend-neutral folders remain recognized. Required fork switches
+  preserve the selected HIP/Vulkan backend.
 - **Window geometry, state & inner layout** — QMainWindow
   `saveGeometry()` (size, position, maximize-state) and `saveState()`
   (toolbars/docks) are persisted as base64 in the settings JSON. **In
@@ -291,10 +294,11 @@ projector. Rebuilding `llama-server` cannot repair an old mmproj.
 AutoTuner's OCR workflow uses the persistent OpenAI-compatible HTTP server, not
 `llama-mtmd-cli`. Therefore a llama.cpp directory is shown in the fork picker
 only after it contains `build/bin/Release/llama-server.exe` (or the native
-Linux/macOS binary). `building llama.cpp/ocr_llama_build.txt` fixes the legacy
-PR #17400 recipe by building both `llama-server` and `llama-mtmd-cli`; that old
-fork remains for DeepSeek-OCR v1. Unlimited-OCR should use the current
-pre-release build from `building llama.cpp/llama_prerelease_build.txt`.
+Linux/macOS binary). `building llama.cpp/ocr_vulkan_llama_build.ps1` and
+`ocr_hip_llama_build.ps1` build both `llama-server` and `llama-mtmd-cli` from
+the exact reviewed legacy PR #17400 commit; that old fork remains for
+DeepSeek-OCR v1. Unlimited-OCR should use either current mainline recipe,
+`llama_prerelease_vulkan_build.ps1` or `llama_prerelease_hip_build.ps1`.
 
 ## Installation
 
@@ -921,41 +925,47 @@ repo keeps the build recipes in separate scripts so this README stays short:
 
 | File | Purpose |
 |------|---------|
-| [`llama_stable_build.txt`](building%20llama.cpp/llama_stable_build.txt) | Stable llama.cpp Vulkan build. Resolves the newest published `X.Y.Z` release (accepting upstream's optional `v` tag prefix), writes `X.Y.Z_llama.cpp`, disables dev versioning, and verifies the corresponding compatibility build. |
-| [`llama_prerelease_build.txt`](building%20llama.cpp/llama_prerelease_build.txt) | Mainline/pre-release llama.cpp Vulkan build (Windows/AMD-friendly; exact `bNNNN` tags use `bNNNN_llama.cpp`, untagged master uses `bNNNN_dev_COMMIT_llama.cpp`; runtime also verifies the current `X.Y.Z-dev` line). |
-| [`turboquant_llama_build.txt`](building%20llama.cpp/turboquant_llama_build.txt) | TurboQuant KV-cache fork (`tq_bXXXX_llama.cpp`). |
-| [`ternary_bonsai_llama_build.txt`](building%20llama.cpp/ternary_bonsai_llama_build.txt) | PrismML Ternary/Bonsai fork (`2b_bXXXX_llama.cpp`), including the old-fork OpenSSL workaround. |
-| [`diffusion_llama_build.txt`](building%20llama.cpp/diffusion_llama_build.txt) | DiffusionGemma PR build with Vulkan. |
-| [`diffusion_hip_llama_build.txt`](building%20llama.cpp/diffusion_hip_llama_build.txt) | DiffusionGemma HIP/ROCm build for AMD when Vulkan hits the ~1 GiB single-allocation limit. |
-| [`setup_llamacpp_cuda.ps1`](building%20llama.cpp/setup_llamacpp_cuda.ps1) | Windows NVIDIA/CUDA one-shot setup helper (PowerShell/Admin; freak288-style script). |
+| [`build_all_windows_llama.ps1`](building%20llama.cpp/build_all_windows_llama.ps1) | Freezes the newest stable/pre-release inputs once, then builds every Windows Vulkan/HIP pair below. It never deletes prior builds. |
+| [`llama_stable_vulkan_build.ps1`](building%20llama.cpp/llama_stable_vulkan_build.ps1) / [`llama_stable_hip_build.ps1`](building%20llama.cpp/llama_stable_hip_build.ps1) | Stable `X.Y.Z` siblings: `X.Y.Z_vulkan_llama.cpp` and `X.Y.Z_hip_llama.cpp`. |
+| [`llama_prerelease_vulkan_build.ps1`](building%20llama.cpp/llama_prerelease_vulkan_build.ps1) / [`llama_prerelease_hip_build.ps1`](building%20llama.cpp/llama_prerelease_hip_build.ps1) | Latest exact `bNNNN` siblings, or truthful `bNNNN_dev_COMMIT_{backend}_llama.cpp` folders with `-Tag master`. |
+| [`turboquant_vulkan_llama_build.ps1`](building%20llama.cpp/turboquant_vulkan_llama_build.ps1) / [`turboquant_hip_llama_build.ps1`](building%20llama.cpp/turboquant_hip_llama_build.ps1) | Pinned TurboQuant KV-cache fork (`tq_bNNNN_{backend}_llama.cpp`). |
+| [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork (`2b_bNNNN_{backend}_llama.cpp`). |
+| [`diffusion_vulkan_llama_build.ps1`](building%20llama.cpp/diffusion_vulkan_llama_build.ps1) / [`diffusion_hip_llama_build.ps1`](building%20llama.cpp/diffusion_hip_llama_build.ps1) | Pinned DiffusionGemma PR #24427 pair; HIP avoids Vulkan's ~1 GiB single-allocation limit. |
+| [`ocr_vulkan_llama_build.ps1`](building%20llama.cpp/ocr_vulkan_llama_build.ps1) / [`ocr_hip_llama_build.ps1`](building%20llama.cpp/ocr_hip_llama_build.ps1) | Reviewed legacy DeepSeek-OCR PR #17400 pair; both build server + MTMD CLI. |
+| [`diffusion_vulkan_llama_build_ubuntu.sh`](building%20llama.cpp/diffusion_vulkan_llama_build_ubuntu.sh) | Ubuntu DiffusionGemma Vulkan recipe with an explicit `_ubuntu_vulkan_` output. |
+| [`windows_llama_build_common.ps1`](building%20llama.cpp/windows_llama_build_common.ps1) | Shared validated Windows implementation; not a standalone recipe. |
+| [`setup_llamacpp_cuda.ps1`](building%20llama.cpp/setup_llamacpp_cuda.ps1) | Windows NVIDIA/CUDA one-shot setup helper. |
 | [`setup_llamacpp_turboquant_cuda.ps1`](building%20llama.cpp/setup_llamacpp_turboquant_cuda.ps1) | Windows NVIDIA/CUDA TurboQuant setup helper. |
 
-The `*.txt` build recipes are PowerShell commands for the documented local
-workspace (`L:/LAB/ai-local` on the documented Pandaking setup). They handle both llama.cpp UI
-layouts automatically (`tools/ui` since b9174, `tools/server/webui` on older
-forks) and fall back to the prebuilt UI if the fork does not ship UI sources.
-Both upstream recipes deliberately keep full Git history (so the embedded
-numeric compatibility build is not incorrectly reported as `b1`). The
-pre-release recipe distinguishes an exact `bNNNN` tag from an untagged HEAD,
-reads the semantic base from upstream CMake, and checks the compiled binary's
-`X.Y.Z-dev` plus build number against `git rev-list --count HEAD`; it never
-labels a development snapshot as a published pre-release. The stable recipe
-resolves the newest published `X.Y.Z` release, verifies the matching `bNNNN`
-compatibility commit, writes an unambiguous `X.Y.Z_llama.cpp` folder, and sets
-`LLAMA_BUILD_IS_DEV=OFF`, making `llama-server --version` report the exact
-stable semantic version plus its real build number for AutoTuner's feature
-gates. The CUDA setup helper likewise creates a fresh truthful folder instead
-of pulling newer source into an older `bNNNN` folder.
+Run a recipe with `pwsh -File <recipe>.ps1`. The Pandaking
+HIP recipes pin ROCm HIP SDK 7.2.3 and compile only `gfx1201`, shared by the RX
+9070 XT and AI PRO R9700. They use upstream's required Windows combination of
+Ninja plus ROCm `clang`/`clang++`; Vulkan remains a separate Visual Studio tree.
+The installed SDK still lacks LLVM PR #201563, so the helper applies that exact
+HIP/MSVC `<cmath>` include-order fix to a workspace-local clang resource copy.
+It also places matching ROCm 7 DLLs beside each executable and links the SDK's
+rocBLAS/hipBLASLt kernel directories, preventing Windows from loading a stale
+System32/ROCm 7.1 runtime. Both backends enable AVX2, AVX-VNNI and BMI2 while
+keeping AVX-512 off. Vulkan shader capabilities (integer dot/cooperative
+matrix/BF16) are detected by current `glslc`, not guessed through a GPU target.
+
+Mainline clones retain full history so the embedded compatibility build is
+truthful. Stable and pre-release recipes verify tag, commit, numeric build,
+runtime version, backend-exclusive device listing, and both AMD cards. Mutable
+third-party branch/PR recipes are pinned to reviewed 2026-08-28 commits so each
+Vulkan/HIP sibling is source-identical, and no recipe recursively replaces a
+known-good destination. The CUDA helpers remain backend-neutral legacy output
+producers and are not renamed automatically.
 
 Ubuntu/Linux users can either build upstream llama.cpp normally or adapt the
 same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10666)
+## Server features (compatible through llama.cpp b10679)
 
-Build/version probing, complete profile-command matrices, and real server
-launches are validated through exact stock **b10666** (`4e97ac86e`). The following
+Build/version probing, complete profile-command matrices, and backend smoke
+checks are validated through exact stock **b10679** (`50f068fff`). The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
 
@@ -993,6 +1003,24 @@ launches are validated through exact stock **b10666** (`4e97ac86e`). The followi
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+
+### Review b10666 → b10679
+
+Reviewed all **13 upstream commits** from exact tag **b10666** (`4e97ac86e`)
+through **b10679** (`50f068fff`). Full source/build evidence is in
+[`docs/llama-b10679-audit.md`](docs/llama-b10679-audit.md).
+
+- No emitted `llama-server` option changed; no additional AutoTuner command
+  pruning is required.
+- b10675 hoists Vulkan MoE row IDs/expert counts and b10677 fixes graph
+  reordering across aliased views. Rebuilding is sufficient to receive both.
+- b10678 reduces Qwen3.8 Flash Next (`qwen4exp`) graph splits without changing
+  its GGUF/CLI/allocation contract, so the measured planner coefficients stand.
+- b10679 renames only the C API's lazy-read enum/field to `llama_lazy_mode` /
+  `lazy_mode`; `--tensor-read-lazy` is unchanged and is newly accepted by
+  `llama-bench`. AutoTuner links no C API, so no launch-code migration is needed.
+- Windows Vulkan/HIP outputs are now unambiguous backend siblings, and
+  backend-neutral profile hints retain the backend selected in the GUI/TUI.
 
 ### Review b10590 → b10666
 
@@ -1211,7 +1239,7 @@ Changes this round are AutoTuner-side additions and fork-build fixes:
   even without `LLAMA_CPP_DIR` set.
 - **`bonsai-ternary.yaml`** corrected: `server_binary` now points to
   `2b_llama` (2-bit/Ternary fork), not `1b_llama` (1-bit Bonsai).
-- **Build scripts** (`*_build.txt`) now probe BOTH UI layouts — pre-b9174
+- **Build scripts** (historically `*_build.txt`, now executable `*.ps1`) probe BOTH UI layouts — pre-b9174
   `tools/server/webui/` and post-b9174 `tools/ui/` — and fall back to the
   HF prebuilt UI when neither exists. The Bonsai (b8840-basis) build adds
   `-DLLAMA_OPENSSL=OFF` to work around the cpp-httplib 0.40.0 / OpenSSL 3.2+

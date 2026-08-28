@@ -6428,11 +6428,14 @@ class MainWindow(QMainWindow):
             for name, fork_path in self._expand_fork_container(root):
                 add(name, fork_path)
 
-        def _fork_sort_key(item: Tuple[str, Path]) -> tuple:
-            name_lower = item[0].lower()
-            return (name_lower != "llama.cpp", name_lower)
+        from auto_tuner import _fork_name_sort_key
 
-        forks.sort(key=_fork_sort_key)
+        forks.sort(
+            key=lambda item: (
+                item[0].lower() != "llama.cpp",
+                *_fork_name_sort_key(item[0]),
+            )
+        )
         return forks
 
     def _populate_fork_combo(
@@ -8163,55 +8166,66 @@ class MainWindow(QMainWindow):
             self._current_draft = None
 
     def _auto_select_fork(self, profile: ModelProfile) -> None:
-        """Auto-select fork from combo based on profile requirement.
+        """Select a required fork family without losing the active backend.
 
-        If the user has manually selected a fork (via dropdown or folder browse),
-        respect that choice and do NOT override it — unless the profile requires
-        a specific fork that is not available.
+        Profile hints stay backend-neutral. When both optimized siblings exist,
+        switching from a HIP mainline build chooses the HIP fork and switching
+        from Vulkan stays on Vulkan. An explicitly backend-qualified hint wins.
         """
-        # Respect manual user override — only auto-switch if profile demands it
-        if self._fork_manual_override:
-            # Check if profile requires a specific fork
-            if profile.server_binary:
-                first = Path(profile.server_binary).parts[0]
-                if not first.endswith(".cpp"):
-                    first = first + ".cpp"
-                first_l = first.lower()
-                found = False
-                for i in range(self._fork_combo.count()):
-                    item_l = self._fork_combo.itemText(i).lower()
-                    if item_l == first_l or item_l.rstrip(".cpp") in first_l:
-                        found = True
-                        break
-                if not found:
-                    self._log(
-                        f"[Fork] Profile requires '{first}' but it's not available. "
-                        f"Keeping manual selection: {self._fork_combo.currentText()}"
-                    )
-                # Keep manual selection regardless
+        if not profile.server_binary:
             return
 
-        # No manual override — apply profile-based auto-selection
-        if profile.server_binary:
-            first = Path(profile.server_binary).parts[0]
-            if not first.endswith(".cpp"):
-                first = first + ".cpp"
-            first_l = first.lower()
-            for i in range(self._fork_combo.count()):
-                item_l = self._fork_combo.itemText(i).lower()
-                if item_l == first_l or item_l.rstrip(".cpp") in first_l:
-                    if self._fork_combo.currentIndex() != i:
-                        self._fork_combo.blockSignals(True)
-                        self._fork_combo.setCurrentIndex(i)
-                        self._fork_combo.blockSignals(False)
-                        self._apply_fork(i)
-                        self._log(
-                            f"[Fork] Auto-selected: {self._fork_combo.itemText(i)}"
-                        )
-                    return
-        else:
-            # No specific fork required — keep current selection, don't reset
-            pass
+        from auto_tuner import _fork_backend, _fork_family, _fork_name_sort_key
+
+        first = Path(profile.server_binary).parts[0]
+        if not first.endswith(".cpp"):
+            first = first + ".cpp"
+        required_family = _fork_family(first)
+        required_backend = _fork_backend(first)
+        current_text = self._fork_combo.currentText()
+        current_backend = _fork_backend(current_text)
+
+        matching: List[int] = []
+        for i in range(self._fork_combo.count()):
+            item = self._fork_combo.itemText(i)
+            if _fork_family(item) != required_family:
+                continue
+            item_backend = _fork_backend(item)
+            if required_backend and item_backend not in (required_backend, None):
+                continue
+            matching.append(i)
+
+        if self._fork_manual_override:
+            if not matching:
+                self._log(
+                    f"[Fork] Profile requires '{first}' but it's not available. "
+                    f"Keeping manual selection: {current_text}"
+                )
+            return
+
+        current_family_matches = _fork_family(current_text) == required_family
+        current_backend_matches = (
+            not required_backend or current_backend in (required_backend, None)
+        )
+        if current_family_matches and current_backend_matches:
+            return
+        if not matching:
+            return
+
+        preferred_backend = required_backend or current_backend
+        matching.sort(
+            key=lambda index: _fork_name_sort_key(
+                self._fork_combo.itemText(index),
+                preferred_backend=preferred_backend,
+            )
+        )
+        chosen = matching[0]
+        if self._fork_combo.currentIndex() != chosen:
+            self._fork_combo.blockSignals(True)
+            self._fork_combo.setCurrentIndex(chosen)
+            self._fork_combo.blockSignals(False)
+            self._apply_fork(chosen)
+            self._log(f"[Fork] Auto-selected: {self._fork_combo.itemText(chosen)}")
 
     # ------------------------------------------------------------------
     # Per-option toggle slots
@@ -11717,7 +11731,7 @@ class MainWindow(QMainWindow):
                     "einem DiffusionGemma-Fähigen Build (PR #24427).\n\n"
                     "Wähle im Fork-Dropdown den Build, der "
                     "llama-diffusion-gemma-server enthält (z.B. "
-                    "d_b9781_llama.cpp / d_bXXXX_hip_llama.cpp).",
+                    "d_bXXXX_vulkan_llama.cpp / d_bXXXX_hip_llama.cpp).",
                 )
                 return
             cmd = build_diffusion_server_command(

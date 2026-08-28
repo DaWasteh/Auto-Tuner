@@ -13,7 +13,8 @@ max_context: 262144
 recommended_kv_quant: q8_0
 
 # Das veröffentlichte Q2_0-g128-GGUF braucht weiterhin PrismMLs prism-Fork.
-# Auto Tuner findet damit versionierte Ordner wie 2b_bXXXX_llama.cpp.
+# AutoTuner findet beide versionierten Backends, z.B.
+# 2b_bXXXX_vulkan_llama.cpp und 2b_bXXXX_hip_llama.cpp.
 server_binary: "2b_llama/llama-server"
 
 # Erforderlich für natives OpenAI-Tool-Calling des Qwen3.6-Backbones.

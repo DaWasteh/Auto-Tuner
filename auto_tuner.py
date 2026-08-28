@@ -903,11 +903,20 @@ def _candidate_search_roots() -> List[Path]:
         parent = Path(env_dir).expanduser()
         # Also add siblings: other forks next to the selected one
         try:
-            for sibling in parent.parent.iterdir():
-                if sibling.is_dir() and re.search(
-                    r"llama", sibling.name, re.IGNORECASE
-                ):
-                    add(sibling)
+            preferred_backend = _fork_backend(parent.name)
+            siblings = [
+                sibling
+                for sibling in parent.parent.iterdir()
+                if sibling.is_dir()
+                and re.search(r"llama", sibling.name, re.IGNORECASE)
+            ]
+            siblings.sort(
+                key=lambda sibling: _fork_name_sort_key(
+                    sibling.name, preferred_backend=preferred_backend
+                )
+            )
+            for sibling in siblings:
+                add(sibling)
         except (OSError, PermissionError):
             pass
         # If env_dir is a CONTAINER (a parent holding several *_llama.cpp
@@ -916,17 +925,23 @@ def _candidate_search_roots() -> List[Path]:
         # child dir like '2b_b8840_llama.cpp'. Without this the resolver only
         # sees the container, not the forks inside it.
         try:
-            for child in parent.iterdir():
-                if child.is_dir() and re.search(r"llama", child.name, re.IGNORECASE):
-                    add(child)
+            children = [
+                child
+                for child in parent.iterdir()
+                if child.is_dir() and re.search(r"llama", child.name, re.IGNORECASE)
+            ]
+            children.sort(key=lambda child: _fork_name_sort_key(child.name))
+            for child in children:
+                add(child)
         except (OSError, PermissionError):
             pass
         add(parent.parent / "BitNet")
 
     bases = [Path(__file__).resolve().parent, Path.cwd()]
-    # Fork hint list — the on-disk names produced by the build scripts
-    # follow '{prefix}_b{NUM}_llama.cpp' (versioned) or '{prefix}_llama.cpp'
-    # (unversioned). The versioned form is NOT listed here because it varies
+    # Fork hint list — current build scripts produce backend-qualified names
+    # such as '{prefix}_b{NUM}_{vulkan|hip}_llama.cpp'; legacy installations
+    # may still use '{prefix}_llama.cpp'. Versioned forms are not listed here
+    # because they vary
     # per build; the fork discovery (_discover_llama_forks) finds those by
     # directory walk + binary probe. These bare names are only hint anchors
     # for the candidate-root search when a user still uses the unversioned
@@ -956,37 +971,60 @@ def _candidate_search_roots() -> List[Path]:
     return roots
 
 
-# Fork dir naming convention: '{prefix}_llama.cpp', pre-release
-# '{prefix}_b{NUM}_llama.cpp', stable '{prefix}_X.Y.Z_llama.cpp' (plus legacy
-# '{prefix}_vX.Y.Z_llama.cpp'), or bare names such as 'b10485_llama.cpp',
-# '0.2.0_llama.cpp', and 'llama.cpp'. A master checkout without an exact b-tag
-# uses the truthful form 'b10548_dev_a298422da_llama.cpp'. To match a profile's
-# fork hint (e.g. "2b_llama") against the versioned dir actually on disk,
-# normalize both to a family form by stripping '.cpp' and the complete
-# build/version segment:
-#     '2b_b8840_llama.cpp'              -> '2b_llama'
-#     '2b_llama.cpp'                    -> '2b_llama'
-#     'b9840_llama.cpp'                 -> 'llama'
-#     'b10548_dev_a298422da_llama.cpp'  -> 'llama'
-#     '0.2.0_llama.cpp'                 -> 'llama'
-#     'v0.1.2_llama.cpp'                -> 'llama'  (legacy folder)
-#     'tq_0.2.0_llama.cpp'              -> 'tq_llama'
-#     '1b_llama.cpp'                    -> '1b_llama'
-# This keeps the 1-bit ('1b_') and 2-bit/Ternary ('2b_') families distinct
-# while tolerating stable, pre-release, development, and legacy names.
+# Fork dir naming convention: backend-qualified current builds use
+# '{prefix}_b{NUM}_{vulkan|hip}_llama.cpp' or
+# '{version}_{vulkan|hip}_llama.cpp'. Legacy backend-neutral forms remain
+# discoverable. To match a backend-neutral profile hint (for example
+# '2b_llama') against either optimized sibling, strip only the complete
+# version and terminal backend token:
+#     '2b_b8840_vulkan_llama.cpp'       -> '2b_llama'
+#     '2b_b8840_hip_llama.cpp'          -> '2b_llama'
+#     'b10678_vulkan_llama.cpp'         -> 'llama'
+#     'b10678_hip_llama.cpp'            -> 'llama'
+#     'b10548_dev_a298422da_llama.cpp'  -> 'llama'  (legacy dev)
+#     'tq_0.3.0_vulkan_llama.cpp'       -> 'tq_llama'
+#     '1b_llama.cpp'                    -> '1b_llama' (legacy)
+# This keeps the 1-bit ('1b_') and 2-bit/Ternary ('2b_') families distinct.
 _FORK_VERSION_RE = re.compile(
     r"(?:^|_)(?:b\d+(?:_dev)?(?:_[0-9a-f]{7,40})?|v?\d+\.\d+\.\d+)(?=_|$)",
     re.IGNORECASE,
 )
+_FORK_BACKEND_RE = re.compile(
+    r"(?:^|_)(vulkan|hip)(?=_llama(?:\.cpp)?$)", re.IGNORECASE
+)
+
+
+def _fork_backend(name: str) -> Optional[str]:
+    """Return the explicit terminal backend token in a build name, if any."""
+    match = _FORK_BACKEND_RE.search(name.lower())
+    return match.group(1).lower() if match else None
 
 
 def _fork_family(name: str) -> str:
-    """Normalize a fork dir/name to its family form for fuzzy matching."""
+    """Normalize a fork dir/name to its backend-neutral family form."""
     n = name.lower()
     if n.endswith(".cpp"):
         n = n[:-4]
     n = _FORK_VERSION_RE.sub("", n).lstrip("_")
-    return n
+    n = re.sub(r"(^|_)(?:vulkan|hip)(?=_llama$)", "", n)
+    return n.lstrip("_")
+
+
+def _fork_name_sort_key(name: str, preferred_backend: Optional[str] = None) -> tuple:
+    """Deterministically group backend twins and prefer an active backend.
+
+    An explicit/persisted selected backend wins. Otherwise Vulkan sorts before
+    HIP to preserve the historically validated default; users can still select
+    either clearly labeled sibling.
+    """
+    lower = name.lower()
+    backend = _fork_backend(lower)
+    if preferred_backend:
+        backend_rank = 0 if backend == preferred_backend else 1 if backend else 2
+    else:
+        backend_rank = {"vulkan": 0, "hip": 1, None: 2}.get(backend, 3)
+    backendless = _FORK_BACKEND_RE.sub("", lower)
+    return (_fork_family(lower), backendless, backend_rank, lower)
 
 
 def _resolve_server_binary(user_value: str) -> str:
@@ -1005,16 +1043,31 @@ def _resolve_server_binary(user_value: str) -> str:
         inner = Path(*parts[1:]) if len(parts) > 1 else None
 
         if inner is not None and fork_name:
-            for root in _candidate_search_roots():
+            roots = _candidate_search_roots()
+            requested_backend = _fork_backend(fork_name)
+            if requested_backend:
+                roots.sort(
+                    key=lambda root: _fork_name_sort_key(
+                        root.name, preferred_backend=requested_backend
+                    )
+                )
+            for root in roots:
                 root_base = root.name.lower()
+                root_backend = _fork_backend(root_base)
+                if (
+                    requested_backend
+                    and root_backend
+                    and root_backend != requested_backend
+                ):
+                    continue
                 if root_base.endswith(".cpp"):
                     root_base = root_base[:-4]
                 if (
                     root_base.startswith(fork_name)
                     or fork_name.startswith(root_base)
-                    # Fuzzy fallback: match after normalizing version
-                    # segments out of both names, so a profile hint '2b_llama'
-                    # resolves to an on-disk dir '2b_b8840_llama.cpp'.
+                    # Fuzzy fallback: normalize version + terminal backend,
+                    # so '2b_llama' resolves to either source-identical
+                    # '2b_bNNNN_vulkan_llama.cpp' / '_hip_llama.cpp' sibling.
                     or _fork_family(root_base).startswith(_fork_family(fork_name))
                     or _fork_family(fork_name).startswith(_fork_family(root_base))
                 ):
@@ -1322,16 +1375,14 @@ def _discover_llama_forks() -> List[Tuple[str, Path]]:
             seen.add(rp)
             forks.append((name, rp))
 
-    # Sort: bare "llama.cpp" first (case-insensitive), then other *llama.cpp* forks alphabetically
-    def _fork_sort_key(item: Tuple[str, Path]) -> tuple:
-        name = item[0]
-        name_lower = name.lower()
-        is_bare = name_lower == "llama.cpp"
-        # Strip common prefixes like "1b_", "atq_" etc for better sorting
-        stripped = re.sub(r"^[\w-]+(?=_llama\.cpp)", "", name_lower)
-        return (not is_bare, stripped)
-
-    forks.sort(key=_fork_sort_key)
+    # Bare legacy llama.cpp first, then family/version pairs with Vulkan before
+    # HIP. Persisted GUI/CLI selections still override this fallback order.
+    forks.sort(
+        key=lambda item: (
+            item[0].lower() != "llama.cpp",
+            *_fork_name_sort_key(item[0]),
+        )
+    )
     return forks
 
 
@@ -1895,9 +1946,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             if required_fork:
                 selected_name = selected_fork_path.name.lower()
                 req_lower = required_fork.lower()
-                # Compare on the family form so a versioned fork dir
-                # (e.g. '2b_b8840_llama.cpp') is recognized as matching a
-                # profile requirement of '2b_llama.cpp'.
+                # Compare on the backend-neutral family form so both
+                # '2b_bNNNN_vulkan_llama.cpp' and '_hip_llama.cpp' match the
+                # profile requirement '2b_llama.cpp'.
                 if _fork_family(selected_name) != _fork_family(req_lower):
                     print(
                         f"\n[AutoTuner] ⚠  Profile '{profile.display_name}' "
@@ -1910,6 +1961,12 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                         for n, p in discovered_forks
                         if _fork_family(n) == _fork_family(req_lower)
                     ]
+                    selected_backend = _fork_backend(selected_name)
+                    matching.sort(
+                        key=lambda item: _fork_name_sort_key(
+                            item[0], preferred_backend=selected_backend
+                        )
+                    )
                     if matching:
                         switch = non_interactive or _confirm(
                             f"Switch to {required_fork} for this model?",

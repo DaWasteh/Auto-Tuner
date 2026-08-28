@@ -8,7 +8,8 @@ recommended_kv_quant: q8_0
 
 # Braucht ebenfalls den PrismML-Fork - Q2_0 Format packt die 1.58-bit
 # Ternary-Gewichte hardware-freundlich in 2 bits. Der 2-bit/Ternary-Fork
-# heisst 2b_ (Build: 2b_bXXXX_llama.cpp); 1b_ ist der 1-bit Bonsai-Fork.
+# heisst 2b_ (Builds: 2b_bXXXX_vulkan_llama.cpp / _hip_llama.cpp);
+# 1b_ ist der 1-bit Bonsai-Fork. Der Profilhinweis bleibt backend-neutral.
 server_binary: "2b_llama/llama-server"
 
 # Sampling-Profile pro Modus.

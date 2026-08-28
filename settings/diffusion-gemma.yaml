@@ -27,7 +27,8 @@ runner: llama-diffusion-gemma-server
 # Binary: KEIN server_binary/Pfad hier eintragen. llama-diffusion-cli wird
 # automatisch in dem llama.cpp-Build gesucht, den du im Fork-Dropdown der
 # GUI auswählst (bzw. unter LLAMA_CPP_DIR). Wähle einfach deinen
-# diffusionsfähigen Build (z.B. "d_b9654_llama.cpp") im Dropdown — der
+# diffusionsfähigen Build (z.B. "d_b9654_vulkan_llama.cpp" oder
+# "d_b9654_hip_llama.cpp") im Dropdown — der
 # AutoTuner findet darin build/bin/[Release/]llama-diffusion-cli. So musst
 # du bei jedem neuen Compile NICHTS am Code/Profil ändern.
 #
@@ -89,8 +90,8 @@ notes: >
   für den normalen llama-server). Es läuft über llama-diffusion-gemma-server
   (PR #24427) — einen EIGENEN OpenAI-kompatiblen HTTP-Server mit /health,
   /v1/chat/completions, /props und Port-Binding. Wähle deinen Diffusion-
-  Build im Fork-Dropdown der GUI (z.B. "d_b9781_llama.cpp" oder den
-  HIP-Build "d_bXXXX_hip_llama.cpp"); der AutoTuner findet
+  Build im Fork-Dropdown der GUI (z.B. "d_bXXXX_vulkan_llama.cpp" oder
+  "d_bXXXX_hip_llama.cpp"); der AutoTuner findet
   llama-diffusion-gemma-server automatisch darin, kein Pfad muss hartcodiert
   werden. Der Server ist persistent abfragbar (Chat-UI, RooCode, OpenAI-
   Clients) — Port/Zustand wie bei jedem anderen Server. Mainline b9700
