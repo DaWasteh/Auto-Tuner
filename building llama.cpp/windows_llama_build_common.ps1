@@ -450,6 +450,235 @@ function Find-LlamaServerBinary {
     throw "llama-server.exe was not produced under $Repo"
 }
 
+function Stop-ProcessTreeBounded {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [ValidateRange(1, 60000)][int]$TimeoutMilliseconds = 10000
+    )
+
+    if ($Process.HasExited) {
+        return
+    }
+    try {
+        $Process.Kill($true)
+    } catch {
+        # The process can exit between HasExited and Kill. Ignore only that
+        # benign race; every other termination failure must fail the gate.
+        if (-not $Process.HasExited) {
+            throw
+        }
+    }
+    if (-not $Process.HasExited -and -not $Process.WaitForExit($TimeoutMilliseconds)) {
+        throw "process $($Process.Id) did not exit within $TimeoutMilliseconds ms"
+    }
+}
+
+function Get-TaskTextBounded {
+    param(
+        [object]$Task,
+        [ValidateRange(1, 60000)][int]$TimeoutMilliseconds = 5000
+    )
+
+    if ($null -eq $Task) {
+        return ""
+    }
+    if (-not $Task.Wait($TimeoutMilliseconds)) {
+        throw "redirected process stream did not close within $TimeoutMilliseconds ms"
+    }
+    return $Task.GetAwaiter().GetResult()
+}
+
+function Remove-FailedLlamaStagingDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+    try {
+        Remove-Item $Path -Recurse -Force
+        Write-Host "==> Removed failed $Description staging tree: $Path"
+    } catch {
+        # Cleanup must never hide the original clone/identity error.
+        Write-Warning "Could not remove failed $Description staging tree '$Path': $($_.Exception.Message)"
+    }
+}
+
+function Get-FreeLoopbackPort {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function Resolve-HipSemanticValidationModel {
+    $override = [Environment]::GetEnvironmentVariable("AUTOTUNER_HIP_VERIFY_MODEL")
+    if ($override) {
+        if (-not (Test-Path $override -PathType Leaf)) {
+            throw "AUTOTUNER_HIP_VERIFY_MODEL does not point to a GGUF file: $override"
+        }
+        return (Resolve-Path $override).Path
+    }
+
+    # The Windows HIP recipes are intentionally pinned to Pandaking's dual-RDNA4
+    # workstation. Keep one small, deterministic Qwen3 model as a correctness
+    # oracle so a fast but numerically corrupt multi-GPU build can never pass.
+    $defaultModel = "I:\models\Microsoft\fastcontext-1.0-4b-rl-q8_0.gguf"
+    if (-not (Test-Path $defaultModel -PathType Leaf)) {
+        throw "HIP semantic verification model not found: $defaultModel. Set AUTOTUNER_HIP_VERIFY_MODEL to a compatible Qwen3 GGUF."
+    }
+    return $defaultModel
+}
+
+function Test-HipMultiGpuSemanticOutput {
+    param(
+        [Parameter(Mandatory = $true)][string]$Server,
+        [Parameter(Mandatory = $true)][string]$Model
+    )
+
+    $expected = "HIP MULTI GPU OK"
+    $alias = "autotuner-hip-verify"
+    $port = Get-FreeLoopbackPort
+    $arguments = @(
+        "-m", $Model,
+        "-c", "4096",
+        "-ngl", "999",
+        "-t", "4",
+        "-tb", "4",
+        "-b", "512",
+        "-ub", "256",
+        "--host", "127.0.0.1",
+        "--port", "$port",
+        "--tensor-split", "0.667,0.333",
+        "--main-gpu", "0",
+        "--parallel", "1",
+        "-fa", "on",
+        "-a", $alias
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Server
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Environment["HIP_VISIBLE_DEVICES"] = "0,1"
+    foreach ($argument in $arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $stdoutTask = $null
+    $stderrTask = $null
+    $failure = $null
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
+    $assistantContent = ""
+    $started = $false
+    try {
+        if (-not $process.Start()) {
+            throw "llama-server process did not start"
+        }
+        $started = $true
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        $ready = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(180)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) {
+                throw "llama-server exited during semantic-check startup (code $($process.ExitCode))"
+            }
+            try {
+                $health = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:$port/health" `
+                    -TimeoutSec 2 `
+                    -ErrorAction Stop
+                if ([string]$health.status -eq "ok") {
+                    $ready = $true
+                    break
+                }
+            } catch {
+                # The server is still loading the bounded 4B validation model.
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $ready) {
+            throw "llama-server did not become ready within 180 seconds"
+        }
+
+        $request = @{
+            model = $alias
+            messages = @(@{
+                role = "user"
+                content = "Reply with exactly: $expected"
+            })
+            seed = 424242
+            temperature = 0.0
+            top_k = 1
+            max_tokens = 32
+            stream = $false
+            chat_template_kwargs = @{ enable_thinking = $false }
+        } | ConvertTo-Json -Depth 8 -Compress
+        $response = Invoke-RestMethod `
+            -Method Post `
+            -Uri "http://127.0.0.1:$port/v1/chat/completions" `
+            -ContentType "application/json" `
+            -Body $request `
+            -TimeoutSec 120 `
+            -ErrorAction Stop
+        $assistantContent = [string]$response.choices[0].message.content
+        if ($assistantContent.Trim() -ne $expected) {
+            throw "expected '$expected', got '$($assistantContent.Trim())'"
+        }
+    } catch {
+        $failure = $_.Exception
+    } finally {
+        if ($started) {
+            try {
+                Stop-ProcessTreeBounded -Process $process -TimeoutMilliseconds 10000
+            } catch {
+                $cleanupErrors.Add($_.Exception.Message)
+            }
+        }
+    }
+
+    $stdout = ""
+    $stderr = ""
+    foreach ($stream in @(
+        @{ Name = "stdout"; Task = $stdoutTask },
+        @{ Name = "stderr"; Task = $stderrTask }
+    )) {
+        try {
+            $text = Get-TaskTextBounded -Task $stream.Task -TimeoutMilliseconds 5000
+            if ($stream.Name -eq "stdout") { $stdout = $text } else { $stderr = $text }
+        } catch {
+            $cleanupErrors.Add("$($stream.Name): $($_.Exception.Message)")
+        }
+    }
+    try {
+        $process.Dispose()
+    } catch {
+        $cleanupErrors.Add("process dispose: $($_.Exception.Message)")
+    }
+
+    if ($failure -or $cleanupErrors.Count -gt 0) {
+        $primary = if ($failure) { $failure.Message } else { "process cleanup failed" }
+        $cleanup = if ($cleanupErrors.Count -gt 0) {
+            "`nCleanup: $($cleanupErrors -join '; ')"
+        } else { "" }
+        $tail = (($stdout + "`n" + $stderr) -split "`r?`n" | Select-Object -Last 30) -join "`n"
+        throw "HIP multi-GPU semantic verification failed: $primary$cleanup`n$tail"
+    }
+
+    Write-Host "==> HIP multi-GPU semantic output verified: $assistantContent"
+}
+
 function Test-LlamaBuildOutput {
     param(
         [Parameter(Mandatory = $true)][string]$Repo,
@@ -500,6 +729,19 @@ function Test-LlamaBuildOutput {
     }
     if ($deviceOutput -match "(?im)^\s*$wrongPrefix\d+:") {
         throw "$Backend build unexpectedly also exposes the $wrongPrefix backend"
+    }
+
+    if ($Backend -eq "HIP") {
+        $cache = Join-Path $Repo "build\CMakeCache.txt"
+        if (-not (Test-Path $cache -PathType Leaf)) {
+            throw "HIP CMake cache was not found: $cache"
+        }
+        $cacheText = Get-Content $cache -Raw
+        if ($cacheText -notmatch '(?m)^GGML_CUDA_NO_PEER_COPY:BOOL=ON\s*$') {
+            throw "Unsafe HIP build: GGML_CUDA_NO_PEER_COPY must be ON to prevent silent Windows multi-GPU output corruption"
+        }
+        $validationModel = Resolve-HipSemanticValidationModel
+        Test-HipMultiGpuSemanticOutput -Server $server -Model $validationModel
     }
 
     Write-Host "==> Verified $Backend output: $server"
@@ -638,6 +880,11 @@ function Invoke-LlamaCMakeBuild {
             "-DGGML_HIP_GRAPHS=ON",
             "-DGGML_HIP_NO_VMM=ON",
             "-DGGML_HIP_RCCL=OFF",
+            # Direct HIP peer copies silently corrupt tensors on this Windows
+            # PCIe pair (R9700 + RX 9070 XT). Force the scheduler's safe staged
+            # fallback; Test-LlamaBuildOutput verifies both the cache bit and
+            # deterministic decoded text on an actual two-GPU layer split.
+            "-DGGML_CUDA_NO_PEER_COPY=ON",
             "-DGGML_CUDA_FA=ON",
             "-DGGML_CUDA_FA_ALL_QUANTS=ON",
             "-DGGML_FMA=ON",
@@ -682,6 +929,8 @@ function Invoke-LlamaPrereleaseBuild {
         throw "Staging directory already exists: $tmp"
     }
 
+    $stagingHandled = $false
+    try {
     if ($Tag -eq "master") {
         Invoke-NativeChecked "llama.cpp master clone" {
             git clone https://github.com/ggml-org/llama.cpp.git $tmp
@@ -715,6 +964,7 @@ function Invoke-LlamaPrereleaseBuild {
     if (Test-Path $repo) {
         Write-Host "==> Existing output found; verify without replacing: $repo"
         Remove-Item $tmp -Recurse -Force
+        $stagingHandled = $true
         try {
             Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedBuild $build -ExpectedVersion $expectedRuntime -ExpectedCommit $commit | Out-Null
             Write-Host "Success (existing): $repo ($expectedRuntime, $buildTag, $Backend)"
@@ -725,6 +975,12 @@ function Invoke-LlamaPrereleaseBuild {
         }
     } else {
         Rename-Item $tmp $dir
+        $stagingHandled = $true
+    }
+    } finally {
+        if (-not $stagingHandled) {
+            Remove-FailedLlamaStagingDirectory -Path $tmp -Description "pre-release"
+        }
     }
 
     Write-Host "==> Build directory: $repo ($buildTag, $Backend, commit $commit)"
@@ -749,6 +1005,19 @@ function Invoke-LlamaStableBuild {
         throw "Tag must be 'latest' or an exact X.Y.Z/vX.Y.Z tag"
     }
     $version = $Tag -replace '^v', ''
+    $remoteTag = $Tag
+    $remoteRef = git ls-remote --refs --tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$remoteTag" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not query llama.cpp stable tag $remoteTag"
+    }
+    if (-not $remoteRef) {
+        $alternateTag = if ($Tag.StartsWith("v")) { $version } else { "v$version" }
+        $alternateRef = git ls-remote --refs --tags https://github.com/ggml-org/llama.cpp.git "refs/tags/$alternateTag" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $alternateRef) {
+            throw "Stable tag was not found as '$Tag' or '$alternateTag'"
+        }
+        $remoteTag = $alternateTag
+    }
     $backendToken = $Backend.ToLowerInvariant()
     $dir = "${version}_${backendToken}_llama.cpp"
     $repo = Join-Path $Workspace $dir
@@ -757,12 +1026,14 @@ function Invoke-LlamaStableBuild {
         throw "Staging directory already exists: $tmp"
     }
 
-    Invoke-NativeChecked "llama.cpp $Tag clone" {
-        git clone --branch $Tag --single-branch https://github.com/ggml-org/llama.cpp.git $tmp
+    $stagingHandled = $false
+    try {
+    Invoke-NativeChecked "llama.cpp $remoteTag clone" {
+        git clone --branch $remoteTag --single-branch https://github.com/ggml-org/llama.cpp.git $tmp
     }
     $resolvedTag = (& git -C $tmp describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $resolvedTag -ne $Tag) {
-        throw "Checkout is not the requested exact stable tag $Tag"
+    if ($LASTEXITCODE -ne 0 -or $resolvedTag -ne $remoteTag) {
+        throw "Checkout is not the requested exact stable tag $remoteTag"
     }
     $commit = (& git -C $tmp rev-parse HEAD | Out-String).Trim()
     $build = Get-LlamaBuildCount -Repo $tmp
@@ -778,6 +1049,7 @@ function Invoke-LlamaStableBuild {
     if (Test-Path $repo) {
         Write-Host "==> Existing output found; verify without replacing: $repo"
         Remove-Item $tmp -Recurse -Force
+        $stagingHandled = $true
         try {
             Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedBuild $build -ExpectedVersion $version -ExpectedCommit $commit | Out-Null
             Write-Host "Success (existing): $repo ($version stable / $buildTag, $Backend)"
@@ -788,6 +1060,12 @@ function Invoke-LlamaStableBuild {
         }
     } else {
         Rename-Item $tmp $dir
+        $stagingHandled = $true
+    }
+    } finally {
+        if (-not $stagingHandled) {
+            Remove-FailedLlamaStagingDirectory -Path $tmp -Description "stable"
+        }
     }
 
     Write-Host "==> Build directory: $repo ($version stable / $buildTag, $Backend, commit $commit)"
@@ -818,6 +1096,8 @@ function Invoke-LlamaPinnedForkBuild {
     if (Test-Path $tmp) {
         throw "Staging directory already exists: $tmp"
     }
+    $stagingHandled = $false
+    try {
     Invoke-NativeChecked "$Name clone" { git clone $RemoteUrl $tmp }
     if ($FetchRef) {
         Invoke-NativeChecked "$Name pinned ref fetch" {
@@ -855,6 +1135,7 @@ function Invoke-LlamaPinnedForkBuild {
     if (Test-Path $repo) {
         Write-Host "==> Existing output found; verify without replacing: $repo"
         Remove-Item $tmp -Recurse -Force
+        $stagingHandled = $true
         try {
             Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedCommit $ExpectedCommit | Out-Null
             Write-Host "Success (existing): $repo ($Name, $Backend, pinned $ExpectedCommit)"
@@ -865,6 +1146,12 @@ function Invoke-LlamaPinnedForkBuild {
         }
     } else {
         Rename-Item $tmp $dir
+        $stagingHandled = $true
+    }
+    } finally {
+        if (-not $stagingHandled) {
+            Remove-FailedLlamaStagingDirectory -Path $tmp -Description $Name
+        }
     }
     Write-Host "==> Build directory: $repo ($Name, $Backend, pinned $ExpectedCommit)"
 

@@ -938,23 +938,37 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`setup_llamacpp_turboquant_cuda.ps1`](building%20llama.cpp/setup_llamacpp_turboquant_cuda.ps1) | Windows NVIDIA/CUDA TurboQuant setup helper. |
 
 Run a recipe with `pwsh -File <recipe>.ps1`. The Pandaking
-HIP recipes pin ROCm HIP SDK 7.2.3 and compile only `gfx1201`, shared by the RX
-9070 XT and AI PRO R9700. They use upstream's required Windows combination of
+HIP recipes default to `C:\Program Files\AMD\ROCm\7.2`, were audited with
+ROCm HIP SDK 7.2.3, and compile only `gfx1201`, shared by the RX 9070 XT and
+AI PRO R9700. `-RocmPath` remains caller-selectable and the chosen SDK is
+probed before each build. They use upstream's required Windows combination of
 Ninja plus ROCm `clang`/`clang++`; Vulkan remains a separate Visual Studio tree.
 The installed SDK still lacks LLVM PR #201563, so the helper applies that exact
 HIP/MSVC `<cmath>` include-order fix to a workspace-local clang resource copy.
 It also places matching ROCm 7 DLLs beside each executable and links the SDK's
 rocBLAS/hipBLASLt kernel directories, preventing Windows from loading a stale
-System32/ROCm 7.1 runtime. Both backends enable AVX2, AVX-VNNI and BMI2 while
-keeping AVX-512 off. Vulkan shader capabilities (integer dot/cooperative
-matrix/BF16) are detected by current `glslc`, not guessed through a GPU target.
+System32/ROCm 7.1 runtime. Windows HIP builds set
+`GGML_CUDA_NO_PEER_COPY=ON`: direct copies between the R9700 and RX 9070 XT can
+silently corrupt decoded tokens even while timing output looks valid, so the
+safe staged transfer path is mandatory. Both backends enable AVX2, AVX-VNNI
+and BMI2 while keeping AVX-512 off. Vulkan shader capabilities (integer
+dot/cooperative matrix/BF16) are detected by current `glslc`, not guessed
+through a GPU target.
 
 Mainline clones retain full history so the embedded compatibility build is
 truthful. Stable and pre-release recipes verify tag, commit, numeric build,
-runtime version, backend-exclusive device listing, and both AMD cards. Mutable
-third-party branch/PR recipes are pinned to reviewed 2026-08-28 commits so each
-Vulkan/HIP sibling is source-identical, and no recipe recursively replaces a
-known-good destination. The CUDA helpers remain backend-neutral legacy output
+runtime version, backend-exclusive device listing, and both AMD cards. HIP
+verification additionally checks the no-peer-copy CMake bit and launches a
+bounded two-GPU layer split that must decode exactly `HIP MULTI GPU OK`; this
+catches numerical corruption that `llama-bench` throughput alone cannot see.
+The default oracle is
+`I:\models\Microsoft\fastcontext-1.0-4b-rl-q8_0.gguf`; set
+`AUTOTUNER_HIP_VERIFY_MODEL` to an equivalent compatible Qwen3 GGUF when it is
+stored elsewhere. Mutable third-party branch/PR recipes are pinned to reviewed
+2026-08-28 commits so each Vulkan/HIP sibling is source-identical, and no
+recipe recursively replaces a known-good destination. A destination that
+fails the safety gate is resumed and rebuilt in place without deleting its
+source checkout. The CUDA helpers remain backend-neutral legacy output
 producers and are not renamed automatically.
 
 Ubuntu/Linux users can either build upstream llama.cpp normally or adapt the

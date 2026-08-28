@@ -11,6 +11,22 @@ The range contains **13 commits**. The exact source and server-parser diffs,
 upstream CMake contracts, official Windows HIP SDK documentation, locally
 compiled backend outputs, and AutoTuner tests form the evidence for this audit.
 
+## AutoTuner v5.3.1 correctness correction
+
+The v5.3.0 audit's speed-only HIP checks missed silent multi-GPU output
+corruption. On Windows, direct HIP peer copies between the R9700 and RX 9070 XT
+produced invalid logits with every locally maintained HIP family: the server
+stayed healthy and reported timings, but decoded isolated symbols, numbers,
+Chinese characters, repetition, or immediate EOS. Vulkan and HIP pinned to the
+R9700 remained coherent.
+
+The defect reproduced with a 4B Qwen3 Q8_0 oracle and the original
+Qwen3.8-27B IQ4_XS SuperCalc request. Rebuilding the same source commits with
+`GGML_CUDA_NO_PEER_COPY=ON` fixed both. AutoTuner v5.3.1 therefore makes that
+CMake option mandatory for Windows HIP and rejects a build unless a bounded
+real two-GPU layer split decodes exactly `HIP MULTI GPU OK`. Throughput-only
+`llama-bench` output is no longer accepted as evidence of decode correctness.
+
 ## AutoTuner compatibility
 
 No emitted `llama-server` option was added, renamed, or removed between b10666
@@ -54,8 +70,10 @@ Every Windows Vulkan recipe now has a source-identical HIP sibling:
 | TurboQuant | `tq_bNNNN_vulkan_llama.cpp` | `tq_bNNNN_hip_llama.cpp` |
 
 Mainline tags are resolved once by `build_all_windows_llama.ps1`; fork/PR heads
-are pinned to exact reviewed commits. Existing destinations are never deleted
-or updated in place. AutoTuner strips only the terminal `_vulkan`/`_hip` token
+are pinned to exact reviewed commits. Existing known-good destinations are
+never deleted or replaced; a destination that fails the build-safety gate is
+reconfigured and rebuilt in its existing clean source tree. AutoTuner strips
+only the terminal `_vulkan`/`_hip` token
 for family matching, keeps both full names in the picker, preserves the active
 backend when a profile switches family, and honors an explicit backend hint.
 
@@ -69,9 +87,10 @@ AVX-512), an RX 9070 XT 16 GB and an AI PRO R9700 32 GB. Both AMD GPUs report
   AVX-VNNI + BMI2, AVX-512 off, checks/debug/validation off. Current `glslc`
   capability probes select integer-dot, BF16 and cooperative-matrix shaders;
   no guessed GPU target flag is used.
-- **HIP:** AMD HIP SDK 7.2.3, Ninja, ROCm `clang`/`clang++`,
-  `GPU_TARGETS=gfx1201`, HIP graphs on, VMM/RCCL off for Windows, and all
-  Flash-Attention KV quant instantiations enabled. The SDK's clang-21 wrapper
+- **HIP (audited local configuration):** AMD HIP SDK 7.2.3, Ninja, ROCm `clang`/`clang++`,
+  `GPU_TARGETS=gfx1201`, HIP graphs on, VMM/RCCL off for Windows, direct peer
+  copies disabled with `GGML_CUDA_NO_PEER_COPY=ON`, and all Flash-Attention KV
+  quant instantiations enabled. The SDK's clang-21 wrapper
   still lacks merged LLVM PR #201563 and collides with MSVC 14.51 `<cmath>`;
   the recipe applies that exact include reorder in a workspace-local clang
   resource copy, leaving Program Files untouched. Matching ROCm runtime DLLs
@@ -87,10 +106,15 @@ AVX-512), an RX 9070 XT 16 GB and an AI PRO R9700 32 GB. Both AMD GPUs report
 
 All six source families built successfully for both backends. Every tree was
 checked for exact source commit, optimized CMake cache, `llama-server --version`,
-backend-exclusive `--list-devices`, and both intended AMD GPUs. The mainline
-pair reports b10679/`50f068fff`; stable reports 0.3.0/b10621. Pinned fork pairs
-use DiffusionGemma `dd0cf0445`, OCR `95cc56658`, PrismML `e311ed38f`, and
-TurboQuant `df7f54729` identically across Vulkan/HIP.
+backend-exclusive `--list-devices`, and both intended AMD GPUs. For v5.3.1 all
+six existing HIP trees were reconfigured with no-peer-copy enabled, fully
+relinked, and independently passed the deterministic dual-GPU text check. The
+mainline b10679 tree additionally passed the exact 262,144-context
+Qwen3.8-27B IQ4_XS + DFlash2 + ngram + mmproj SuperCalc reproduction with
+coherent reasoning. The mainline pair reports b10679/`50f068fff`; stable
+reports 0.3.0/b10621. Pinned fork pairs use DiffusionGemma `dd0cf0445`, OCR
+`95cc56658`, PrismML `e311ed38f`, and TurboQuant `df7f54729` identically across
+Vulkan/HIP.
 
 Focused R9700 benchmarks (same model/settings, three repetitions) confirm a
 backend-dependent tradeoff rather than one universal winner:
@@ -117,5 +141,6 @@ removed only after these replacements passed.
 - b10679 lazy-mode/bench change: <https://github.com/ggml-org/llama.cpp/commit/50f068ffffc3e0e4c9c2e4139281c6075224f429>
 - LLVM HIP/MSVC `<cmath>` fix: <https://github.com/llvm/llvm-project/pull/201563>
 - Windows HIP build instructions: <https://github.com/ggml-org/llama.cpp/blob/b10679/docs/build.md#hip>
+- ROCm multi-GPU garbage-output report and no-peer-copy workaround: <https://github.com/ggml-org/llama.cpp/issues/16424>
 - HIP SDK 7.2 release notes: <https://rocm.docs.amd.com/projects/install-on-windows/en/docs-7.2/about/releasenotes.html>
 - HIP SDK 7.2 system requirements: <https://rocm.docs.amd.com/projects/install-on-windows/en/docs-7.2/reference/system-requirements.html>
