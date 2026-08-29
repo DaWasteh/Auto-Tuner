@@ -71,7 +71,7 @@ def test_unlimited_projector_warns_when_32_tile_metadata_is_missing(
     assert ocr_projector_warning(model) == ""
 
 
-def test_unlimited_profile_pins_reference_quality_runtime() -> None:
+def test_ocr_profile_metadata_does_not_override_global_q4_auto_default() -> None:
     from settings_loader import load_profiles, match_profile
     from tuner import _pick_kv_quant
 
@@ -85,9 +85,9 @@ def test_unlimited_profile_pins_reference_quality_runtime() -> None:
     assert profile.min_llama_build == 10287
     assert profile.flash_attn is False
     assert profile.recommended_kv_quant == "f16"
-    assert _pick_kv_quant(" f16 ", 32768, 0.01, 64.0) == ("f16", "f16")
-    assert _pick_kv_quant("q4_1", 1024, 0.001, 64.0) == ("f16", "f16")
-    assert _pick_kv_quant("", 1024, 0.001, 64.0) == ("f16", "f16")
+    assert _pick_kv_quant(" f16 ", 32768, 0.01, 64.0) == ("q4_0", "q4_0")
+    assert _pick_kv_quant("q4_1", 1024, 0.001, 64.0) == ("q4_0", "q4_0")
+    assert _pick_kv_quant("", 1024, 0.001, 64.0) == ("q4_0", "q4_0")
 
 
 def test_profile_loader_accepts_numeric_flash_attention(tmp_path) -> None:

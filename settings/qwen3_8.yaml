@@ -15,7 +15,7 @@ patterns:
 # extension to 1,000,000; the 2.4T-A95B card states 1,010,000. Use the lower
 # common limit so this shared profile remains valid for both variants.
 max_context: 262144
-recommended_kv_quant: q5_0
+recommended_kv_quant: q4_0
 
 rope_scale:
   enabled: false

@@ -49,6 +49,12 @@ class BenchmarkFailure(RuntimeError):
     """Raised when the baseline or benchmark infrastructure cannot run."""
 
 
+# Increment when persisted evidence or the search/decision procedure changes
+# in a way that makes an older winner unsafe to reuse automatically.
+BENCHMARK_RECORD_SCHEMA = 3
+BENCHMARK_SEARCH_SCHEMA = 2
+
+
 @dataclass(frozen=True)
 class BenchmarkLimits:
     """Hard bounds that keep a thorough tuning run finite."""
@@ -72,6 +78,12 @@ class BenchmarkLimits:
     max_draft_tokens: int = 64
     min_improvement: float = 0.03
     max_sample_spread: float = 0.35
+    # A single tiny decode dip is measurement noise, not proof that larger MTP
+    # depths are slower. Require two consecutive regressions that exceed this
+    # threshold before ending the one-token sweep; an unsupported depth remains
+    # an immediate hard boundary.
+    draft_regression_threshold: float = 0.03
+    draft_regression_patience: int = 2
 
 
 @dataclass(frozen=True)
@@ -202,6 +214,38 @@ class CandidateResult:
             spreads.append((max(values) - min(values)) / max(values))
         return max(spreads, default=math.inf)
 
+    def paired_ratio_bounds(
+        self, baseline: "CandidateResult", metric: str = "overall"
+    ) -> Tuple[float, float]:
+        """Return conservative paired sample-ratio bounds versus ``baseline``.
+
+        Every candidate uses the same deterministic prompt variants in the same
+        order, so pairwise ratios preserve workload shape better than comparing
+        two independent medians. The lower bound gates winner promotion; the
+        upper generation bound confirms that an MTP-depth decline is real.
+        """
+        count = min(len(self.samples), len(baseline.samples))
+        if count <= 0:
+            return 0.0, math.inf
+
+        def value(sample: BenchmarkSample) -> float:
+            if metric == "generation":
+                return sample.generation_tps
+            if metric == "prompt":
+                return sample.prompt_tps
+            return sample.overall_tps
+
+        ratios: List[float] = []
+        for index in range(count):
+            base_value = value(baseline.samples[index])
+            item_value = value(self.samples[index])
+            if base_value <= 0 or item_value <= 0:
+                continue
+            ratios.append(item_value / base_value)
+        if not ratios:
+            return 0.0, math.inf
+        return min(ratios), max(ratios)
+
 
 @dataclass
 class BenchmarkResult:
@@ -235,13 +279,20 @@ class BenchmarkResult:
             return 0.0
         return result.overall_tps / base.overall_tps
 
+    def conservative_score(self, result: CandidateResult) -> float:
+        """Worst paired end-to-end ratio across deterministic sample variants."""
+        if not result.valid or not self.baseline.valid:
+            return 0.0
+        return result.paired_ratio_bounds(self.baseline, "overall")[0]
+
     def winning_config(self, base: TunedConfig) -> TunedConfig:
         return self.winner.candidate.apply(base)
 
     def to_record(self, *, model_path: str, model_size: int, model_mtime_ns: int) -> dict:
         """Return bounded JSON evidence; prompts, raw argv, and full logs stay out."""
         return {
-            "schema": 2,
+            "schema": BENCHMARK_RECORD_SCHEMA,
+            "search_schema": BENCHMARK_SEARCH_SCHEMA,
             "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "model_path": model_path,
             "model_size": int(model_size),
@@ -253,6 +304,9 @@ class BenchmarkResult:
             "winner_id": self.winner_id,
             "reason": self.reason,
             "winner_score": round(self.score(self.winner), 6),
+            "winner_conservative_score": round(
+                self.conservative_score(self.winner), 6
+            ),
             "winner_settings": self.winner.candidate.settings(),
             "baseline_settings": self.baseline.candidate.settings(),
             "candidates": [
@@ -1176,28 +1230,44 @@ class BenchmarkRunner:
                 by_id[candidate.id] = measured
                 seen.add(_candidate_key(candidate))
 
-            best_thread = self._rank(results, baseline)[0].candidate
+            # Stage 2: batch/ubatch can interact strongly with CPU thread count.
+            # Standard's 14-candidate budget fits bounded batch families for the
+            # top two distinct thread finalists; testing only the single Stage-1
+            # winner could miss the global combination while leaving budget idle.
+            thread_finalists: List[BenchmarkCandidate] = []
+            seen_threads: set[Tuple[int, int]] = set()
+            for item in self._rank(list(results), baseline):
+                thread_key = (item.candidate.threads, item.candidate.batch_threads)
+                if thread_key in seen_threads:
+                    continue
+                seen_threads.add(thread_key)
+                thread_finalists.append(item.candidate)
+                if len(thread_finalists) >= 2:
+                    break
 
-            # Stage 2: combine the winning thread setting with bounded batches.
-            for candidate in batch_candidates(best_thread):
+            for thread_seed in thread_finalists:
+                for candidate in batch_candidates(thread_seed):
+                    if len(results) >= self.limits.max_candidates:
+                        break
+                    if _candidate_key(candidate) in seen:
+                        continue
+                    self._check_cancelled()
+                    try:
+                        measured = self._run_candidate(candidate)
+                    except BenchmarkCancelled:
+                        raise
+                    except BenchmarkFailure as exc:
+                        measured = CandidateResult(candidate=candidate, error=str(exc))
+                    results.append(measured)
+                    by_id[candidate.id] = measured
+                    seen.add(_candidate_key(candidate))
                 if len(results) >= self.limits.max_candidates:
                     break
-                if _candidate_key(candidate) in seen:
-                    continue
-                self._check_cancelled()
-                try:
-                    measured = self._run_candidate(candidate)
-                except BenchmarkCancelled:
-                    raise
-                except BenchmarkFailure as exc:
-                    measured = CandidateResult(candidate=candidate, error=str(exc))
-                results.append(measured)
-                by_id[candidate.id] = measured
-                seen.add(_candidate_key(candidate))
 
         # Stage 3 (optional): retain the best runtime axes and increase draft
-        # depth one token at a time until decode speed regresses. The old fixed
-        # [1, 3, 4, 6, 8] list could stop at 6 even when 7 was still faster.
+        # depth one token at a time until two meaningful decode regressions are
+        # confirmed. The old fixed [1, 3, 4, 6, 8] list could stop at 6 even
+        # when 7 was still faster; a single noisy dip could do the same.
         # Draft exploration now has its own bounded budget instead of competing
         # with CPU/batch candidates for ``max_candidates`` slots.
         if self.tune_draft_n_max:
@@ -1211,7 +1281,12 @@ class BenchmarkRunner:
                     maximum=self._draft_depth_max,
                 )
             }
-            previous_depth_result: Optional[CandidateResult] = None
+            best_depth_result: Optional[CandidateResult] = None
+            consecutive_regressions = 0
+            regression_threshold = max(
+                0.0, float(self.limits.draft_regression_threshold)
+            )
+            regression_patience = max(1, int(self.limits.draft_regression_patience))
             for depth in range(self._draft_depth_min, self._draft_depth_max + 1):
                 self._check_cancelled()
                 if depth == best_runtime.draft_n_max:
@@ -1243,18 +1318,36 @@ class BenchmarkRunner:
                     # depths are not useful/safe to probe automatically.
                     break
                 if (
-                    previous_depth_result is not None
-                    and measured.generation_tps
-                    < previous_depth_result.generation_tps
+                    best_depth_result is None
+                    or measured.generation_tps > best_depth_result.generation_tps
                 ):
+                    best_depth_result = measured
+                    consecutive_regressions = 0
+                    continue
+
+                _lower_ratio, upper_ratio = measured.paired_ratio_bounds(
+                    best_depth_result, "generation"
+                )
+                meaningful_regression = upper_ratio < 1.0 - regression_threshold
+                if meaningful_regression:
+                    consecutive_regressions += 1
                     self._emit(
-                        "Draft-depth regression: "
-                        f"n-max {depth} ({measured.generation_tps:.2f} tok/s) < "
-                        f"n-max {previous_depth_result.candidate.draft_n_max} "
-                        f"({previous_depth_result.generation_tps:.2f} tok/s); stopping"
+                        "Draft-depth regression evidence: "
+                        f"n-max {depth} ({measured.generation_tps:.2f} tok/s) vs "
+                        f"best n-max {best_depth_result.candidate.draft_n_max} "
+                        f"({best_depth_result.generation_tps:.2f} tok/s), "
+                        f"{consecutive_regressions}/{regression_patience}"
                     )
-                    break
-                previous_depth_result = measured
+                    if consecutive_regressions >= regression_patience:
+                        self._emit(
+                            "Draft-depth regression confirmed; stopping the "
+                            "one-token sweep"
+                        )
+                        break
+                else:
+                    # A sub-threshold dip is allowed one or more chances to
+                    # recover; it must not hide a faster following depth.
+                    consecutive_regressions = 0
 
         ranked = self._rank(results, baseline)
         finalists = ranked[: min(2, self.limits.confirmation_runs, len(ranked))]
@@ -1285,9 +1378,11 @@ class BenchmarkRunner:
             raise BenchmarkFailure("all benchmark candidates failed")
         winner = final_ranked[0]
         winner_score = self._score(winner, baseline)
+        conservative_score = winner.paired_ratio_bounds(baseline, "overall")[0]
         reason = "measured winner"
         if winner.candidate.id != baseline_spec.id and (
             winner_score < 1.0 + self.limits.min_improvement
+            or conservative_score < 1.0 + self.limits.min_improvement
             or (
                 confirmed_ids
                 and winner.candidate.id not in confirmed_ids
@@ -1296,8 +1391,9 @@ class BenchmarkRunner:
         ):
             winner = baseline
             reason = (
-                "Auto baseline kept because no confirmed candidate improved the "
-                f"end-to-end workload by {self.limits.min_improvement * 100:.0f}%"
+                "Auto baseline kept because no uncertainty-safe candidate "
+                f"improved every paired workload sample by "
+                f"{self.limits.min_improvement * 100:.0f}%"
             )
         elif winner.candidate.id == baseline_spec.id:
             reason = "Auto baseline remained fastest within the noise threshold"

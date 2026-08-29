@@ -1792,20 +1792,43 @@ def save_performance_tuning_result(
         if bank is None:
             bank = _legacy_profile_bank(settings, model_name, model_path, target)
     if target:
-        _set_target_value(
-            settings,
-            _os_path_key("performance_tuning_results_by_performance"),
-            key,
-            target,
-            result,
+        # Quick pass is deliberately provisional. Preserve its analysis record,
+        # but never let it replace a validated Standard/Custom Perform snapshot
+        # for the same model/mode/drafter. It may seed Perform only when no
+        # validated snapshot exists yet (or replace an older provisional one).
+        assert bank is not None
+        snapshots = bank.setdefault("snapshots", {})
+        per_drafter = snapshots.get(PROFILE_PERFORM)
+        if not isinstance(per_drafter, dict):
+            per_drafter = {}
+        existing_perform = per_drafter.get(profile_drafter)
+        existing_is_validated = bool(
+            isinstance(existing_perform, dict)
+            and _valid_expert_snapshot(existing_perform)
+            and str(existing_perform.get("confidence", "") or "").lower()
+            != "provisional"
         )
-        _set_target_value(
-            settings,
-            _os_path_key("expert_overrides_by_performance"),
-            key,
-            target,
-            snapshot,
-        )
+        promote_profile = not (test_type == "fast" and existing_is_validated)
+        history_record["profile_promoted"] = promote_profile
+
+        if promote_profile:
+            _set_target_value(
+                settings,
+                _os_path_key("performance_tuning_results_by_performance"),
+                key,
+                target,
+                result,
+            )
+            _set_target_value(
+                settings,
+                _os_path_key("expert_overrides_by_performance"),
+                key,
+                target,
+                snapshot,
+            )
+
+        # Evidence is always retained independently by test type and drafter,
+        # regardless of whether the snapshot was promoted for launch.
         _set_benchmark_result_value(
             settings,
             _os_path_key("performance_run_results_by_test"),
@@ -1825,20 +1848,21 @@ def save_performance_tuning_result(
         )
         portable = portable_model_key(model_path, result.get("model_size"))
         if portable:
-            _set_target_value(
-                settings,
-                _os_path_key("performance_tuning_results_portable_by_performance"),
-                portable,
-                target,
-                result,
-            )
-            _set_target_value(
-                settings,
-                _os_path_key("expert_overrides_portable_by_performance"),
-                portable,
-                target,
-                snapshot,
-            )
+            if promote_profile:
+                _set_target_value(
+                    settings,
+                    _os_path_key("performance_tuning_results_portable_by_performance"),
+                    portable,
+                    target,
+                    result,
+                )
+                _set_target_value(
+                    settings,
+                    _os_path_key("expert_overrides_portable_by_performance"),
+                    portable,
+                    target,
+                    snapshot,
+                )
             _set_benchmark_result_value(
                 settings,
                 _os_path_key("performance_run_results_portable_by_test"),
@@ -1857,21 +1881,17 @@ def save_performance_tuning_result(
                 history_record,
             )
 
-        # The measured snapshot belongs to the immutable Perform slot rather
-        # than replacing a user's Custom profile. Draft heads have independent
-        # variants so changing embedded/Q4/Q8/BF16 drafters restores the exact
-        # runtime winner measured for that head.
-        assert bank is not None
-        snapshots = bank.setdefault("snapshots", {})
-        per_drafter = snapshots.get(PROFILE_PERFORM)
-        if not isinstance(per_drafter, dict):
-            per_drafter = {}
-        per_drafter[profile_drafter] = copy.deepcopy(snapshot)
-        snapshots[PROFILE_PERFORM] = per_drafter
-        bank["selected"] = PROFILE_PERFORM
-        selected_by_drafter = bank.setdefault("selected_by_drafter", {})
-        selected_by_drafter[profile_drafter] = PROFILE_PERFORM
-        _write_profile_bank(settings, model_path, target, bank)
+        if promote_profile:
+            # The measured snapshot belongs to the immutable Perform slot rather
+            # than replacing a user's Custom profile. Draft heads have independent
+            # variants so changing embedded/Q4/Q8/BF16 drafters restores the exact
+            # runtime winner measured for that head.
+            per_drafter[profile_drafter] = copy.deepcopy(snapshot)
+            snapshots[PROFILE_PERFORM] = per_drafter
+            bank["selected"] = PROFILE_PERFORM
+            selected_by_drafter = bank.setdefault("selected_by_drafter", {})
+            selected_by_drafter[profile_drafter] = PROFILE_PERFORM
+            _write_profile_bank(settings, model_path, target, bank)
     else:
         result_key = _os_path_key("performance_tuning_results")
         results = settings.get(result_key)

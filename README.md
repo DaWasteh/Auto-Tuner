@@ -48,9 +48,11 @@ Performance Test Result:
   `--list-devices` table. AutoTuner emits only that backend's selector
   (`HIP_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`) when known, so HIP and
   Vulkan's different physical-device order cannot silently select the wrong GPU.
-- **Free-memory aware** — context length and KV quant are picked to
-  use the RAM/VRAM that's actually free *right now*, not a hard-coded
-  cap. The original v1 cap of 16k context is gone.
+- **Free-memory aware, Q4-first KV** — Auto mode uses symmetric `q4_0`
+  K/V for normal llama.cpp models and spends saved RAM/VRAM on context instead
+  of silently upgrading the cache toward F16. Context still follows memory
+  that is actually free *right now*, not a hard-coded cap; manual Expert K/V
+  pins remain authoritative. The original v1 cap of 16k context is gone.
 - **Per-family YAML profiles** in `settings/` — override sampling,
   max context, chat template, and llama-server flags per model family.
   Easy for contributors to extend without touching Python.
@@ -128,7 +130,11 @@ Performance Test Result:
   a 65,536 prompt cap; **Custom** accepts 0.01–100% uncapped. Optional **Try only
   best Settings** remeasures a conservative shortlist from stable two-sample Quick
   evidence and falls back to the full search when evidence is missing or noisy.
-  All-model suites skip exact completed model/mode/drafter workloads by default;
+  A provisional Quick pass never overwrites an existing validated Standard or
+  Custom Perform profile. Completed-run reuse is keyed to the exact binary
+  build/file, backend/devices, frozen quality/placement, baseline, and search
+  schema, so Vulkan/HIP or build changes force revalidation. All-model suites
+  skip only exact matching model/mode/drafter workloads by default;
   **Rerun completed model / mode / drafter runs** opts back into them. The MTP
   option can enumerate every
   compatible external drafter/quantization as well as embedded MTP and saves each
@@ -142,8 +148,11 @@ Performance Test Result:
   complete runtime settings, PP/decode/end-to-end speeds, errors, drafter identity,
   and native llama.cpp drafted/accepted token counters, plus inline throughput and
   acceptance graphics. Legacy fixed-25% results are classified as Custom; the old
-  legacy tile is gone. Winner ranking still uses measured workload time, the fastest
-  performance mode is remembered, and exact contexts above the static estimate are
+  legacy tile is gone. Standard search now checks batch families for its top two
+  thread finalists, MTP depth stops only after two meaningful regressions, and a
+  candidate must clear 3% in every paired prompt variant before promotion. The
+  fastest performance mode is remembered only when context, token mix, test tier,
+  and drafter are directly comparable. Exact contexts above the static estimate are
   saved only after a real isolated inference succeeds. `low_vram` remains the safe
   explicit RAM-KV path. Settings → **Performance profiles** exports/imports the
   complete portable profile bank and drafter evidence. AutoTuner never changes
@@ -281,8 +290,9 @@ PDF rendering requires PyMuPDF and image normalization requires Pillow (both are
 installed by `requirements.txt`). Word/Office/OpenDocument input additionally
 requires a local LibreOffice installation; without it AutoTuner gives a clear
 error and leaves the source untouched. Unlimited-OCR uses its verified
-`document parsing.` prompt, F16 KV, deterministic sampling, explicit Flash
-Attention off, and requires llama.cpp b10287+ (a current build such as b10362
+`document parsing.` prompt, the global Q4 Auto KV default, deterministic
+sampling, explicit Flash Attention off, and requires llama.cpp b10287+ (a
+current build such as b10362
 is recommended). **There is no CMake/build flag for `max_tiles=32`.** The value
 comes from the projector GGUF metadata. For the full 32-tile Unlimited-OCR
 path, the mmproj must contain `clip.vision.preproc_max_tiles=32`; AutoTuner
@@ -732,12 +742,14 @@ When you start the tuner, you can choose between:
 
 #### KV precision and TurboQuant options
 
-Auto mode first preserves the requested/native context window, then spends any
-remaining memory on the least-quantized KV cache that fits. Its quality ladder
-starts at F16 (or profile-requested BF16), then steps through asymmetric
-F16/Q8, Q8, Q5, and Q4 pairs. On multi-GPU systems, a peer GPU is used when it
-is needed to preserve context or improve KV precision; it stays free only when
-the primary card already fits both goals.
+Auto mode uses symmetric `q4_0` K/V as one capacity-first contract across
+normal llama.cpp model families. It does not spend spare memory on an implicit
+F16/Q8/Q5 upgrade, and it avoids mixed-cache FlashAttention fallbacks that vary
+by backend/build. On multi-GPU systems, a peer GPU is used when Q4 plus the
+requested/native context does not fit the primary card; otherwise the peer
+stays free. Expert mode can still pin any supported K/V types explicitly.
+Dedicated non-llama-server runners that do not expose quantized KV (currently
+DiffusionGemma) continue to report their real F16 runtime contract.
 
 The Expert K/V dropdowns expose the mainline types `f16`, `bf16`, `q8_0`,
 `q5_0`, `q5_1`, `q4_0`, `q4_1`, and `iq4_nl`, plus fork-only `turbo2`,
@@ -786,7 +798,7 @@ patterns:
   - my-model-base
 
 max_context: 131072
-recommended_kv_quant: q8_0
+recommended_kv_quant: q4_0
 
 sampling:
   temperature: 0.7
@@ -802,6 +814,10 @@ extra_args:
 notes: >
   Anything you want to remind yourself about this model.
 ```
+
+`recommended_kv_quant` is retained for profile compatibility/documentation;
+from v5.3.2 normal Auto mode deliberately standardizes on Q4_0. Manual Expert
+K/V selections are the supported way to override that global default.
 
 Profiles with empty `patterns:` become the fallback when nothing else
 matches. See `settings/_default.yaml`.
@@ -840,9 +856,11 @@ Notes on the new profiles:
   without claiming those ambiguous architecture fallbacks.
 - **Qwen3.8 Flash Next** is the separate `qwen4exp` architecture merged in
   llama.cpp b10660. AutoTuner excludes its ~26.8 GiB read-lazy PLE n-gram
-  table from splittable layer weights, budgets the extra QSA indexer KV, and
-  uses ubatch 64/128/256 for Safe/Balanced/Throughput because its graph buffers
-  scale with context × ubatch.
+  table from splittable layer weights, budgets only its measured active-row
+  residency against physical RAM while still displaying the full file-backed
+  mapping, and budgets the extra QSA indexer KV. It defaults to Safe/ubatch 64;
+  Balanced/Throughput remain available at 128/256 because graph buffers scale
+  with context × ubatch.
 - **Nemotron 3.5 Lightning** uses NVIDIA's temp 1.0/top-p 0.95 contract and
   b10665's DSpark variant. `draft_max: 7` plus `draft_p_min: 0.0` supports
   checkpoints that deliberately omit the confidence head.
@@ -874,9 +892,10 @@ Notes on the new profiles:
    offload using the GGUF's exact `n_layers`, else CPU only.
 3. **Compute the KV budget**: free VRAM (after the model) plus free
    RAM (minus a safety reserve).
-4. **Pick KV quant + context**: try q8 → q5 → q4, pick the highest
-   quality that fits the profile's `max_context`. Round context down
-   to a multiple of 1024.
+4. **Pick KV quant + context**: use symmetric Q4_0 by default and allocate
+   the resulting memory headroom to the largest safe context. Explicit Expert
+   pins can choose another K/V type. Round automatic context down to a bounded
+   alignment.
 5. **Threads / batch**: scale with placement (full GPU offload needs
    fewer CPU threads than CPU-only inference; long context wants
    smaller batches to keep prompt-prefill memory bounded).
@@ -1016,7 +1035,30 @@ checks are validated through exact stock **b10679** (`50f068fff`). The following
 | `--numa` | ✅ Already present |
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
-| Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 KV, `-fa off`, DRY guard, and normal `/v1/chat/completions` API |
+| Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.2 — Q4 defaults, Flash-Next long context, robust performance search
+
+- **Global Q4 KV Auto default:** normal llama.cpp launches now use symmetric
+  `q4_0/q4_0`; higher or mixed precision remains available through Expert
+  settings. Placement uses the same Q4 contract instead of spreading onto a
+  peer GPU merely to upgrade KV precision.
+- **Qwen3.8 Flash Next context regression fixed:** the full 26.82 GiB PLE table
+  remains visible as a file-backed lazy mapping, but only its measured 5%
+  active-row working set is charged as mandatory physical RAM. The profile now
+  defaults to Safe/ubatch 64. On the local 16+32 GiB AMD system, both b10679
+  Vulkan and HIP loaded `130000` requested context (`130048` allocated), Q4 KV,
+  and completed a real request with only ~30 GiB RAM free before launch.
+- **Performance/MTP decisions hardened:** Quick evidence cannot replace an
+  already validated Perform profile; binary/backend/device/quality/search
+  fingerprints invalidate stale results; Standard tests the top two
+  thread×batch families; winner promotion requires a conservative paired 3%
+  gain; and MTP depth needs two meaningful regressions before stopping.
+  Cross-mode fastest selection runs only for identical workloads.
+- **Real MTP counter validation:** the Qwen3.8-27B embedded MTP path reported
+  bounded native acceptance counters on both backends (Vulkan 79/85, HIP
+  72/74). Full commands and bounded evidence are in
+  [`docs/v5.3.2-validation.md`](docs/v5.3.2-validation.md).
 
 ### Review b10666 → b10679
 

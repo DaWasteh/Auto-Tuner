@@ -18,14 +18,16 @@ min_llama_build: 10660
 # block. Do not inherit the separate Qwen3.8 27B/2.4T profile's optional 1M
 # YaRN claim until the Flash-Next model/runtime publishes that contract.
 max_context: 262144
-recommended_kv_quant: q5_0
+recommended_kv_quant: q4_0
 
 rope_scale:
   enabled: false
   max_context: 262144
   scale_factor: 1.0
 
-performance_target: throughput
+# The PLE/QSA model is already decode-efficient; default to the 64-token
+# ubatch tier so long-context capacity wins over a marginal batch increase.
+performance_target: safe
 
 # Metadata-embedded generation defaults.
 sampling:
@@ -61,7 +63,8 @@ notes: >
   512 experts with 10 active, full attention every fourth block (12 normal KV
   layers), an additional QSA indexer cache, and 262,144 native context. Its PLE
   per-layer n-gram embedding table is a giant read-lazy host mapping rather than
-  splittable layer weight; AutoTuner sizes it separately and uses ubatch
-  64/128/256 for Safe/Balanced/Throughput because the QSA graph grows with
-  context x ubatch. PLE is not advertised as
+  splittable layer weight; AutoTuner sizes the full file mapping separately
+  from its active-row residency and defaults this profile to Safe/ubatch 64.
+  Balanced/Throughput remain available at ubatch 128/256 because the QSA graph
+  grows with context x ubatch. PLE is not advertised as
   generic draft-mtp.

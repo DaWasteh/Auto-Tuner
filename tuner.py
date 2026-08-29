@@ -47,6 +47,12 @@ MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[
 ].moe_placement_ctx_target
 MOE_KV_RESERVE_FRAC = 0.06
 
+# Capacity-first stock llama.cpp KV default. Q4_0/Q4_0 is supported by the
+# current Vulkan and HIP FlashAttention paths and avoids mixed-quant backend
+# fallbacks. Expert/manual pins remain authoritative, and runner-specific
+# exceptions (currently DiffusionGemma) still report the cache they really use.
+DEFAULT_KV_CACHE_TYPE = "q4_0"
+
 # Default host-RAM prompt-cache size in MiB (``--cache-ram``). A bounded,
 # computed default replaces the previous unlimited/uncomputed value so the
 # cache no longer silently consumes all available RAM. -1 keeps the legacy
@@ -84,6 +90,15 @@ _QWEN4EXP_UBATCH = 256
 _QWEN4EXP_GPU_COMPUTE_BYTES = 72
 _QWEN4EXP_HOST_COMPUTE_BYTES = 215
 _QWEN4EXP_FIXED_HOST_RUNTIME_GB = 5.5
+
+# ``--tensor-read-lazy`` maps the complete row table into the process address
+# space, but untouched file-backed pages are reclaimable and do not consume
+# committed/physical RAM merely because MapViewOfFile/mmap spans them. Budget
+# the measured active-row working set (upstream observed about 4.4%) rather
+# than the full virtual mapping. Keep the full mapping visible separately so
+# users can still see the paging/I/O pressure it may create.
+_READ_LAZY_RESIDENT_FRACTION = 0.05
+_READ_LAZY_RESIDENT_MIN_GB = 0.5
 
 
 def _qwen4exp_ubatch_for_target(target_name: str) -> int:
@@ -1473,9 +1488,12 @@ class TunedConfig:
     estimated_model_vram_gb: float = 0.0
     estimated_model_ram_gb: float = 0.0
     # Giant row-gather weights left mmap-backed by --tensor-read-lazy auto.
-    # They are fixed host mappings, not ordinary CPU-offloaded layers and not
-    # eligible for GPU tensor splitting (notably qwen4exp's ~26.8 GiB PLE table).
+    # ``mapped_model_ram_gb`` is the full file-backed virtual mapping;
+    # ``mapped_model_resident_gb`` is the conservative active working-set
+    # reservation used for physical-memory planning. They are not ordinary
+    # CPU-offloaded layers and are not eligible for GPU tensor splitting.
     mapped_model_ram_gb: float = 0.0
+    mapped_model_resident_gb: float = 0.0
     estimated_kv_gb: float = 0.0
     full_offload: bool = False
     # CPU and accelerator allocations share one physical pool (Apple
@@ -1692,12 +1710,14 @@ def _decide_moe_offload(
     shared_overhead_gb = model_size_gb * 0.08
     per_layer_expert_gb = max(0.001, (model_size_gb - shared_overhead_gb) / n_layers)
 
-    # ---- KV reservation in VRAM (q5_0 assumption) -----------------------
+    # ---- KV reservation in VRAM (global Q4_0 default) -------------------
     # Cap at moe_placement_ctx_target so we don't pessimise layer placement
     # for huge profile_max values (Qwen3.6 → 262k, but most users run 32k).
     kv_reservation_ctx = max(2048, min(target_ctx, moe_placement_ctx_target))
     kv_reserve_gb = (
-        kv_reservation_ctx * base_kv_per_token_mb * kv_quant_factor("q5_0")
+        kv_reservation_ctx
+        * base_kv_per_token_mb
+        * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
     ) / 1024.0
 
     # If even the estimated non-expert/shared tensors cannot fit, --n-cpu-moe
@@ -1991,57 +2011,30 @@ def _pick_kv_quant(
     base_k_per_token_mb: Optional[float] = None,
     base_v_per_token_mb: Optional[float] = None,
 ) -> Tuple[str, str]:
-    """Pick the highest-quality K/V pair that preserves ``target_ctx``.
+    """Return the capacity-first automatic K/V cache pair.
 
-    Context is the primary objective. Once the requested/model maximum fits,
-    unused memory is reinvested in KV precision instead of leaving a q4/q5
-    cache selected merely because a profile named that conservative default.
-    ``profile_recommended`` remains a compatibility hint: an explicit
-    ``bf16`` chooses BF16 as the full-precision tier; every other profile uses
-    llama.cpp's reference F16 tier. It is deliberately *not* a quality ceiling.
+    v5.3.2 intentionally standardises stock llama.cpp Auto mode on symmetric
+    Q4_0 for every normal model. This avoids spending otherwise usable context
+    on an automatic F16/Q8 upgrade and avoids mixed K/V FlashAttention fallback
+    differences across Vulkan, HIP, and default CUDA builds. The historical
+    ``profile_recommended`` and ``asymmetric`` parameters remain in the public
+    signature for compatibility, but no longer raise automatic precision.
 
-    With ``asymmetric=True`` (default — Vulkan ≥ b9106 and ROCm support it),
-    K and V may use different types. K is kept one tier above V where useful
-    because K quantisation generally hurts attention recall more than V
-    quantisation hurts output quality. Backends that require K == V pass
-    ``asymmetric=False``.
-
-    With ``turbo=True`` the chosen labels are mapped via
-    :data:`_TURBO_QUANT_MAP` to fork-only TurboQuant equivalents.
-
-    Order tried (top → bottom = best → worst quality):
-
-        K=f16   V=f16      # reference/full precision (bf16 if requested)
-        K=f16   V=q8_0     # asymmetric high     (only if asymmetric=True)
-        K=q8_0  V=q8_0     # symmetric high
-        K=q8_0  V=q5_0     # asymmetric mid      (only if asymmetric=True)
-        K=q5_0  V=q5_0     # symmetric mid
-        K=q5_0  V=q4_0     # asymmetric low      (only if asymmetric=True)
-        K=q4_0  V=q4_0     # symmetric low
+    Manual Expert pins remain untouched by :func:`compute_config`. With
+    ``turbo=True`` the Q4_0 baseline maps to the fork-only TurboQuant default.
+    Runner-specific paths that cannot apply cache quantisation bypass this
+    helper and report their real F16 cache.
     """
     # Beschränke target_ctx auf Modell-Maximum wenn nötig.
     if model_max_ctx > 0 and target_ctx > model_max_ctx:
         target_ctx = model_max_ctx
 
-    rec = profile_recommended.strip().lower()
-    full_precision = "bf16" if rec == "bf16" else "f16"
-    if asymmetric:
-        pairs: List[Tuple[str, str]] = [
-            (full_precision, full_precision),
-            (full_precision, "q8_0"),
-            ("q8_0", "q8_0"),
-            ("q8_0", "q5_0"),
-            ("q5_0", "q5_0"),
-            ("q5_0", "q4_0"),
-            ("q4_0", "q4_0"),
-        ]
-    else:
-        pairs = [
-            (full_precision, full_precision),
-            ("q8_0", "q8_0"),
-            ("q5_0", "q5_0"),
-            ("q4_0", "q4_0"),
-        ]
+    # Read the legacy arguments so static analyzers and third-party wrappers
+    # can keep calling the old signature without implying they affect Auto.
+    _ = profile_recommended, asymmetric
+    pairs: List[Tuple[str, str]] = [
+        (DEFAULT_KV_CACHE_TYPE, DEFAULT_KV_CACHE_TYPE)
+    ]
 
     budget_mb = kv_budget_gb * 1024 * 0.98
 
@@ -2320,14 +2313,24 @@ def compute_config(
     model_arch = str((model.metadata or {}).get("general.architecture") or "").lower()
     placement_model_size_gb = model.placement_size_gb
     read_lazy_table_gb = model.read_lazy_size_gb
-    # Windows cannot unmap unused fragments from a MapViewOfFile and the real
-    # b10666 load retained essentially the complete 26.8 GiB PLE mapping in
-    # the process working set. POSIX marks the lazy range random/on-demand;
-    # upstream measured ~4.4% resident, so reserve a conservative 5% there.
-    mapped_model_ram_gb = (
-        read_lazy_table_gb
-        if platform.system() == "Windows"
-        else min(read_lazy_table_gb, max(0.5, read_lazy_table_gb * 0.05))
+    # The complete lazy tensor remains visible as a file-backed virtual map,
+    # while only rows touched by inference need physical residency. Charging
+    # the entire mapping against *currently free* RAM made a 26.8-GiB PLE map
+    # consume more planner budget whenever unrelated applications were open,
+    # collapsing an otherwise valid Qwen3.8 Flash-Next context to the 2k floor.
+    # Keep both facts: full mapping for diagnostics, bounded active residency
+    # for capacity planning. File-backed pages remain reclaimable on Windows
+    # and POSIX; additional residency may page under pressure but is not an OOM
+    # requirement at mapping time.
+    mapped_model_ram_gb = read_lazy_table_gb
+    mapped_model_resident_gb = (
+        min(
+            read_lazy_table_gb,
+            max(
+                _READ_LAZY_RESIDENT_MIN_GB,
+                read_lazy_table_gb * _READ_LAZY_RESIDENT_FRACTION,
+            ),
+        )
         if read_lazy_table_gb > 0
         else 0.0
     )
@@ -2585,7 +2588,7 @@ def compute_config(
         0.0,
         system.free_ram_gb
         - ram_safety_gb
-        - mapped_model_ram_gb
+        - mapped_model_resident_gb
         - runtime_ram_overhead_gb
         - vision_ram_gb
         - prompt_cache_ram_gb,
@@ -2597,7 +2600,7 @@ def compute_config(
     shared_host_reserve_gb = (
         vision_ram_gb
         + prompt_cache_ram_gb
-        + mapped_model_ram_gb
+        + mapped_model_resident_gb
         + runtime_ram_overhead_gb
         if unified_memory
         else 0.0
@@ -2768,9 +2771,9 @@ def compute_config(
     else:
         # Reserve VRAM for the KV cache before placing dense weight layers,
         # sized by the tier's dense_kv_reserve_ctx (0 for low_vram, whose KV
-        # goes to RAM instead). Assume q5_0 KV for the reservation — matches
-        # the MoE path and stays conservative vs. the q4_0/q8_0 the caller may
-        # finally pick. Capped at the model's native context so we never
+        # goes to RAM instead). Use the same Q4_0 pair Auto will emit so layer
+        # placement and final context are planned against one cache contract.
+        # Capped at the model's native context so we never
         # reserve for tokens the model can't address.
         #
         # Reserve only when weights + the tier's desired KV target do not fit
@@ -2783,7 +2786,7 @@ def compute_config(
             if native_ctx > 0:
                 reserve_ctx = min(reserve_ctx, native_ctx)
             desired_dense_kv_reserve_gb += (
-                reserve_ctx * base_kv_mb * kv_quant_factor("q5_0")
+                reserve_ctx * base_kv_mb * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
             ) / 1024.0
         model_weights_fit_vram = (
             placement_model_size_gb
@@ -2882,18 +2885,12 @@ def compute_config(
         else 0.0
     )
 
-    # Prefer one GPU only when it can deliver BOTH the requested/model-maximum
-    # context and the best normal KV precision (F16/BF16). The previous test
-    # looked only at fixed weights: Qwen3.8 Q3–Q6 therefore fit on the R9700,
-    # were pinned there, and lost context or fell to Q4/Q5 while the RX 9070 XT
-    # sat idle. The larger Q8 crossed the weight-only threshold, used both GPUs,
-    # and paradoxically achieved a better context/precision result.
-    #
-    # The objective is now lexicographic:
-    #   1. preserve requested/native context;
-    #   2. maximise KV precision;
-    #   3. keep peer GPUs free only when (1) and (2) already fit on primary.
-    # A hard force_gpu pin remains authoritative even when it sacrifices (1/2).
+    # Prefer one GPU when it can deliver the requested/model-maximum context
+    # with the global Q4_0 cache default. Before v5.3.2 this gate required F16,
+    # so Auto spread onto an otherwise idle peer solely to upgrade KV precision.
+    # Q4 is now the explicit capacity-first contract: preserve context first,
+    # then keep peer GPUs free whenever the Q4 cache and fixed footprint fit.
+    # A hard force_gpu pin remains authoritative even when it sacrifices context.
     planned_single_gpu = forced_gpu is not None
     gpu_budget_free_vram = free_vram
     fixed_gpu_footprint = (
@@ -2931,10 +2928,13 @@ def compute_config(
                 n_parallel,
                 quality_rope_scaling,
             )
-            full_precision_kv_gb = (
-                quality_target_ctx * base_kv_mb * n_parallel
+            default_kv_gb = (
+                quality_target_ctx
+                * base_kv_mb
+                * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
+                * n_parallel
             ) / 1024.0
-            if full_precision_kv_gb <= primary_usable_kv_budget * 0.98:
+            if default_kv_gb <= primary_usable_kv_budget * 0.98:
                 planned_single_gpu = True
                 gpu_budget_free_vram = primary_cap
 
@@ -2958,7 +2958,7 @@ def compute_config(
         system.free_ram_gb
         - ram_safety_gb
         - model_ram
-        - mapped_model_ram_gb
+        - mapped_model_resident_gb
         - vision_ram_gb
         - prompt_cache_ram_gb
         - runtime_ram_overhead_gb
@@ -2976,7 +2976,7 @@ def compute_config(
             - max(effective_vram_safety, ram_safety_gb)
             - model_vram
             - model_ram
-            - mapped_model_ram_gb
+            - mapped_model_resident_gb
             - vision_vram_gb
             - vision_ram_gb
             - draft_vram_gb
@@ -3109,8 +3109,8 @@ def compute_config(
         and native_ctx > 0
         and native_ctx < profile_rope_max
     ):
-        # KV-Speicherbedarf pro Token (q5_0 als Entscheidungsgrundlage)
-        kv_per_tok_q5 = base_kv_mb * kv_quant_factor("q5_0")
+        # KV-Speicherbedarf pro Token (globales Q4_0-Auto-Default)
+        kv_per_tok_q4 = base_kv_mb * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
 
         # ---- RoPE-Ziel-Context ----------------------------------------
         # Wie weit wir via YaRN ausdehnen wollen. Das alte Gate prüfte
@@ -3143,13 +3143,13 @@ def compute_config(
             # n_parallel zu teilen verhindert Überprovisionierung.
             kv_budget_per_slot_gb = kv_budget_gb / n_parallel
 
-            # Context, den das Budget (q5_0-Basis) pro Slot tatsächlich hält.
+            # Context, den das Budget (Q4_0-Basis) pro Slot tatsächlich hält.
             # kv_budget_gb wird in Schritt (2.6) um den Compute-Buffer-Reserve
             # verkleinert, daher fällt der finale ctx (max_fit_ctx) etwas
             # kleiner aus — model_ctx_limit fängt das über min() ab.
             budget_ctx = (
-                int((kv_budget_per_slot_gb * 1024) / kv_per_tok_q5)
-                if kv_per_tok_q5 > 0
+                int((kv_budget_per_slot_gb * 1024) / kv_per_tok_q4)
+                if kv_per_tok_q4 > 0
                 else 0
             )
 
@@ -3368,7 +3368,7 @@ def compute_config(
             shared_fixed_gb = (
                 model_vram
                 + model_ram
-                + mapped_model_ram_gb
+                + mapped_model_resident_gb
                 + vision_vram_gb
                 + vision_ram_gb
                 + draft_vram_gb
@@ -3399,7 +3399,7 @@ def compute_config(
             )
             host_fixed_gb = (
                 model_ram
-                + mapped_model_ram_gb
+                + mapped_model_resident_gb
                 + vision_ram_gb
                 + prompt_cache_ram_gb
                 + recurrent_state_ram_gb
@@ -3457,7 +3457,7 @@ def compute_config(
         shared_total = (
             model_vram
             + model_ram
-            + mapped_model_ram_gb
+            + mapped_model_resident_gb
             + estimated_kv_gb
             + recurrent_state_total_gb
             + vision_vram_gb
@@ -3472,10 +3472,10 @@ def compute_config(
         shared_free = min(free_vram, max(0.0, system.free_ram_gb))
         if shared_total > shared_free * 0.98:
             tight = (
-                f"Unified-memory budget tight: model "
-                f"{model_vram + model_ram + mapped_model_ram_gb:.1f} "
+                f"Unified-memory budget tight: resident model "
+                f"{model_vram + model_ram + mapped_model_resident_gb:.1f} "
                 f"GB + KV {estimated_kv_gb:.1f} GB + overhead/reserves "
-                f"{shared_total - model_vram - model_ram - mapped_model_ram_gb - estimated_kv_gb:.1f} "
+                f"{shared_total - model_vram - model_ram - mapped_model_resident_gb - estimated_kv_gb:.1f} "
                 f"GB ≈ {shared_total:.1f} GB of {shared_free:.1f} GB available."
             )
             warning = f"{warning} {tight}" if warning else tight
@@ -3505,7 +3505,7 @@ def compute_config(
     if not unified_memory:
         host_total = (
             model_ram
-            + mapped_model_ram_gb
+            + mapped_model_resident_gb
             + vision_ram_gb
             + prompt_cache_ram_gb
             + runtime_ram_overhead_gb
@@ -3515,13 +3515,27 @@ def compute_config(
         )
         if host_total > system.free_ram_gb * 0.98:
             tight = (
-                f"RAM budget tight: CPU weights {model_ram:.1f} GB + mapped "
-                f"weights {mapped_model_ram_gb:.1f} GB + runtime/cache/state "
-                f"{host_total - model_ram - mapped_model_ram_gb - ram_safety_gb:.1f} "
+                f"RAM budget tight: CPU weights {model_ram:.1f} GB + lazy-map "
+                f"resident budget {mapped_model_resident_gb:.1f} GB + runtime/cache/state "
+                f"{host_total - model_ram - mapped_model_resident_gb - ram_safety_gb:.1f} "
                 f"GB + safety {ram_safety_gb:.1f} GB ≈ {host_total:.1f} GB "
                 f"of {system.free_ram_gb:.1f} GB free."
             )
             warning = f"{warning} {tight}" if warning else tight
+
+        full_lazy_pressure_gb = (
+            host_total - mapped_model_resident_gb + mapped_model_ram_gb
+        )
+        if (
+            mapped_model_ram_gb > mapped_model_resident_gb + 0.05
+            and full_lazy_pressure_gb > system.free_ram_gb * 0.98
+        ):
+            paging = (
+                f"Lazy tensor map is {mapped_model_ram_gb:.1f} GB file-backed "
+                f"({mapped_model_resident_gb:.1f} GB active-row budget); Windows/OS "
+                "may reclaim or page cold rows under current RAM pressure."
+            )
+            warning = f"{warning} {paging}" if warning else paging
 
     # ---- (4) Threads — weniger Threads für bessere Performance
     # start_llama.py verwendet: cpu_count // 2 (max 8 bei <16 cores)
@@ -4153,6 +4167,7 @@ def compute_config(
         estimated_model_vram_gb=model_vram,
         estimated_model_ram_gb=model_ram,
         mapped_model_ram_gb=mapped_model_ram_gb,
+        mapped_model_resident_gb=mapped_model_resident_gb,
         estimated_kv_gb=estimated_kv_gb,
         full_offload=full_off,
         unified_memory=unified_memory,
@@ -4173,7 +4188,7 @@ def compute_config(
         no_context_shift=no_context_shift,
         no_kv_offload=no_kv_offload,
         rope_scaling=rope_scaling_active,
-        # YaRN-Faktor aus dem TATSÄCHLICH erreichten rope_scaled_ctx ableiten
+        # YaRN-Faktor aus dem TATSÄCHLICH erreichten finalen ctx ableiten
         # (ceil(ctx/native)), gedeckelt auf den profil-erlaubten Maximal-
         # faktor (z.B. 4.0 für Qwen3.5/3.6). Früher war der Faktor immer fix
         # profile_rope_factor (4.0) — selbst wenn nur ein 300k-Context auf
@@ -4185,7 +4200,7 @@ def compute_config(
                 1.0,
                 min(
                     float(profile_rope_factor),
-                    float(math.ceil(rope_scaled_ctx / native_ctx))
+                    float(math.ceil(ctx / native_ctx))
                     if (rope_scaling_active and native_ctx > 0)
                     else float(profile_rope_factor),
                 ),

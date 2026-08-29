@@ -152,6 +152,7 @@ from model_benchmark import (
     BenchmarkSuiteJobResult,
     BenchmarkSuiteResult,
     BenchmarkSuiteRunner,
+    BENCHMARK_SEARCH_SCHEMA,
     baseline_candidate,
     shortlist_candidates_from_record,
 )
@@ -185,6 +186,72 @@ def _about_text() -> str:
     """Return static, network-free application information for the About dialog."""
     url = f"https://github.com/{GITHUB_REPO}"
     return f'<b>AutoTuner</b><br>Version v{VERSION}<br><a href="{url}">{url}</a>'
+
+
+def _runtime_identity(value: str) -> str:
+    """Return a stable absolute/case-normalized identity for one executable."""
+    resolved = shutil.which(value) or value
+    try:
+        path = Path(resolved).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return os.path.normcase(str(resolved))
+    return os.path.normcase(str(path))
+
+
+def _benchmark_environment_fingerprint(
+    runtime_binary: str,
+    runtime_build: Optional[int],
+    system: SystemInfo,
+    baseline: TunedConfig,
+) -> dict:
+    """Describe every stable dimension that can invalidate a measured winner."""
+    runtime_path = _runtime_identity(runtime_binary)
+    try:
+        runtime_stat = Path(runtime_path).stat()
+        runtime_size = int(runtime_stat.st_size)
+        runtime_mtime_ns = int(runtime_stat.st_mtime_ns)
+    except OSError:
+        runtime_size = 0
+        runtime_mtime_ns = 0
+    return {
+        "search_schema": BENCHMARK_SEARCH_SCHEMA,
+        "runtime_path": runtime_path,
+        "runtime_build": int(runtime_build) if runtime_build is not None else None,
+        "runtime_size": runtime_size,
+        "runtime_mtime_ns": runtime_mtime_ns,
+        "os": str(system.os_name),
+        "cpu": str(system.cpu_name),
+        "physical_cores": int(system.cpu_cores_physical),
+        "logical_cores": int(system.cpu_cores_logical),
+        "devices": [
+            {
+                "name": str(gpu.name),
+                "backend": str(gpu.runtime_backend or ""),
+                "device": str(gpu.runtime_device or ""),
+                "vram_mb": int(gpu.total_vram_mb),
+            }
+            for gpu in system.gpus
+        ],
+        "quality": {
+            "cache_k": str(baseline.cache_k),
+            "cache_v": str(baseline.cache_v),
+            "flash_attn": bool(baseline.flash_attn),
+            "ctx": int(baseline.ctx),
+            "ngl": int(baseline.ngl),
+            "n_cpu_moe": (
+                int(baseline.n_cpu_moe) if baseline.n_cpu_moe is not None else None
+            ),
+            "tensor_split": str(baseline.tensor_split or ""),
+            "main_gpu": (
+                int(baseline.main_gpu) if baseline.main_gpu is not None else None
+            ),
+            "no_kv_offload": bool(baseline.no_kv_offload),
+            "rope_scaling": bool(baseline.rope_scaling),
+            "rope_factor": float(baseline.rope_scale_factor),
+            "parallel": 1,
+        },
+        "baseline_runtime": baseline_candidate(baseline).settings(),
+    }
 
 
 def _application_theme_manager(
@@ -8411,6 +8478,27 @@ class MainWindow(QMainWindow):
             self._log(f"[Warning] compute_config failed: {exc}")
             return None
 
+    def _measured_snapshot_matches_environment(
+        self, snapshot: dict, baseline: TunedConfig
+    ) -> bool:
+        """Reject measured winners from another binary/backend/search schema."""
+        source = str(snapshot.get("source", "") or "").lower()
+        if not source.startswith("measured-"):
+            return True
+        stored = snapshot.get("benchmark_environment")
+        if not isinstance(stored, dict) or self._system is None:
+            return False
+        runtime_binary = self._active_llama_binary()
+        if not runtime_binary:
+            return False
+        expected = _benchmark_environment_fingerprint(
+            runtime_binary,
+            probe_binary_build_number(runtime_binary),
+            self._system,
+            baseline,
+        )
+        return stored == expected
+
     def _effective_config(
         self,
         entry: ModelEntry,
@@ -8445,6 +8533,12 @@ class MainWindow(QMainWindow):
             entry.name, entry.path, target_name, slot, drafter_key
         )
         if not override:
+            return base
+        if not self._measured_snapshot_matches_environment(override, base):
+            self._log(
+                f"[Performance] Ignoring stale measured profile for {entry.name} "
+                f"[{target_name}]; binary/backend/search environment changed."
+            )
             return base
         vals = override.get("values") or {}
         try:
@@ -8500,7 +8594,13 @@ class MainWindow(QMainWindow):
             self._expert_loaded_drafter_key,
         )
         if override:
-            self._expert_panel.restore_from_snapshot(override)
+            if self._measured_snapshot_matches_environment(override, cfg):
+                self._expert_panel.restore_from_snapshot(override)
+            else:
+                self._log(
+                    f"[Performance] Measured Expert profile for {entry.name} "
+                    f"[{target_name}] needs revalidation on this runtime."
+                )
 
     def _update_config_text(self, entry: ModelEntry, profile: ModelProfile) -> None:
         """Recompute the effective config (Auto or saved Expert override)
@@ -8638,9 +8738,12 @@ class MainWindow(QMainWindow):
             + cfg.runtime_vram_overhead_gb
             + cfg.batch_vram_overhead_gb
         )
+        mapped_resident_gb = float(
+            getattr(cfg, "mapped_model_resident_gb", cfg.mapped_model_ram_gb) or 0.0
+        )
         total_cpu = (
             cfg.estimated_model_ram_gb
-            + cfg.mapped_model_ram_gb
+            + mapped_resident_gb
             + cfg.vision_ram_gb
             + cfg.kv_ram_gb
             + cfg.recurrent_state_ram_gb
@@ -8681,7 +8784,10 @@ class MainWindow(QMainWindow):
             lines.append(f"  Batch GPU : ~{cfg.batch_vram_overhead_gb:5.1f} GB")
         lines.append(f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB")
         if cfg.mapped_model_ram_gb > 0.05:
-            lines.append(f"  Lazy mmap : ~{cfg.mapped_model_ram_gb:5.1f} GB")
+            lines.append(
+                f"  Lazy mmap : ~{cfg.mapped_model_ram_gb:5.1f} GB file-backed"
+                f"   (active budget {mapped_resident_gb:.1f} GB)"
+            )
         if cfg.unified_memory:
             lines.append(
                 f"  Unified total: ~{total_gpu + total_cpu:5.1f} GB"
@@ -9451,6 +9557,9 @@ class MainWindow(QMainWindow):
         baseline: TunedConfig,
         benchmark_type: str,
         prompt_fraction: float,
+        *,
+        runtime_binary: str,
+        system: SystemInfo,
     ) -> bool:
         if not isinstance(record, dict) or not isinstance(
             record.get("candidates"), list
@@ -9474,7 +9583,15 @@ class MainWindow(QMainWindow):
             return False
         if abs(stored_fraction - float(prompt_fraction)) > 1e-9:
             return False
-        return str(record.get("benchmark_type", "")) == benchmark_type
+        if str(record.get("benchmark_type", "")) != benchmark_type:
+            return False
+        expected_environment = _benchmark_environment_fingerprint(
+            runtime_binary,
+            probe_binary_build_number(runtime_binary),
+            system,
+            baseline,
+        )
+        return record.get("environment_fingerprint") == expected_environment
 
     def _shortlist_for_full_benchmark(
         self,
@@ -9482,6 +9599,9 @@ class MainWindow(QMainWindow):
         performance_target: str,
         drafter_key: str,
         baseline: TunedConfig,
+        *,
+        runtime_binary: str,
+        system: SystemInfo,
     ) -> List[BenchmarkCandidate]:
         short_record = app_settings.get_performance_tuning_result(
             entry.path,
@@ -9490,6 +9610,14 @@ class MainWindow(QMainWindow):
             drafter_key,
         )
         if not isinstance(short_record, dict):
+            return []
+        expected_environment = _benchmark_environment_fingerprint(
+            runtime_binary,
+            probe_binary_build_number(runtime_binary),
+            system,
+            baseline,
+        )
+        if short_record.get("environment_fingerprint") != expected_environment:
             return []
         try:
             if int(short_record.get("desired_context", 0) or 0) != int(baseline.ctx):
@@ -9787,16 +9915,8 @@ class MainWindow(QMainWindow):
             _find_compatible_draft_server,
         )
 
-        def runtime_identity(value: str) -> str:
-            resolved = shutil.which(value) or value
-            try:
-                path = Path(resolved).expanduser().resolve(strict=False)
-            except (OSError, RuntimeError, ValueError):
-                return os.path.normcase(str(resolved))
-            return os.path.normcase(str(path))
-
         active_runtime = self._active_llama_binary()
-        active_runtime_key = runtime_identity(active_runtime) if active_runtime else ""
+        active_runtime_key = _runtime_identity(active_runtime) if active_runtime else ""
 
         for candidate in source_entries:
             candidate_profile = match_profile(
@@ -9836,7 +9956,7 @@ class MainWindow(QMainWindow):
                     ) and not shutil.which(runtime_binary):
                         raise FileNotFoundError(runtime_binary)
 
-                    preferred_key = runtime_identity(runtime_binary)
+                    preferred_key = _runtime_identity(runtime_binary)
                     compatibility_key = (drafter_key, preferred_key)
                     if compatibility_key in draft_runtime_cache:
                         compatible_draft_binary = draft_runtime_cache[
@@ -9875,7 +9995,7 @@ class MainWindow(QMainWindow):
                             f"{candidate.name} [{drafter_label}]: {draft_message}"
                         )
                         continue
-                    runtime_key = runtime_identity(runtime_binary)
+                    runtime_key = _runtime_identity(runtime_binary)
                     exact_system = system_cache.get(runtime_key)
                     if exact_system is None:
                         if (
@@ -9938,6 +10058,8 @@ class MainWindow(QMainWindow):
                             baseline,
                             benchmark_type,
                             prompt_context_fraction,
+                            runtime_binary=runtime_binary,
+                            system=exact_system,
                         ):
                             skipped.append(
                                 f"{candidate.name} [{target_name}, {drafter_label}]: "
@@ -9948,7 +10070,12 @@ class MainWindow(QMainWindow):
                     candidate_plan: List[BenchmarkCandidate] = []
                     if try_best_only and benchmark_type != "fast":
                         candidate_plan = self._shortlist_for_full_benchmark(
-                            candidate, target_name, drafter_key, baseline
+                            candidate,
+                            target_name,
+                            drafter_key,
+                            baseline,
+                            runtime_binary=runtime_binary,
+                            system=exact_system,
                         )
                         if candidate_plan:
                             planning_notes.append(
@@ -10243,6 +10370,15 @@ class MainWindow(QMainWindow):
                 winning_cfg,
                 validated_exact_context=bool(job.metadata.get("exact_trial")),
             )
+            environment_fingerprint = _benchmark_environment_fingerprint(
+                measured.runtime_binary,
+                measured.runtime_build,
+                system,
+                base,
+            )
+            snapshot["benchmark_environment"] = copy.deepcopy(
+                environment_fingerprint
+            )
             try:
                 stat = entry.path.stat()
                 record = measured.to_record(
@@ -10262,6 +10398,8 @@ class MainWindow(QMainWindow):
             if benchmark_type == "fast":
                 snapshot["source"] = "measured-quick-pass"
                 snapshot["confidence"] = "provisional"
+            else:
+                snapshot["confidence"] = "validated"
             prompt_fraction = float(
                 job.metadata.get(
                     "prompt_context_fraction",
@@ -10275,6 +10413,7 @@ class MainWindow(QMainWindow):
             )
             record["model_name"] = entry.name
             record["performance_target"] = job.performance_target
+            record["environment_fingerprint"] = environment_fingerprint
             record["benchmark_type"] = benchmark_type
             record["drafter_key"] = drafter_key
             record["drafter_label"] = str(
@@ -10309,6 +10448,7 @@ class MainWindow(QMainWindow):
                 "n_cpu_moe": winning_cfg.n_cpu_moe,
                 "tensor_split": winning_cfg.tensor_split,
                 "main_gpu": winning_cfg.main_gpu,
+                "no_kv_offload": winning_cfg.no_kv_offload,
                 "rope_scaling": winning_cfg.rope_scaling,
                 "rope_factor": winning_cfg.rope_scale_factor,
             }
@@ -10321,10 +10461,26 @@ class MainWindow(QMainWindow):
                     {
                         "name": gpu.name,
                         "vram_mb": gpu.total_vram_mb,
+                        "runtime_backend": gpu.runtime_backend,
                         "runtime_device": gpu.runtime_device,
                     }
                     for gpu in system.gpus
                 ],
+            }
+            winner_samples = measured.winner.samples
+            record["workload_signature"] = {
+                "desired_context": int(measured.desired_context),
+                "benchmark_type": benchmark_type,
+                "drafter_key": drafter_key,
+                "prompt_context_fraction": prompt_fraction,
+                "prompt_token_cap": job.runner.limits.max_prompt_tokens,
+                "generated_token_target": int(job.runner.limits.generated_tokens),
+                "prompt_tokens": sorted(
+                    {int(sample.prompt_tokens) for sample in winner_samples}
+                ),
+                "generated_tokens": sorted(
+                    {int(sample.generated_tokens) for sample in winner_samples}
+                ),
             }
             saved = app_settings.save_performance_tuning_result(
                 entry.name,
@@ -10358,6 +10514,9 @@ class MainWindow(QMainWindow):
                 "decode_tps": winner.generation_tps,
                 "overall_tps": winner.overall_tps,
                 "desired_context": measured.desired_context,
+                "workload_signature": copy.deepcopy(
+                    record.get("workload_signature", {})
+                ),
                 "improvement": (measured.score(winner) - 1.0) * 100.0,
             }
         )
@@ -10405,10 +10564,10 @@ class MainWindow(QMainWindow):
 
         saved_rows: List[str] = []
         failed_rows: List[str] = []
-        # path -> [(target, model name, PP, n_decode, end-to-end TPS, ctx)]
-        mode_measurements: Dict[
-            str, List[Tuple[str, str, float, float, float, int]]
-        ] = {}
+        # model key -> independently checkpointed mode measurements. Automatic
+        # fastest-mode selection is allowed only when every row has the exact
+        # same measured workload signature (context/tokens/head/test tier).
+        mode_measurements: Dict[str, List[dict]] = {}
         measured_model_paths: Dict[str, Path] = {}
         detailed: Optional[Tuple[BenchmarkSuiteJob, BenchmarkResult]] = None
         refresh_current = False
@@ -10450,14 +10609,17 @@ class MainWindow(QMainWindow):
             model_key = str(checkpoint["model_key"])
             measured_model_paths[model_key] = cast(Path, checkpoint["model_path"])
             mode_measurements.setdefault(model_key, []).append(
-                (
-                    job.performance_target,
-                    entry.name,
-                    winner.prompt_tps,
-                    winner.generation_tps,
-                    winner.overall_tps,
-                    measured.desired_context,
-                )
+                {
+                    "target": job.performance_target,
+                    "model_name": entry.name,
+                    "prompt_tps": winner.prompt_tps,
+                    "decode_tps": winner.generation_tps,
+                    "overall_tps": winner.overall_tps,
+                    "context": measured.desired_context,
+                    "workload_signature": copy.deepcopy(
+                        checkpoint.get("workload_signature", {})
+                    ),
+                }
             )
             self._log(
                 f"[Performance] Saved {entry.path} [{job.performance_target}]: "
@@ -10479,22 +10641,37 @@ class MainWindow(QMainWindow):
 
         self._finish_performance_tuning_ui()
 
-        fastest_by_model = {
-            model_key: max(rows, key=lambda row: row[4])
-            for model_key, rows in mode_measurements.items()
-            if rows
-        }
+        fastest_by_model: Dict[str, dict] = {}
+        incomparable_models: set[str] = set()
+        for model_key, rows in mode_measurements.items():
+            signatures = {
+                json.dumps(row.get("workload_signature"), sort_keys=True)
+                for row in rows
+                if isinstance(row.get("workload_signature"), dict)
+                and row.get("workload_signature")
+            }
+            # One mode cannot establish a cross-mode winner. Missing/different
+            # signatures likewise make raw end-to-end TPS incomparable.
+            if len(rows) < 2 or len(signatures) != 1:
+                incomparable_models.add(model_key)
+                continue
+            fastest_by_model[model_key] = max(
+                rows, key=lambda row: float(row.get("overall_tps", 0.0))
+            )
+
         for model_key, fastest_row in fastest_by_model.items():
             model_path = measured_model_paths.get(model_key)
             if model_path is not None:
-                app_settings.set_model_performance_target(model_path, fastest_row[0])
+                app_settings.set_model_performance_target(
+                    model_path, str(fastest_row["target"])
+                )
 
         selected_fastest: Optional[str] = None
         if self._current_entry is not None:
             current_key = app_settings.favorite_model_key(self._current_entry.path)
             current_fastest = fastest_by_model.get(current_key)
             if current_fastest is not None:
-                selected_fastest = current_fastest[0]
+                selected_fastest = str(current_fastest["target"])
                 index = self._perf_combo.findText(selected_fastest)
                 if index >= 0:
                     if self._perf_combo.currentIndex() != index:
@@ -10507,7 +10684,14 @@ class MainWindow(QMainWindow):
                 self._log(
                     f"[Performance] Fastest measured mode for "
                     f"{self._current_entry.name}: {selected_fastest} "
-                    f"({current_fastest[4]:.2f} end-to-end tok/s); selected automatically."
+                    f"({float(current_fastest['overall_tps']):.2f} end-to-end tok/s); "
+                    "selected automatically."
+                )
+            elif current_key in incomparable_models:
+                self._log(
+                    f"[Performance] No automatic fastest-mode selection for "
+                    f"{self._current_entry.name}: measured workloads differed or "
+                    "only one mode completed."
                 )
         if refresh_current:
             self._refresh_setting_profile_selector()
@@ -10540,9 +10724,10 @@ class MainWindow(QMainWindow):
                     f"tokens (static safe estimate: {safe_context:,}).\n"
                 )
             selection_line = (
-                f"Fastest measured mode: {job.performance_target} (selected automatically)."
+                f"Fastest comparable measured mode: {job.performance_target} "
+                "(selected automatically)."
                 if selected_fastest == job.performance_target
-                else f"Fastest measured mode in this run: {job.performance_target}."
+                else "Only one comparable mode completed; no automatic mode selection."
             )
             message = (
                 f"Saved {job.performance_target} profile at "
@@ -10568,30 +10753,38 @@ class MainWindow(QMainWindow):
                 f"Saved {len(saved_rows)} independent performance profile(s).",
                 *([result.stop_reason] if result.stopped_early else []),
                 "Speeds below are the measured winning settings for every mode;",
-                "★ marks the fastest end-to-end mode for that model.",
+                "★ marks a fastest mode only when workloads are identical.",
             ]
             shown_modes = 0
             mode_order = {name: index for index, name in enumerate(list_target_names())}
             for model_key in sorted(mode_measurements, key=str.casefold):
                 rows = sorted(
                     mode_measurements[model_key],
-                    key=lambda row: mode_order.get(row[0], 999),
+                    key=lambda row: mode_order.get(str(row.get("target", "")), 999),
                 )
                 if not rows:
                     continue
-                lines.extend(["", rows[0][1]])
-                fastest_target = fastest_by_model[model_key][0]
-                for target, _name, prompt_tps, decode_tps, overall_tps, ctx in rows:
+                lines.extend(["", str(rows[0].get("model_name", model_key))])
+                fastest = fastest_by_model.get(model_key)
+                fastest_target = str(fastest.get("target", "")) if fastest else ""
+                for row in rows:
                     if shown_modes >= 20:
                         break
-                    marker = "★" if target == fastest_target else " "
+                    target = str(row.get("target", ""))
+                    marker = "★" if fastest_target and target == fastest_target else " "
                     lines.append(
-                        f"{marker} {target}: PP {prompt_tps:.1f}, n_decode "
-                        f"{decode_tps:.1f}, end-to-end {overall_tps:.1f} tok/s "
-                        f"(ctx {ctx:,})"
+                        f"{marker} {target}: PP {float(row.get('prompt_tps', 0.0)):.1f}, "
+                        f"n_decode {float(row.get('decode_tps', 0.0)):.1f}, "
+                        f"end-to-end {float(row.get('overall_tps', 0.0)):.1f} tok/s "
+                        f"(ctx {int(row.get('context', 0)):,})"
                     )
                     shown_modes += 1
-                lines.append(f"  Fastest: {fastest_target}")
+                if fastest_target:
+                    lines.append(f"  Fastest comparable: {fastest_target}")
+                else:
+                    lines.append(
+                        "  No auto-selection: workloads differ or only one mode completed."
+                    )
                 if shown_modes >= 20:
                     break
             total_modes = sum(len(rows) for rows in mode_measurements.values())

@@ -148,6 +148,8 @@ def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
     assert profile.rope_scale_max_ctx == 262144
     assert profile.sampling["chat"] == profile.sampling["coding"]
     assert profile.ngram_method == "ngram-map-k4v"
+    assert profile.recommended_kv_quant == "q4_0"
+    assert profile.performance_target == "safe"
     assert profile.min_llama_build == 10660
     assert match_profile("opaque-preview.gguf", profiles, "qwen4exp") is profile
 
@@ -720,13 +722,10 @@ def test_nvidia_auto_kv_stays_symmetric_for_cuda_flash_attention(tmp_path) -> No
         profile,
     )
 
-    # AMD may choose an asymmetric pair when it fits, but NVIDIA must retain
-    # a symmetric pair. Auto is allowed to upgrade all the way to F16/BF16
-    # when full context still fits.
-    normal_types = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
-    assert amd_cfg.cache_k in normal_types
-    assert amd_cfg.cache_v in normal_types
-    assert nvidia_cfg.cache_k == nvidia_cfg.cache_v
+    # v5.3.2 uses one backend-friendly, symmetric capacity default everywhere;
+    # manual Expert pins remain the escape hatch for higher precision.
+    assert (amd_cfg.cache_k, amd_cfg.cache_v) == ("q4_0", "q4_0")
+    assert (nvidia_cfg.cache_k, nvidia_cfg.cache_v) == ("q4_0", "q4_0")
 
 
 def test_devstral_uses_high_context_when_ram_is_plenty(tmp_path) -> None:
@@ -1437,9 +1436,16 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     window._all_entries = [model]
     window._show_config(model)
 
-    def outcome(target: str, prompt: float, decode: float):
+    def outcome(
+        target: str,
+        prompt: float,
+        decode: float,
+        *,
+        context: int = 8192,
+        prompt_tokens: int = 4096,
+    ):
         cfg = TunedConfig(
-            ctx=8192,
+            ctx=context,
             ngl=999,
             threads=8,
             batch_threads=8,
@@ -1457,10 +1463,14 @@ def test_performance_suite_selects_and_reports_fastest_mode(
         winner_candidate = BenchmarkCandidate(
             f"winner-{target}", f"Winner {target}", 8, 8, 1024, 512
         )
-        baseline_sample = BenchmarkSample(100.0, 20.0, 4096, 256, 1.0)
-        winner_sample = BenchmarkSample(prompt, decode, 4096, 256, 1.0)
+        baseline_sample = BenchmarkSample(
+            100.0, 20.0, prompt_tokens, 256, 1.0
+        )
+        winner_sample = BenchmarkSample(
+            prompt, decode, prompt_tokens, 256, 1.0
+        )
         measured = BenchmarkResult(
-            desired_context=8192,
+            desired_context=context,
             baseline_id="baseline",
             winner_id=winner_candidate.id,
             candidates=[
@@ -1485,7 +1495,7 @@ def test_performance_suite_selects_and_reports_fastest_mode(
             label=f"{model.name} [{target}]",
             performance_target=target,
             runner=runner,
-            metadata={"system": system, "safe_context": 8192},
+            metadata={"system": system, "safe_context": context},
         )
         return BenchmarkSuiteJobResult(job=job, result=measured)
 
@@ -1514,6 +1524,31 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     qt_launcher.app_settings.set_model_performance_target(model.path, "safe")
     window._show_config(model)
     assert window._perf_combo.currentText() == "safe"
+
+    # Different contexts/token mixes are not comparable. Keep the user's
+    # current mode instead of selecting the numerically larger raw TPS.
+    messages.clear()
+    window._benchmark_checkpoints = {}
+    mismatched = BenchmarkSuiteResult(
+        jobs=[
+            outcome("safe", 180.0, 24.0, context=8192, prompt_tokens=4096),
+            outcome(
+                "throughput",
+                300.0,
+                50.0,
+                context=16384,
+                prompt_tokens=2048,
+            ),
+        ],
+        elapsed_s=20.0,
+    )
+    window._on_performance_tuning_finished(mismatched)
+    assert window._perf_combo.currentText() == "safe"
+    assert (
+        qt_launcher.app_settings.get_model_performance_target(model.path) == "safe"
+    )
+    assert messages
+    assert "No auto-selection" in messages[-1]
     window.close()
 
 
@@ -1556,8 +1591,8 @@ def test_performance_test_enumerates_external_drafter_quantizations(
     window.close()
 
 
-def test_completed_benchmark_matching_is_exact_to_workload_and_model(
-    tmp_path,
+def test_completed_benchmark_matching_is_exact_to_environment_workload_and_model(
+    tmp_path, monkeypatch
 ) -> None:
     qt_launcher = pytest.importorskip("qt_launcher")
     model = _fake_model(tmp_path, "CompletedModel", 1.0)
@@ -1573,6 +1608,10 @@ def test_completed_benchmark_matching_is_exact_to_workload_and_model(
         flash_attn=True,
         sampling={},
     )
+    system = _fake_system()
+    monkeypatch.setattr(
+        qt_launcher, "probe_binary_build_number", lambda _binary: 10572
+    )
     stat = model.path.stat()
     record = {
         "model_size": stat.st_size,
@@ -1581,16 +1620,98 @@ def test_completed_benchmark_matching_is_exact_to_workload_and_model(
         "benchmark_type": "quick",
         "prompt_context_fraction": 0.125,
         "candidates": [{"id": "baseline"}],
+        "environment_fingerprint": qt_launcher._benchmark_environment_fingerprint(
+            "llama-server", 10572, system, cfg
+        ),
     }
     assert qt_launcher.MainWindow._completed_benchmark_matches(
-        record, model, cfg, "quick", 0.125
+        record,
+        model,
+        cfg,
+        "quick",
+        0.125,
+        runtime_binary="llama-server",
+        system=system,
     )
     assert not qt_launcher.MainWindow._completed_benchmark_matches(
-        record, model, cfg, "fast", 0.03125
+        record,
+        model,
+        cfg,
+        "fast",
+        0.03125,
+        runtime_binary="llama-server",
+        system=system,
     )
     changed = dict(record, desired_context=65536)
     assert not qt_launcher.MainWindow._completed_benchmark_matches(
-        changed, model, cfg, "quick", 0.125
+        changed,
+        model,
+        cfg,
+        "quick",
+        0.125,
+        runtime_binary="llama-server",
+        system=system,
+    )
+    monkeypatch.setattr(
+        qt_launcher, "probe_binary_build_number", lambda _binary: 10679
+    )
+    assert not qt_launcher.MainWindow._completed_benchmark_matches(
+        record,
+        model,
+        cfg,
+        "quick",
+        0.125,
+        runtime_binary="llama-server",
+        system=system,
+    )
+
+
+def test_measured_profile_is_applied_only_to_matching_environment(
+    tmp_path, monkeypatch
+) -> None:
+    qt_launcher = pytest.importorskip("qt_launcher")
+    cfg = TunedConfig(
+        ctx=32768,
+        ngl=99,
+        threads=6,
+        batch_threads=6,
+        batch=512,
+        ubatch=256,
+        cache_k="q4_0",
+        cache_v="q4_0",
+        flash_attn=True,
+        sampling={},
+    )
+    system = _fake_system()
+    monkeypatch.setattr(
+        qt_launcher, "probe_binary_build_number", lambda _binary: 10572
+    )
+    fake_window = types.SimpleNamespace(
+        _system=system,
+        _active_llama_binary=lambda: "llama-server",
+    )
+    environment = qt_launcher._benchmark_environment_fingerprint(
+        "llama-server", 10572, system, cfg
+    )
+    measured = {
+        "source": "measured-performance-test",
+        "benchmark_environment": environment,
+    }
+    assert qt_launcher.MainWindow._measured_snapshot_matches_environment(
+        fake_window, measured, cfg
+    )
+
+    changed_system = copy.deepcopy(system)
+    changed_system.gpus[0].runtime_backend = "HIP"
+    fake_window._system = changed_system
+    assert not qt_launcher.MainWindow._measured_snapshot_matches_environment(
+        fake_window, measured, cfg
+    )
+    assert not qt_launcher.MainWindow._measured_snapshot_matches_environment(
+        fake_window, {"source": "measured-performance-test"}, cfg
+    )
+    assert qt_launcher.MainWindow._measured_snapshot_matches_environment(
+        fake_window, {"source": "user-custom"}, cfg
     )
 
 
@@ -1620,6 +1741,10 @@ def test_completed_external_drafters_are_reused_when_rerun_is_off(
         sampling={},
     )
     stat = model.path.stat()
+    system = _fake_system()
+    monkeypatch.setattr(
+        qt_launcher, "probe_binary_build_number", lambda _binary: 10572
+    )
     snapshot = {"mode": "auto", "values": {}}
     drafter_keys = []
     for index, quant in enumerate(("Q4_K_M", "Q8_0", "BF16"), start=1):
@@ -1638,6 +1763,9 @@ def test_completed_external_drafters_are_reused_when_rerun_is_off(
             "drafter_key": key,
             "drafter_label": draft.name,
             "candidates": [{"id": "baseline"}],
+            "environment_fingerprint": qt_launcher._benchmark_environment_fingerprint(
+                "llama-server", 10572, system, cfg
+            ),
         }
         assert app_settings.save_performance_tuning_result(
             model.name,
@@ -1657,7 +1785,13 @@ def test_completed_external_drafters_are_reused_when_rerun_is_off(
         assert completed is not None
         assert completed["drafter_key"] == key
         assert qt_launcher.MainWindow._completed_benchmark_matches(
-            completed, model, cfg, "quick", 0.125
+            completed,
+            model,
+            cfg,
+            "quick",
+            0.125,
+            runtime_binary="llama-server",
+            system=system,
         )
 
     # Read-only cache access must still return caller-owned records; mutating a
@@ -3129,19 +3263,14 @@ def _fake_dual_gpu_system(
     )
 
 
-def test_multi_gpu_pins_to_largest_when_model_and_best_kv_fit(tmp_path) -> None:
-    """Keep the peer GPU free only after requested context and F16 KV fit.
-
-    The explicit 32k request makes the synthetic metadata-free fallback small
-    enough for the R9700. A 262k request that needed lower KV precision would
-    intentionally spread under the context-first/quality-second policy.
-    """
+def test_multi_gpu_pins_to_largest_when_model_and_q4_kv_fit(tmp_path) -> None:
+    """Keep the peer GPU free when requested context and Q4 KV fit."""
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
     profile = match_profile(model.name, profiles)
     cfg = compute_config(model, _fake_dual_gpu_system(), profile, user_ctx=32768)
 
-    assert cfg.cache_k == cfg.cache_v == "f16"
+    assert cfg.cache_k == cfg.cache_v == "q4_0"
     assert cfg.tensor_split is not None, "Expected tensor_split to be set"
     assert cfg.main_gpu == 0, f"Expected main_gpu=0 (largest), got {cfg.main_gpu}"
 
@@ -3187,15 +3316,10 @@ def _fake_qwen38_27b_model(tmp_path, name: str, size_gb: float):
         ("Qwen3.8-27B-UD-Q8_K_XL", 29.30),
     ],
 )
-def test_qwen38_dual_gpu_preserves_full_context_then_maximises_kv_quality(
+def test_qwen38_dual_gpu_preserves_full_context_with_q4_default(
     tmp_path, name, size_gb
 ) -> None:
-    """Regression for Q5/Q6 losing context while Q8 used both GPUs.
-
-    Every quant must first reach the native 262,144-token window. Remaining
-    headroom then upgrades KV above Q4/Q5; peer-GPU use is valid whenever it
-    is what makes the better context/precision pair safe.
-    """
+    """Every weight quant keeps native context with the global Q4 KV pair."""
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_qwen38_27b_model(tmp_path, name, size_gb)
     profile = match_profile(model.name, profiles, model.architecture)
@@ -3216,13 +3340,10 @@ def test_qwen38_dual_gpu_preserves_full_context_then_maximises_kv_quality(
     )
 
     assert cfg.ctx == 262144
-    assert cfg.cache_k in {"f16", "bf16", "q8_0"}
-    assert cfg.cache_v in {"f16", "bf16", "q8_0"}
-    assert cfg.tensor_split is not None
-    parts = [float(part) for part in cfg.tensor_split.split(",")]
-    assert all(part > 0 for part in parts), cfg.tensor_split
+    assert (cfg.cache_k, cfg.cache_v) == ("q4_0", "q4_0")
 
-    # tensor_split is in Vulkan order: RX 9070 XT (0), then R9700 (1).
+    # Small variants may now stay on the R9700 because Auto no longer spreads
+    # solely to upgrade KV precision. Larger variants still use both cards.
     from tuner import _gpu_usable_cap_gb
 
     footprint = (
@@ -3234,11 +3355,18 @@ def test_qwen38_dual_gpu_preserves_full_context_then_maximises_kv_quality(
     )
     small_cap = _gpu_usable_cap_gb(system.gpus[1], False)
     large_cap = _gpu_usable_cap_gb(system.gpus[0], True)
-    assert footprint * parts[0] <= small_cap + 0.05
-    assert footprint * parts[1] <= large_cap + 0.05
+    if cfg.tensor_split is None:
+        assert footprint <= large_cap + 0.05
+    else:
+        # tensor_split is runtime order: RX 9070 XT, then R9700.
+        parts = [float(part) for part in cfg.tensor_split.split(",")]
+        assert footprint * parts[0] <= small_cap + 0.05
+        assert footprint * parts[1] <= large_cap + 0.05
 
 
-def test_qwen4exp_plans_lazy_ple_qsa_and_90k_context(tmp_path, monkeypatch) -> None:
+def test_qwen4exp_plans_130k_with_lazy_ple_active_residency(
+    tmp_path, monkeypatch
+) -> None:
     import tuner
     from performance_target import PERFORMANCE_TARGETS
 
@@ -3275,24 +3403,28 @@ def test_qwen4exp_plans_lazy_ple_qsa_and_90k_context(tmp_path, monkeypatch) -> N
             large_free=31,
             small_free=16,
             ram_total=48,
-            ram_free=47,
+            ram_free=30.6,
         ),
         profile,
-        user_ctx=90000,
+        user_ctx=130000,
         perf_target=PERFORMANCE_TARGETS["safe"],
-        prompt_cache_ram_mib=0,
+        prompt_cache_ram_mib=2048,
     )
 
-    assert cfg.ctx == 90000
+    assert cfg.ctx == 130000
     assert cfg.ubatch == 64
     assert cfg.mapped_model_ram_gb == pytest.approx(model.read_lazy_size_gb)
+    assert cfg.mapped_model_resident_gb == pytest.approx(
+        model.read_lazy_size_gb * 0.05
+    )
     assert cfg.estimated_model_vram_gb + cfg.estimated_model_ram_gb == pytest.approx(
         model.placement_size_gb
     )
-    assert (cfg.cache_k, cfg.cache_v) == ("f16", "q8_0")
-    assert cfg.estimated_kv_gb == pytest.approx(2.137, rel=0.03)
-    assert cfg.runtime_vram_overhead_gb == pytest.approx(0.386, rel=0.05)
-    assert cfg.runtime_ram_overhead_gb == pytest.approx(6.65, rel=0.05)
+    assert (cfg.cache_k, cfg.cache_v) == ("q4_0", "q4_0")
+    assert cfg.estimated_kv_gb == pytest.approx(1.319, rel=0.03)
+    assert cfg.runtime_vram_overhead_gb == pytest.approx(0.558, rel=0.05)
+    assert cfg.runtime_ram_overhead_gb == pytest.approx(7.17, rel=0.05)
+    assert "file-backed" in (cfg.warning or "")
 
     cmd = build_command(model, cfg, profile)
     lazy_index = cmd.index("--tensor-read-lazy")
@@ -3304,7 +3436,7 @@ def test_dense_split_reserves_primary_only_mmproj_vram(tmp_path) -> None:
     from tuner import _gpu_usable_cap_gb
 
     profiles = load_profiles(SETTINGS_DIR)
-    model = _fake_qwen38_27b_model(tmp_path, "Qwen3.8-27B-UD-Q5_K_XL", size_gb=18.83)
+    model = _fake_qwen38_27b_model(tmp_path, "Qwen3.8-27B-UD-Q6_K_XL", size_gb=24.14)
     model.mmproj = types.SimpleNamespace(
         stat=lambda: types.SimpleNamespace(st_size=int(3.585 * 1024**3))
     )
@@ -5311,8 +5443,8 @@ def test_alternate_kv_head_key_is_used_by_sizing() -> None:
     assert not any(w.id == "KV-HEAD-COUNT-MISSING" for w in audit_model_metadata(model))
 
 
-def test_auto_kv_upgrades_profile_default_after_full_context_fits() -> None:
-    """A q5 profile hint is not a ceiling when F16 preserves max context."""
+def test_auto_kv_uses_q4_even_when_full_precision_fits() -> None:
+    """Unused memory no longer upgrades Auto beyond the Q4 capacity default."""
     from tuner import _pick_kv_quant
 
     pair = _pick_kv_quant(
@@ -5325,10 +5457,10 @@ def test_auto_kv_upgrades_profile_default_after_full_context_fits() -> None:
         base_k_per_token_mb=0.03125,
         base_v_per_token_mb=0.03125,
     )
-    assert pair == ("f16", "f16")
+    assert pair == ("q4_0", "q4_0")
 
 
-def test_asymmetric_kv_quant_weights_unequal_kv_dimensions() -> None:
+def test_auto_kv_stays_symmetric_with_unequal_kv_dimensions() -> None:
     from tuner import (
         _pick_kv_quant,
         kv_per_token_mb_from_metadata,
@@ -5356,7 +5488,7 @@ def test_asymmetric_kv_quant_weights_unequal_kv_dimensions() -> None:
         base_k_per_token_mb=k_mb,
         base_v_per_token_mb=v_mb,
     )
-    assert pair == ("q5_0", "q5_0")
+    assert pair == ("q4_0", "q4_0")
 
 
 def test_pure_mamba_recurrent_layers_use_minimal_kv_sentinel(tmp_path) -> None:

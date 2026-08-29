@@ -399,13 +399,19 @@ def _print_config(
     print()
     print("  Memory estimate (with current options):")
     mapped_model_ram_gb = float(getattr(cfg, "mapped_model_ram_gb", 0.0) or 0.0)
+    mapped_model_resident_gb = float(
+        getattr(cfg, "mapped_model_resident_gb", mapped_model_ram_gb) or 0.0
+    )
     runtime_ram_overhead_gb = float(getattr(cfg, "runtime_ram_overhead_gb", 0.0) or 0.0)
     gpu_label = "accelerator" if cfg.unified_memory else "GPU"
     cpu_label = "host" if cfg.unified_memory else "CPU"
     print(f"    Model {gpu_label:<11}: ~ {cfg.estimated_model_vram_gb:5.1f} GB")
     print(f"    Model {cpu_label:<11}: ~ {cfg.estimated_model_ram_gb:5.1f} GB")
     if mapped_model_ram_gb:
-        print(f"    Lazy mapped RAM  : ~ {mapped_model_ram_gb:5.1f} GB")
+        print(
+            f"    Lazy mapped file : ~ {mapped_model_ram_gb:5.1f} GB "
+            f"(active budget {mapped_model_resident_gb:.1f} GB)"
+        )
     if cfg.vision_vram_gb:
         print(f"    Vision GPU       : ~ {cfg.vision_vram_gb:5.1f} GB")
     if cfg.vision_ram_gb:
@@ -426,7 +432,7 @@ def _print_config(
         total_unified = (
             cfg.estimated_model_vram_gb
             + cfg.estimated_model_ram_gb
-            + mapped_model_ram_gb
+            + mapped_model_resident_gb
             + cfg.vision_vram_gb
             + cfg.vision_ram_gb
             + cfg.draft_vram_gb
@@ -2137,6 +2143,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             f"vram={cfg.estimated_model_vram_gb:.1f}GB  "
             f"ram={cfg.estimated_model_ram_gb:.1f}GB  "
             f"mapped={float(getattr(cfg, 'mapped_model_ram_gb', 0.0) or 0.0):.1f}GB  "
+            f"mapped_active={float(getattr(cfg, 'mapped_model_resident_gb', 0.0) or 0.0):.1f}GB  "
             f"runtime_ram={float(getattr(cfg, 'runtime_ram_overhead_gb', 0.0) or 0.0):.1f}GB"
         )
         print(

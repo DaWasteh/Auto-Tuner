@@ -2,7 +2,7 @@ display_name: "Generic / fallback"
 patterns: []
 
 max_context: 8192
-recommended_kv_quant: q8_0
+recommended_kv_quant: q4_0
 
 # Sampling-Profile pro Modus.
 # Die GUI-Dropdown wählt zwischen "chat" (default) und "coding".

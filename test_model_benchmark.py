@@ -282,6 +282,48 @@ def test_staged_search_is_bounded_and_combines_best_axes(monkeypatch) -> None:
     assert result.score(result.winner) > 1.03
 
 
+def test_staged_search_checks_batch_interactions_for_two_thread_finalists(
+    monkeypatch,
+) -> None:
+    runner = _runner(
+        BenchmarkLimits(
+            max_candidates=14,
+            confirmation_runs=0,
+            samples_per_candidate=2,
+            total_timeout_s=60,
+        )
+    )
+    calls: list[BenchmarkCandidate] = []
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        calls.append(candidate)
+        prompt = generation = 100.0
+        if (candidate.batch, candidate.ubatch) == (512, 256):
+            generation = {8: 130.0, 4: 120.0, 6: 100.0, 16: 90.0}.get(
+                candidate.threads, 95.0
+            )
+        elif (candidate.batch, candidate.ubatch) == (2048, 1024):
+            prompt = generation = 200.0 if candidate.threads == 4 else 140.0
+        return _measured(candidate, prompt, generation)
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: 10572
+    )
+    result = runner.run()
+
+    assert any(
+        item.threads == 4 and (item.batch, item.ubatch) == (2048, 1024)
+        for item in calls
+    )
+    assert result.winner.candidate.threads == 4
+    assert (result.winner.candidate.batch, result.winner.candidate.ubatch) == (
+        2048,
+        1024,
+    )
+    assert len(calls) <= 14
+
+
 def test_speculative_runs_allow_expected_cross_prompt_acceptance_variance() -> None:
     regular = _runner(BenchmarkLimits(max_sample_spread=0.35))
     speculative = BenchmarkRunner(
@@ -298,7 +340,7 @@ def test_speculative_runs_allow_expected_cross_prompt_acceptance_variance() -> N
     assert speculative._sample_spread_limit() == pytest.approx(0.65)
 
 
-def test_draft_depth_sweep_continues_until_first_decode_regression(
+def test_draft_depth_sweep_requires_two_meaningful_regressions(
     monkeypatch,
 ) -> None:
     limits = BenchmarkLimits(
@@ -334,12 +376,84 @@ def test_draft_depth_sweep_continues_until_first_decode_regression(
     result = runner.run()
 
     # Baseline/profile depth 2 is reused; every increasing value is measured,
-    # including the user-reported 5 -> 6 -> 7 progression. Depth 8 regresses,
-    # so 9 and 10 must never launch.
-    assert calls == [2, 1, 3, 4, 5, 6, 7, 8]
+    # including the user-reported 5 -> 6 -> 7 progression. Depths 8 and 9 are
+    # both meaningfully slower than the best, confirming the stop before 10.
+    assert calls == [2, 1, 3, 4, 5, 6, 7, 8, 9]
     assert 7 in [item.candidate.draft_n_max for item in result.candidates]
-    assert 8 in [item.candidate.draft_n_max for item in result.candidates]
-    assert 9 not in calls
+    assert 9 in [item.candidate.draft_n_max for item in result.candidates]
+    assert 10 not in calls
+
+
+def test_draft_depth_sweep_ignores_small_dip_before_later_gain(monkeypatch) -> None:
+    runner = BenchmarkRunner(
+        model=SimpleNamespace(path=Path("model.gguf")),
+        profile=SimpleNamespace(draft_max=2),
+        base_config=_config(),
+        runtime_binary="llama-server",
+        physical_cores=8,
+        logical_cores=16,
+        enable_speculative=True,
+        tune_draft_n_max=True,
+        limits=BenchmarkLimits(
+            max_candidates=1,
+            confirmation_runs=0,
+            total_timeout_s=60,
+            max_draft_tokens=7,
+        ),
+    )
+    calls: list[int] = []
+    speeds = {1: 50.0, 2: 55.0, 3: 58.0, 4: 60.0, 5: 62.0, 6: 61.0, 7: 70.0}
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        calls.append(candidate.draft_n_max)
+        return _measured(candidate, 100.0, speeds[candidate.draft_n_max])
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: 10590
+    )
+    result = runner.run()
+
+    assert 6 in calls and 7 in calls
+    assert max(result.candidates, key=lambda item: item.generation_tps).candidate.draft_n_max == 7
+
+
+def test_search_keeps_baseline_when_noisy_gain_overlaps_it(monkeypatch) -> None:
+    runner = _runner(
+        BenchmarkLimits(max_candidates=2, confirmation_runs=0, max_sample_spread=0.35)
+    )
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        rates = (100.0, 100.0) if candidate.id == "baseline" else (98.0, 130.0)
+        samples = [
+            BenchmarkSample(rate, rate, 1024, 64, 1.0) for rate in rates
+        ]
+        return CandidateResult(candidate=candidate, samples=samples)
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: None
+    )
+    result = runner.run()
+    assert result.by_id(next(item.candidate.id for item in result.candidates if item.candidate.id != "baseline")).overall_tps > result.baseline.overall_tps * 1.03
+    assert result.winner_id == "baseline"
+    assert "uncertainty-safe" in result.reason
+
+
+def test_search_promotes_stable_gain_above_threshold(monkeypatch) -> None:
+    runner = _runner(BenchmarkLimits(max_candidates=2, confirmation_runs=0))
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        gain = 1.05 if candidate.id != "baseline" else 1.0
+        return _measured(candidate, 100.0 * gain, 100.0 * gain)
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: None
+    )
+    result = runner.run()
+    assert result.winner_id != "baseline"
+    assert result.conservative_score(result.winner) >= 1.05
 
 
 def test_search_keeps_baseline_for_immaterial_gain(monkeypatch) -> None:
@@ -649,6 +763,71 @@ def test_profile_bank_keeps_auto_perform_and_custom_drafter_variants(
     assert app_settings.get_setting_profile_snapshot(
         "model", model, "balanced", "custom1", "external:q4"
     ) == custom
+
+
+def test_quick_pass_does_not_replace_validated_perform_profile(
+    tmp_path, monkeypatch
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"validated-before-quick")
+    drafter = app_settings.NO_DRAFTER_PROFILE_KEY
+    validated_snapshot = {
+        "mode": "auto",
+        "values": {"ctx": 65536, "batch": 2048},
+        "source": "measured-performance-test",
+        "confidence": "validated",
+    }
+    provisional_snapshot = {
+        "mode": "auto",
+        "values": {"ctx": 65536, "batch": 512},
+        "source": "measured-quick-pass",
+        "confidence": "provisional",
+    }
+    validated_record = {
+        "performance_target": "balanced",
+        "benchmark_type": "quick",
+        "model_size": model.stat().st_size,
+        "winner_id": "validated",
+    }
+    provisional_record = {
+        **validated_record,
+        "benchmark_type": "fast",
+        "winner_id": "provisional",
+    }
+
+    assert app_settings.save_performance_tuning_result(
+        "model",
+        model,
+        validated_record,
+        validated_snapshot,
+        "balanced",
+        "quick",
+        drafter,
+    )
+    assert app_settings.save_performance_tuning_result(
+        "model",
+        model,
+        provisional_record,
+        provisional_snapshot,
+        "balanced",
+        "fast",
+        drafter,
+    )
+
+    assert app_settings.get_setting_profile_snapshot(
+        "model", model, "balanced", "perform", drafter
+    ) == validated_snapshot
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced"
+    )["winner_id"] == "validated"
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced", "fast", drafter
+    )["winner_id"] == "provisional"
+    assert app_settings.get_performance_tuning_result(
+        model, "balanced", "quick", drafter
+    )["winner_id"] == "validated"
 
 
 def test_custom_profile_bank_export_import_round_trip(tmp_path, monkeypatch) -> None:

@@ -30,7 +30,7 @@ class ModelProfile:
     arch_fallback: List[str] = field(default_factory=list)
     max_context: int = 8192
     sampling: Dict[str, Any] = field(default_factory=dict)
-    recommended_kv_quant: str = "q5_0"
+    recommended_kv_quant: str = "q4_0"
     # Optional profile override for Flash Attention. None keeps AutoTuner's
     # normal default; OCR/reference-sensitive models can require it off.
     flash_attn: Optional[bool] = None
@@ -235,7 +235,7 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                 ],
                 max_context=int(data.get("max_context", 8192)),
                 sampling=sampling,
-                recommended_kv_quant=str(data.get("recommended_kv_quant", "q5_0")),
+                recommended_kv_quant=str(data.get("recommended_kv_quant", "q4_0")),
                 flash_attn=flash_attn,
                 min_llama_build=min_llama_build,
                 extra_args=[str(x) for x in extra],
