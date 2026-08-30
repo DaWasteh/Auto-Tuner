@@ -147,6 +147,26 @@ def test_html_uses_vertical_side_by_side_model_bars_and_unique_chart_ids() -> No
     html = build_performance_report_html(
         {"fast": [], "quick": [first, second], "custom": []}
     )
+    assert html.count('class="overview-scroll"') == 1
+    assert html.count('class="model-chart"') == 3
+    assert 'class="overview-grid" style="width:max(100%,' in html
+    assert ".overview-grid{display:grid;grid-template-columns:1fr" in html
+    assert "grid-template-columns:repeat(3" not in html
+    assert "Scroll the stacked panels together" in html
+    assert not re.search(
+        r'class="metric-panel".*?class="vertical-scroll"', html, re.DOTALL
+    )
+    metric_panels = re.findall(
+        r'<section class="metric-panel">(.*?)</section>', html, re.DOTALL
+    )
+    assert len(metric_panels) == 3
+    column_orders = [
+        re.findall(r'class="column-label"><b>(.*?)</b>', panel)
+        for panel in metric_panels
+    ]
+    assert column_orders[0] == column_orders[1] == column_orders[2]
+    assert set(column_orders[0]) == {"Unsafe &lt;Model&gt;", "Second model"}
+
     assert 'class="model-chart"' in html
     assert 'class="vertical-bar bar-pp"' in html
     assert 'class="vertical-bar bar-decode"' in html

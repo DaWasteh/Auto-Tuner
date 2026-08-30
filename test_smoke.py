@@ -2439,6 +2439,12 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
             app_dialog.about_button,
             app_dialog.export_profiles_button,
             app_dialog.import_profiles_button,
+            app_dialog.control_api_checkbox,
+            app_dialog.control_api_port,
+            app_dialog.control_api_token,
+            app_dialog.control_api_copy_key_button,
+            app_dialog.control_api_regenerate_button,
+            app_dialog.control_api_copy_pi_button,
         ]
     )
     widgets.extend(
@@ -2458,6 +2464,11 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         "_perf_combo",
         "_mode_combo",
         "_gpu_combo",
+        "_btn_more",
+        "_language_combo",
+        "_btn_language_folder",
+        "_btn_font_smaller",
+        "_btn_font_larger",
         "_search",
         "_btn_list_view",
         "_btn_tree_view",
@@ -2505,6 +2516,52 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     assert toolbar_texts <= {
         button.text() for button in window.findChildren(qt_widgets.QPushButton)
     }
+    assert window._btn_models_folder.parent() is window._main_toolbar
+    assert window._btn_refresh.parent() is window._main_toolbar
+    assert window._btn_update.parent() is window._more_toolbar
+    assert window._btn_settings.parent() is window._more_toolbar
+    assert window._btn_font_smaller.parent() is window._more_toolbar
+    assert window._btn_font_larger.parent() is window._more_toolbar
+    assert window._more_toolbar.isHidden()
+    assert window._language_combo.findData("builtin:en-GB") >= 0
+    assert window._language_combo.findData("builtin:de-DE") >= 0
+    assert window._language_combo.findData("builtin:nl-NL") >= 0
+    assert window._language_combo.findData("builtin:sv-SE") >= 0
+    assert window._language_combo.findData("builtin:ja-JP") >= 0
+    assert window._language_combo.findData("builtin:fr-FR") >= 0
+    assert window._language_combo.findData("builtin:el-GR") >= 0
+    assert window._language_combo.findData("builtin:pl-PL") >= 0
+    assert window._language_combo.findData(
+        qt_launcher.CUSTOM_LANGUAGE_ACTION
+    ) >= 0
+
+    window._btn_more.click()
+    _QT_TEST_APP.processEvents()
+    assert not window._more_toolbar.isHidden()
+    qt_widgets.QApplication.sendEvent(
+        window._more_toolbar, qt_launcher.QEvent(qt_launcher.QEvent.Type.Leave)
+    )
+    _QT_TEST_APP.processEvents()
+    assert not window._more_toolbar.isHidden()
+    window._btn_more.click()
+    _QT_TEST_APP.processEvents()
+    assert window._more_toolbar.isHidden()
+
+    window._language_combo.setCurrentIndex(
+        window._language_combo.findData("builtin:de-DE")
+    )
+    _QT_TEST_APP.processEvents()
+    assert window._btn_settings.text() == "⚙ Einstellungen"
+    assert window._btn_models_folder.text() == "📂 Modellordner"
+    assert window._language_combo.itemText(
+        window._language_combo.findData(qt_launcher.CUSTOM_LANGUAGE_ACTION)
+    ) == "Eigenes Sprachpaket…"
+    assert qt_launcher.app_settings.get_language_id() == "builtin:de-DE"
+    window._language_combo.setCurrentIndex(
+        window._language_combo.findData("builtin:en-GB")
+    )
+    _QT_TEST_APP.processEvents()
+    assert window._btn_settings.text() == "⚙ Settings"
 
     for widget in widgets:
         tooltip = widget.toolTip()
@@ -2513,6 +2570,14 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
 
     assert "<b>In short:</b>" in app_dialog.theme_combo.toolTip()
     assert app_dialog.about_button.accessibleName() == "About AutoTuner"
+    assert app_dialog.control_api_port.value() == 1233
+    assert app_dialog.control_api_endpoint.text() == "http://127.0.0.1:1233/v1"
+    app_dialog._copy_pi_setup()
+    clipboard_text = _QT_TEST_APP.clipboard().text()
+    assert clipboard_text.startswith(
+        "AUTOTUNER_API_URL=http://127.0.0.1:1233\nAUTOTUNER_API_KEY="
+    )
+    assert len(clipboard_text.rsplit("=", 1)[-1]) >= 32
     assert (
         app_dialog.theme_combo.itemData(
             app_dialog.theme_combo.currentIndex(),
@@ -2817,6 +2882,7 @@ def test_terminal_process_streams_output_live(tmp_path, monkeypatch) -> None:
     proc.start()
     assert proc.proc is not None
     proc.proc.wait(timeout=10)
+    assert proc.wait_stopped(timeout=2)
     deadline = time.monotonic() + 5
     while len(lines) < 2 and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -9101,6 +9167,9 @@ def test_prune_dead_server_finalizes_pending_ocr() -> None:
 
         def _fail_pending_ocr(self, failed_record, message):
             self.failures.append((failed_record, message))
+
+        def _fail_control_record(self, _failed_record, _message):
+            return
 
     window = Window()
     qt_launcher.MainWindow._prune_dead_servers(window)

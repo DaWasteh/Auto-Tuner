@@ -126,6 +126,9 @@ jobs:
           $stage = "stage/AutoTuner"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item dist/AutoTuner.exe $stage/
+          New-Item -ItemType Directory -Force -Path "$stage/pi" | Out-Null
+          Copy-Item integrations/pi/autotuner.ts "$stage/pi/"
+          Copy-Item integrations/pi/README.md "$stage/pi/"
           @"
           AutoTuner v${{ steps.ver.outputs.version }}  (Windows 10/11)
 
@@ -140,8 +143,9 @@ jobs:
       - name: Stage zip contents (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p stage/AutoTuner
+          mkdir -p stage/AutoTuner/pi
           cp dist/AutoTuner-Linux stage/AutoTuner/
+          cp integrations/pi/autotuner.ts integrations/pi/README.md stage/AutoTuner/pi/
           cat > "stage/AutoTuner/LiesMich - AutoTuner.txt" <<EOF
           AutoTuner v${{ steps.ver.outputs.version }}  (Linux)
 
@@ -158,7 +162,8 @@ jobs:
       - name: Stage zip contents (macOS)
         if: runner.os == 'macOS'
         run: |
-          mkdir -p stage/AutoTuner
+          mkdir -p stage/AutoTuner/pi
+          cp integrations/pi/autotuner.ts integrations/pi/README.md stage/AutoTuner/pi/
           if [ -d dist/AutoTuner-macOS.app ]; then
             cp -R dist/AutoTuner-macOS.app stage/AutoTuner/
             launch_hint='open AutoTuner-macOS.app'

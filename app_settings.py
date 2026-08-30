@@ -31,6 +31,16 @@ Public API:
     set_model_tree_collapsed_paths(set[str])
     get_theme_id()         -> str
     set_theme_id(str)
+    get_language_id()      -> str
+    set_language_id(str)
+    get_control_api_enabled() -> bool
+    set_control_api_enabled(bool)
+    get_control_api_port() -> int
+    set_control_api_port(int)
+    set_control_api_config(bool, int, Optional[str])
+    ensure_control_api_token() -> str
+    set_control_api_token(str)
+    regenerate_control_api_token() -> str
     get_minimize_on_close() -> bool
     set_minimize_on_close(bool)
     get_debug_mode() -> bool
@@ -67,6 +77,7 @@ import copy
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import sys
 import tempfile
@@ -3719,6 +3730,162 @@ def set_theme_id(theme_id: str) -> None:
     """Persist a namespaced ThemeManager id; validation happens at load time."""
     if isinstance(theme_id, str) and theme_id:
         _update("theme_id", theme_id)
+
+
+# ---------------------------------------------------------------------------
+# Interface language
+
+_DEFAULT_LANGUAGE_ID = "builtin:en-GB"
+
+
+def get_language_id() -> str:
+    """Return the selected built-in/user language-pack ID."""
+    value = _read_settings_shared().get("language_id")
+    return value if isinstance(value, str) and value else _DEFAULT_LANGUAGE_ID
+
+
+def set_language_id(language_id: str) -> None:
+    """Persist a qualified language-pack ID; pack validation happens at load time."""
+    if isinstance(language_id, str) and language_id:
+        _update("language_id", language_id)
+
+
+# ---------------------------------------------------------------------------
+# Authenticated loopback control API
+
+_CONTROL_API_ENABLED_ENV = "AUTOTUNER_CONTROL_API_ENABLED"
+_CONTROL_API_PORT_ENV = "AUTOTUNER_CONTROL_API_PORT"
+_CONTROL_API_KEY_ENV = "AUTOTUNER_CONTROL_API_KEY"
+_DEFAULT_CONTROL_API_PORT = 1233
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    normalized = raw.strip().casefold()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def get_control_api_enabled() -> bool:
+    """Return whether the local external-control gateway should run."""
+    overridden = _env_bool(_CONTROL_API_ENABLED_ENV)
+    if overridden is not None:
+        return overridden
+    return bool(_read_settings_shared().get("control_api_enabled", False))
+
+
+@_settings_mutation
+def set_control_api_enabled(enabled: bool) -> None:
+    settings = load_settings()
+    settings["control_api_enabled"] = bool(enabled)
+    if not save_settings(settings):
+        raise OSError("could not persist the control API enabled state")
+
+
+def get_control_api_port() -> int:
+    """Return the validated loopback gateway port (default 1233)."""
+    raw: Any = os.environ.get(_CONTROL_API_PORT_ENV)
+    if raw is None:
+        raw = _read_settings_shared().get(
+            "control_api_port", _DEFAULT_CONTROL_API_PORT
+        )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CONTROL_API_PORT
+    return value if 1024 <= value <= 65535 else _DEFAULT_CONTROL_API_PORT
+
+
+@_settings_mutation
+def set_control_api_port(port: int) -> None:
+    value = int(port)
+    if not 1024 <= value <= 65535:
+        raise ValueError("control API port must be between 1024 and 65535")
+    settings = load_settings()
+    settings["control_api_port"] = value
+    if not save_settings(settings):
+        raise OSError("could not persist the control API port")
+
+
+@_settings_mutation
+def set_control_api_config(
+    enabled: bool, port: int, token: Optional[str] = None
+) -> None:
+    """Atomically persist the complete gateway config or leave the old one intact."""
+    value = int(port)
+    if not 1024 <= value <= 65535:
+        raise ValueError("control API port must be between 1024 and 65535")
+    if token is not None and (not isinstance(token, str) or len(token) < 16):
+        raise ValueError("control API token must be at least 16 characters")
+    settings = load_settings()
+    settings["control_api_enabled"] = bool(enabled)
+    settings["control_api_port"] = value
+    if token is not None:
+        settings["control_api_token"] = token
+    if not save_settings(settings):
+        raise OSError("could not persist the control API configuration")
+
+
+def control_api_token_is_overridden() -> bool:
+    """Whether AUTOTUNER_CONTROL_API_KEY owns the effective API token."""
+    return bool(os.environ.get(_CONTROL_API_KEY_ENV, "").strip())
+
+
+def get_control_api_token() -> str:
+    """Return the effective stored/environment token without creating one."""
+    override = os.environ.get(_CONTROL_API_KEY_ENV, "").strip()
+    if override:
+        return override
+    value = _read_settings_shared().get("control_api_token")
+    return value if isinstance(value, str) and len(value) >= 16 else ""
+
+
+@_settings_mutation
+def set_control_api_token(token: str) -> None:
+    """Persist a caller-generated token after validating its minimum strength."""
+    if not isinstance(token, str) or len(token) < 16:
+        raise ValueError("control API token must be at least 16 characters")
+    settings = load_settings()
+    settings["control_api_token"] = token
+    if not save_settings(settings):
+        raise OSError("could not persist the control API token")
+
+
+@_settings_mutation
+def ensure_control_api_token() -> str:
+    """Atomically create a cryptographically random per-installation token."""
+    override = os.environ.get(_CONTROL_API_KEY_ENV, "").strip()
+    if override:
+        if len(override) < 16:
+            raise ValueError("AUTOTUNER_CONTROL_API_KEY must be at least 16 characters")
+        return override
+    settings = load_settings()
+    current = settings.get("control_api_token")
+    if isinstance(current, str) and len(current) >= 16:
+        return current
+    token = secrets.token_urlsafe(32)
+    settings["control_api_token"] = token
+    if not save_settings(settings):
+        raise OSError("could not persist the control API token")
+    return token
+
+
+@_settings_mutation
+def regenerate_control_api_token() -> str:
+    """Replace the persisted token; environment overrides remain authoritative."""
+    if control_api_token_is_overridden():
+        return ensure_control_api_token()
+    settings = load_settings()
+    token = secrets.token_urlsafe(32)
+    settings["control_api_token"] = token
+    if not save_settings(settings):
+        raise OSError("could not persist the control API token")
+    return token
 
 
 # ---------------------------------------------------------------------------

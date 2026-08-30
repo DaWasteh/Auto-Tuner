@@ -243,8 +243,11 @@ def test_settings_json_root_and_theme_roundtrip(tmp_path, monkeypatch):
     path.write_text("[]", encoding="utf-8")
     assert app_settings.load_settings() == {}
     assert app_settings.get_theme_id() == SYSTEM_THEME_ID
+    assert app_settings.get_language_id() == "builtin:en-GB"
     app_settings.set_theme_id("user:ocean")
+    app_settings.set_language_id("builtin:de-DE")
     assert app_settings.get_theme_id() == "user:ocean"
+    assert app_settings.get_language_id() == "builtin:de-DE"
 
 
 def test_all_roles_present_in_example():

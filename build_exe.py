@@ -143,6 +143,8 @@ def main() -> int:
         "autotuner_version",
         "theme_manager",
         "theme_dialog",
+        "localization",
+        "control_api",
         "ocr_workflow",
         "model_benchmark",
         "performance_report",

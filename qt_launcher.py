@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -161,6 +163,12 @@ from model_benchmark import (
 from performance_report import write_performance_report
 from theme_dialog import ThemeEditorDialog
 from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
+from localization import (
+    CUSTOM_LANGUAGE_ACTION,
+    LanguageManager,
+    LanguagePackError,
+)
+from control_api import ApiModel, ControlApiServer, ControlRequest
 
 
 def _get_fork_tools():
@@ -524,6 +532,8 @@ class _TerminalProcess:
         self.on_output = on_output
         self.proc: Optional[subprocess.Popen] = None
         self.log_path: Optional[Path] = None
+        self._stopped_event = threading.Event()
+        self._stopped_event.set()
 
     def _open_posix_log(self):
         log_dir = app_settings.app_data_dir() / "logs"
@@ -536,9 +546,15 @@ class _TerminalProcess:
         env = os.environ.copy()
         if self.env_overrides:
             env.update(self.env_overrides)
+        self._stopped_event.clear()
         if os.name == "nt":
             flags = subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
-            self.proc = subprocess.Popen(self.cmd, creationflags=flags, env=env)
+            try:
+                self.proc = subprocess.Popen(self.cmd, creationflags=flags, env=env)
+            except BaseException:
+                self._stopped_event.set()
+                raise
+            self._watch_exit(self.proc)
             return
         log_fh = self._open_posix_log()
         try:
@@ -552,13 +568,26 @@ class _TerminalProcess:
                 env=env,
             )
         except BaseException:
+            self._stopped_event.set()
             log_fh.close()
             raise
+        self._watch_exit(self.proc)
         threading.Thread(
             target=self._pump_output,
             args=(self.proc, log_fh),
             daemon=True,
         ).start()
+
+    def _watch_exit(self, proc: subprocess.Popen) -> None:
+        def watch() -> None:
+            try:
+                proc.wait()
+            except Exception:
+                return
+            if self.proc is proc or self.proc is None:
+                self._stopped_event.set()
+
+        threading.Thread(target=watch, daemon=True).start()
 
     def _pump_output(self, proc: subprocess.Popen, log_fh) -> None:
         """Mirror every server line to log file, own stdout and callback.
@@ -598,9 +627,17 @@ class _TerminalProcess:
     def returncode(self) -> Optional[int]:
         return self.proc.returncode if self.proc is not None else None
 
+    def has_stopped(self) -> bool:
+        """Whether the most recently started process has fully exited."""
+        return self._stopped_event.is_set()
+
+    def wait_stopped(self, timeout: Optional[float] = None) -> bool:
+        return self._stopped_event.wait(timeout)
+
     def stop(self) -> None:
-        """Non-blocking signal + background wait."""
+        """Non-blocking signal + background wait, observable via has_stopped()."""
         if self.proc is None:
+            self._stopped_event.set()
             return
         try:
             if os.name == "nt":
@@ -627,6 +664,13 @@ class _TerminalProcess:
                         os.kill(-proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
                     pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            finally:
+                if proc.poll() is not None:
+                    self._stopped_event.set()
 
         threading.Thread(target=_wait, daemon=True).start()
 
@@ -833,7 +877,7 @@ class _ApplicationSettingsDialog(QDialog):
         appearance = QGroupBox("Appearance")
         appearance.setMaximumWidth(760)
         appearance_layout = QGridLayout(appearance)
-        theme_label = QLabel("&Theme:")
+        theme_label = QLabel("Theme:")
         self.theme_combo = QComboBox()
         self.theme_combo.setMinimumWidth(160)
         self.theme_combo.setMaximumWidth(500)
@@ -868,7 +912,7 @@ class _ApplicationSettingsDialog(QDialog):
             index = self.theme_combo.findData(manager.current_id)
             self.theme_combo.setCurrentIndex(max(0, index))
         self.reload_themes_button = QPushButton("Reload")
-        self.customize_theme_button = QPushButton("Customize…")
+        self.customize_theme_button = QPushButton("Customise…")
         self.open_themes_button = QPushButton("Open folder")
         self.about_button = QPushButton("About AutoTuner")
         self.about_button.setAccessibleName("About AutoTuner")
@@ -962,6 +1006,112 @@ class _ApplicationSettingsDialog(QDialog):
         )
         layout.addWidget(self.debug_checkbox)
 
+        control_api = QGroupBox("External control API")
+        control_api.setMaximumWidth(760)
+        api_layout = QGridLayout(control_api)
+        api_help = QLabel(
+            "Use this loopback API to list AutoTuner models, switch the active "
+            "model with saved settings, and proxy OpenAI-compatible requests."
+        )
+        api_help.setWordWrap(True)
+        api_layout.addWidget(api_help, 0, 0, 1, 3)
+
+        self.control_api_checkbox = QCheckBox(
+            "Enable local OpenAI-compatible control API"
+        )
+        self.control_api_checkbox.setChecked(app_settings.get_control_api_enabled())
+        self.control_api_checkbox.setToolTip(
+            _setting_tooltip(
+                "Lets trusted programs on this computer select and use your "
+                "AutoTuner models through one stable OpenAI-compatible address.",
+                "The gateway binds only to 127.0.0.1, requires a cryptographically "
+                "random bearer token, serializes model switches, reuses saved launch "
+                "settings, and stops only the previous API-managed model.",
+            )
+        )
+        api_layout.addWidget(self.control_api_checkbox, 1, 0, 1, 3)
+
+        api_port_label = QLabel("Port:")
+        self.control_api_port = QSpinBox()
+        self.control_api_port.setRange(1024, 65535)
+        self.control_api_port.setValue(app_settings.get_control_api_port())
+        self.control_api_port.setToolTip(
+            _setting_tooltip(
+                "Chooses the local port used by external clients.",
+                "The listener is always loopback-only. The default is 1233 so it "
+                "does not collide with llama-server's default base port 1234.",
+            )
+        )
+        api_port_label.setBuddy(self.control_api_port)
+        api_layout.addWidget(api_port_label, 2, 0)
+        api_layout.addWidget(self.control_api_port, 2, 1)
+
+        self.control_api_endpoint = QLabel()
+        self.control_api_endpoint.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        api_layout.addWidget(self.control_api_endpoint, 2, 2)
+
+        api_key_label = QLabel("API key:")
+        initial_token = app_settings.get_control_api_token() or secrets.token_urlsafe(32)
+        self.control_api_token = QLineEdit(initial_token)
+        self.control_api_token.setReadOnly(True)
+        self.control_api_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.control_api_token.setAccessibleName("API key")
+        self.control_api_token.setToolTip(
+            _setting_tooltip(
+                "The secret that authorised local clients must send as a bearer token.",
+                "It contains at least 256 bits of random material and is stored in the "
+                "per-user settings file. Regenerating it immediately invalidates old "
+                "client configurations after you accept this dialog.",
+            )
+        )
+        api_key_label.setBuddy(self.control_api_token)
+        api_layout.addWidget(api_key_label, 3, 0)
+        api_layout.addWidget(self.control_api_token, 3, 1, 1, 2)
+
+        api_buttons = QHBoxLayout()
+        self.control_api_copy_key_button = QPushButton("Copy")
+        self.control_api_regenerate_button = QPushButton("Regenerate")
+        self.control_api_copy_pi_button = QPushButton("Copy Pi setup")
+        self.control_api_copy_key_button.setToolTip(
+            _setting_tooltip(
+                "Copies only the current API key to the clipboard.",
+                "The clipboard contains a credential until another application "
+                "replaces it; paste it only into a trusted local client.",
+            )
+        )
+        self.control_api_regenerate_button.setToolTip(
+            _setting_tooltip(
+                "Creates a new random API key in this dialog.",
+                "The old key remains active until OK is clicked. Environment-owned "
+                "keys cannot be regenerated here.",
+            )
+        )
+        self.control_api_copy_pi_button.setToolTip(
+            _setting_tooltip(
+                "Copies the endpoint and key names used by AutoTuner's Pi extension.",
+                "The two newline-separated environment assignments are "
+                "AUTOTUNER_API_URL and AUTOTUNER_API_KEY; the copied key is a secret.",
+            )
+        )
+        self.control_api_copy_key_button.clicked.connect(self._copy_api_key)
+        self.control_api_regenerate_button.clicked.connect(self._regenerate_api_key)
+        self.control_api_copy_pi_button.clicked.connect(self._copy_pi_setup)
+        api_buttons.addWidget(self.control_api_copy_key_button)
+        api_buttons.addWidget(self.control_api_regenerate_button)
+        api_buttons.addWidget(self.control_api_copy_pi_button)
+        api_layout.addLayout(api_buttons, 4, 0, 1, 3)
+        if app_settings.control_api_token_is_overridden():
+            self.control_api_regenerate_button.setEnabled(False)
+            self.control_api_token.setToolTip(
+                self.control_api_token.toolTip()
+                + "<br><br>AUTOTUNER_CONTROL_API_KEY currently overrides this value."
+            )
+        self.control_api_port.valueChanged.connect(self._update_api_endpoint)
+        self._update_api_endpoint()
+        layout.addWidget(control_api)
+
         profiles = QGroupBox("Performance profiles")
         profiles.setMaximumWidth(760)
         profile_layout = QVBoxLayout(profiles)
@@ -1000,6 +1150,30 @@ class _ApplicationSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _update_api_endpoint(self) -> None:
+        self.control_api_endpoint.setText(
+            f"http://127.0.0.1:{self.control_api_port.value()}/v1"
+        )
+
+    def _copy_api_key(self) -> None:
+        app = cast(Optional[QApplication], QApplication.instance())
+        if app is not None:
+            app.clipboard().setText(self.control_api_token.text())
+
+    def _regenerate_api_key(self) -> None:
+        if app_settings.control_api_token_is_overridden():
+            return
+        self.control_api_token.setText(secrets.token_urlsafe(32))
+
+    def _copy_pi_setup(self) -> None:
+        app = cast(Optional[QApplication], QApplication.instance())
+        if app is None:
+            return
+        app.clipboard().setText(
+            f"AUTOTUNER_API_URL=http://127.0.0.1:{self.control_api_port.value()}\n"
+            f"AUTOTUNER_API_KEY={self.control_api_token.text()}"
+        )
 
     def sizeHint(self) -> QSize:  # noqa: N802
         """Keep the settings dialog bounded across platform font metrics."""
@@ -3600,6 +3774,122 @@ def _clean_model_name(name: str) -> str:
     return _re.sub(r"[-_](?:ud|unsloth)$", "", clean, flags=_re.IGNORECASE).strip("-_")
 
 
+def _extract_server_api_key(command: Sequence[object]) -> Optional[str]:
+    """Return the llama-server credential without logging or exposing its file."""
+    args = [str(value) for value in command]
+    for index, arg in enumerate(args):
+        if arg == "--api-key" and index + 1 < len(args):
+            return args[index + 1] or None
+        if arg.startswith("--api-key="):
+            return arg.split("=", 1)[1] or None
+        if arg == "--api-key-file" and index + 1 < len(args):
+            path = Path(args[index + 1])
+            try:
+                if path.stat().st_size > 1024 * 1024:
+                    return None
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    candidate = line.strip()
+                    if candidate and not candidate.startswith("#"):
+                        return candidate
+            except (OSError, UnicodeError):
+                return None
+    return None
+
+
+def _redacted_command(command: Sequence[object]) -> str:
+    """Format a launch command while removing direct credential arguments."""
+    args = [str(value) for value in command]
+    redacted: List[str] = []
+    hide_next = False
+    for arg in args:
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+            continue
+        if arg in ("--api-key", "--api-key-file"):
+            redacted.append(arg)
+            hide_next = True
+        elif arg.startswith("--api-key="):
+            redacted.append("--api-key=<redacted>")
+        else:
+            redacted.append(arg)
+    return " ".join(redacted)
+
+
+def _control_model_id(entry: ModelEntry) -> str:
+    """Return a readable, path-stable external ID for one GGUF entry."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", entry.name).strip("-._").lower()
+    slug = (slug or "model")[:96].rstrip("-._") or "model"
+    try:
+        identity = os.path.normcase(str(entry.path.resolve(strict=False)))
+    except (OSError, RuntimeError):
+        identity = os.path.normcase(str(entry.path))
+    digest = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"{slug}--{digest}"
+
+
+def _control_api_catalogue(
+    entries: Sequence[ModelEntry], profiles: Sequence[ModelProfile]
+) -> List[ApiModel]:
+    """Describe every scanned model and mark non-server runners explicitly."""
+    models: List[ApiModel] = []
+    used_ids: set[str] = set()
+    profile_list = list(profiles)
+    for entry in entries:
+        profile = match_profile(
+            entry.name, profile_list, getattr(entry, "architecture", "")
+        )
+        runner = str(profile.runner or "llama-server")
+        extra = {str(arg).strip().casefold() for arg in profile.extra_args}
+        reason = ""
+        if entry.is_standalone_drafter:
+            reason = "Standalone draft models cannot serve requests by themselves."
+        elif entry.is_diffusion and runner != "llama-diffusion-gemma-server":
+            reason = (
+                "This diffusion model uses a single-shot CLI rather than an HTTP server."
+            )
+        elif "--embeddings" in extra or "--embedding" in extra:
+            reason = "This profile exposes embeddings rather than chat completions."
+
+        model_id = _control_model_id(entry)
+        if model_id in used_ids:
+            # A 40-bit path digest collision is extraordinarily unlikely, but
+            # never let it silently remove a model from the external catalogue.
+            suffix = hashlib.sha256(str(entry.path).encode("utf-8")).hexdigest()[:16]
+            model_id = f"{model_id.rsplit('--', 1)[0]}--{suffix}"
+        used_ids.add(model_id)
+
+        limits = [
+            int(value)
+            for value in (entry.native_context, profile.max_context)
+            if isinstance(value, int) and value > 0
+        ]
+        context_window = min(limits) if limits else 8192
+        max_tokens = max(256, min(16_384, context_window // 2))
+        overrides = app_settings.get_model_overrides(entry.name)
+        remembered_mmproj = app_settings.get_mmproj_selection(entry.name)
+        vision = bool(entry.mmproj)
+        if remembered_mmproj == app_settings.MMPROJ_NONE_SENTINEL or (
+            remembered_mmproj is None and overrides.get("vision") is False
+        ):
+            vision = False
+
+        models.append(
+            ApiModel(
+                id=model_id,
+                name=entry.name,
+                path=str(entry.path),
+                context_window=context_window,
+                max_tokens=max_tokens,
+                reasoning=entry.supports_thinking,
+                input_types=("text", "image") if vision else ("text",),
+                runnable=not reason,
+                unavailable_reason=reason,
+            )
+        )
+    return models
+
+
 # ---------------------------------------------------------------------------
 # Expert-panel value helpers (widget-state ↔ config)
 #
@@ -5213,6 +5503,8 @@ class MainWindow(QMainWindow):
     # Background work emits this signal; the slot runs on the GUI thread.
     _sysinfo_ready = pyqtSignal(object)  # SystemInfo
     _bg_log = pyqtSignal(str)  # log message from background thread
+    _control_request_ready = pyqtSignal(object)  # ControlRequest from HTTP threads
+    _control_log_ready = pyqtSignal(str)  # gateway log line from HTTP threads
 
     _FORK_TOOLTIP_SUMMARY = (
         "Selects which llama.cpp build starts the server. AutoTuner can choose a "
@@ -5285,6 +5577,10 @@ class MainWindow(QMainWindow):
         self._server_base_url: Optional[str] = None
         self._server_ready: bool = False
         self._all_entries: List[ModelEntry] = []
+        self._control_api: Optional[ControlApiServer] = None
+        self._control_model_paths: Dict[str, Path] = {}
+        self._control_api_record: Optional[dict] = None
+        self._control_closing = False
         self._system: Optional[SystemInfo] = None
         self._profiles: List[ModelProfile] = []
         self._forks: List[Tuple[str, Path]] = []
@@ -5375,6 +5671,17 @@ class MainWindow(QMainWindow):
         if app is None:  # QMainWindow requires a QApplication in normal Qt use.
             raise RuntimeError("MainWindow requires a QApplication")
         self._theme_manager = _application_theme_manager(app)
+        self._language_manager = LanguageManager(
+            _bundled_resource("assets", "languages"),
+            app_settings.app_data_dir() / "languages",
+            self,
+        )
+        selected_language = self._language_manager.select(
+            app_settings.get_language_id()
+        )
+        if selected_language != app_settings.get_language_id():
+            app_settings.set_language_id(selected_language)
+        self._language_manager.install(app)
 
         self._build_ui()
         # Wire background → GUI signals BEFORE the first scan kicks off,
@@ -5382,7 +5689,10 @@ class MainWindow(QMainWindow):
         # that hasn't been connected yet (one of the crash patterns).
         self._sysinfo_ready.connect(self._update_sysinfo_labels)
         self._bg_log.connect(self._log)
+        self._control_request_ready.connect(self._handle_control_request)
+        self._control_log_ready.connect(self._log)
         if start_background:
+            self._configure_control_api()
             QTimer.singleShot(0, self._startup_load)
 
         # Server crash-detection (lightweight poll — no stdout read)
@@ -5401,9 +5711,15 @@ class MainWindow(QMainWindow):
     # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        # ── Toolbar ────────────────────────────────────────────────────
+        # ── Primary toolbar ─────────────────────────────────────────────
+        # Keep the high-frequency model/runtime controls on one compact row.
+        # Font, language, update, and application settings deliberately live
+        # in a second persistent row toggled by the final ellipsis button.
         tb = QToolBar("Main")
+        tb.setObjectName("mainToolbar")
         tb.setMovable(False)
+        tb.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self._main_toolbar = tb
         self.addToolBar(tb)
 
         toolbar_actions = (
@@ -5427,28 +5743,6 @@ class MainWindow(QMainWindow):
                     "without freezing the interface.",
                 ),
             ),
-            (
-                "⬆ Update",
-                self._start_update,
-                _setting_tooltip(
-                    "Checks GitHub for a newer AutoTuner version and installs it while "
-                    "keeping your personal settings.",
-                    "Source checkouts update through git or a source ZIP. Frozen builds "
-                    "download the OS-specific GitHub Release ZIP and use a restart "
-                    "swap helper. autotuner_settings.json is backed up and restored "
-                    "around either update path.",
-                ),
-            ),
-            (
-                "⚙ Settings",
-                self._open_application_settings,
-                _setting_tooltip(
-                    "Opens application-wide startup and window behaviour options.",
-                    "These opt-in preferences are shared by source and frozen "
-                    "builds through ~/.autotuner. They do not change model tuning, generated "
-                    "llama-server arguments, or per-model Expert overrides.",
-                ),
-            ),
         )
         for label, slot, tooltip in toolbar_actions:
             btn = QPushButton(label)
@@ -5456,16 +5750,12 @@ class MainWindow(QMainWindow):
             btn.setToolTip(tooltip)
             if label.startswith("📂"):
                 self._btn_models_folder = btn
-            elif label.startswith("🔄"):
+            else:
                 self._btn_refresh = btn
-            elif "Update" in label:
-                self._btn_update = btn
-            elif "Settings" in label:
-                self._btn_settings = btn
             tb.addWidget(btn)
 
         tb.addSeparator()
-        tb.addWidget(QLabel(" Fork:"))
+        tb.addWidget(QLabel("Fork:"))
         self._fork_combo = QComboBox()
         self._fork_combo.setMinimumWidth(self._FORK_COMBO_MIN_WIDTH)
         self._fork_combo.setSizeAdjustPolicy(
@@ -5489,7 +5779,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._btn_fork_folder)
 
         tb.addSeparator()
-        tb.addWidget(QLabel(" Performance:"))
+        tb.addWidget(QLabel("Performance:"))
         self._perf_combo = QComboBox()
         self._perf_combo.setMinimumWidth(120)
         # Build technical details from the registry so future tiers auto-appear.
@@ -5520,7 +5810,7 @@ class MainWindow(QMainWindow):
 
         # ── Mode (chat / coding) ───────────────────────────────────────
         tb.addSeparator()
-        tb.addWidget(QLabel(" Mode:"))
+        tb.addWidget(QLabel("Mode:"))
         self._mode_combo = QComboBox()
         self._mode_combo.setMinimumWidth(90)
         self._mode_combo.setToolTip(
@@ -5542,15 +5832,8 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._mode_combo)
 
         # ── GPU pin (Auto / per-card) ──────────────────────────────────
-        # Hard-pins the next launch to a single card. This is the click-path
-        # equivalent of the CLI `--gpu <name>` flag and the `forced_gpu` key
-        # in autotuner_settings.json — all three feed the same
-        # app_settings.set_forced_gpu() / compute_config(force_gpu=...) path.
-        # The card entries are filled in once hardware detection finishes
-        # (see _populate_gpu_combo, called from _update_sysinfo_labels); until
-        # then only "Auto" is offered.
         tb.addSeparator()
-        tb.addWidget(QLabel(" GPU:"))
+        tb.addWidget(QLabel("GPU:"))
         self._gpu_combo = QComboBox()
         self._gpu_combo.setMinimumWidth(110)
         self._gpu_combo.setToolTip(
@@ -5564,19 +5847,75 @@ class MainWindow(QMainWindow):
                 "uses live VRAM-aware placement.",
             )
         )
-        # Seed with Auto only; real cards are appended after detection.
         self._gpu_combo.addItem("Auto", None)
         self._gpu_combo.currentIndexChanged.connect(self._on_gpu_changed)
         tb.addWidget(self._gpu_combo)
 
         tb.addSeparator()
-        tb.addWidget(QLabel(" Font:"))
-        for delta, label in ((-1, "A−"), (+1, "A+")):
-            b = QPushButton(label)
-            b.setFixedWidth(36)
-            d = delta
-            b.clicked.connect(lambda _, d=d: self._change_font(d))
-            b.setToolTip(
+        self._btn_more = QPushButton("⋯")
+        self._btn_more.setObjectName("moreToolbarButton")
+        self._btn_more.setAccessibleName("More controls")
+        self._btn_more.setCheckable(True)
+        self._btn_more.setFixedWidth(38)
+        self._btn_more.setToolTip(
+            _setting_tooltip(
+                "Shows or hides language, font, update, and application settings.",
+                "The secondary toolbar is click-persistent: it remains open while the "
+                "pointer moves elsewhere and closes only when this ellipsis is clicked "
+                "again.",
+            )
+        )
+        self._btn_more.toggled.connect(self._toggle_more_toolbar)
+        tb.addWidget(self._btn_more)
+
+        # ── Click-persistent secondary toolbar ─────────────────────────
+        more = QToolBar("More controls")
+        more.setObjectName("moreToolbar")
+        more.setMovable(False)
+        more.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self._more_toolbar = more
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, more)
+
+        more.addWidget(QLabel("Language:"))
+        self._language_combo = QComboBox()
+        self._language_combo.setObjectName("languageSelector")
+        self._language_combo.setMinimumWidth(180)
+        self._language_combo.setToolTip(
+            _setting_tooltip(
+                "Changes AutoTuner's interface language immediately.",
+                "Built-in JSON packs fall back to English (UK) for unknown strings. "
+                "Custom packs are validated and copied into ~/.autotuner/languages.",
+            )
+        )
+        self._populate_language_combo()
+        self._language_combo.currentIndexChanged.connect(self._on_language_changed)
+        more.addWidget(self._language_combo)
+
+        self._btn_language_folder = QPushButton("Open language folder")
+        self._btn_language_folder.setToolTip(
+            _setting_tooltip(
+                "Opens the folder for your own JSON language packs.",
+                "AutoTuner creates an English-based custom-language-template.json "
+                "there once. Edit its ID, name, locale, and translations, then choose "
+                "Custom language pack… to validate and activate it.",
+            )
+        )
+        self._btn_language_folder.clicked.connect(self._open_language_folder)
+        more.addWidget(self._btn_language_folder)
+
+        more.addSeparator()
+        more.addWidget(QLabel("Font:"))
+        for delta, label, attribute in (
+            (-1, "A−", "_btn_font_smaller"),
+            (+1, "A+", "_btn_font_larger"),
+        ):
+            button = QPushButton(label)
+            button.setFixedWidth(36)
+            button.clicked.connect(
+                lambda _checked=False, amount=delta: self._change_font(amount)
+            )
+            button.setToolTip(
                 _setting_tooltip(
                     "Makes all interface text smaller or larger.",
                     "Changes the QApplication font size by one point within the 7–22 "
@@ -5584,7 +5923,36 @@ class MainWindow(QMainWindow):
                     "and persists the result for the next launch.",
                 )
             )
-            tb.addWidget(b)
+            setattr(self, attribute, button)
+            more.addWidget(button)
+
+        more.addSeparator()
+        self._btn_update = QPushButton("⬆ Update")
+        self._btn_update.clicked.connect(self._start_update)
+        self._btn_update.setToolTip(
+            _setting_tooltip(
+                "Checks GitHub for a newer AutoTuner version and installs it while "
+                "keeping your personal settings.",
+                "Source checkouts update through git or a source ZIP. Frozen builds "
+                "download the OS-specific GitHub Release ZIP and use a restart swap "
+                "helper. autotuner_settings.json is backed up and restored around "
+                "either update path.",
+            )
+        )
+        more.addWidget(self._btn_update)
+
+        self._btn_settings = QPushButton("⚙ Settings")
+        self._btn_settings.clicked.connect(self._open_application_settings)
+        self._btn_settings.setToolTip(
+            _setting_tooltip(
+                "Opens application-wide startup and window behaviour options.",
+                "These opt-in preferences are shared by source and frozen builds "
+                "through ~/.autotuner. They do not change model tuning, generated "
+                "llama-server arguments, or per-model Expert overrides.",
+            )
+        )
+        more.addWidget(self._btn_settings)
+        more.hide()
 
         # ── Sysinfo bar ────────────────────────────────────────────────
         sysbar = QWidget()
@@ -5620,7 +5988,7 @@ class MainWindow(QMainWindow):
         self._search.textChanged.connect(self._apply_filter)
         frl.addWidget(self._search, 1)
 
-        self._btn_list_view = QPushButton("☷ Liste")
+        self._btn_list_view = QPushButton("☷ List")
         self._btn_list_view.setCheckable(True)
         self._btn_list_view.setToolTip(
             _setting_tooltip(
@@ -5634,7 +6002,7 @@ class MainWindow(QMainWindow):
         )
         frl.addWidget(self._btn_list_view)
 
-        self._btn_tree_view = QPushButton("🌳 Ordner")
+        self._btn_tree_view = QPushButton("🌳 Folders")
         self._btn_tree_view.setCheckable(True)
         self._btn_tree_view.setToolTip(
             _setting_tooltip(
@@ -6058,7 +6426,7 @@ class MainWindow(QMainWindow):
         )
         bl.addWidget(self._host_edit)
 
-        bl.addWidget(QLabel(" Base port:"))
+        bl.addWidget(QLabel("Base port:"))
         self._port_edit = QLineEdit(str(self._base_port))
         self._port_edit.setFixedWidth(60)
         self._port_edit.setToolTip(
@@ -6076,7 +6444,7 @@ class MainWindow(QMainWindow):
         self._port_edit.editingFinished.connect(self._persist_base_port)
         bl.addWidget(self._port_edit)
 
-        bl.addWidget(QLabel(" Offset:"))
+        bl.addWidget(QLabel("Offset:"))
         self._port_offset_combo = QComboBox()
         self._port_offset_combo.setFixedWidth(60)
         self._port_offset_combo.setToolTip(
@@ -6112,7 +6480,7 @@ class MainWindow(QMainWindow):
         # Lets the user target a SPECIFIC running server (to stop just that
         # one) instead of only ever the most-recent. Repopulated whenever the
         # server registry changes (launch / stop / crash poll).
-        bl.addWidget(QLabel(" Server:"))
+        bl.addWidget(QLabel("Server:"))
         self._server_combo = QComboBox()
         self._server_combo.setMinimumWidth(220)
         self._server_combo.setToolTip(
@@ -6141,7 +6509,7 @@ class MainWindow(QMainWindow):
         self._btn_toggle_log.clicked.connect(self._toggle_log_panel)
         bl.addWidget(self._btn_toggle_log)
 
-        self._btn_ocr = QPushButton("📄  OCR…")
+        self._btn_ocr = QPushButton("📄 OCR…")
         self._btn_ocr.setFixedHeight(32)
         self._btn_ocr.setEnabled(False)
         self._btn_ocr.setVisible(False)
@@ -6157,7 +6525,7 @@ class MainWindow(QMainWindow):
         self._btn_ocr.clicked.connect(self._open_ocr_workflow)
         bl.addWidget(self._btn_ocr)
 
-        self._btn_launch = QPushButton("▶  Launch")
+        self._btn_launch = QPushButton("▶ Launch")
         self._btn_launch.setFixedHeight(32)
         self._btn_launch.setEnabled(False)
         self._btn_launch.setToolTip(
@@ -6173,7 +6541,7 @@ class MainWindow(QMainWindow):
         self._btn_launch.clicked.connect(self._launch_server)
         bl.addWidget(self._btn_launch)
 
-        self._btn_stop = QPushButton("■  Stop")
+        self._btn_stop = QPushButton("■ Stop")
         self._btn_stop.setFixedHeight(32)
         self._btn_stop.setEnabled(False)
         self._btn_stop.setToolTip(
@@ -6229,8 +6597,404 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
         self._status.showMessage("Starting…")
 
+        # Translate the complete first-built widget tree. Later dialogs are
+        # handled by LanguageManager's application event filter on Show.
+        self._language_manager.apply_to(self)
+        for error in self._language_manager.errors:
+            self._log(f"[Language] Ignored pack: {error}")
+
         # Re-apply the inner pane arrangement now that every splitter exists.
         self._restore_splitter_states()
+
+    def _toggle_more_toolbar(self, expanded: bool) -> None:
+        """Keep the secondary toolbar open until the ellipsis is toggled again."""
+        self._more_toolbar.setVisible(bool(expanded))
+
+    def _populate_language_combo(self) -> None:
+        """List every validated built-in/custom pack plus the import action."""
+        combo = self._language_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for pack in self._language_manager.available():
+            label = pack.name if pack.source == "builtin" else f"★ {pack.name}"
+            combo.addItem(label, pack.qualified_id)
+            combo.setItemData(
+                combo.count() - 1,
+                f"{pack.locale} · {pack.path}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        combo.insertSeparator(combo.count())
+        combo.addItem(
+            self._language_manager.translate("Custom language pack…"),
+            CUSTOM_LANGUAGE_ACTION,
+        )
+        index = combo.findData(self._language_manager.current_id)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+
+    def _restore_language_combo(self) -> None:
+        index = self._language_combo.findData(self._language_manager.current_id)
+        self._language_combo.blockSignals(True)
+        self._language_combo.setCurrentIndex(max(0, index))
+        self._language_combo.blockSignals(False)
+
+    def _activate_language(self, language_id: str) -> None:
+        selected = self._language_manager.select(language_id)
+        app_settings.set_language_id(selected)
+        self._populate_language_combo()
+        self._language_manager.apply_all()
+        self._status.showMessage(
+            self._language_manager.translate("Language changed."), 3000
+        )
+
+    def _on_language_changed(self, _index: int) -> None:
+        language_id = self._language_combo.currentData()
+        if language_id == CUSTOM_LANGUAGE_ACTION:
+            self._import_custom_language()
+            return
+        if isinstance(language_id, str):
+            self._activate_language(language_id)
+
+    def _import_custom_language(self) -> None:
+        tr = self._language_manager.translate
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            tr("Select a custom AutoTuner language pack"),
+            str(self._language_manager.user_dir),
+            tr("AutoTuner language packs (*.json);;All files (*)"),
+        )
+        if not selected:
+            self._restore_language_combo()
+            return
+        source = Path(selected)
+        try:
+            imported = self._language_manager.import_pack(source)
+        except FileExistsError:
+            reply = QMessageBox.question(
+                self,
+                tr("Language pack"),
+                tr("A language pack with this ID already exists. Replace it?"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._restore_language_combo()
+                return
+            try:
+                imported = self._language_manager.import_pack(source, replace=True)
+            except (LanguagePackError, OSError) as exc:
+                QMessageBox.warning(
+                    self, tr("Could not load language pack"), str(exc)
+                )
+                self._restore_language_combo()
+                return
+        except (LanguagePackError, OSError) as exc:
+            QMessageBox.warning(self, tr("Could not load language pack"), str(exc))
+            self._restore_language_combo()
+            return
+
+        self._populate_language_combo()
+        self._activate_language(imported.qualified_id)
+        self._log(f"[Language] Imported {imported.name}: {imported.path}")
+        QMessageBox.information(
+            self,
+            self._language_manager.translate("Language pack imported"),
+            self._language_manager.translate(
+                "The language pack was imported and activated."
+            ),
+        )
+
+    def _open_language_folder(self) -> None:
+        try:
+            template = self._language_manager.ensure_custom_template()
+            _open_local_folder(self._language_manager.user_dir)
+            self._log(f"[Language] Custom-pack template: {template}")
+        except (LanguagePackError, OSError) as exc:
+            QMessageBox.warning(
+                self,
+                self._language_manager.translate("Could not load language pack"),
+                str(exc),
+            )
+
+    # ------------------------------------------------------------------
+    # Authenticated external-control gateway
+    # ------------------------------------------------------------------
+    def _configure_control_api(self) -> bool:
+        """Apply persisted API settings without ever exposing a non-loopback bind."""
+        if not app_settings.get_control_api_enabled():
+            self._stop_control_api()
+            return True
+        try:
+            token = app_settings.ensure_control_api_token()
+            port = app_settings.get_control_api_port()
+        except (OSError, ValueError) as exc:
+            self._log(f"[Control API] Could not prepare credentials: {exc}")
+            return False
+
+        current = self._control_api
+        if (
+            current is not None
+            and current.running
+            and current.port == port
+            and current.token == token
+        ):
+            self._refresh_control_api_catalogue()
+            return True
+        self._stop_control_api()
+        try:
+            api = ControlApiServer(
+                host="127.0.0.1",
+                port=port,
+                token=token,
+                switch_callback=self._control_switch_from_http,
+                stop_callback=self._control_stop_from_http,
+                log_callback=self._control_log_ready.emit,
+                switch_timeout_s=900.0,
+            )
+            self._control_api = api
+            self._refresh_control_api_catalogue()
+            endpoint = api.start()
+            self._log(
+                f"[Control API] OpenAI endpoint ready: {endpoint}/v1 "
+                "(bearer authentication required)."
+            )
+            return True
+        except (OSError, ValueError) as exc:
+            self._control_api = None
+            self._log(f"[Control API] Could not start on port {port}: {exc}")
+            return False
+
+    def _stop_control_api(self) -> None:
+        api = self._control_api
+        self._control_api = None
+        if api is not None:
+            api.stop()
+
+    def _refresh_control_api_catalogue(self) -> None:
+        try:
+            models = _control_api_catalogue(self._all_entries, self._profiles)
+            model_paths = {
+                model.id: Path(model.path) for model in models if model.runnable
+            }
+            if self._control_api is not None:
+                self._control_api.update_models(models)
+            self._control_model_paths = model_paths
+        except Exception as exc:
+            self._log(f"[Control API] Could not refresh model catalogue: {exc}")
+
+    def _control_switch_from_http(
+        self, model_id: str, timeout_s: float
+    ) -> Dict[str, object]:
+        request = ControlRequest(
+            action="switch", model_id=model_id, timeout_s=timeout_s
+        )
+        self._control_request_ready.emit(request)
+        return request.wait()
+
+    def _control_stop_from_http(self, timeout_s: float) -> Dict[str, object]:
+        request = ControlRequest(action="stop", timeout_s=timeout_s)
+        self._control_request_ready.emit(request)
+        return request.wait()
+
+    def _handle_control_request(self, request: object) -> None:
+        """Execute an HTTP-thread request on Qt's GUI thread."""
+        if not isinstance(request, ControlRequest):
+            return
+        if self._control_closing:
+            request.fail(
+                "AutoTuner is shutting down.", status=503, code="shutting_down"
+            )
+            return
+        if request.action == "stop":
+            record = self._control_api_record
+            if record is not None and record in self._servers:
+                process = record.get("proc")
+                self._stop_specific_server(record)
+                if isinstance(process, _TerminalProcess) and not process.has_stopped():
+                    self._wait_for_control_process(
+                        request,
+                        process,
+                        time.monotonic() + 15.0,
+                        lambda: request.complete({"status": "stopped"}),
+                    )
+                    return
+            else:
+                self._control_api_record = None
+                if self._control_api is not None:
+                    self._control_api.clear_active()
+            request.complete({"status": "stopped"})
+            return
+        if request.action != "switch":
+            request.fail("Unknown control action.", status=400, code="invalid_action")
+            return
+
+        benchmark_busy = False
+        try:
+            benchmark_busy = bool(
+                self._benchmark_thread is not None
+                and self._benchmark_thread.isRunning()
+            )
+        except RuntimeError:
+            benchmark_busy = False
+        if benchmark_busy or self._ocr_thread is not None:
+            request.fail(
+                "AutoTuner is busy with an exclusive benchmark or OCR workflow.",
+                status=409,
+                code="autotuner_busy",
+            )
+            return
+        if self._system is None:
+            request.fail(
+                "Hardware detection is still running; retry in a moment.",
+                status=503,
+                code="hardware_pending",
+            )
+            return
+
+        path = self._control_model_paths.get(request.model_id)
+        entry = next(
+            (model for model in self._all_entries if path is not None and model.path == path),
+            None,
+        )
+        if entry is None:
+            request.fail(
+                f"The model {request.model_id!r} is no longer available.",
+                status=404,
+                code="model_not_found",
+            )
+            return
+
+        active = self._control_api_record
+        if active is not None and active in self._servers:
+            if active.get("control_model_id") == request.model_id:
+                if active.get("ready"):
+                    request.complete(self._control_record_result(active))
+                else:
+                    active.setdefault("control_requests", []).append(request)
+                return
+            process = active.get("proc")
+            self._stop_specific_server(active)
+            self._control_api_record = None
+            if isinstance(process, _TerminalProcess) and not process.has_stopped():
+                # _TerminalProcess.stop() is intentionally non-blocking for the
+                # GUI. The queued transition waits until its process group has
+                # actually exited, so old and new models never overlap in VRAM.
+                self._wait_for_control_process(
+                    request,
+                    process,
+                    time.monotonic() + 15.0,
+                    lambda: self._launch_control_entry(request, entry),
+                )
+                return
+        else:
+            self._control_api_record = None
+        self._launch_control_entry(request, entry)
+
+    def _wait_for_control_process(
+        self,
+        request: ControlRequest,
+        process: _TerminalProcess,
+        deadline: float,
+        on_stopped: Callable[[], None],
+    ) -> None:
+        """Poll process-group termination without blocking Qt's event loop."""
+        if request.done:
+            return
+        if process.has_stopped():
+            on_stopped()
+            return
+        if self._control_closing:
+            request.fail(
+                "AutoTuner is shutting down.", status=503, code="shutting_down"
+            )
+            return
+        if time.monotonic() >= deadline:
+            request.fail(
+                "The previous llama-server did not exit; the new model was not started.",
+                status=504,
+                code="stop_timeout",
+            )
+            return
+        QTimer.singleShot(
+            50,
+            lambda: self._wait_for_control_process(
+                request, process, deadline, on_stopped
+            ),
+        )
+
+    def _launch_control_entry(
+        self, request: ControlRequest, entry: ModelEntry
+    ) -> None:
+        if request.done:
+            return
+        # Reuse exactly the same per-model target/profile/draft/mmproj and
+        # application-wide mode/GPU controls as a click launch. The external
+        # API never constructs an independent TunedConfig.
+        self._show_config(entry)
+        self._select_model_path(entry.path, self._active_model_view())
+        try:
+            record = self._launch_server(interactive=False)
+        except Exception as exc:
+            self._log(f"[Control API] Launch raised {type(exc).__name__}: {exc}")
+            request.fail(
+                f"AutoTuner could not start the requested model: {exc}",
+                status=500,
+                code="launch_exception",
+            )
+            return
+        if record is None:
+            request.fail(
+                self._last_launch_error
+                or "AutoTuner could not start the requested model.",
+                status=409,
+                code="launch_failed",
+            )
+            return
+        record["control_model_id"] = request.model_id
+        record["control_requests"] = [request]
+        # Expire slightly before the HTTP wait so Qt can stop an alive but
+        # never-ready backend and deliver a structured timeout response.
+        record["control_deadline"] = max(
+            time.monotonic(), request.deadline - 0.5
+        )
+        self._control_api_record = record
+        if record.get("ready"):
+            self._complete_control_record(record)
+
+    @staticmethod
+    def _control_record_result(record: dict) -> Dict[str, object]:
+        return {
+            "backend_url": str(
+                record.get("client_base_url") or record.get("base_url") or ""
+            ),
+            "backend_api_key": _extract_server_api_key(record.get("command", [])),
+            "alias": str(record.get("alias") or record.get("model") or ""),
+        }
+
+    def _complete_control_record(self, record: dict) -> None:
+        result = self._control_record_result(record)
+        record.pop("control_deadline", None)
+        pending = list(record.pop("control_requests", []))
+        for request in pending:
+            if isinstance(request, ControlRequest):
+                request.complete(result)
+
+    def _fail_control_record(
+        self,
+        record: dict,
+        message: str,
+        *,
+        status: int = 502,
+        code: str = "backend_exited",
+    ) -> None:
+        record.pop("control_deadline", None)
+        pending = list(record.pop("control_requests", []))
+        for request in pending:
+            if isinstance(request, ControlRequest):
+                request.fail(message, status=status, code=code)
+        if record is self._control_api_record:
+            self._control_api_record = None
+            if self._control_api is not None:
+                self._control_api.clear_active(str(record.get("control_model_id") or ""))
 
     def _open_application_settings(self) -> None:
         """Preview appearance and persist selection only on confirmation.
@@ -6400,12 +7164,47 @@ class MainWindow(QMainWindow):
         debug_enabled = dialog.debug_checkbox.isChecked()
         app_settings.set_debug_mode(debug_enabled)
         self._set_internal_debug_mode(debug_enabled)
+        api_enabled = dialog.control_api_checkbox.isChecked()
+        api_save_error = ""
+        try:
+            stored_token = (
+                None
+                if app_settings.control_api_token_is_overridden()
+                else dialog.control_api_token.text()
+            )
+            app_settings.set_control_api_config(
+                api_enabled, dialog.control_api_port.value(), stored_token
+            )
+            api_configured = self._configure_control_api()
+        except (OSError, ValueError) as exc:
+            api_configured = False
+            api_save_error = str(exc)
+            self._log(f"[Control API] Could not save settings: {exc}")
+        if api_save_error:
+            QMessageBox.warning(
+                self,
+                "External control API",
+                "The control API settings were not saved; the previous configuration "
+                f"is still active.\n\n{api_save_error}",
+            )
+        elif api_enabled and not api_configured:
+            QMessageBox.warning(
+                self,
+                "External control API",
+                "The loopback control API could not start. Check whether the selected "
+                "port is already in use; details are in the AutoTuner log.",
+            )
         selected_theme = str(dialog.theme_combo.currentData())
         if selected_theme in self._theme_manager.themes:
             app_settings.set_theme_id(selected_theme)
         if not minimize_to_tray:
             self._destroy_tray_icon()
-        self._status.showMessage("Settings saved", 3000)
+        self._status.showMessage(
+            "Settings saved"
+            if not api_save_error
+            else "Settings saved; control API settings unchanged",
+            3000,
+        )
 
     def _apply_theme_definition(
         self,
@@ -7791,6 +8590,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_done(self, entries: List[ModelEntry]) -> None:
         self._all_entries = entries
+        self._refresh_control_api_catalogue()
         self._btn_refresh.setEnabled(True)
         if not entries:
             roots = getattr(self, "_last_scan_roots", [])
@@ -8865,9 +9665,11 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._log(f"[Warning] Could not save mmproj selection: {exc}")
-        # mmproj presence changes CPU placement and OCR availability.
+        # mmproj presence changes CPU placement, OCR availability, and the
+        # image-input capability advertised to external clients.
         self._update_checkboxes(self._current_entry)
         self._refresh_config_preview()
+        self._refresh_control_api_catalogue()
 
     def _on_draft_combo_changed(self, index: int) -> None:
         """User picked a different draft head from the dropdown.
@@ -11883,16 +12685,19 @@ class MainWindow(QMainWindow):
                 dead.append(server)
         self._servers = live
         for server in dead:
-            if server is not self._ocr_server_record:
-                continue
             code = server.get("proc").returncode() if server.get("proc") else None
-            if server.get("ocr_started") and self._ocr_worker is not None:
-                self._ocr_worker.cancel()
-            else:
-                self._fail_pending_ocr(
-                    server,
-                    f"llama-server exited while loading the OCR model (code {code}).",
-                )
+            self._fail_control_record(
+                server,
+                f"llama-server exited while loading the requested model (code {code}).",
+            )
+            if server is self._ocr_server_record:
+                if server.get("ocr_started") and self._ocr_worker is not None:
+                    self._ocr_worker.cancel()
+                else:
+                    self._fail_pending_ocr(
+                        server,
+                        f"llama-server exited while loading the OCR model (code {code}).",
+                    )
 
     def _requested_start_port(self, base_port: int, offset: int) -> int:
         """Return the user's requested first port before collision probing.
@@ -12517,25 +13322,30 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Server control
     # ------------------------------------------------------------------
-    def _launch_server(self) -> Optional[dict]:
+    def _launch_server(self, *, interactive: bool = True) -> Optional[dict]:
+        self._last_launch_error = ""
+
+        def launch_warning(title: str, message: str) -> None:
+            self._last_launch_error = message or title
+            self._log(f"[Launch] {title}: {message}")
+            if interactive:
+                QMessageBox.warning(self, title, message)
+
         # Multi-server: we no longer refuse when one is already running.
         # Prune any that have exited so the port counter and VRAM picture
         # are current before we plan this launch.
         self._prune_dead_servers()
 
         if self._current_entry is None:
-            QMessageBox.warning(
-                self, "No model selected", "Click a model in the list first."
-            )
-            return
+            launch_warning("No model selected", "Click a model in the list first.")
+            return None
 
         if self._system is None:
-            QMessageBox.warning(
-                self,
+            launch_warning(
                 "System info unavailable",
                 "Hardware detection has not completed yet. Please wait a moment and try again.",
             )
-            return
+            return None
 
         use_vision = self._vision_enabled()
         use_draft = self._draft_enabled()
@@ -12625,12 +13435,11 @@ class MainWindow(QMainWindow):
         if draft_message:
             self._log(f"[Draft compatibility] {draft_message}")
         if not draft_allowed:
-            QMessageBox.warning(
-                self,
+            launch_warning(
                 "DFlash2-capable llama.cpp build required",
                 draft_message,
             )
-            return
+            return None
 
         # Resolve the launch config:
         #   • Expert panel open → the user is editing live; flush any
@@ -12720,8 +13529,8 @@ class MainWindow(QMainWindow):
             )
             if refusal is not None:
                 self._log(f"[Balance] Launch refused — {refusal.splitlines()[0]}")
-                QMessageBox.warning(self, "Not enough free VRAM", refusal)
-                return
+                launch_warning("Not enough free VRAM", refusal)
+                return None
             if chosen_gpu is not None:
                 self._pin_cfg_to_gpu(cfg, chosen_gpu)
         else:
@@ -12734,8 +13543,8 @@ class MainWindow(QMainWindow):
                 # CPU systems; otherwise warn and let the split proceed.
                 if self._system and len(self._system.gpus) <= 1:
                     self._log(f"[Balance] Launch refused — {refusal.splitlines()[0]}")
-                    QMessageBox.warning(self, "Not enough free VRAM", refusal)
-                    return
+                    launch_warning("Not enough free VRAM", refusal)
+                    return None
                 self._log(
                     "[Balance] First model may not fit on a single card; "
                     "letting the AutoTuner split it across GPUs."
@@ -12792,8 +13601,7 @@ class MainWindow(QMainWindow):
                 self._log(
                     f"[Diffusion-Server] Binary nicht gefunden: {gemma_server_bin}"
                 )
-                QMessageBox.warning(
-                    self,
+                launch_warning(
                     "llama-diffusion-gemma-server nicht gefunden",
                     "DiffusionGemma benötigt llama-diffusion-gemma-server aus "
                     "einem DiffusionGemma-Fähigen Build (PR #24427).\n\n"
@@ -12801,7 +13609,7 @@ class MainWindow(QMainWindow):
                     "llama-diffusion-gemma-server enthält (z.B. "
                     "d_bXXXX_vulkan_llama.cpp / d_bXXXX_hip_llama.cpp).",
                 )
-                return
+                return None
             cmd = build_diffusion_server_command(
                 model=entry,
                 config=cfg,
@@ -12846,12 +13654,11 @@ class MainWindow(QMainWindow):
         if build_message:
             self._log(f"[Compat] {build_message}")
         if not build_allowed:
-            QMessageBox.warning(
-                self,
+            launch_warning(
                 "llama.cpp build too old",
                 build_message,
             )
-            return
+            return None
 
         cmd, removed_args = prepare_command_for_binary(cmd)
         for adjustment in removed_args:
@@ -12886,7 +13693,7 @@ class MainWindow(QMainWindow):
             )
 
         self._log("\n" + "─" * 60)
-        self._log(f"Starting: {' '.join(cmd)}")
+        self._log(f"Starting: {_redacted_command(cmd)}")
         metrics_active = "--metrics" in cmd
         slots_active = "--slots" in cmd
         self._log(
@@ -12914,21 +13721,21 @@ class MainWindow(QMainWindow):
         except FileNotFoundError:
             self._log(f"[Error] Binary not found: {cmd[0]}")
             self._log("  → Check fork selection or set LLAMA_CPP_DIR / LLAMA_SERVER")
-            return
+            self._last_launch_error = f"Binary not found: {cmd[0]}"
+            return None
         except OSError as exc:
             self._log(f"[Error] Could not start binary: {cmd[0]} ({exc})")
             self._log(
                 "  → Check that the selected llama.cpp build matches this OS/CPU "
                 "and is executable."
             )
-            QMessageBox.warning(
-                self,
+            launch_warning(
                 "llama-server konnte nicht starten",
                 f"{cmd[0]}\n\n{exc}\n\n"
                 "Prüfe, ob der gewählte llama.cpp-Build zu diesem Betriebssystem "
                 "passt und ausführbar ist.",
             )
-            return
+            return None
 
         pid = proc.proc.pid if proc.proc else "?"
         base_url = f"http://{host}:{port}"
@@ -13159,6 +13966,12 @@ class MainWindow(QMainWindow):
                 self._fail_pending_ocr(
                     record, "The OCR server was stopped before it became ready."
                 )
+        self._fail_control_record(
+            record,
+            "The API-managed model server was stopped.",
+            status=409,
+            code="model_stopped",
+        )
         self._servers.remove(record)
 
         srv = record.get("proc")
@@ -13273,6 +14086,12 @@ class MainWindow(QMainWindow):
             self._finish_ocr_ui()
             self._set_ocr_controls_locked(False)
         for record in self._servers:
+            self._fail_control_record(
+                record,
+                "The API-managed model server was stopped.",
+                status=409,
+                code="model_stopped",
+            )
             srv = record.get("proc")
             if srv is not None:
                 try:
@@ -13310,6 +14129,10 @@ class MainWindow(QMainWindow):
                     record,
                     f"llama-server exited while loading the OCR model (code {code}).",
                 )
+                self._fail_control_record(
+                    record,
+                    f"llama-server exited while loading the requested model (code {code}).",
+                )
         if len(still_live) != len(self._servers):
             self._servers = still_live
             if self._servers:
@@ -13337,6 +14160,16 @@ class MainWindow(QMainWindow):
             base_url = record.get("base_url")
             health_base_url = record.get("client_base_url") or base_url
             if not health_base_url:
+                continue
+            control_deadline = float(record.get("control_deadline", 0.0) or 0.0)
+            if control_deadline and time.monotonic() >= control_deadline:
+                self._fail_control_record(
+                    record,
+                    "llama-server did not become ready before the control API timeout.",
+                    status=504,
+                    code="switch_timeout",
+                )
+                QTimer.singleShot(0, lambda r=record: self._stop_specific_server(r))
                 continue
             deadline = float(record.get("ocr_deadline", 0.0) or 0.0)
             if deadline and time.monotonic() >= deadline:
@@ -13392,6 +14225,7 @@ class MainWindow(QMainWindow):
                         f"Ready — PID {pid} — {base_url}  "
                         f"({len(self._servers)} server(s) running)"
                     )
+                self._complete_control_record(record)
                 self._start_pending_ocr(record)
 
         # If enabled, poll /slots at a lower cadence than the 500 ms process
@@ -13716,6 +14550,12 @@ class MainWindow(QMainWindow):
                 if a0 is not None:
                     a0.ignore()
                 return
+
+        # No later user decision can cancel shutdown. Stop accepting external
+        # model switches before terminating the model processes they control.
+        self._control_closing = True
+        self._stop_control_api()
+        if self._servers:
             self._stop_all_servers()
 
         self._destroy_tray_icon()
@@ -13947,6 +14787,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         themes_dir = _bundled_resource("assets", "themes")
         if not themes_dir.is_dir():
             raise RuntimeError("frozen smoke test found no bundled themes")
+        languages_dir = _bundled_resource("assets", "languages")
+        if len(list(languages_dir.glob("*.json"))) < 8:
+            raise RuntimeError("frozen smoke test found incomplete bundled languages")
         print(
             f"AutoTuner v{VERSION} frozen smoke test OK ({len(profiles)} profiles)",
             flush=True,
@@ -14032,6 +14875,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     # to fire — the standard Qt-plus-Python-signals pattern.
     def _shutdown_on_signal(_signum: int, _frame: object) -> None:
         try:
+            window._control_closing = True
+            window._stop_control_api()
             window._stop_all_servers()
         except Exception:
             pass

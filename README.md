@@ -520,6 +520,21 @@ python qt_launcher.py
 Same engine as the terminal launcher, plus a few quality-of-life bits
 that only make sense with persistent state:
 
+- **Compact, persistent secondary toolbar and live languages.** Fonts, Update,
+  and Settings now stay under **⋯**, leaving the primary model/runtime row
+  wider. The second row remains open until **⋯** is clicked again. Its language
+  selector includes English (UK), German, Dutch, Swedish, Japanese, French,
+  Greek, and Polish. Validated custom JSON packs live under
+  `~/.autotuner/languages`, fall back to English for missing strings, and can be
+  created from the generated template described in
+  [`docs/languages.md`](docs/languages.md).
+- **Opt-in local model-control API.** Settings can start a bearer-authenticated,
+  loopback-only OpenAI endpoint that lists the live AutoTuner catalogue and
+  atomically switches to a requested model with its saved launch settings. It
+  stops only the prior API-managed server, waits for `/health`, and preserves
+  SSE streaming through the proxy. The dynamic Pi provider is in
+  [`integrations/pi/autotuner.ts`](integrations/pi/autotuner.ts); endpoint and
+  security details are in [`docs/control-api.md`](docs/control-api.md).
 - **OCR dialog and progress.** OCR models show **📄 OCR…**; double-clicking one
   opens the same workflow as the TUI. Inputs are prepared off the GUI thread,
   mutable launch controls are locked until the validated server starts, Cancel
@@ -1054,6 +1069,36 @@ checks are validated through exact stock **b10679** (`50f068fff`). The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.4 — aligned reports, multilingual UI, secure model control
+
+- **Aligned model overview:** decode, prompt/encode, and end-to-end winner panels
+  now stack vertically, retain the same model/backend/build column order, and
+  share one synchronized horizontal scrollbar. More model columns fit on screen
+  without losing cross-metric alignment.
+- **Persistent compact toolbar:** low-frequency Fonts, language, Update, and
+  Settings controls live in a secondary toolbar that remains open until the
+  ellipsis is clicked again. It no longer disappears when the pointer leaves.
+- **English (UK) plus seven complete built-ins:** English (UK) is the canonical
+  fallback, joined by grammatically reviewed Deutsch, Nederlands, Svenska,
+  日本語, Français, Ελληνικά, and Polski packs. Validated schema-1 custom JSON
+  packs import atomically into per-user storage, can replace their own ID, live
+  retranslate open/later dialogs, and survive source or frozen upgrades.
+- **Authenticated local model control:** an opt-in, loopback-only API publishes
+  stable IDs for the live scanned catalogue, serializes model transitions on
+  Qt's GUI thread, reuses saved AutoTuner launch settings, waits for the prior
+  process to exit and the new `/health` check to pass, and stops only the
+  API-managed server. In-flight proxy leases prevent a switch from truncating
+  an active stream or routing it to the wrong model.
+- **OpenAI and Pi integration:** authenticated `/v1/*` requests are rewritten to
+  llama-server's launch alias without forwarding client credentials; SSE chunks
+  are flushed immediately. The async Pi extension discovers models before
+  `pi.registerProvider()`, supports refresh, and honours persisted or
+  environment-owned loopback credentials and ports.
+- **Validation:** 438 tests pass with 7 platform/environment skips; Ruff,
+  compileall, diff checks, TypeScript/Pi runtime discovery, PyInstaller analysis,
+  frozen resources, and the Windows frozen smoke gate pass. Full evidence is in
+  [`docs/v5.3.4-validation.md`](docs/v5.3.4-validation.md).
 
 ### v5.3.3 — adaptive campaigns, backend evidence, complete analysis
 
