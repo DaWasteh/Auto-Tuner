@@ -11,8 +11,37 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][scriptblock]$Command
     )
 
-    & $Command 2>&1 | ForEach-Object { Write-Host $_ }
-    $exitCode = $LASTEXITCODE
+    # Windows PowerShell 5.1 promotes native stderr records to terminating
+    # NativeCommandError exceptions when ErrorActionPreference is Stop. Tools
+    # such as git and cmake legitimately write progress to stderr even on exit
+    # code 0, so suppress that promotion locally and trust the native exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hasNativeErrorPreference = [bool](
+        Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+    )
+    if ($hasNativeErrorPreference) {
+        $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    }
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($hasNativeErrorPreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        & $Command 2>&1 | ForEach-Object {
+            $line = if ($_ -is [Management.Automation.ErrorRecord]) {
+                [string]$_.Exception.Message
+            } else {
+                [string]$_
+            }
+            Write-Host $line
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        if ($hasNativeErrorPreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+        }
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($exitCode -ne 0) {
         throw "$Description failed with exit code $exitCode"
     }
@@ -24,8 +53,33 @@ function Get-NativeText {
         [Parameter(Mandatory = $true)][scriptblock]$Command
     )
 
-    $text = (& $Command 2>&1 | Out-String).Trim()
-    $exitCode = $LASTEXITCODE
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hasNativeErrorPreference = [bool](
+        Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+    )
+    if ($hasNativeErrorPreference) {
+        $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    }
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($hasNativeErrorPreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        $output = @(& $Command 2>&1)
+        $exitCode = $LASTEXITCODE
+        $text = ($output | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) {
+                [string]$_.Exception.Message
+            } else {
+                [string]$_
+            }
+        } | Out-String).Trim()
+    } finally {
+        if ($hasNativeErrorPreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+        }
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($exitCode -ne 0) {
         throw "$Description failed with exit code $exitCode`n$text"
     }
@@ -40,14 +94,45 @@ function Assert-CommandAvailable {
     }
 }
 
+function Get-Sha256FileHash {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Use .NET directly: a PowerShell 7 module path can shadow the Windows
+    # PowerShell Utility module and make Get-FileHash unavailable in 5.1.
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Import-VisualStudioBuildEnvironment {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere -PathType Leaf)) {
         throw "vswhere.exe was not found: $vswhere"
     }
-    $vsPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $vsPath) {
+    $instanceJson = Get-NativeText "Visual Studio discovery" {
+        & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+    }
+    $instances = $instanceJson | ConvertFrom-Json
+    $instance = @($instances)[0]
+    if (-not $instance) {
         throw "A Visual Studio C++ x64 toolchain was not found"
+    }
+    $vsPath = [string]$instance.installationPath
+    $vsVersion = [string]$instance.installationVersion
+    if (-not $vsPath -or $vsVersion -notmatch '^(\d+)\.') {
+        throw "Visual Studio discovery returned an incomplete installation record"
+    }
+    $vsGenerator = switch ([int]$Matches[1]) {
+        18 { "Visual Studio 18 2026" }
+        17 { "Visual Studio 17 2022" }
+        16 { "Visual Studio 16 2019" }
+        15 { "Visual Studio 15 2017" }
+        default { throw "Unsupported Visual Studio version: $vsVersion" }
     }
     $vsDevCmd = Join-Path $vsPath "Common7\Tools\VsDevCmd.bat"
     if (-not (Test-Path $vsDevCmd -PathType Leaf)) {
@@ -66,7 +151,11 @@ function Import-VisualStudioBuildEnvironment {
             Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
         }
     }
-    return $vsPath
+    return [PSCustomObject]@{
+        Path = $vsPath
+        Version = $vsVersion
+        Generator = $vsGenerator
+    }
 }
 
 function Resolve-NinjaPath {
@@ -116,7 +205,7 @@ function Get-HipCompatibilityResourceDir {
     $clangVersion = Split-Path $resourceDir -Leaf
     $patchedDir = Join-Path $Workspace "toolchains\rocm-${rocmVersion}-clang-${clangVersion}-llvm-pr201563"
     $patchedWrapper = Join-Path $patchedDir "include\__clang_hip_runtime_wrapper.h"
-    $sourceHash = (Get-FileHash $wrapper -Algorithm SHA256).Hash
+    $sourceHash = Get-Sha256FileHash $wrapper
     $marker = Join-Path $patchedDir ".autotuner-source-sha256"
     $reuse = $false
     if ((Test-Path $patchedWrapper -PathType Leaf) -and (Test-Path $marker -PathType Leaf)) {
@@ -149,7 +238,11 @@ function Get-HipCompatibilityResourceDir {
             ('$1' + $forwardInclude + $newline),
             1
         )
-        Set-Content -LiteralPath $patchedWrapper -Value $patchedText -NoNewline -Encoding utf8
+        [IO.File]::WriteAllText(
+            $patchedWrapper,
+            $patchedText,
+            [Text.UTF8Encoding]::new($false)
+        )
         Set-Content -LiteralPath $marker -Value $sourceHash -NoNewline -Encoding ascii
     }
 
@@ -164,22 +257,23 @@ function Initialize-LlamaBuildEnvironment {
         [string]$RocmPath = ""
     )
 
-    if (-not $IsWindows) {
+    if ($env:OS -ne "Windows_NT") {
         throw "These recipes are for native Windows builds"
     }
-    foreach ($tool in ("git", "cmake", "npm")) {
+    foreach ($tool in ("git", "cmake")) {
         Assert-CommandAvailable $tool
     }
     if (-not (Test-Path $Workspace -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
     }
 
-    $vsPath = Import-VisualStudioBuildEnvironment
+    $vs = Import-VisualStudioBuildEnvironment
     if ($Backend -eq "Vulkan") {
         Assert-CommandAvailable "glslc"
         return [PSCustomObject]@{
             Backend = "Vulkan"
-            VisualStudioPath = $vsPath
+            VisualStudioPath = $vs.Path
+            VisualStudioGenerator = $vs.Generator
             RocmPath = $null
             NinjaPath = $null
         }
@@ -206,7 +300,7 @@ function Initialize-LlamaBuildEnvironment {
     $env:ROCM_PATH = $RocmPath
     $env:HIP_PATH = "$RocmPath\"
     $env:PATH = "$bin;$env:PATH"
-    $ninja = Resolve-NinjaPath -VisualStudioPath $vsPath
+    $ninja = Resolve-NinjaPath -VisualStudioPath $vs.Path
     $compatResourceDir = Get-HipCompatibilityResourceDir `
         -Clang $clang -RocmPath $RocmPath -Workspace $Workspace
 
@@ -223,7 +317,8 @@ function Initialize-LlamaBuildEnvironment {
 
     return [PSCustomObject]@{
         Backend = "HIP"
-        VisualStudioPath = $vsPath
+        VisualStudioPath = $vs.Path
+        VisualStudioGenerator = $vs.Generator
         RocmPath = $RocmPath
         NinjaPath = $ninja
         Clang = $clang
@@ -418,6 +513,7 @@ function Invoke-LlamaUiBuild {
         return "ON"
     }
 
+    Assert-CommandAvailable "npm"
     Write-Host "==> Building Web UI from $uiSource"
     Push-Location $uiSource
     try {
@@ -460,10 +556,29 @@ function Stop-ProcessTreeBounded {
         return
     }
     try {
-        $Process.Kill($true)
+        $treeKillMethod = $Process.GetType().GetMethod("Kill", [type[]]@([bool]))
+        if ($treeKillMethod) {
+            $Process.Kill($true)
+        } else {
+            # .NET Framework (Windows PowerShell 5.1) has no Kill(Boolean)
+            # overload. taskkill provides equivalent bounded tree termination.
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = "Continue"
+                & taskkill.exe /PID $Process.Id /T /F 2>&1 | Out-Null
+                $taskkillExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            $Process.Refresh()
+            if ($taskkillExit -ne 0 -and -not $Process.HasExited) {
+                throw "taskkill failed with exit code $taskkillExit"
+            }
+        }
     } catch {
         # The process can exit between HasExited and Kill. Ignore only that
         # benign race; every other termination failure must fail the gate.
+        $Process.Refresh()
         if (-not $Process.HasExited) {
             throw
         }
@@ -535,6 +650,46 @@ function Resolve-HipSemanticValidationModel {
     return $defaultModel
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Argument
+    )
+
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    # ProcessStartInfo.ArgumentList is unavailable on .NET Framework. Apply
+    # the documented CommandLineToArgvW escaping rules for its Arguments fallback.
+    $quoted = [Text.StringBuilder]::new()
+    [void]$quoted.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq [char]'\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq [char]'"') {
+            [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
+            [void]$quoted.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$quoted.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void]$quoted.Append($character)
+    }
+    if ($backslashes -gt 0) {
+        [void]$quoted.Append(('\' * (2 * $backslashes)))
+    }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
 function Test-HipMultiGpuSemanticOutput {
     param(
         [Parameter(Mandatory = $true)][string]$Server,
@@ -567,9 +722,15 @@ function Test-HipMultiGpuSemanticOutput {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.Environment["HIP_VISIBLE_DEVICES"] = "0,1"
-    foreach ($argument in $arguments) {
-        [void]$startInfo.ArgumentList.Add($argument)
+    $startInfo.EnvironmentVariables["HIP_VISIBLE_DEVICES"] = "0,1"
+    if ($startInfo.PSObject.Properties.Name -contains "ArgumentList") {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+    } else {
+        $startInfo.Arguments = (
+            $arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ }
+        ) -join " "
     }
 
     $process = [Diagnostics.Process]::new()
@@ -837,7 +998,7 @@ function Invoke-LlamaCMakeBuild {
     }
 
     if ($Backend -eq "Vulkan") {
-        $generator = "Visual Studio 18 2026"
+        $generator = $environment.VisualStudioGenerator
         $spirvInstall = Ensure-SpirvHeaders -Workspace $Workspace -Generator $generator -Parallel $Parallel
         $cmakeArgs = @(
             "-G", $generator,

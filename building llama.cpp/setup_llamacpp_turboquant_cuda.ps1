@@ -4,8 +4,25 @@
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\setup_llamacpp_turboquant_cuda.ps1
 
+# Windows PowerShell 5.1 turns harmless native stderr progress into terminating
+# NativeCommandError records. Relaunch this installer under PowerShell 7, whose
+# native-process semantics the package-manager flow below is written for.
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if (-not $pwsh) {
+        throw "PowerShell 7 is required. Install 'pwsh' and run this script again."
+    }
+    & $pwsh.Source -NoProfile -File $PSCommandPath
+    $pwshExit = $LASTEXITCODE
+    if ($pwshExit -ne 0) {
+        throw "PowerShell 7 setup process failed with exit code $pwshExit"
+    }
+    return
+}
+
 Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 
 # --- KONFIGURATION ---
 $INSTALL_DIR   = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -36,36 +53,18 @@ function Is-Available($cmd) {
     return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
-function Get-LlamaBuildTag {
-    param(
-        [string]$Commit = "HEAD",
-        [string]$Remote = "origin"
-    )
+function Get-LlamaBuildNumber {
+    param([string]$Commit = "HEAD")
 
-    $sha = (git rev-parse $Commit 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $sha) {
-        # llama.cpp b10470+ creates/pushes the lightweight release tag explicitly
-        # in CI, before the GitHub Release is created. Ask the remote tag
-        # namespace directly first, so even a just-created tag is recognized.
-        $remoteTags = git ls-remote --tags $Remote "refs/tags/b*" 2>$null
-        foreach ($row in $remoteTags) {
-            if ($row -match "^$sha\s+refs/tags/(b\d+)$") { return $Matches[1] }
-        }
+    $buildText = (git rev-list --count $Commit 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or $buildText -notmatch '^\d+$') {
+        throw "llama.cpp Buildnummer fuer '$Commit' konnte nicht bestimmt werden."
     }
-
-    git fetch $Remote --tags --force 2>$null
-
-    $pointingTags = @(
-        git tag --points-at $Commit --list "b[0-9]*" 2>$null |
-            Where-Object { $_ -match '^b\d+$' } |
-            Sort-Object { [int]($_ -replace '^b', '') } -Descending
-    )
-    if ($pointingTags.Count -gt 0) { return $pointingTags[0] }
-
-    $desc = (git describe --tags --abbrev=0 --match "b[0-9]*" $Commit 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $desc -match 'b\d+') { return $Matches[0] }
-
-    return "bUNKNOWN"
+    $build = [int]$buildText
+    if ($build -lt 1000) {
+        throw "Unvollstaendige Git-History; verdaechtige Buildnummer $build."
+    }
+    return $build
 }
 
 
@@ -469,58 +468,109 @@ foreach ($cmd in @("git","node","npm","nvcc")) {
 if (-not $allOk) { exit 1 }
 OK "cmake OK: $CMAKE_EXE"
 
-# --- 8. LLAMA-CPP-TURBOQUANT KLONEN (ueberspringen falls vorhanden) ---
+# --- 8. LLAMA-CPP-TURBOQUANT WAHRHEITSGEMAESS STAGEN ---
 Log "Pruefe llama-cpp-turboquant"
 Set-Location $INSTALL_DIR
 
-# Vorhandenes b*_turboquant.cpp Verzeichnis suchen (eigenes Muster, kollidiert nicht mit b*_llama.cpp)
-$existingDir = Get-ChildItem $INSTALL_DIR -Directory | Where-Object { $_.Name -match "^b\d+_$([regex]::Escape($DIR_SUFFIX))$" } | Sort-Object Name -Descending | Select-Object -First 1
-
-if ($existingDir) {
-    $dir = $existingDir.FullName
-    OK "Vorhandenes Verzeichnis gefunden: $dir"
-    if (Test-Path (Join-Path $dir ".git")) {
-        Log "Aktualisiere llama-cpp-turboquant auf den neuesten Stand des Branches $REPO_BRANCH"
-        Push-Location $dir
-        git fetch --prune origin
-        git checkout $REPO_BRANCH
-        git pull --ff-only origin $REPO_BRANCH
-        if ($LASTEXITCODE -ne 0) { Pop-Location; throw "TurboQuant-Repository konnte nicht aktualisiert werden." }
-        Pop-Location
-        OK "TurboQuant-Quellcode aktualisiert"
-    }
-} else {
-    $tmpDir = Join-Path $INSTALL_DIR "_tmp_turboquant"
-    if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
-    git clone --branch $REPO_BRANCH $REPO_URL $tmpDir
-    Push-Location $tmpDir
-    git remote add upstream https://github.com/ggml-org/llama.cpp.git 2>$null
-    git fetch upstream --tags 2>$null
-    $base = git merge-base HEAD upstream/master 2>$null
-    if (-not $base) { $base = "HEAD" }
-    $ver = Get-LlamaBuildTag -Commit $base -Remote upstream
-    Pop-Location
-    $dir = Join-Path $INSTALL_DIR "${ver}_$DIR_SUFFIX"
-    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
-    Rename-Item $tmpDir $dir
-    OK "Verzeichnis: $dir"
+# Nie einen versionierten Quellordner in-place auf einen anderen Fork-Commit
+# ziehen. Der Mainline-Buildcount plus Fork-Commit haelt den Namen eindeutig;
+# vorhandene funktionierende Builds bleiben unangetastet.
+$tmpDir = Join-Path $INSTALL_DIR "_tmp_turboquant_$PID"
+if (Test-Path $tmpDir) {
+    throw "Staging-Verzeichnis existiert bereits: $tmpDir"
 }
+$stagingHandled = $false
+try {
+    git clone --branch $REPO_BRANCH --single-branch $REPO_URL $tmpDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "TurboQuant-Repository konnte nicht geklont werden."
+    }
 
-# --- 9. UI BAUEN (ueberspringen falls dist vorhanden) ---
+    Push-Location $tmpDir
+    try {
+        $forkCommit = (git rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $forkCommit) {
+            throw "TurboQuant-Commit konnte nicht bestimmt werden."
+        }
+        $shortCommit = $forkCommit.Substring(0, 9)
+        git remote add upstream https://github.com/ggml-org/llama.cpp.git
+        if ($LASTEXITCODE -ne 0) {
+            throw "llama.cpp Upstream-Remote konnte nicht hinzugefuegt werden."
+        }
+        git fetch upstream master --tags --force
+        if ($LASTEXITCODE -ne 0) {
+            throw "llama.cpp Upstream-History konnte nicht geladen werden."
+        }
+        $base = (git merge-base HEAD upstream/master 2>$null).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $base) {
+            throw "TurboQuant-Mainline-Basis konnte nicht bestimmt werden."
+        }
+        $baseBuild = Get-LlamaBuildNumber -Commit $base
+    } finally {
+        Pop-Location
+    }
+
+    $folderVersion = "b${baseBuild}_dev_${shortCommit}"
+    $dir = Join-Path $INSTALL_DIR "${folderVersion}_$DIR_SUFFIX"
+    if (Test-Path $dir) {
+        $existingCommit = ""
+        if (Test-Path (Join-Path $dir ".git")) {
+            $existingCommit = (git -C $dir rev-parse HEAD 2>$null).Trim()
+        }
+        if ($existingCommit -ne $forkCommit) {
+            throw "Zielordner existiert mit anderem Commit; nichts geloescht: $dir"
+        }
+        Remove-Item $tmpDir -Recurse -Force
+        $stagingHandled = $true
+        OK "Exakter TurboQuant-Quellordner bereits vorhanden: $dir"
+    } else {
+        Rename-Item $tmpDir $dir
+        $stagingHandled = $true
+        OK "Verzeichnis: $dir"
+    }
+} finally {
+    if (-not $stagingHandled -and (Test-Path $tmpDir)) {
+        try {
+            Remove-Item $tmpDir -Recurse -Force
+            WARN "Fehlgeschlagenes TurboQuant-Staging entfernt: $tmpDir"
+        } catch {
+            WARN "TurboQuant-Staging konnte nicht entfernt werden: $tmpDir ($($_.Exception.Message))"
+        }
+    }
+}
+OK "TurboQuant Basis b$baseBuild; Fork-Commit $forkCommit"
+
+# --- 9. UI BAUEN (layout-tolerant; sonst Prebuilt-UI) ---
 Log "Pruefe Web-UI"
-$uiDir  = Join-Path $dir "tools\ui"
-$distDir = Join-Path $uiDir "dist"
-if (Test-Path $distDir) {
-    OK "UI bereits gebaut - uebersprungen"
-} elseif (Test-Path $uiDir) {
-    Log "Baue Web-UI..."
-    Push-Location $uiDir
-    npm ci
-    npm run build
-    Pop-Location
-    OK "UI gebaut"
+$uiDir = $null
+foreach ($relativeUiDir in @("tools\ui", "tools\server\webui")) {
+    $candidateUiDir = Join-Path $dir $relativeUiDir
+    if (Test-Path (Join-Path $candidateUiDir "package.json")) {
+        $uiDir = $candidateUiDir
+        break
+    }
+}
+$uiPrebuilt = "ON"
+if ($uiDir) {
+    $distDir = Join-Path $uiDir "dist"
+    if (Test-Path $distDir) {
+        OK "UI bereits gebaut - uebersprungen"
+    } else {
+        Log "Baue Web-UI aus $uiDir..."
+        Push-Location $uiDir
+        try {
+            if (Test-Path "package-lock.json") { npm ci } else { npm install }
+            if ($LASTEXITCODE -ne 0) { throw "npm dependency install failed" }
+            npm run build
+            if ($LASTEXITCODE -ne 0) { throw "npm UI build failed" }
+        } finally {
+            Pop-Location
+        }
+        OK "UI gebaut"
+    }
+    $uiPrebuilt = "OFF"
 } else {
-    WARN "tools\ui nicht gefunden - uebersprungen"
+    WARN "Keine UI-Quellen gefunden - CMake verwendet die Prebuilt-UI"
 }
 
 # --- 10. CMAKE CONFIGURE ---
@@ -563,10 +613,11 @@ $cmakeArgs = @(
     "-S", $dir, "-B", $buildDir,
     "-G", $vsGenerator, "-A", "x64",
     "-DCMAKE_BUILD_TYPE=Release",
+    "-DLLAMA_BUILD_IS_DEV=ON",
     "-DGGML_CUDA=ON", "-DGGML_VULKAN=OFF",
     "-DGGML_NATIVE=OFF", "-DGGML_AVX2=ON", "-DGGML_FMA=ON", "-DGGML_F16C=ON",
     "-DBUILD_SHARED_LIBS=ON", "-DLLAMA_BUILD_SERVER=ON",
-    "-DLLAMA_BUILD_UI=ON", "-DLLAMA_USE_PREBUILT_UI=OFF",
+    "-DLLAMA_BUILD_UI=ON", "-DLLAMA_USE_PREBUILT_UI=$uiPrebuilt",
     "-DLLAMA_CURL=OFF", "-DGGML_CCACHE=OFF"
 )
 Log "Starte: $CMAKE_EXE $($cmakeArgs -join ' ')"

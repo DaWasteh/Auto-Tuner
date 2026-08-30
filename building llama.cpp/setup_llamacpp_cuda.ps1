@@ -4,8 +4,25 @@
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\setup_llamacpp_cuda.ps1
 
+# Windows PowerShell 5.1 turns harmless native stderr progress into terminating
+# NativeCommandError records. Relaunch this installer under PowerShell 7, whose
+# native-process semantics the package-manager flow below is written for.
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if (-not $pwsh) {
+        throw "PowerShell 7 is required. Install 'pwsh' and run this script again."
+    }
+    & $pwsh.Source -NoProfile -File $PSCommandPath
+    $pwshExit = $LASTEXITCODE
+    if ($pwshExit -ne 0) {
+        throw "PowerShell 7 setup process failed with exit code $pwshExit"
+    }
+    return
+}
+
 Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 
 # --- KONFIGURATION ---
 $INSTALL_DIR   = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -476,77 +493,107 @@ $tmpDir = Join-Path $INSTALL_DIR "_tmp_llama_$PID"
 if (Test-Path $tmpDir) {
     throw "Staging-Verzeichnis existiert bereits: $tmpDir"
 }
-git clone https://github.com/ggml-org/llama.cpp.git $tmpDir
-if ($LASTEXITCODE -ne 0) { throw "llama.cpp konnte nicht geklont werden." }
-
-Push-Location $tmpDir
+$stagingHandled = $false
 try {
-    $commit = (git rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $commit) {
-        throw "llama.cpp Commit konnte nicht bestimmt werden."
-    }
-    $shortCommit = $commit.Substring(0, 9)
-    $buildText = (git rev-list --count HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or $buildText -notmatch '^\d+$') {
-        throw "llama.cpp Buildnummer konnte nicht bestimmt werden."
-    }
-    $expectedBuild = [int]$buildText
-    if ($expectedBuild -lt 1000) {
-        throw "Unvollstaendige Git-History; verdaechtige Buildnummer $expectedBuild."
-    }
-    $buildTag = "b$expectedBuild"
-    $exactTag = Get-ExactLlamaBuildTag -Commit HEAD -Remote origin
-    if ($exactTag -and $exactTag -ne $buildTag) {
-        throw "Tag/History-Widerspruch: $exactTag vs. $buildTag"
-    }
-    $isExactTag = $exactTag -eq $buildTag
+    git clone https://github.com/ggml-org/llama.cpp.git $tmpDir
+    if ($LASTEXITCODE -ne 0) { throw "llama.cpp konnte nicht geklont werden." }
 
-    $cmakeText = Get-Content (Join-Path $tmpDir "CMakeLists.txt") -Raw
-    $majorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MAJOR\s+(\d+)\)')
-    $minorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MINOR\s+(\d+)\)')
-    $patchMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_PATCH\s+(\d+)\)')
-    if (-not ($majorMatch.Success -and $minorMatch.Success -and $patchMatch.Success)) {
-        throw "Semantische llama.cpp Version konnte nicht gelesen werden."
+    Push-Location $tmpDir
+    try {
+        $commit = (git rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $commit) {
+            throw "llama.cpp Commit konnte nicht bestimmt werden."
+        }
+        $shortCommit = $commit.Substring(0, 9)
+        $buildText = (git rev-list --count HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $buildText -notmatch '^\d+$') {
+            throw "llama.cpp Buildnummer konnte nicht bestimmt werden."
+        }
+        $expectedBuild = [int]$buildText
+        if ($expectedBuild -lt 1000) {
+            throw "Unvollstaendige Git-History; verdaechtige Buildnummer $expectedBuild."
+        }
+        $buildTag = "b$expectedBuild"
+        $exactTag = Get-ExactLlamaBuildTag -Commit HEAD -Remote origin
+        if ($exactTag -and $exactTag -ne $buildTag) {
+            throw "Tag/History-Widerspruch: $exactTag vs. $buildTag"
+        }
+        $isExactTag = $exactTag -eq $buildTag
+
+        $cmakeText = Get-Content (Join-Path $tmpDir "CMakeLists.txt") -Raw
+        $majorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MAJOR\s+(\d+)\)')
+        $minorMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_MINOR\s+(\d+)\)')
+        $patchMatch = [regex]::Match($cmakeText, '(?m)^set\(LLAMA_VERSION_PATCH\s+(\d+)\)')
+        if (-not ($majorMatch.Success -and $minorMatch.Success -and $patchMatch.Success)) {
+            throw "Semantische llama.cpp Version konnte nicht gelesen werden."
+        }
+        $semanticVersion = "$($majorMatch.Groups[1].Value).$($minorMatch.Groups[1].Value).$($patchMatch.Groups[1].Value)"
+        $expectedRuntimeVersion = "$semanticVersion-dev"
+    } finally {
+        Pop-Location
     }
-    $semanticVersion = "$($majorMatch.Groups[1].Value).$($minorMatch.Groups[1].Value).$($patchMatch.Groups[1].Value)"
-    $expectedRuntimeVersion = "$semanticVersion-dev"
+
+    $folderVersion = if ($isExactTag) { $buildTag } else { "${buildTag}_dev_${shortCommit}" }
+    $dir = Join-Path $INSTALL_DIR "${folderVersion}_llama.cpp"
+    if (Test-Path $dir) {
+        $existingCommit = ""
+        if (Test-Path (Join-Path $dir ".git")) {
+            $existingCommit = (git -C $dir rev-parse HEAD 2>$null).Trim()
+        }
+        if ($existingCommit -ne $commit) {
+            throw "Zielordner existiert mit anderem Commit; nichts geloescht: $dir"
+        }
+        Remove-Item $tmpDir -Recurse -Force
+        $stagingHandled = $true
+        OK "Exakter Quellordner bereits vorhanden: $dir"
+    } else {
+        Rename-Item $tmpDir $dir
+        $stagingHandled = $true
+        OK "Verzeichnis: $dir"
+    }
 } finally {
-    Pop-Location
-}
-
-$folderVersion = if ($isExactTag) { $buildTag } else { "${buildTag}_dev_${shortCommit}" }
-$dir = Join-Path $INSTALL_DIR "${folderVersion}_llama.cpp"
-if (Test-Path $dir) {
-    $existingCommit = ""
-    if (Test-Path (Join-Path $dir ".git")) {
-        $existingCommit = (git -C $dir rev-parse HEAD 2>$null).Trim()
+    if (-not $stagingHandled -and (Test-Path $tmpDir)) {
+        try {
+            Remove-Item $tmpDir -Recurse -Force
+            WARN "Fehlgeschlagenes llama.cpp Staging-Verzeichnis entfernt: $tmpDir"
+        } catch {
+            WARN "Staging-Verzeichnis konnte nicht entfernt werden: $tmpDir ($($_.Exception.Message))"
+        }
     }
-    if ($existingCommit -ne $commit) {
-        throw "Zielordner existiert mit anderem Commit; nichts geloescht: $dir"
-    }
-    Remove-Item $tmpDir -Recurse -Force
-    OK "Exakter Quellordner bereits vorhanden: $dir"
-} else {
-    Rename-Item $tmpDir $dir
-    OK "Verzeichnis: $dir"
 }
 OK "Nightly $buildTag; Runtime-Version $expectedRuntimeVersion; Commit $commit"
 
-# --- 9. UI BAUEN (ueberspringen falls dist vorhanden) ---
+# --- 9. UI BAUEN (layout-tolerant; sonst Prebuilt-UI) ---
 Log "Pruefe Web-UI"
-$uiDir  = Join-Path $dir "tools\ui"
-$distDir = Join-Path $uiDir "dist"
-if (Test-Path $distDir) {
-    OK "UI bereits gebaut - uebersprungen"
-} elseif (Test-Path $uiDir) {
-    Log "Baue Web-UI..."
-    Push-Location $uiDir
-    npm ci
-    npm run build
-    Pop-Location
-    OK "UI gebaut"
+$uiDir = $null
+foreach ($relativeUiDir in @("tools\ui", "tools\server\webui")) {
+    $candidateUiDir = Join-Path $dir $relativeUiDir
+    if (Test-Path (Join-Path $candidateUiDir "package.json")) {
+        $uiDir = $candidateUiDir
+        break
+    }
+}
+$uiPrebuilt = "ON"
+if ($uiDir) {
+    $distDir = Join-Path $uiDir "dist"
+    if (Test-Path $distDir) {
+        OK "UI bereits gebaut - uebersprungen"
+    } else {
+        Log "Baue Web-UI aus $uiDir..."
+        Push-Location $uiDir
+        try {
+            if (Test-Path "package-lock.json") { npm ci } else { npm install }
+            if ($LASTEXITCODE -ne 0) { throw "npm dependency install failed" }
+            npm run build
+            if ($LASTEXITCODE -ne 0) { throw "npm UI build failed" }
+        } finally {
+            Pop-Location
+        }
+        OK "UI gebaut"
+    }
+    $uiPrebuilt = "OFF"
 } else {
-    WARN "tools\ui nicht gefunden - uebersprungen"
+    WARN "Keine UI-Quellen gefunden - CMake verwendet die Prebuilt-UI"
 }
 
 # --- 10. CMAKE CONFIGURE ---
@@ -592,7 +639,7 @@ $cmakeArgs = @(
     "-DGGML_CUDA=ON", "-DGGML_VULKAN=OFF",
     "-DGGML_NATIVE=OFF", "-DGGML_AVX2=ON", "-DGGML_FMA=ON", "-DGGML_F16C=ON",
     "-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_BUILD_SERVER=ON",
-    "-DLLAMA_BUILD_UI=ON", "-DLLAMA_USE_PREBUILT_UI=OFF",
+    "-DLLAMA_BUILD_UI=ON", "-DLLAMA_USE_PREBUILT_UI=$uiPrebuilt",
     "-DLLAMA_CURL=OFF", "-DGGML_CCACHE=OFF"
 )
 Log "Starte: $CMAKE_EXE $($cmakeArgs -join ' ')"

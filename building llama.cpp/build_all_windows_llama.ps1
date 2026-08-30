@@ -34,9 +34,8 @@ function Invoke-Recipe {
     Write-Host "==============================================================================="
     Write-Host "==> $File $($Arguments -join ' ')"
     Write-Host "==============================================================================="
-    & pwsh -NoProfile -File $path @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$File failed with exit code $LASTEXITCODE"
+    Invoke-NativeChecked "$File recipe" {
+        & pwsh -NoProfile -File $path @Arguments
     }
 }
 

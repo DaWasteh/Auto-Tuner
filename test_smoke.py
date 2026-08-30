@@ -3961,6 +3961,78 @@ def test_cuda_setup_never_updates_a_stale_versioned_folder_in_place() -> None:
     assert "$env:ComSpec" in recipe
 
 
+def test_windows_build_recipes_tolerate_native_stderr_and_older_powershell() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(
+        encoding="utf-8"
+    )
+    build_all = (build_dir / "build_all_windows_llama.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    # git/cmake progress on stderr is not a failure; the checked helper restores
+    # the caller's preference and decides from the native exit code instead.
+    assert '$ErrorActionPreference = "Continue"' in common
+    assert "[Management.Automation.ErrorRecord]" in common
+    assert "$previousErrorActionPreference" in common
+    assert 'throw "$Description failed with exit code $exitCode"' in common
+    assert 'Invoke-NativeChecked "$File recipe"' in build_all
+
+    # Public Vulkan/HIP wrappers remain runnable from Windows PowerShell 5.1.
+    assert '$env:OS -ne "Windows_NT"' in common
+    assert 'GetMethod("Kill", [type[]]@([bool]))' in common
+    assert "taskkill.exe" in common
+    assert 'Properties.Name -contains "ArgumentList"' in common
+    assert "$startInfo.Arguments" in common
+    assert "$sourceHash = Get-Sha256FileHash $wrapper" in common
+    assert "(Get-FileHash $wrapper" not in common
+
+    # Match the generator to the Visual Studio instance found by vswhere.
+    assert "$environment.VisualStudioGenerator" in common
+    assert "installationVersion" in common
+
+
+def test_legacy_cuda_recipes_use_safe_staging_and_ui_fallbacks() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    cuda = (build_dir / "setup_llamacpp_cuda.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+    turbo = (build_dir / "setup_llamacpp_turboquant_cuda.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+
+    for recipe in (cuda, turbo):
+        assert "$PSVersionTable.PSVersion.Major -lt 7" in recipe
+        assert "pwsh.exe" in recipe
+        assert '"tools\\ui", "tools\\server\\webui"' in recipe
+        assert '"-DLLAMA_USE_PREBUILT_UI=$uiPrebuilt"' in recipe
+        assert "$stagingHandled" in recipe
+
+    assert "_tmp_turboquant_$PID" in turbo
+    assert '"b${baseBuild}_dev_${shortCommit}"' in turbo
+    assert "git pull --ff-only" not in turbo
+    assert "Remove-Item $dir -Recurse" not in turbo
+
+
+def test_ubuntu_diffusion_recipe_is_pinned_and_preserves_existing_builds() -> None:
+    build_dir = ROOT / "building llama.cpp"
+    ubuntu = (build_dir / "diffusion_vulkan_llama_build_ubuntu.sh").read_text(
+        encoding="utf-8"
+    )
+    windows = (build_dir / "diffusion_vulkan_llama_build.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    expected_commit = "dd0cf04459b0c4f43aa6667dbc0879ac0cd50323"
+    assert ubuntu.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail\n")
+    assert f'EXPECTED_COMMIT="{expected_commit}"' in ubuntu
+    assert f'-ExpectedCommit "{expected_commit}"' in windows
+    assert "_tmp_d_ubuntu_vulkan_llama_$$" in ubuntu
+    assert 'existing_commit="$(git -C "$repo" rev-parse HEAD)"' in ubuntu
+    assert 'rm -rf -- "$dir"' not in ubuntu
+    assert 'dir="d_b${build}_ubuntu_vulkan_llama.cpp"' in ubuntu
+
+
 def _fake_llama_server_path(fork_root: Path) -> Path:
     binary = "llama-server.exe" if os.name == "nt" else "llama-server"
     return fork_root / "build" / "bin" / "Release" / binary
