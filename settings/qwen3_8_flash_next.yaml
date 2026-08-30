@@ -9,9 +9,9 @@ patterns:
 arch_fallback:
   - qwen4exp
 
-# qwen4exp reached stock llama.cpp in b10660 (PR #27742). Unlike ordinary
-# option compatibility, model-loader support cannot be inferred from --help.
-min_llama_build: 10660
+# qwen4exp loader support landed in b10660 (PR #27742), but AutoTuner's
+# context×ubatch QSA safety coefficients are validated from b10666 onward.
+min_llama_build: 10666
 
 # The supplied GGUF metadata is authoritative for this checkpoint:
 # qwen4exp.context_length=262144, 48 blocks, and full attention every fourth
@@ -59,7 +59,9 @@ ngram_method: ngram-map-k4v
 
 notes: >
   Dedicated profile for Qwen3.8-Flash-Next GGUFs declaring qwen4exp. Mainline
-  llama.cpp supports the loader from b10660. The model has 48 hybrid MoE blocks,
+  llama.cpp added the loader in b10660; AutoTuner requires b10666+ because its
+  QSA graph-memory safety contract was validated against that allocator. The
+  model has 48 hybrid MoE blocks,
   512 experts with 10 active, full attention every fourth block (12 normal KV
   layers), an additional QSA indexer cache, and 262,144 native context. Its PLE
   per-layer n-gram embedding table is a giant read-lazy host mapping rather than

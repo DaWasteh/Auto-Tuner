@@ -828,7 +828,7 @@ matches. See `settings/_default.yaml`.
 |--------------|--------|----------------|
 | `gemma-4.yaml` | Gemma 4 E2B/E4B/**12B**/26B-A4B/31B | `gemma4` |
 | `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
-| `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10660+) | `qwen4exp` |
+| `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
 | `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
 | `mellum.yaml` | JetBrains Mellum2-12B-A2.5B (Base/Instruct/Thinking), MoE | `mellum` |
@@ -838,7 +838,9 @@ matches. See `settings/_default.yaml`.
 | `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash | `muse-glimmer` |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
-| `glm-5_2.yaml` | GLM-5.2, 1M + IndexShare/MTP | `glm-dsa` |
+| `glm-5_2.yaml` | GLM-5.2 + GLM-5.3 (non-Flash), 1M + IndexShare/MTP | `glm-dsa` |
+| `glm-5_3_flash.yaml` | GLM-5.3-Flash, 320B-A18B multimodal KDA/DSA hybrid | `glm5next` / `glm5-next` |
+| `hy4-preview.yaml` | Tencent Hy4 Preview, 770B-A49B, 1M (community patch required) | `hyv4` / `hy_v4` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
@@ -847,6 +849,21 @@ matches. See `settings/_default.yaml`.
 
 Notes on the new profiles:
 
+- **GLM-5.3** (non-Flash) deliberately extends the GLM-5.2 profile because
+  both publish `glm-dsa`, 1M context, temp 1.0/top-p 0.95, IndexShare, and a
+  NextN head. **GLM-5.3-Flash** is separate: it is a 320B-A18B multimodal
+  KDA/DSA hybrid (`glm5next`) with different placement/KV behavior. Its
+  upstream llama.cpp PRs were still open when this profile shipped, so use a
+  matching patched build. The preview profile currently caps automatic context
+  at 262,140 (while documenting the model's native 1M metadata); current
+  development caveats and the IQ3+ recommendation are recorded in the profile.
+- **Hy4 Preview** uses Tencent's official temp 0.9/top-p 1.0 sampling and
+  1M native-context metadata, while AutoTuner still caps the actual context to
+  each selected quant/backend/system. Stock upstream llama.cpp does not yet
+  expose `hyv4`; the currently published 435-GiB Q4_K_M and 214-GiB STQ1_0
+  GGUFs require the community architecture patch documented by their author.
+  That conversion drops the native MTP layer, so the profile does not claim
+  embedded speculative decoding.
 - **Qwen3.8** keeps a separate profile from Qwen3.5/3.6 because its official
   coding evaluations use the thinking defaults (`temp 1.0`, `top_p 0.95`,
   `top_k 20`) instead of Qwen3.6's older coding temperature. The 27B variant
@@ -855,7 +872,8 @@ Notes on the new profiles:
   architecture family, so filename patterns deliberately take precedence
   without claiming those ambiguous architecture fallbacks.
 - **Qwen3.8 Flash Next** is the separate `qwen4exp` architecture merged in
-  llama.cpp b10660. AutoTuner excludes its ~26.8 GiB read-lazy PLE n-gram
+  llama.cpp (loader landed in b10660; AutoTuner gates at b10666 for validated
+  QSA graph-memory coefficients). AutoTuner excludes its ~26.8 GiB read-lazy PLE n-gram
   table from splittable layer weights, budgets only its measured active-row
   residency against physical RAM while still displaying the full file-backed
   mapping, and budgets the extra QSA indexer KV. It defaults to Safe/ubatch 64;
@@ -1037,6 +1055,38 @@ checks are validated through exact stock **b10679** (`50f068fff`). The following
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
 
+### v5.3.3 — adaptive campaigns, backend evidence, complete analysis
+
+- **Per-job adaptive context:** all-model campaigns now recompute a safe context
+  for every model, selected llama build, and performance mode. Fixed context is
+  the only path that requests exact real-context validation. Dense partial
+  placement balances both VRAM and host-RAM KV pools, while Qwen3.8 Flash Next
+  accounts for QSA/context×ubatch workspace, all parallel slots, and its
+  26.82-GiB read-lazy PLE table without allowing an infeasible 2k floor.
+- **Backend- and runtime-qualified evidence:** HIP, Vulkan, CUDA, CPU, and other
+  measurements no longer borrow concrete sibling-backend winners. Multiple
+  installed builds of the same backend can run in one campaign; every
+  runtime-qualified result survives for comparison while launch snapshots and
+  preferred modes remain backend-scoped and environment-validated. Profile
+  export/import preserves those backend preferences.
+- **Complete performance analysis:** the in-app view is selected-model-only and
+  retains Winner, Measured, and Failed candidates with exact settings, samples,
+  errors, and bounded logs. The generated accessible HTML remains global and
+  compares model/backend/build winners with vertical side-by-side metric bars.
+- **Transactional reruns and settings writes:** “Reset old measured data, then
+  rerun all” clears scoped measured evidence in one fail-closed write before a
+  server starts, keeps Custom profiles, and checkpoints both successes and
+  bounded failures. Serialized read/modify/write transactions and unique temp
+  files prevent concurrent GUI/checkpoint updates from overwriting each other.
+- **Evidence-gated model profiles:** full GLM-5.3 shares the verified `glm-dsa`
+  contract with GLM-5.2; GLM-5.3-Flash stays separate, requires a `glm5next`
+  patched runtime, and is conservatively capped at 262,140 pending upstream
+  1M-context validation. HY4 Preview requires `hyv4` runtime capability and
+  documents its patched loader and GGUF-without-MTP limitation.
+- **Validation:** 419 tests pass locally across estimator, persistence, Qt,
+  report, profile, and build-recipe coverage; the detailed release gate is in
+  [`docs/v5.3.3-validation.md`](docs/v5.3.3-validation.md).
+
 ### v5.3.2 — Q4 defaults, Flash-Next long context, robust performance search
 
 - **Global Q4 KV Auto default:** normal llama.cpp launches now use symmetric
@@ -1089,7 +1139,8 @@ in [`docs/llama-b10666-audit.md`](docs/llama-b10666-audit.md).
   legacy draft/ngram spellings are not emitted.
 - **Mainline promotions:** DFlash2 merged in b10658 and Qwen3.8 Flash Next
   (`qwen4exp`) in b10660. Both dedicated PR build recipes were removed; the
-  qwen4exp profile now enforces b10660+. DFlash2 preflight accepts b10658+
+  qwen4exp loader landed in b10660; the profile now enforces b10666+ so its
+  measured QSA allocator coefficients are applicable. DFlash2 preflight accepts b10658+
   while still recognizing an explicitly selected reviewed legacy PR binary.
 - **Qwen3.8 Flash Next memory corrected from real loads:** the 67.55 GiB IQ1_S
   GGUF contains a 26.82 GiB `per_layer_token_embd.weight` PLE table that

@@ -1,0 +1,64 @@
+display_name: "Hy4 Preview (Tencent, patched llama.cpp)"
+patterns:
+  - hy4-preview
+  - hy4_preview
+  - hy4preview
+
+# AngelSlim's community converter/runtime patch writes this architecture as
+# "hyv4". The official Transformers model_type is "hy_v4"; retain both as
+# fallbacks so future upstream converters do not miss the profile.
+arch_fallback:
+  - hyv4
+  - hy_v4
+
+# Official Tencent model card/config: 1,048,576 native tokens. AutoTuner still
+# computes the actually affordable context from the selected quant, RAM/VRAM,
+# backend, and performance target; it does not blindly allocate the full 1M.
+max_context: 1048576
+required_runtime_markers:
+  - hyv4
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+# Official generation_config.json and model card recommendations.
+sampling:
+  chat:
+    temperature: 0.9
+    top_k: 0          # llama.cpp 0 = disabled; official config uses -1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.9
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  # Required by the community GGUF documentation: Hy4's template does not
+  # match a built-in llama.cpp template family.
+  - --jinja
+
+# The currently published community GGUF conversion intentionally drops the
+# native 10B/0.7B-active MTP layer. Keep ordinary draftless n-gram assistance;
+# do not claim embedded speculative decoding support.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Tencent Hy4 Preview (August 2026): 770B total / 49B active MoE, 78 layers,
+  256 routed experts + 1 shared expert, top-8 routing, Gated DSA/IndexCache,
+  iHC residual streams, and native 1M context. Official sampling is temp=0.9,
+  top_p=1.0, top_k disabled; reasoning defaults to high and can be changed by
+  the embedded chat template's reasoning_effort parameter. IMPORTANT: stock
+  upstream llama.cpp does not yet contain the "hyv4" architecture at the time
+  of this profile. AngelSlim/Hy4-preview-GGUF documents a community patch based
+  on llama.cpp commit 0cea36222; both published GGUFs require that architecture
+  patch. Their Q4_K_M is about 435 GiB and STQ1_0 about 214 GiB at full
+  residency, so practical use needs datacenter-class aggregate VRAM or very
+  large RAM with expert offload. The community conversion drops Hy4's native
+  MTP layer, therefore its GGUF cannot use embedded speculative decoding.

@@ -13,6 +13,7 @@ from model_benchmark import (
     BenchmarkRunner,
     BenchmarkSample,
     BenchmarkSuiteJob,
+    BenchmarkSuiteJobResult,
     BenchmarkSuiteRunner,
     CandidateResult,
     batch_candidates,
@@ -95,7 +96,9 @@ def test_legacy_quick_measurement_still_accepts_twelve_percent() -> None:
     assert runner._target_prompt_tokens(110592) == 13271
     payload = runner._measurement_payload(110592)
     assert payload["n_predict"] == 256
-    assert len(payload["prompt"]) < len(_runner()._measurement_payload(110592)["prompt"])
+    assert len(payload["prompt"]) < len(
+        _runner()._measurement_payload(110592)["prompt"]
+    )
 
 
 def test_custom_context_fraction_ignores_65k_cap_and_4k_floor() -> None:
@@ -415,7 +418,12 @@ def test_draft_depth_sweep_ignores_small_dip_before_later_gain(monkeypatch) -> N
     result = runner.run()
 
     assert 6 in calls and 7 in calls
-    assert max(result.candidates, key=lambda item: item.generation_tps).candidate.draft_n_max == 7
+    assert (
+        max(
+            result.candidates, key=lambda item: item.generation_tps
+        ).candidate.draft_n_max
+        == 7
+    )
 
 
 def test_search_keeps_baseline_when_noisy_gain_overlaps_it(monkeypatch) -> None:
@@ -425,9 +433,7 @@ def test_search_keeps_baseline_when_noisy_gain_overlaps_it(monkeypatch) -> None:
 
     def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
         rates = (100.0, 100.0) if candidate.id == "baseline" else (98.0, 130.0)
-        samples = [
-            BenchmarkSample(rate, rate, 1024, 64, 1.0) for rate in rates
-        ]
+        samples = [BenchmarkSample(rate, rate, 1024, 64, 1.0) for rate in rates]
         return CandidateResult(candidate=candidate, samples=samples)
 
     monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
@@ -435,7 +441,16 @@ def test_search_keeps_baseline_when_noisy_gain_overlaps_it(monkeypatch) -> None:
         "model_benchmark.probe_binary_build_number", lambda _binary: None
     )
     result = runner.run()
-    assert result.by_id(next(item.candidate.id for item in result.candidates if item.candidate.id != "baseline")).overall_tps > result.baseline.overall_tps * 1.03
+    assert (
+        result.by_id(
+            next(
+                item.candidate.id
+                for item in result.candidates
+                if item.candidate.id != "baseline"
+            )
+        ).overall_tps
+        > result.baseline.overall_tps * 1.03
+    )
     assert result.winner_id == "baseline"
     assert "uncertainty-safe" in result.reason
 
@@ -479,7 +494,9 @@ def test_cancel_before_start_never_launches_baseline() -> None:
         runner.run()
 
 
-def test_suite_runs_jobs_sequentially_and_keeps_individual_failures(monkeypatch) -> None:
+def test_suite_runs_jobs_sequentially_and_keeps_individual_failures(
+    monkeypatch,
+) -> None:
     first = _runner()
     second = _runner()
     first._total_runs = 3
@@ -515,18 +532,100 @@ def test_suite_continues_after_bounded_model_failure(monkeypatch) -> None:
 
     first = _runner()
     second = _runner()
-    monkeypatch.setattr(first, "run", lambda: (_ for _ in ()).throw(BenchmarkFailure("OOM")))
+    monkeypatch.setattr(
+        first, "run", lambda: (_ for _ in ()).throw(BenchmarkFailure("OOM"))
+    )
     monkeypatch.setattr(second, "run", lambda: SimpleNamespace(name="ok"))
+    checkpoints: list[BenchmarkSuiteJobResult] = []
     suite = BenchmarkSuiteRunner(
         [
             BenchmarkSuiteJob("first", "A [safe]", "safe", first),
             BenchmarkSuiteJob("second", "B [safe]", "safe", second),
-        ]
+        ],
+        checkpoint=checkpoints.append,
     )
     result = suite.run()
+    assert [item.job.key for item in checkpoints] == ["first", "second"]
+    assert checkpoints[0].error == "OOM"
+    assert checkpoints[1].valid
     assert len(result.failed) == 1
     assert result.failed[0].error == "OOM"
     assert len(result.successful) == 1
+
+
+def test_bounded_failure_checkpoint_is_durable_and_non_promoting(
+    tmp_path, monkeypatch
+) -> None:
+    qt_launcher = pytest.importorskip("qt_launcher")
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    model_path = tmp_path / "failed.gguf"
+    model_path.write_bytes(b"failed-model")
+    runner = _runner()
+    runner.model = SimpleNamespace(path=model_path, name="failed")
+    job = BenchmarkSuiteJob(
+        "failed-key",
+        "Failed [safe]",
+        "safe",
+        runner,
+        metadata={
+            "benchmark_type": "quick",
+            "benchmark_backend": "hip",
+            "runtime_key": "hip-build-a",
+            "runtime_label": "HIP build A",
+            "drafter_key": app_settings.NO_DRAFTER_PROFILE_KEY,
+        },
+    )
+    outcome = BenchmarkSuiteJobResult(job=job, error="bounded OOM")
+    payload = qt_launcher.MainWindow._save_performance_job_outcome(object(), outcome)
+    assert payload["saved"] is True
+    assert payload["failed"] is True
+    assert payload["error"] == "bounded OOM"
+    records = app_settings.list_performance_run_results()["quick"]
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert records[0]["error"] == "bounded OOM"
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "failed",
+            model_path,
+            "safe",
+            app_settings.performance_profile_slot("hip"),
+        )
+        is None
+    )
+
+
+def test_suite_stops_before_next_job_when_checkpoint_fails(monkeypatch) -> None:
+    from model_benchmark import BenchmarkFailure
+
+    first = _runner()
+    second = _runner()
+    order: list[str] = []
+    monkeypatch.setattr(
+        first,
+        "run",
+        lambda: order.append("first") or SimpleNamespace(name="first"),
+    )
+    monkeypatch.setattr(
+        second,
+        "run",
+        lambda: order.append("second") or SimpleNamespace(name="second"),
+    )
+
+    def fail_checkpoint(_outcome):
+        raise BenchmarkFailure("settings save failed")
+
+    suite = BenchmarkSuiteRunner(
+        [
+            BenchmarkSuiteJob("first", "A [safe]", "safe", first),
+            BenchmarkSuiteJob("second", "B [safe]", "safe", second),
+        ],
+        checkpoint=fail_checkpoint,
+    )
+    with pytest.raises(BenchmarkFailure, match="settings save failed"):
+        suite.run()
+    assert order == ["first"]
 
 
 def test_suite_stop_after_mode_checkpoints_current_job(monkeypatch) -> None:
@@ -574,15 +673,24 @@ def test_suite_stop_after_model_finishes_remaining_modes(monkeypatch) -> None:
     suite = BenchmarkSuiteRunner(
         [
             BenchmarkSuiteJob(
-                "model-a::safe", "A [safe]", "safe", first,
+                "model-a::safe",
+                "A [safe]",
+                "safe",
+                first,
                 metadata={"model_key": "model-a"},
             ),
             BenchmarkSuiteJob(
-                "model-a::throughput", "A [throughput]", "throughput", second,
+                "model-a::throughput",
+                "A [throughput]",
+                "throughput",
+                second,
                 metadata={"model_key": "model-a"},
             ),
             BenchmarkSuiteJob(
-                "model-b::safe", "B [safe]", "safe", third,
+                "model-b::safe",
+                "B [safe]",
+                "safe",
+                third,
                 metadata={"model_key": "model-b"},
             ),
         ],
@@ -731,12 +839,18 @@ def test_profile_bank_keeps_auto_perform_and_custom_drafter_variants(
     bank = app_settings.get_setting_profile_bank("model", model, "balanced")
     assert bank["selected"] == "custom1"
     assert bank["names"]["custom1"] == "My Q4 experiment"
-    assert app_settings.get_setting_profile_snapshot(
-        "model", model, "balanced", "custom1", "external:q4"
-    ) == custom
-    assert app_settings.get_setting_profile_snapshot(
-        "model", model, "balanced", "custom1", "external:q8"
-    ) is None
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model", model, "balanced", "custom1", "external:q4"
+        )
+        == custom
+    )
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model", model, "balanced", "custom1", "external:q8"
+        )
+        is None
+    )
 
     for drafter, snapshot in (("external:q4", q4_perform), ("external:q8", q8_perform)):
         record = {
@@ -748,21 +862,336 @@ def test_profile_bank_keeps_auto_perform_and_custom_drafter_variants(
         assert app_settings.save_performance_tuning_result(
             "model", model, record, snapshot, "balanced", "quick", drafter
         )
-    assert app_settings.get_setting_profile_snapshot(
-        "model", model, "balanced", "perform", "external:q4"
-    ) == q4_perform
-    assert app_settings.get_setting_profile_snapshot(
-        "model", model, "balanced", "perform", "external:q8"
-    ) == q8_perform
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model", model, "balanced", "perform", "external:q4"
+        )
+        == q4_perform
+    )
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model", model, "balanced", "perform", "external:q8"
+        )
+        == q8_perform
+    )
     grouped = app_settings.list_performance_run_results()
     assert {item["drafter_key"] for item in grouped["quick"]} == {
         "external:q4",
         "external:q8",
     }
     # Benchmark writes never replace the independent user-owned profile.
-    assert app_settings.get_setting_profile_snapshot(
-        "model", model, "balanced", "custom1", "external:q4"
-    ) == custom
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model", model, "balanced", "custom1", "external:q4"
+        )
+        == custom
+    )
+
+
+def test_backend_specific_perform_profiles_and_runs_coexist(
+    tmp_path, monkeypatch
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"backend-specific-model")
+    drafter = app_settings.NO_DRAFTER_PROFILE_KEY
+
+    legacy_snapshot = {
+        "mode": "auto",
+        "values": {"ctx": 65536, "batch": 512},
+        "source": "measured-performance-test",
+    }
+    legacy_record = {
+        "model_name": "model",
+        "model_path": str(model),
+        "model_size": model.stat().st_size,
+        "performance_target": "safe",
+        "benchmark_type": "quick",
+        "winner_id": "winner-legacy",
+        "drafter_key": drafter,
+    }
+    assert app_settings.save_performance_tuning_result(
+        "model",
+        model,
+        legacy_record,
+        legacy_snapshot,
+        "safe",
+        "quick",
+        drafter,
+    )
+
+    snapshots = {
+        "vulkan": {
+            "mode": "auto",
+            "values": {"ctx": 131072, "batch": 1024},
+            "source": "measured-performance-test",
+        },
+        "hip": {
+            "mode": "auto",
+            "values": {"ctx": 98304, "batch": 2048},
+            "source": "measured-performance-test",
+        },
+    }
+    for backend, snapshot in snapshots.items():
+        record = {
+            "model_name": "model",
+            "model_path": str(model),
+            "model_size": model.stat().st_size,
+            "performance_target": "safe",
+            "benchmark_type": "quick",
+            "benchmark_backend": backend,
+            "winner_id": f"winner-{backend}",
+            "drafter_key": drafter,
+            "workload_signature": {"runtime_key": f"runtime-{backend}-1"},
+        }
+        assert app_settings.save_performance_tuning_result(
+            "model",
+            model,
+            record,
+            snapshot,
+            "safe",
+            "quick",
+            drafter,
+            backend,
+        )
+
+    for backend, snapshot in snapshots.items():
+        slot = app_settings.performance_profile_slot(backend)
+        assert app_settings.setting_profile_label(slot) == (
+            "Perform Vulkan" if backend == "vulkan" else "Perform HIP"
+        )
+        assert app_settings.get_setting_profile_snapshot(
+            "model", model, "safe", slot, drafter
+        ) == {**snapshot, "benchmark_backend": backend}
+        assert (
+            app_settings.get_performance_tuning_result(
+                model, "safe", "quick", drafter, backend
+            )["winner_id"]
+            == f"winner-{backend}"
+        )
+        assert (
+            app_settings.get_selected_setting_profile(
+                "model", model, "safe", drafter, backend
+            )
+            == slot
+        )
+
+    second_vulkan_record = {
+        "model_name": "model",
+        "model_path": str(model),
+        "model_size": model.stat().st_size,
+        "performance_target": "safe",
+        "benchmark_type": "quick",
+        "benchmark_backend": "vulkan",
+        "winner_id": "winner-vulkan-second-build",
+        "drafter_key": drafter,
+        "workload_signature": {"runtime_key": "runtime-vulkan-2"},
+    }
+    assert app_settings.save_performance_tuning_result(
+        "model",
+        model,
+        second_vulkan_record,
+        snapshots["vulkan"],
+        "safe",
+        "quick",
+        drafter,
+        "vulkan",
+    )
+
+    # A concrete sibling backend must never inherit the latest compatibility
+    # mirror. Backendless legacy evidence remains the only allowed fallback.
+    assert (
+        app_settings.get_performance_tuning_result(
+            model, "safe", "quick", drafter, "cuda"
+        )
+        is None
+    )
+
+    custom = {
+        "mode": "manual",
+        "values": {"ctx": 4096, "batch": 128},
+        "source": "expert-panel",
+    }
+    assert app_settings.set_setting_profile_snapshot(
+        "model",
+        model,
+        "safe",
+        app_settings.CUSTOM_PROFILE_SLOTS[0],
+        custom,
+        drafter,
+        select=True,
+        selection_backend="hip",
+    )
+    assert (
+        app_settings.get_selected_setting_profile(
+            "model", model, "safe", drafter, "hip"
+        )
+        == app_settings.CUSTOM_PROFILE_SLOTS[0]
+    )
+    assert app_settings.clear_custom_setting_profile(
+        "model",
+        model,
+        "safe",
+        app_settings.CUSTOM_PROFILE_SLOTS[0],
+        drafter,
+        "hip",
+    )
+    assert (
+        app_settings.get_selected_setting_profile(
+            "model", model, "safe", drafter, "hip"
+        )
+        == app_settings.PROFILE_AUTO
+    )
+
+    grouped = app_settings.list_performance_run_results()
+    assert len(grouped["quick"]) == 3
+    assert {item["winner_id"] for item in grouped["quick"]} == {
+        "winner-vulkan",
+        "winner-vulkan-second-build",
+        "winner-hip",
+    }
+    assert {
+        (item["benchmark_backend"], item["drafter_key"]) for item in grouped["quick"]
+    } == {
+        ("vulkan", drafter),
+        ("hip", drafter),
+    }
+
+    app_settings.set_model_performance_target(model, "safe", "vulkan")
+    app_settings.set_model_performance_target(model, "throughput", "hip")
+    assert app_settings.get_model_performance_target(model, "vulkan") == "safe"
+    assert app_settings.get_model_performance_target(model, "hip") == "throughput"
+
+
+def test_rerun_reset_removes_all_measured_backends_but_keeps_custom(
+    tmp_path, monkeypatch
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"reset-model")
+    drafter = app_settings.NO_DRAFTER_PROFILE_KEY
+    measured_snapshot = {
+        "mode": "auto",
+        "values": {"ctx": 8192, "batch": 512},
+        "source": "measured-performance-test",
+    }
+    for backend in ("vulkan", "hip"):
+        for target in ("safe", "balanced"):
+            record = {
+                "model_name": "model",
+                "model_path": str(model),
+                "model_size": model.stat().st_size,
+                "performance_target": target,
+                "benchmark_type": "quick",
+                "benchmark_backend": backend,
+                "winner_id": f"{backend}-{target}",
+                "drafter_key": drafter,
+            }
+            assert app_settings.save_performance_tuning_result(
+                "model",
+                model,
+                record,
+                measured_snapshot,
+                target,
+                "quick",
+                drafter,
+                backend,
+            )
+    custom_snapshot = {
+        "mode": "manual",
+        "values": {"ctx": 4096, "batch": 128},
+        "source": "expert-panel",
+    }
+    assert app_settings.set_setting_profile_snapshot(
+        "model",
+        model,
+        "safe",
+        app_settings.CUSTOM_PROFILE_SLOTS[0],
+        custom_snapshot,
+        drafter,
+    )
+
+    # The campaign planner knows the merged ModelEntry size; historical split
+    # records may have used shard-1 stat size. Reset must tombstone both portable
+    # identities so neither fallback can resurrect old evidence.
+    ok, removed = app_settings.clear_performance_campaign_data(
+        [(model, model.stat().st_size + 123, "model")], ["safe"]
+    )
+    assert ok and removed > 0
+    for backend in ("vulkan", "hip"):
+        assert (
+            app_settings.get_performance_tuning_result(
+                model, "safe", "quick", drafter, backend
+            )
+            is None
+        )
+        assert not app_settings.has_setting_profile_snapshot(
+            "model",
+            model,
+            "safe",
+            app_settings.performance_profile_slot(backend),
+            drafter,
+        )
+        assert (
+            app_settings.get_performance_tuning_result(
+                model, "balanced", "quick", drafter, backend
+            )
+            is not None
+        )
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model",
+            model,
+            "safe",
+            app_settings.CUSTOM_PROFILE_SLOTS[0],
+            drafter,
+        )
+        == custom_snapshot
+    )
+    assert not any(
+        record.get("performance_target") == "safe"
+        for record in app_settings.list_performance_run_results()["quick"]
+    )
+
+
+def test_rerun_reset_write_failure_keeps_previous_file(tmp_path, monkeypatch) -> None:
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"reset-failure-model")
+    snapshot = {
+        "mode": "auto",
+        "values": {"ctx": 8192},
+        "source": "measured-performance-test",
+    }
+    record = {
+        "model_name": "model",
+        "model_path": str(model),
+        "model_size": model.stat().st_size,
+        "performance_target": "safe",
+        "benchmark_type": "quick",
+        "benchmark_backend": "hip",
+    }
+    assert app_settings.save_performance_tuning_result(
+        "model",
+        model,
+        record,
+        snapshot,
+        "safe",
+        "quick",
+        app_settings.NO_DRAFTER_PROFILE_KEY,
+        "hip",
+    )
+    before = settings_file.read_bytes()
+    monkeypatch.setattr(app_settings, "save_settings", lambda _settings: False)
+
+    ok, removed = app_settings.clear_performance_campaign_data(
+        [(model, model.stat().st_size, "model")], ["safe"]
+    )
+    assert not ok and removed == 0
+    assert settings_file.read_bytes() == before
 
 
 def test_quick_pass_does_not_replace_validated_perform_profile(
@@ -816,18 +1245,28 @@ def test_quick_pass_does_not_replace_validated_perform_profile(
         drafter,
     )
 
-    assert app_settings.get_setting_profile_snapshot(
-        "model", model, "balanced", "perform", drafter
-    ) == validated_snapshot
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced"
-    )["winner_id"] == "validated"
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced", "fast", drafter
-    )["winner_id"] == "provisional"
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced", "quick", drafter
-    )["winner_id"] == "validated"
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "model", model, "balanced", "perform", drafter
+        )
+        == validated_snapshot
+    )
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced")["winner_id"]
+        == "validated"
+    )
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced", "fast", drafter)[
+            "winner_id"
+        ]
+        == "provisional"
+    )
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced", "quick", drafter)[
+            "winner_id"
+        ]
+        == "validated"
+    )
 
 
 def test_custom_profile_bank_export_import_round_trip(tmp_path, monkeypatch) -> None:
@@ -843,25 +1282,60 @@ def test_custom_profile_bank_export_import_round_trip(tmp_path, monkeypatch) -> 
     assert app_settings.rename_custom_setting_profile(
         "portable", model, "throughput", "custom2", "DFlash Q4 lab"
     )
+    app_settings.set_model_performance_target(model, "safe", "hip")
+    app_settings.set_model_performance_target(model, "throughput", "vulkan")
 
     bundle = tmp_path / "profiles.json"
     ok, message, count = app_settings.export_performance_profiles(bundle)
     assert ok, message
     assert count == 1
-    assert __import__("json").loads(bundle.read_text(encoding="utf-8"))["schema"] == 2
+    assert __import__("json").loads(bundle.read_text(encoding="utf-8"))["schema"] == 3
 
     active_settings[0] = tmp_path / "imported-settings.json"
     ok, message, count = app_settings.import_performance_profiles(bundle, [model])
     assert ok, message
     assert count == 1
-    restored = app_settings.get_setting_profile_bank(
-        "portable", model, "throughput"
-    )
+    restored = app_settings.get_setting_profile_bank("portable", model, "throughput")
     assert restored["names"]["custom2"] == "DFlash Q4 lab"
     assert restored["selected_by_drafter"][drafter] == "custom2"
-    assert app_settings.get_setting_profile_snapshot(
-        "portable", model, "throughput", "custom2", drafter
-    ) == snapshot
+    assert (
+        app_settings.get_setting_profile_snapshot(
+            "portable", model, "throughput", "custom2", drafter
+        )
+        == snapshot
+    )
+    assert app_settings.get_model_performance_target(model, "hip") == "safe"
+    assert app_settings.get_model_performance_target(model, "vulkan") == "throughput"
+
+
+def test_concurrent_settings_mutations_do_not_lose_sibling_updates(
+    tmp_path, monkeypatch
+) -> None:
+    import threading
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: settings_file)
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def mutate(index: int) -> None:
+        barrier.wait()
+        app_settings._update(f"concurrent_{index}", index)
+
+    threads = [
+        threading.Thread(target=mutate, args=(index,)) for index in range(workers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    stored = app_settings.load_settings()
+    assert {stored.get(f"concurrent_{index}") for index in range(workers)} == set(
+        range(workers)
+    )
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_mode_scoped_measured_result_round_trip(tmp_path, monkeypatch) -> None:
@@ -912,15 +1386,22 @@ def test_quick_and_legacy_normal_results_map_to_standard_and_custom(
         "model", model, quick, snapshot, "balanced", "quick"
     )
 
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced", "normal"
-    )["winner_id"] == "normal-winner"
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced", "quick"
-    )["winner_id"] == "quick-winner"
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced"
-    )["winner_id"] == "quick-winner"
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced", "normal")[
+            "winner_id"
+        ]
+        == "normal-winner"
+    )
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced", "quick")[
+            "winner_id"
+        ]
+        == "quick-winner"
+    )
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced")["winner_id"]
+        == "quick-winner"
+    )
     grouped = app_settings.list_performance_run_results()
     assert [item["winner_id"] for item in grouped["custom"]] == ["normal-winner"]
     assert [item["winner_id"] for item in grouped["quick"]] == ["quick-winner"]
@@ -934,12 +1415,18 @@ def test_quick_and_legacy_normal_results_map_to_standard_and_custom(
     ok, message, count = app_settings.import_performance_profiles(bundle, [model])
     assert ok, message
     assert count == 1
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced", "normal"
-    )["winner_id"] == "normal-winner"
-    assert app_settings.get_performance_tuning_result(
-        model, "balanced", "quick"
-    )["winner_id"] == "quick-winner"
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced", "normal")[
+            "winner_id"
+        ]
+        == "normal-winner"
+    )
+    assert (
+        app_settings.get_performance_tuning_result(model, "balanced", "quick")[
+            "winner_id"
+        ]
+        == "quick-winner"
+    )
 
 
 def test_custom_performance_result_round_trips_without_65k_cap(
@@ -975,9 +1462,7 @@ def test_custom_performance_result_round_trips_without_65k_cap(
     ok, message, count = app_settings.import_performance_profiles(bundle, [model])
     assert ok, message
     assert count == 1
-    restored = app_settings.get_performance_tuning_result(
-        model, "throughput", "custom"
-    )
+    restored = app_settings.get_performance_tuning_result(model, "throughput", "custom")
     assert restored is not None
     assert restored["prompt_context_fraction"] == pytest.approx(0.875)
     assert restored["prompt_token_cap"] is None
@@ -987,9 +1472,7 @@ def test_performance_profile_export_import_maps_moved_model(
     tmp_path, monkeypatch
 ) -> None:
     active_settings = [tmp_path / "old-settings.json"]
-    monkeypatch.setattr(
-        app_settings, "_settings_file", lambda: active_settings[0]
-    )
+    monkeypatch.setattr(app_settings, "_settings_file", lambda: active_settings[0])
     old_model = tmp_path / "old" / "model.gguf"
     old_model.parent.mkdir()
     old_model.write_bytes(b"same-model-bytes")
@@ -1014,20 +1497,23 @@ def test_performance_profile_export_import_maps_moved_model(
     moved_model = tmp_path / "new" / "model.gguf"
     moved_model.parent.mkdir()
     moved_model.write_bytes(old_model.read_bytes())
-    ok, message, count = app_settings.import_performance_profiles(
-        bundle, [moved_model]
-    )
+    ok, message, count = app_settings.import_performance_profiles(bundle, [moved_model])
     assert ok, message
     assert count == 2
-    assert app_settings.get_expert_override(
-        "model", moved_model, "safe"
-    )["values"]["ctx"] == 65536
-    assert app_settings.get_expert_override(
-        "model", moved_model, "throughput"
-    )["values"]["ctx"] == 32768
-    assert app_settings.get_performance_tuning_result(
-        moved_model, "safe"
-    )["winner_id"] == "winner-safe"
+    assert (
+        app_settings.get_expert_override("model", moved_model, "safe")["values"]["ctx"]
+        == 65536
+    )
+    assert (
+        app_settings.get_expert_override("model", moved_model, "throughput")["values"][
+            "ctx"
+        ]
+        == 32768
+    )
+    assert (
+        app_settings.get_performance_tuning_result(moved_model, "safe")["winner_id"]
+        == "winner-safe"
+    )
     assert app_settings.get_model_performance_target(moved_model) == "throughput"
 
 

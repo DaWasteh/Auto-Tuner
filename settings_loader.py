@@ -37,6 +37,10 @@ class ModelProfile:
     # Minimum numeric llama.cpp build needed by this model/runtime contract.
     # Launchers surface this before model load; 0 means no build gate.
     min_llama_build: int = 0
+    # ASCII capability markers that must exist in the selected llama runtime
+    # executable or its sibling shared library. This safely gates community
+    # architectures that have no meaningful numeric mainline build minimum.
+    required_runtime_markers: List[str] = field(default_factory=list)
     extra_args: List[str] = field(default_factory=list)
     notes: str = ""
     source_file: Optional[str] = None  # which YAML this came from
@@ -155,6 +159,9 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         extra = data.get("extra_args") or []
         if not isinstance(extra, list):
             extra = []
+        runtime_markers = data.get("required_runtime_markers") or []
+        if not isinstance(runtime_markers, list):
+            runtime_markers = []
 
         flash_raw = data.get("flash_attn", None)
         flash_attn: Optional[bool]
@@ -238,6 +245,11 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                 recommended_kv_quant=str(data.get("recommended_kv_quant", "q4_0")),
                 flash_attn=flash_attn,
                 min_llama_build=min_llama_build,
+                required_runtime_markers=[
+                    str(marker).strip().lower()
+                    for marker in runtime_markers
+                    if str(marker).strip()
+                ],
                 extra_args=[str(x) for x in extra],
                 notes=str(data.get("notes", "") or ""),
                 source_file=yml.name,

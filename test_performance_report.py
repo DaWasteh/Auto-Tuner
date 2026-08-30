@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import re
 from datetime import datetime, timezone
 
 from performance_report import build_performance_report_html, write_performance_report
@@ -116,12 +118,61 @@ def test_html_report_contains_every_candidate_metric_and_escapes_content() -> No
     assert "<script" not in html
 
 
-def test_report_writer_uses_shared_autotuner_report_folder(tmp_path, monkeypatch) -> None:
-    data_dir = tmp_path / ".autotuner"
-    monkeypatch.setattr("performance_report.app_settings.app_data_dir", lambda: data_dir)
-    path = write_performance_report(
-        {"fast": [], "quick": [_record()], "custom": []}
+def test_html_uses_vertical_side_by_side_model_bars_and_unique_chart_ids() -> None:
+    first = _record()
+    first["benchmark_backend"] = "vulkan"
+    first["runtime_label"] = "Vulkan · b10690"
+    second = copy.deepcopy(first)
+    second["model_name"] = "Second model"
+    second["model_path"] = "C:/models/second.gguf"
+    second["benchmark_backend"] = "hip"
+    second["runtime_label"] = "HIP · b10690"
+    second["winner_id"] = "baseline"
+    second["candidates"][1]["settings"]["batch"] = 2048
+    second["candidates"].append(
+        {
+            "id": "failed",
+            "label": "Too large",
+            "settings": {
+                "threads": 16,
+                "batch_threads": 16,
+                "batch": 4096,
+                "ubatch": 2048,
+                "draft_n_max": 7,
+            },
+            "error": "allocation <failed>",
+        }
     )
+
+    html = build_performance_report_html(
+        {"fast": [], "quick": [first, second], "custom": []}
+    )
+    assert 'class="model-chart"' in html
+    assert 'class="vertical-bar bar-pp"' in html
+    assert 'class="vertical-bar bar-decode"' in html
+    assert 'class="vertical-bar bar-overall"' in html
+    assert 'style="height:' in html
+    assert "display:flex;align-items:flex-end" in html
+    assert "Unsafe &lt;Model&gt;" in html and "Second model" in html
+    assert "Vulkan · b10690" in html and "HIP · b10690" in html
+    assert "batch 4096 / ubatch 2048" in html
+    assert "allocation &lt;failed&gt;" in html
+
+    ids = re.findall(r'\bid="([^"]+)"', html)
+    assert len(ids) == len(set(ids))
+    for references in re.findall(r'aria-labelledby="([^"]+)"', html):
+        for reference in references.split():
+            assert reference in ids
+
+
+def test_report_writer_uses_shared_autotuner_report_folder(
+    tmp_path, monkeypatch
+) -> None:
+    data_dir = tmp_path / ".autotuner"
+    monkeypatch.setattr(
+        "performance_report.app_settings.app_data_dir", lambda: data_dir
+    )
+    path = write_performance_report({"fast": [], "quick": [_record()], "custom": []})
     assert path.parent == data_dir / "reports"
     assert path.name.startswith("performance-report-")
     assert path.read_text(encoding="utf-8").startswith("<!doctype html>")
@@ -138,9 +189,7 @@ def test_report_accepts_legacy_custom_records_without_candidate_details() -> Non
         "prompt_context_fraction": 0.25,
         "desired_context": 16384,
     }
-    html = build_performance_report_html(
-        {"fast": [], "quick": [], "custom": [legacy]}
-    )
+    html = build_performance_report_html({"fast": [], "quick": [], "custom": [legacy]})
     assert "Legacy" in html
     assert "No candidate details were stored." in html
     assert "Legacy 25% records are classified as Custom" in html

@@ -109,59 +109,56 @@ def _svg_text(x: float, y: float, value: object, *, css: str = "") -> str:
     return f'<text x="{x:.1f}" y="{y:.1f}"{class_attr}>{escape(str(value))}</text>'
 
 
-def _throughput_chart(record: dict) -> str:
-    rows = [row for row in _candidate_rows(record) if not row.get("error")]
+def _throughput_chart(record: dict, chart_id: str) -> str:
+    rows = [row for row in _candidate_rows(record) if not row.get("error")][:24]
     if not rows:
         return '<p class="muted">No valid candidate timings to graph.</p>'
-    rows = rows[:24]
     metrics = (
         ("PP", "prompt_tps", "bar-pp"),
         ("Decode", "generation_tps", "bar-decode"),
         ("End-to-end", "overall_tps", "bar-overall"),
     )
-    maximum = max(
-        (_float(row.get(field)) for row in rows for _label, field, _css in metrics),
-        default=0.0,
-    )
-    width = 1120
-    label_width = 245
-    plot_width = 780
-    row_height = 58
-    height = 48 + row_height * len(rows)
-    parts = [
-        f'<svg class="chart" viewBox="0 0 {width} {height}" role="img" '
-        'aria-labelledby="throughput-title throughput-desc">',
-        '<title id="throughput-title">Candidate throughput comparison</title>',
-        '<desc id="throughput-desc">Prompt processing, decode and end-to-end tokens per second for every valid candidate.</desc>',
-    ]
+    maxima = {
+        field: max((_float(row.get(field)) for row in rows), default=0.0)
+        for _label, field, _css in metrics
+    }
     winner_id = _text(record.get("winner_id"))
-    for index, row in enumerate(rows):
-        top = 35 + index * row_height
+    groups: List[str] = []
+    for row in rows:
         identifier = _text(row.get("label"), _text(row.get("id"), "candidate"))
-        if _text(row.get("id")) == winner_id:
-            identifier = f"★ {identifier}"
-        parts.append(_svg_text(8, top + 20, identifier[:40], css="chart-label"))
-        for metric_index, (label, field, css) in enumerate(metrics):
+        winner = _text(row.get("id")) == winner_id
+        bars: List[str] = []
+        for label, field, css in metrics:
             value = _float(row.get(field))
-            y = top + metric_index * 12
-            bar_width = (value / maximum * plot_width) if maximum > 0 else 0
-            parts.append(
-                f'<rect x="{label_width}" y="{y:.1f}" width="{bar_width:.1f}" '
-                f'height="9" rx="3" class="{css}"><title>{escape(label)}: {value:.2f} tok/s</title></rect>'
+            maximum = maxima[field]
+            height = value / maximum * 100.0 if maximum > 0.0 else 0.0
+            bars.append(
+                '<div class="mini-metric">'
+                f'<span class="bar-number">{value:.1f}</span>'
+                '<div class="bar-stage">'
+                f'<div class="vertical-bar {css}" style="height:{height:.3f}%" '
+                f'title="{escape(label)}: {value:.2f} tok/s"></div>'
+                "</div>"
+                f'<span class="bar-caption">{escape(label)}</span>'
+                "</div>"
             )
-            parts.append(
-                _svg_text(
-                    label_width + bar_width + 6,
-                    y + 8,
-                    f"{label} {value:.1f}",
-                    css="chart-value",
-                )
-            )
-    parts.append("</svg>")
-    return "".join(parts)
+        groups.append(
+            '<div class="candidate-column">'
+            f'<div class="candidate-bars">{"".join(bars)}</div>'
+            f'<div class="column-label"><b>{"★ " if winner else ""}{escape(identifier)}</b></div>'
+            "</div>"
+        )
+    title_id = f"throughput-title-{chart_id}"
+    desc_id = f"throughput-desc-{chart_id}"
+    return (
+        f'<div class="vertical-scroll chart" role="img" aria-labelledby="{title_id} {desc_id}">'
+        f'<span class="sr-only" id="{title_id}">Candidate throughput comparison</span>'
+        f'<span class="sr-only" id="{desc_id}">Vertical prompt processing, decode, and end-to-end bars. Candidates are side by side; each metric is normalized only against the same metric.</span>'
+        f'<div class="candidate-chart">{"".join(groups)}</div></div>'
+    )
 
 
-def _acceptance_chart(record: dict) -> str:
+def _acceptance_chart(record: dict, chart_id: str) -> str:
     rows: List[Tuple[dict, int, int, float]] = []
     for candidate in _candidate_rows(record):
         drafted, accepted, ratio = _acceptance(candidate)
@@ -172,42 +169,29 @@ def _acceptance_chart(record: dict) -> str:
             '<p class="muted">This run reported no drafted-token counters. '
             "Throughput remains available above.</p>"
         )
-    rows = rows[:24]
-    width = 1000
-    label_width = 270
-    plot_width = 600
-    row_height = 34
-    height = 42 + row_height * len(rows)
-    parts = [
-        f'<svg class="chart acceptance-chart" viewBox="0 0 {width} {height}" role="img" '
-        'aria-labelledby="acceptance-title acceptance-desc">',
-        '<title id="acceptance-title">Drafted-token acceptance</title>',
-        '<desc id="acceptance-desc">Accepted drafted tokens divided by all drafted tokens for each candidate.</desc>',
-    ]
     winner_id = _text(record.get("winner_id"))
-    for index, (candidate, drafted, accepted, ratio) in enumerate(rows):
-        y = 24 + index * row_height
+    columns: List[str] = []
+    for candidate, drafted, accepted, ratio in rows[:24]:
         label = _text(candidate.get("label"), _text(candidate.get("id"), "candidate"))
-        if _text(candidate.get("id")) == winner_id:
-            label = f"★ {label}"
-        parts.append(_svg_text(8, y + 14, label[:44], css="chart-label"))
-        parts.append(
-            f'<rect x="{label_width}" y="{y:.1f}" width="{plot_width}" height="18" rx="5" class="bar-track" />'
+        winner = _text(candidate.get("id")) == winner_id
+        columns.append(
+            '<div class="acceptance-column">'
+            f'<span class="bar-number">{ratio * 100:.1f}%</span>'
+            '<div class="bar-stage acceptance-stage">'
+            f'<div class="vertical-bar bar-accept" style="height:{ratio * 100:.3f}%" '
+            f'title="{accepted}/{drafted} accepted ({ratio * 100:.1f}%)"></div>'
+            "</div>"
+            f'<div class="column-label"><b>{"★ " if winner else ""}{escape(label)}</b>'
+            f"<br><span>{accepted}/{drafted}</span></div></div>"
         )
-        parts.append(
-            f'<rect x="{label_width}" y="{y:.1f}" width="{ratio * plot_width:.1f}" '
-            f'height="18" rx="5" class="bar-accept"><title>{accepted}/{drafted} accepted ({ratio * 100:.1f}%)</title></rect>'
-        )
-        parts.append(
-            _svg_text(
-                label_width + plot_width + 8,
-                y + 14,
-                f"{ratio * 100:.1f}% · {accepted}/{drafted}",
-                css="chart-value",
-            )
-        )
-    parts.append("</svg>")
-    return "".join(parts)
+    title_id = f"acceptance-title-{chart_id}"
+    desc_id = f"acceptance-desc-{chart_id}"
+    return (
+        f'<div class="vertical-scroll chart" role="img" aria-labelledby="{title_id} {desc_id}">'
+        f'<span class="sr-only" id="{title_id}">Drafted-token acceptance</span>'
+        f'<span class="sr-only" id="{desc_id}">Vertical acceptance percentage bars for side-by-side candidates.</span>'
+        f'<div class="acceptance-chart">{"".join(columns)}</div></div>'
+    )
 
 
 def _samples_summary(candidate: dict) -> str:
@@ -232,7 +216,9 @@ def _candidate_table(record: dict) -> str:
     for candidate in _candidate_rows(record):
         settings = _candidate_settings(candidate)
         drafted, accepted, acceptance = _acceptance(candidate)
-        identifier = _text(candidate.get("label"), _text(candidate.get("id"), "candidate"))
+        identifier = _text(
+            candidate.get("label"), _text(candidate.get("id"), "candidate")
+        )
         winner = _text(candidate.get("id")) == winner_id
         error = _text(candidate.get("error"))
         cls = ' class="winner"' if winner else (' class="failed"' if error else "")
@@ -264,10 +250,17 @@ def _candidate_table(record: dict) -> str:
         "<th>Candidate</th><th>Runtime settings</th><th>PP tok/s</th>"
         "<th>Decode tok/s</th><th>End-to-end tok/s</th><th>Inference s</th>"
         "<th>Draft acceptance</th><th>Samples</th><th>Error</th>"
-        "</tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table></div>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
     )
+
+
+def _backend_text(record: dict) -> str:
+    backend = app_settings.normalise_performance_backend(
+        _text(record.get("benchmark_backend"))
+    )
+    label = app_settings.performance_backend_label(backend)
+    runtime_label = _text(record.get("runtime_label"))
+    return runtime_label or label
 
 
 def _quality_text(record: dict) -> str:
@@ -291,6 +284,7 @@ def _quality_text(record: dict) -> str:
 def _record_detail(record: dict, index: int) -> str:
     model = _model_name(record)
     target = _text(record.get("performance_target"), "unknown")
+    backend = _backend_text(record)
     drafter = _text(record.get("drafter_label"), "No drafter")
     context = _integer(record.get("desired_context"))
     fraction = _float(record.get("prompt_context_fraction"))
@@ -302,7 +296,7 @@ def _record_detail(record: dict, index: int) -> str:
         else "—"
     )
     summary = (
-        f"{model} · {target} · {drafter} · ctx {context:,} · "
+        f"{model} · {target} · {backend} · {drafter} · ctx {context:,} · "
         f"winner {winner_label}"
     )
     path = _text(record.get("model_path"))
@@ -312,22 +306,22 @@ def _record_detail(record: dict, index: int) -> str:
         f'<details class="run" id="run-{index}"><summary>{escape(summary)}</summary>'
         '<div class="run-body">'
         '<div class="facts">'
-        f'<div><b>Model path</b><span>{escape(path or "—")}</span></div>'
-        f'<div><b>Workload</b><span>{fraction * 100:.4g}% context · '
-        f'{_integer(record.get("generated_token_target"))} decode target</span></div>'
-        f'<div><b>Elapsed</b><span>{elapsed:.1f}s</span></div>'
-        f'<div><b>Strategy</b><span>{escape(_text(record.get("search_strategy"), "legacy/full"))} '
-        f'· {escape(_text(record.get("profile_confidence"), "unknown confidence"))}</span></div>'
-        f'<div><b>Runtime</b><span>{escape(runtime)} · build {escape(str(build))}</span></div>'
-        f'<div><b>Decision</b><span>{escape(_text(record.get("reason"), "—"))}</span></div>'
+        f"<div><b>Model path</b><span>{escape(path or '—')}</span></div>"
+        f"<div><b>Workload</b><span>{fraction * 100:.4g}% context · "
+        f"{_integer(record.get('generated_token_target'))} decode target</span></div>"
+        f"<div><b>Elapsed</b><span>{elapsed:.1f}s</span></div>"
+        f"<div><b>Strategy</b><span>{escape(_text(record.get('search_strategy'), 'legacy/full'))} "
+        f"· {escape(_text(record.get('profile_confidence'), 'unknown confidence'))}</span></div>"
+        f"<div><b>Runtime</b><span>{escape(backend)} · {escape(runtime)} · build {escape(str(build))}</span></div>"
+        f"<div><b>Decision</b><span>{escape(_text(record.get('reason'), '—'))}</span></div>"
         f'<div class="wide"><b>Frozen quality/placement</b><span>{escape(_quality_text(record))}</span></div>'
         "</div>"
-        '<h4>All candidate runs</h4>'
+        "<h4>All candidate runs</h4>"
         + _candidate_table(record)
-        + '<h4>Throughput comparison</h4>'
-        + _throughput_chart(record)
-        + '<h4>MTP / speculative drafted-token acceptance</h4>'
-        + _acceptance_chart(record)
+        + "<h4>Throughput comparison</h4>"
+        + _throughput_chart(record, str(index))
+        + "<h4>MTP / speculative drafted-token acceptance</h4>"
+        + _acceptance_chart(record, str(index))
         + "</div></details>"
     )
 
@@ -343,25 +337,74 @@ def _summary_table(records: Sequence[dict]) -> str:
         rows.append(
             "<tr>"
             f'<td><a href="#run-{index}">{escape(_model_name(record))}</a></td>'
-            f'<td>{escape(_text(record.get("performance_target"), "unknown"))}</td>'
-            f'<td>{escape(_text(record.get("drafter_label"), "No drafter"))}</td>'
-            f'<td>{_integer(record.get("desired_context")):,}</td>'
-            f'<td>{escape(_text(winner.get("label"), _text(winner.get("id"), "—")) if winner else "—")}</td>'
-            f'<td>{_format_tps(winner.get("prompt_tps") if winner else None)}</td>'
-            f'<td>{_format_tps(winner.get("generation_tps") if winner else None)}</td>'
-            f'<td>{_format_tps(winner.get("overall_tps") if winner else None)}</td>'
-            f'<td>{acceptance_text}</td>'
+            f"<td>{escape(_text(record.get('performance_target'), 'unknown'))}</td>"
+            f"<td>{escape(_backend_text(record))}</td>"
+            f"<td>{escape(_text(record.get('drafter_label'), 'No drafter'))}</td>"
+            f"<td>{_integer(record.get('desired_context')):,}</td>"
+            f"<td>{escape(_text(winner.get('label'), _text(winner.get('id'), '—')) if winner else '—')}</td>"
+            f"<td>{_format_tps(winner.get('prompt_tps') if winner else None)}</td>"
+            f"<td>{_format_tps(winner.get('generation_tps') if winner else None)}</td>"
+            f"<td>{_format_tps(winner.get('overall_tps') if winner else None)}</td>"
+            f"<td>{acceptance_text}</td>"
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="9">No saved benchmark runs.</td></tr>')
+        rows.append('<tr><td colspan="10">No saved benchmark runs.</td></tr>')
     return (
         '<div class="table-wrap"><table><thead><tr><th>Model</th><th>Mode</th>'
-        "<th>Drafter</th><th>Context</th><th>Winner</th><th>PP tok/s</th>"
+        "<th>Backend / build</th><th>Drafter</th><th>Context</th><th>Winner</th><th>PP tok/s</th>"
         "<th>Decode tok/s</th><th>End-to-end tok/s</th><th>Draft acceptance</th>"
-        "</tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table></div>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+
+def _winner_overview(records: Sequence[dict], chart_id: str) -> str:
+    """Render winner bars vertically so model/backend runs sit side by side."""
+    rows: List[Tuple[dict, dict]] = []
+    for record in records:
+        winner = _winner(record)
+        if isinstance(winner, dict) and not winner.get("error"):
+            rows.append((record, winner))
+    if not rows:
+        return '<p class="muted">No valid winning timings to compare.</p>'
+    metrics = (
+        ("Prompt processing", "prompt_tps", "bar-pp"),
+        ("Decode", "generation_tps", "bar-decode"),
+        ("End-to-end", "overall_tps", "bar-overall"),
+    )
+    panels: List[str] = []
+    for metric_index, (metric_label, field, css) in enumerate(metrics):
+        maximum = max(
+            (_float(winner.get(field)) for _record, winner in rows), default=0.0
+        )
+        columns: List[str] = []
+        for record, winner in rows:
+            value = _float(winner.get(field))
+            height = value / maximum * 100.0 if maximum > 0.0 else 0.0
+            model = _model_name(record)
+            target = _text(record.get("performance_target"), "unknown")
+            backend = _backend_text(record)
+            columns.append(
+                '<div class="model-column">'
+                f'<span class="bar-number">{value:.1f}</span>'
+                '<div class="bar-stage overview-stage">'
+                f'<div class="vertical-bar {css}" style="height:{height:.3f}%" '
+                f'title="{escape(model)} · {escape(metric_label)}: {value:.2f} tok/s"></div>'
+                "</div>"
+                f'<div class="column-label"><b>{escape(model)}</b><br>'
+                f"<span>{escape(target)} · {escape(backend)}</span></div></div>"
+            )
+        title_id = f"overview-{chart_id}-{metric_index}"
+        panels.append(
+            '<section class="metric-panel">'
+            f'<h3 id="{title_id}">{escape(metric_label)} <small>tok/s</small></h3>'
+            f'<div class="vertical-scroll" role="img" aria-labelledby="{title_id}">'
+            f'<div class="model-chart">{"".join(columns)}</div></div></section>'
+        )
+    return (
+        '<div class="overview-note">Vertical bars; model/backend runs are side by '
+        "side. Each panel has its own scale, so compare only bars of the same metric."
+        '</div><div class="overview-grid">' + "".join(panels) + "</div>"
     )
 
 
@@ -406,26 +449,57 @@ def build_performance_report_html(
         )
         offset += len(typed)
         sections.append(
-            f'<section><h2>{escape(_TEST_TITLES[test_type])}</h2>'
-            f'<p class="muted">{len(typed)} model/mode/drafter run(s).</p>'
-            f'{details or "<p>No saved runs for this workload.</p>"}</section>'
+            f'<section id="workload-{test_type}"><h2>{escape(_TEST_TITLES[test_type])}</h2>'
+            f'<p class="muted">{len(typed)} model/mode/backend/drafter run(s).</p>'
+            + (_winner_overview(typed, test_type) if typed else "")
+            + f"{details or '<p>No saved runs for this workload.</p>'}</section>"
         )
 
     css = """
-:root{color-scheme:dark;--bg:#11141a;--panel:#1a2029;--panel2:#222a35;--text:#edf3fa;--muted:#aab7c6;--line:#344150;--accent:#62b4ff;--good:#64d98b;--warn:#ffcb6b;--bad:#ff7b86}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1500px;margin:auto;padding:24px}h1,h2,h3,h4{line-height:1.2}h1{margin-bottom:4px}h2{margin-top:38px;border-bottom:1px solid var(--line);padding-bottom:8px}a{color:var(--accent)}.muted{color:var(--muted)}.callout{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);padding:12px 16px;border-radius:8px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;min-width:900px;background:var(--panel)}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel2);z-index:1}tr.winner{background:color-mix(in srgb,var(--good) 13%,transparent)}tr.failed{background:color-mix(in srgb,var(--bad) 10%,transparent)}details.run{margin:12px 0;border:1px solid var(--line);border-radius:9px;background:var(--panel)}details.run>summary{cursor:pointer;padding:13px 15px;font-weight:650}.run-body{padding:0 15px 18px}.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;margin:8px 0 18px}.facts div{background:var(--panel2);padding:9px;border-radius:6px;display:flex;flex-direction:column}.facts .wide{grid-column:1/-1}.facts span{color:var(--muted);overflow-wrap:anywhere}.chart{width:100%;height:auto;max-height:760px;background:var(--panel2);border:1px solid var(--line);border-radius:8px}.chart text{fill:var(--text);font-size:11px}.chart .chart-label{font-size:12px}.chart .chart-value{fill:var(--muted)}.bar-pp{fill:#62b4ff}.bar-decode{fill:#b58cff}.bar-overall{fill:#64d98b}.bar-track{fill:#303b49}.bar-accept{fill:#ffcb6b}@media print{body{background:#fff;color:#111}.run,.table-wrap,.chart{break-inside:avoid}.muted,.facts span{color:#444}}
+:root{color-scheme:dark;--bg:#0b1018;--panel:#151d29;--panel2:#1d2837;--panel3:#253448;--text:#f2f6fb;--muted:#a8b7c9;--line:#33445a;--accent:#66bbff;--good:#58d68d;--violet:#b794f6;--warn:#ffd166;--bad:#ff7f8a;--shadow:0 16px 45px #0006}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 15% -10%,#1d3958 0,transparent 32rem),var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1600px;margin:auto;padding:28px}h1,h2,h3,h4{line-height:1.2}h1{font-size:clamp(2rem,5vw,3.6rem);margin:.15em 0}h2{margin-top:46px;border-bottom:1px solid var(--line);padding-bottom:10px}h3 small{color:var(--muted);font-weight:500}a{color:var(--accent)}.muted{color:var(--muted)}.hero{padding:28px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(135deg,#1a2738dd,#111923dd);box-shadow:var(--shadow)}.eyebrow{color:var(--accent);font-weight:750;letter-spacing:.13em;text-transform:uppercase}.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:22px}.kpi{padding:14px;border:1px solid var(--line);border-radius:12px;background:#0b111acc}.kpi b{display:block;font-size:1.6rem}.kpi span{color:var(--muted)}nav{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 24px}nav a{padding:7px 11px;border:1px solid var(--line);border-radius:999px;background:var(--panel);text-decoration:none}.callout,.overview-note{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);padding:12px 16px;border-radius:10px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 24px #0003}table{border-collapse:collapse;width:100%;min-width:980px;background:var(--panel)}th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel3);z-index:1}tbody tr:hover{background:#ffffff08}tr.winner{background:color-mix(in srgb,var(--good) 13%,transparent)}tr.failed{background:color-mix(in srgb,var(--bad) 11%,transparent)}details.run{margin:14px 0;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:0 7px 22px #0002}details.run>summary{cursor:pointer;padding:14px 16px;font-weight:700}details.run[open]>summary{border-bottom:1px solid var(--line);background:var(--panel2)}.run-body{padding:4px 16px 20px}.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;margin:12px 0 20px}.facts div{background:var(--panel2);padding:10px;border-radius:8px;display:flex;flex-direction:column}.facts .wide{grid-column:1/-1}.facts span{color:var(--muted);overflow-wrap:anywhere}.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:12px 0 20px}.metric-panel{min-width:0;margin:0;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.metric-panel h3{margin:0 0 8px}.vertical-scroll{overflow-x:auto;overflow-y:hidden;padding:8px 4px 4px}.model-chart,.candidate-chart,.acceptance-chart{display:flex;align-items:flex-end;gap:12px;min-width:max-content}.model-column{width:126px;text-align:center}.candidate-column{width:220px;text-align:center}.acceptance-column{width:130px;text-align:center}.candidate-bars{display:flex;align-items:flex-end;justify-content:center;gap:10px}.mini-metric{display:flex;flex-direction:column;align-items:center;width:58px}.bar-stage{height:190px;width:32px;display:flex;align-items:flex-end;border-radius:7px 7px 3px 3px;background:linear-gradient(#ffffff0b,#ffffff03);border-bottom:2px solid var(--line);overflow:hidden}.overview-stage{height:220px;width:42px;margin:auto}.acceptance-stage{height:180px;width:46px;margin:auto}.vertical-bar{width:100%;min-height:2px;border-radius:6px 6px 2px 2px;box-shadow:inset 0 1px #fff5;transition:filter .15s}.vertical-bar:hover{filter:brightness(1.2)}.bar-number{display:block;color:var(--text);font-variant-numeric:tabular-nums;margin-bottom:4px}.bar-caption{color:var(--muted);font-size:.76rem;margin-top:5px}.column-label{margin-top:8px;overflow-wrap:anywhere}.column-label span{color:var(--muted);font-size:.82rem}.bar-pp{background:linear-gradient(#86ccff,#298ee3)}.bar-decode{background:linear-gradient(#ccb3ff,#805ad5)}.bar-overall{background:linear-gradient(#83e8aa,#2cab68)}.bar-accept{background:linear-gradient(#ffe49b,#e5a923)}.chart{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:10px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:1050px){.overview-grid{grid-template-columns:1fr}.bar-stage{height:160px}.overview-stage{height:190px}}@media(max-width:640px){main{padding:14px}.hero{padding:18px}.candidate-column{width:190px}.mini-metric{width:50px}.bar-stage{height:140px}}@media print{body{background:#fff;color:#111}.hero,.run,.table-wrap,.metric-panel,.chart{break-inside:avoid;box-shadow:none}.muted,.facts span,.column-label span{color:#444}.vertical-scroll{overflow:visible}.bar-pp,.bar-decode,.bar-overall,.bar-accept{print-color-adjust:exact}}
 """
     generated_text = generated.astimezone(timezone.utc).isoformat(timespec="seconds")
+    model_count = len({_model_name(record).casefold() for record in records})
+    backend_labels = {
+        _backend_text(record)
+        for record in records
+        if _backend_text(record) != "Unknown"
+    }
+    candidates = [
+        candidate
+        for record in records
+        for candidate in (
+            record.get("candidates")
+            if isinstance(record.get("candidates"), list)
+            else []
+        )
+        if isinstance(candidate, dict)
+    ]
+    failed_candidates = sum(
+        bool(_text(candidate.get("error"))) for candidate in candidates
+    )
     return (
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:; base-uri \'none\'; form-action \'none\'">'
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">"
         "<title>AutoTuner performance report</title>"
         f"<style>{css}</style></head><body><main>"
+        '<header class="hero"><div class="eyebrow">Measured llama.cpp evidence</div>'
         "<h1>AutoTuner performance report</h1>"
-        f'<p class="muted">Generated {escape(generated_text)} · {len(records)} saved run(s)</p>'
-        '<p class="callout"><b>How to read this report:</b> each saved model/performance-mode/drafter run is expanded into every measured candidate. ★ marks the applied winner. Prompt processing, decode, end-to-end throughput and drafted-token acceptance use the native llama.cpp response timings/counters. Legacy 25% records are classified as Custom.</p>'
-        "<h2>Winner overview</h2>"
+        f'<p class="muted">Generated {escape(generated_text)} · backend-specific, dependency-free report</p>'
+        '<div class="kpis">'
+        f'<div class="kpi"><b>{model_count}</b><span>models</span></div>'
+        f'<div class="kpi"><b>{len(records)}</b><span>saved runs</span></div>'
+        f'<div class="kpi"><b>{len(candidates)}</b><span>candidate runs</span></div>'
+        f'<div class="kpi"><b>{failed_candidates}</b><span>failed candidates retained</span></div>'
+        f'<div class="kpi"><b>{len(backend_labels)}</b><span>backend/build lanes</span></div>'
+        "</div></header>"
+        '<nav aria-label="Report sections"><a href="#winner-overview">Winner table</a>'
+        '<a href="#workload-fast">Quick pass</a><a href="#workload-quick">Standard</a>'
+        '<a href="#workload-custom">Custom</a></nav>'
+        '<p class="callout"><b>How to read this report:</b> vertical bars place models and candidates side by side. Compare heights only within one metric panel. Each saved model/performance-mode/backend/drafter run expands into every measured candidate, including failed settings. ★ marks the applied winner. Prompt processing, decode, end-to-end throughput, and drafted-token acceptance use native llama.cpp response timings/counters. Legacy 25% records are classified as Custom.</p>'
+        '<h2 id="winner-overview">Winner overview</h2>'
         + _summary_table(records)
         + "".join(sections)
         + "</main></body></html>"

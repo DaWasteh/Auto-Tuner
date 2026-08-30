@@ -493,36 +493,105 @@ def probe_binary_build_number(binary: str) -> Optional[int]:
     return _probe_binary_build_number(binary)
 
 
+@lru_cache(maxsize=32)
+def _runtime_markers_present_cached(
+    files: Tuple[Tuple[str, int, int], ...], markers: Tuple[bytes, ...]
+) -> bool:
+    remaining = set(markers)
+    max_marker = max((len(marker) for marker in remaining), default=1)
+    for filename, _mtime_ns, _size in files:
+        try:
+            with Path(filename).open("rb") as handle:
+                overlap = b""
+                while remaining:
+                    chunk = handle.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    data = (overlap + chunk).lower()
+                    remaining = {marker for marker in remaining if marker not in data}
+                    overlap = data[-max_marker:]
+        except OSError:
+            continue
+        if not remaining:
+            return True
+    return not remaining
+
+
+def _runtime_has_required_markers(binary: str, markers: List[str]) -> bool:
+    resolved = _resolve_probe_binary(binary)
+    if not resolved:
+        return False
+    executable = Path(resolved)
+    candidates = [executable]
+    try:
+        for candidate in executable.parent.iterdir():
+            name = candidate.name.lower()
+            if not candidate.is_file() or candidate == executable:
+                continue
+            if (
+                (name.startswith("llama") and name.endswith(".dll"))
+                or (name.startswith("libllama") and ".so" in name)
+                or (name.startswith("libllama") and name.endswith(".dylib"))
+            ):
+                candidates.append(candidate)
+    except OSError:
+        pass
+    signatures: List[Tuple[str, int, int]] = []
+    for candidate in candidates:
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        signatures.append((str(candidate), stat.st_mtime_ns, stat.st_size))
+    encoded = tuple(
+        marker.strip().lower().encode("ascii", errors="ignore")
+        for marker in markers
+        if marker.strip().encode("ascii", errors="ignore")
+    )
+    return bool(encoded) and _runtime_markers_present_cached(tuple(signatures), encoded)
+
+
 def check_profile_build(
     profile: ModelProfile, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
-    """Validate a profile's minimum llama.cpp build against ``binary``.
+    """Validate numeric and fork-capability requirements against ``binary``.
 
-    Returns ``(allowed, message, detected_build)``. An unprobeable binary is
-    allowed with a warning so custom wrappers and remote launch shims keep
-    working; a positively identified older build is rejected before model
-    loading. This is shared by GUI, TUI, and OCR launch paths.
+    Returns ``(allowed, message, detected_build)``. Numeric-only profiles keep
+    allowing unprobeable wrappers with a warning. Fork-only architecture
+    markers fail closed because a stock runtime is known not to load them.
+    This is shared by GUI, TUI, and OCR launch paths.
     """
     required = max(0, int(getattr(profile, "min_llama_build", 0) or 0))
-    if required == 0:
-        return True, "", None
-
-    detected = probe_binary_build_number(binary)
-    if detected is None:
-        return (
-            True,
-            f"Could not verify the selected binary's llama.cpp build; "
-            f"{profile.display_name} requires b{required}+.",
-            None,
-        )
-    if detected < required:
+    markers = [
+        str(marker).strip().lower()
+        for marker in getattr(profile, "required_runtime_markers", [])
+        if str(marker).strip()
+    ]
+    detected: Optional[int] = None
+    build_warning = ""
+    if required > 0:
+        detected = probe_binary_build_number(binary)
+        if detected is None:
+            build_warning = (
+                f"Could not verify the selected binary's llama.cpp build; "
+                f"{profile.display_name} requires b{required}+."
+            )
+        elif detected < required:
+            return (
+                False,
+                f"{profile.display_name} requires llama.cpp b{required}+; "
+                f"the selected binary reports b{detected}.",
+                detected,
+            )
+    if markers and not _runtime_has_required_markers(binary, markers):
         return (
             False,
-            f"{profile.display_name} requires llama.cpp b{required}+; "
-            f"the selected binary reports b{detected}.",
+            f"{profile.display_name} requires a patched llama runtime with "
+            f"capability marker(s): {', '.join(markers)}. The selected binary "
+            "and its sibling llama library do not contain them.",
             detected,
         )
-    return True, "", detected
+    return True, build_warning, detected
 
 
 def resolve_draft_n_max(
@@ -1366,6 +1435,8 @@ _KNOWN_MOE_ARCHS = frozenset(
         "ernie4_5_moe",
         "exaone-moe",
         "glm4moe",
+        "glm5next",
+        "glm5-next",
         "gpt-oss",
         "granitemoe",
         "granitemoehybrid",
@@ -1373,6 +1444,8 @@ _KNOWN_MOE_ARCHS = frozenset(
         "grovemoe",
         "hunyuan-moe",
         "hunyuan_moe",
+        "hyv4",
+        "hy_v4",
         "jamba",
         "kimi-k3",
         "kimi_k3",
@@ -1631,6 +1704,7 @@ def _decide_offload(
     has_gpu: bool,
     vram_headroom_gb: float = DEFAULT_VRAM_SAFETY_GB,
     kv_reserve_gb: float = 0.0,
+    free_ram_gb: Optional[float] = None,
 ) -> Tuple[int, float, float, bool]:
     if not has_gpu or free_vram_gb < 1.0:
         return 0, 0.0, model_size_gb, False
@@ -1660,10 +1734,75 @@ def _decide_offload(
 
     if n_layers > 0:
         per_layer_gb = model_size_gb / n_layers
+        residual_overhead = model_size_gb * 0.02
+
+        # A partial dense load splits KV by layer. Packing layers from VRAM
+        # alone can push so many weights into host RAM that the CPU-side KV
+        # becomes the real bottleneck (Safe then paradoxically gets less
+        # context than Throughput). Search the discrete layer placements and
+        # choose the fastest one that preserves the requested total KV reserve
+        # in *both* pools. If the target itself cannot fit, maximize the actual
+        # two-pool KV capacity rather than blindly filling either pool.
+        if free_ram_gb is not None and kv_reserve_gb > 0:
+            host_usable = max(0.0, float(free_ram_gb))
+            feasible: List[Tuple[int, float, float, bool]] = []
+            fallback: List[Tuple[float, int, float, float, bool]] = []
+            for layers_on_gpu in range(n_layers + 1):
+                full = layers_on_gpu == n_layers
+                model_vram = layers_on_gpu * per_layer_gb
+                model_ram = (
+                    0.0
+                    if full
+                    else (n_layers - layers_on_gpu) * per_layer_gb + residual_overhead
+                )
+                gpu_fraction = layers_on_gpu / n_layers
+                cpu_fraction = 1.0 - gpu_fraction
+                gpu_fixed = model_vram + (FULL_OFF_HEADROOM_GB if full else 0.0)
+                gpu_remaining = max(0.0, usable - gpu_fixed)
+                ram_remaining = max(0.0, host_usable - model_ram)
+                gpu_capacity = (
+                    math.inf if gpu_fraction <= 0.0 else gpu_remaining / gpu_fraction
+                )
+                ram_capacity = (
+                    math.inf if cpu_fraction <= 0.0 else ram_remaining / cpu_fraction
+                )
+                total_kv_capacity = min(gpu_capacity, ram_capacity)
+                if model_ram <= host_usable and gpu_fixed <= usable:
+                    fallback.append(
+                        (
+                            total_kv_capacity,
+                            layers_on_gpu,
+                            model_vram,
+                            model_ram,
+                            full,
+                        )
+                    )
+                    if total_kv_capacity >= kv_reserve_gb:
+                        feasible.append((layers_on_gpu, model_vram, model_ram, full))
+            if feasible:
+                layers_on_gpu, model_vram, model_ram, full = max(
+                    feasible, key=lambda item: item[0]
+                )
+                return (
+                    999 if full else layers_on_gpu,
+                    model_vram,
+                    model_ram,
+                    full,
+                )
+            if fallback:
+                _capacity, layers_on_gpu, model_vram, model_ram, full = max(
+                    fallback, key=lambda item: (item[0], item[1])
+                )
+                return (
+                    999 if full else layers_on_gpu,
+                    model_vram,
+                    model_ram,
+                    full,
+                )
+
         ngl = int(weight_budget / per_layer_gb)
         ngl = max(0, min(n_layers, ngl))
         model_vram = ngl * per_layer_gb
-        residual_overhead = model_size_gb * 0.02  # Reduced overhead
         model_ram = (n_layers - ngl) * per_layer_gb + residual_overhead
         return ngl, model_vram, model_ram, False
 
@@ -1686,6 +1825,8 @@ def _decide_moe_offload(
     moe_vram_safety_gb: float = MOE_VRAM_SAFETY_GB,
     moe_placement_ctx_target: int = MOE_PLACEMENT_CTX_TARGET,
     batch_vram_reserve_gb: float = 0.0,
+    n_parallel: int = 1,
+    rope_scaling: bool = False,
 ) -> Tuple[int, Optional[int], float, float, bool]:
     """Decide how to split an MoE model between GPU and CPU.
 
@@ -1718,7 +1859,24 @@ def _decide_moe_offload(
         kv_reservation_ctx
         * base_kv_per_token_mb
         * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
+        * max(1, n_parallel)
     ) / 1024.0
+
+    # The final context planner withholds both an absolute backend workspace
+    # and a context-scaled fractional guard from the raw KV budget. Placement
+    # must reserve that same raw amount *before* packing expert layers; otherwise
+    # a slightly smaller quant that just fits fully on GPU paradoxically gets
+    # less context than a larger quant that is forced to spill experts to RAM.
+    # Solve ``usable = raw * (1 - fraction) - absolute`` for the raw budget
+    # needed to leave ``kv_reserve_gb`` usable after the final guard.
+    headroom_absolute_gb, headroom_fraction = _kv_headroom_reserve(
+        kv_reservation_ctx,
+        max(1, n_parallel),
+        rope_scaling,
+    )
+    raw_kv_reserve_gb = (kv_reserve_gb + headroom_absolute_gb) / max(
+        0.01, 1.0 - headroom_fraction
+    )
 
     # If even the estimated non-expert/shared tensors cannot fit, --n-cpu-moe
     # cannot rescue the model: that flag moves experts only. Fall back to a
@@ -1732,7 +1890,7 @@ def _decide_moe_offload(
         free_vram_gb
         - moe_vram_safety_gb
         - shared_overhead_gb
-        - kv_reserve_gb
+        - raw_kv_reserve_gb
         - max(0.0, batch_vram_reserve_gb)
     )
 
@@ -2032,9 +2190,7 @@ def _pick_kv_quant(
     # Read the legacy arguments so static analyzers and third-party wrappers
     # can keep calling the old signature without implying they affect Auto.
     _ = profile_recommended, asymmetric
-    pairs: List[Tuple[str, str]] = [
-        (DEFAULT_KV_CACHE_TYPE, DEFAULT_KV_CACHE_TYPE)
-    ]
+    pairs: List[Tuple[str, str]] = [(DEFAULT_KV_CACHE_TYPE, DEFAULT_KV_CACHE_TYPE)]
 
     budget_mb = kv_budget_gb * 1024 * 0.98
 
@@ -2718,6 +2874,15 @@ def compute_config(
             batch_vram_reserve_gb=(
                 perf_target.moe_batch_vram_reserve_gb + state_vram_reserve_for_placement
             ),
+            n_parallel=n_parallel,
+            rope_scaling=bool(
+                force_rope_scale is True
+                or (
+                    profile_rope_scale
+                    and native_ctx > 0
+                    and target_ctx_for_placement > native_ctx
+                )
+            ),
         )
 
         # ---- Two-pass placement fallback ---------------------------------
@@ -2750,6 +2915,15 @@ def compute_config(
                 batch_vram_reserve_gb=(
                     perf_target.moe_batch_vram_reserve_gb
                     + state_vram_reserve_for_placement
+                ),
+                n_parallel=n_parallel,
+                rope_scaling=bool(
+                    force_rope_scale is True
+                    or (
+                        profile_rope_scale
+                        and native_ctx > 0
+                        and target_ctx_for_placement > native_ctx
+                    )
                 ),
             )
             # Only adopt the second pass if it actually placed layers on GPU.
@@ -2813,6 +2987,7 @@ def compute_config(
             has_gpu=has_gpu,
             vram_headroom_gb=dense_placement_safety_gb,
             kv_reserve_gb=dense_kv_reserve_gb,
+            free_ram_gb=effective_free_ram_for_weights,
         )
 
     # ---- (1.5) Expert overrides: force_ngl / force_n_cpu_moe -----------
@@ -3422,7 +3597,11 @@ def compute_config(
             )
             qwen_physical_max_ctx = min(gpu_max_ctx, host_max_ctx)
 
-        qwen_physical_max_ctx = max(2048, qwen_physical_max_ctx)
+        if qwen_physical_max_ctx < 2048:
+            raise MemoryError(
+                "qwen4exp fixed model/runtime reservations leave insufficient "
+                "RAM or VRAM for the minimum 2,048-token context"
+            )
         if ctx > qwen_physical_max_ctx:
             if user_ctx is not None and pin_clamped_to_budget is None:
                 pin_clamped_to_budget = ctx

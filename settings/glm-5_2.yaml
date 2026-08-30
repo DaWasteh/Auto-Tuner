@@ -1,5 +1,11 @@
-display_name: "GLM-5.2 (Z.ai, 1M + IndexShare)"
+display_name: "GLM-5.2 / 5.3 (Z.ai, 1M + IndexShare)"
 patterns:
+  # GLM-5.3 (non-Flash) retains the glm-dsa architecture and the same
+  # generation/runtime contract as 5.2. The longer Flash pattern belongs to
+  # glm-5_3_flash.yaml and wins filename matching before these entries.
+  - glm-5.3
+  - glm5.3
+  - glm-5_3
   - glm-5.2
   - glm5.2
   - glm-5_2
@@ -37,11 +43,14 @@ draft_p_min: 0.75
 ngram_method: ngram-map-k4v
 
 notes: >
-  Z.ai GLM-5.2 is a 744B-A40B MoE with a solid 1M context, IndexShare
-  sparse attention, and one improved NextN/MTP layer. Use llama.cpp b10174
-  or newer for the complete MTP path; current builds are strongly preferred
-  for DSA indexer/backend fixes. Official generation config is temp 1.0 /
-  top_p 0.95; min_p 0.01 and top_k 40 retain the established local profile.
-  Datacenter scale: even low-bit quants need hundreds of GB, so a 48 GB
+  Z.ai GLM-5.2 and GLM-5.3 (non-Flash) share the glm-dsa GGUF architecture,
+  native 1M context, IndexShare sparse attention, and one NextN/MTP layer, so
+  they intentionally share this profile. GLM-5.3 keeps the official generation
+  config temp=1.0 / top_p=0.95 and adds low/high/max reasoning effort in its
+  embedded template (max by default); min_p=0.01 and top_k=40 retain the
+  established local profile. Use llama.cpp b10174 or newer for the complete
+  GLM DSA/MTP path, with current builds strongly preferred for indexer/backend
+  fixes. Datacenter scale: even low-bit quants need hundreds of GB, so a 48 GB
   workstation requires substantial RAM/CPU expert offload and cannot exploit
-  a 1M cache.
+  a 1M cache. GLM-5.3-Flash is intentionally separate: it is a 320B-A18B
+  multimodal KDA/DSA hybrid with the new glm5next architecture.

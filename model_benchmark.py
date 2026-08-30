@@ -51,8 +51,8 @@ class BenchmarkFailure(RuntimeError):
 
 # Increment when persisted evidence or the search/decision procedure changes
 # in a way that makes an older winner unsafe to reuse automatically.
-BENCHMARK_RECORD_SCHEMA = 3
-BENCHMARK_SEARCH_SCHEMA = 2
+BENCHMARK_RECORD_SCHEMA = 4
+BENCHMARK_SEARCH_SCHEMA = 3
 
 
 @dataclass(frozen=True)
@@ -191,9 +191,7 @@ class CandidateResult:
 
     @property
     def draft_tokens_accepted(self) -> int:
-        return sum(
-            max(0, int(sample.draft_tokens_accepted)) for sample in self.samples
-        )
+        return sum(max(0, int(sample.draft_tokens_accepted)) for sample in self.samples)
 
     @property
     def draft_acceptance(self) -> float:
@@ -288,7 +286,9 @@ class BenchmarkResult:
     def winning_config(self, base: TunedConfig) -> TunedConfig:
         return self.winner.candidate.apply(base)
 
-    def to_record(self, *, model_path: str, model_size: int, model_mtime_ns: int) -> dict:
+    def to_record(
+        self, *, model_path: str, model_size: int, model_mtime_ns: int
+    ) -> dict:
         """Return bounded JSON evidence; prompts, raw argv, and full logs stay out."""
         return {
             "schema": BENCHMARK_RECORD_SCHEMA,
@@ -304,9 +304,7 @@ class BenchmarkResult:
             "winner_id": self.winner_id,
             "reason": self.reason,
             "winner_score": round(self.score(self.winner), 6),
-            "winner_conservative_score": round(
-                self.conservative_score(self.winner), 6
-            ),
+            "winner_conservative_score": round(self.conservative_score(self.winner), 6),
             "winner_settings": self.winner.candidate.settings(),
             "baseline_settings": self.baseline.candidate.settings(),
             "candidates": [
@@ -556,9 +554,7 @@ def shortlist_candidates_from_record(
                 ),
                 batch=max(1, int(settings.get("batch", seed.batch))),
                 ubatch=max(1, int(settings.get("ubatch", seed.ubatch))),
-                draft_n_max=max(
-                    0, int(settings.get("draft_n_max", seed.draft_n_max))
-                ),
+                draft_n_max=max(0, int(settings.get("draft_n_max", seed.draft_n_max))),
             )
         except (TypeError, ValueError):
             continue
@@ -637,13 +633,9 @@ def parse_timing_payload(
         generation_tps = predicted_n / (predicted_ms / 1000.0)
 
     if prompt_n < min_prompt_tokens:
-        raise BenchmarkFailure(
-            f"measurement prompt was too short ({prompt_n} tokens)"
-        )
+        raise BenchmarkFailure(f"measurement prompt was too short ({prompt_n} tokens)")
     if predicted_n < min_generated_tokens:
-        raise BenchmarkFailure(
-            f"generation ended too early ({predicted_n} tokens)"
-        )
+        raise BenchmarkFailure(f"generation ended too early ({predicted_n} tokens)")
     if prompt_tps <= 0 or generation_tps <= 0:
         raise BenchmarkFailure("llama-server returned invalid throughput timings")
     return BenchmarkSample(
@@ -849,9 +841,7 @@ class BenchmarkRunner:
             raw = response.read()
             if response.status not in accept_status:
                 detail = raw.decode("utf-8", errors="replace")[-500:]
-                raise BenchmarkFailure(
-                    f"HTTP {response.status} from {path}: {detail}"
-                )
+                raise BenchmarkFailure(f"HTTP {response.status} from {path}: {detail}")
             if not raw:
                 return response.status, {}
             parsed = json.loads(raw.decode("utf-8"))
@@ -982,10 +972,10 @@ class BenchmarkRunner:
             # Very old/forked servers may not expose /tokenize. Keep the test
             # runnable with a conservative fallback rather than restoring the
             # known 1.6x overshoot.
-            self._emit(f"Prompt tokenizer calibration unavailable ({exc}); using fallback")
-            best_prompt = _fixed_prompt(
-                max(1, int(target * 0.55)), variant=variant_id
+            self._emit(
+                f"Prompt tokenizer calibration unavailable ({exc}); using fallback"
             )
+            best_prompt = _fixed_prompt(max(1, int(target * 0.55)), variant=variant_id)
             best_count = 0
 
         if best_prompt is None:
@@ -1137,9 +1127,7 @@ class BenchmarkRunner:
             for a, b in zip(_candidate_key(candidate), _candidate_key(baseline))
         )
 
-    def _score(
-        self, item: CandidateResult, baseline: CandidateResult
-    ) -> float:
+    def _score(self, item: CandidateResult, baseline: CandidateResult) -> float:
         if not item.valid or not baseline.valid or baseline.overall_tps <= 0:
             return 0.0
         return item.overall_tps / baseline.overall_tps
@@ -1511,8 +1499,7 @@ class BenchmarkSuiteRunner:
             if (
                 outcomes
                 and self._stop_after_model.is_set()
-                and self._job_model_key(job)
-                != self._job_model_key(outcomes[-1].job)
+                and self._job_model_key(job) != self._job_model_key(outcomes[-1].job)
             ):
                 stop_reason = "Stopped after all modes for the completed model."
                 break
@@ -1522,9 +1509,7 @@ class BenchmarkSuiteRunner:
             try:
                 model_budget_s = max(
                     0.0,
-                    float(
-                        str(job.metadata.get("model_time_budget_s", 0.0) or 0.0)
-                    ),
+                    float(str(job.metadata.get("model_time_budget_s", 0.0) or 0.0)),
                 )
             except (TypeError, ValueError):
                 model_budget_s = 0.0
@@ -1559,6 +1544,14 @@ class BenchmarkSuiteRunner:
             job.runner.progress = relay
             self.progress(completed, total, f"{prefix}: preparing")
             self._active = job.runner
+            # Close the cancellation handoff window between the loop-level
+            # check and publishing the active runner. If cancellation arrived
+            # in that interval, propagate it into the now-visible runner before
+            # it can launch a private server.
+            if self._cancel.is_set():
+                self._active.cancel()
+                self._active = None
+                raise BenchmarkCancelled("Performance tuning cancelled")
             outcome: Optional[BenchmarkSuiteJobResult] = None
             try:
                 result = job.runner.run()

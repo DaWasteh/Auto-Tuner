@@ -849,6 +849,10 @@ _HYBRID_ARCHS = frozenset(
         "kimi_linear",
         "kimi-k3",  # Kimi-K3: KDA + gated MLA (b10448, text path)
         "kimi_k3",
+        "glm5next",  # GLM-5.3-Flash KDA/DSA (full-layer safety accounting below)
+        "glm5-next",
+        "hyv4",  # HY4 Gated DSA/IndexCache (fork-only allocation contract)
+        "hy_v4",
         "qwen35",  # Qwen3.5–3.8 dense: linear + full attention
         "qwen35moe",  # Qwen3.5–3.8 MoE: linear + full attention
         "qwen4exp",  # Qwen3.8 Flash Next preview: GDN + 1-in-4 attention
@@ -943,6 +947,13 @@ def metadata_attention_layer_count(md: Dict[str, Any]) -> int:
     total = metadata_layer_count(md)
     if total <= 0:
         return 0
+
+    # HY4 and GLM-5.3-Flash use fork-only DSA/KDA index pools whose exact
+    # allocation is not represented by ordinary KV metadata yet. Budget every
+    # layer conservatively until a selected runtime exposes a validated pool
+    # formula; applying the generic 25% hybrid heuristic could otherwise OOM.
+    if arch.lower() in {"hyv4", "hy_v4", "glm5next", "glm5-next"}:
+        return total
 
     # Interleaved sliding-window attention: only global-attention layers
     # grow with the requested context. A per-layer pattern stores True for

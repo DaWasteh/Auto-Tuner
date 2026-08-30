@@ -150,7 +150,7 @@ def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
     assert profile.ngram_method == "ngram-map-k4v"
     assert profile.recommended_kv_quant == "q4_0"
     assert profile.performance_target == "safe"
-    assert profile.min_llama_build == 10660
+    assert profile.min_llama_build == 10666
     assert match_profile("opaque-preview.gguf", profiles, "qwen4exp") is profile
 
     model = ModelEntry(
@@ -352,9 +352,7 @@ def test_scanner_handles_empty_folder(tmp_path) -> None:
     assert scan_models(tmp_path) == []
 
 
-def test_scanner_persists_and_invalidates_metadata_cache(
-    tmp_path, monkeypatch
-) -> None:
+def test_scanner_persists_and_invalidates_metadata_cache(tmp_path, monkeypatch) -> None:
     import scanner
 
     cache_path = tmp_path / "cache" / "metadata.json"
@@ -1249,7 +1247,9 @@ def test_launch_button_recovers_after_selection_and_benchmark_cleanup(
     window.close()
 
 
-def test_ngram_defaults_on_but_explicit_model_off_survives(tmp_path, monkeypatch) -> None:
+def test_ngram_defaults_on_but_explicit_model_off_survives(
+    tmp_path, monkeypatch
+) -> None:
     global _QT_TEST_APP
 
     qt_launcher = pytest.importorskip("qt_launcher")
@@ -1295,12 +1295,8 @@ def test_performance_test_real_validates_qwen38_above_static_estimate(
         qt_launcher.app_settings, "get_minimize_on_close", lambda: False
     )
 
-    model = _fake_qwen38_27b_model(
-        tmp_path, "Qwen3.8-27B-3.27bpw", size_gb=13.04
-    )
-    profile = match_profile(
-        model.name, load_profiles(SETTINGS_DIR), model.architecture
-    )
+    model = _fake_qwen38_27b_model(tmp_path, "Qwen3.8-27B-3.27bpw", size_gb=13.04)
+    profile = match_profile(model.name, load_profiles(SETTINGS_DIR), model.architecture)
     system = _fake_system(
         ram_total=64,
         ram_free=55.7,
@@ -1393,6 +1389,84 @@ def test_performance_test_real_validates_qwen38_above_static_estimate(
     window.close()
 
 
+def test_adaptive_context_recomputes_for_each_model_build_and_mode(
+    tmp_path, monkeypatch
+) -> None:
+    """Adaptive campaigns never reuse one lane's context in another lane."""
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "adaptive-settings.json",
+    )
+    monkeypatch.setattr(
+        qt_launcher.app_settings, "get_minimize_on_close", lambda: False
+    )
+
+    models = [
+        _fake_qwen38_27b_model(
+            tmp_path / "qwen", "Qwen3.8-27B-UD-Q6_K_XL", size_gb=24.14
+        ),
+        _mistral_dense_md(tmp_path / "mistral", size_gb=57.0),
+    ]
+    builds = {
+        "compact-hip": _fake_system(
+            ram_total=64, ram_free=52, vram_total=16, vram_free=15.5
+        ),
+        "dual-vulkan": _fake_system(
+            ram_total=96, ram_free=82, vram_total=48, vram_free=46
+        ),
+    }
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    contexts: dict[tuple[str, str, str], int] = {}
+    for model in models:
+        profile = match_profile(model.name, window._profiles, model.architecture)
+        options = {
+            "model": model,
+            "draft_model": None,
+            "enable_speculative": False,
+            "no_mmproj_offload": False,
+            "prompt_cache_ram_mib": 0,
+            "drafter_key": qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+        }
+        for build_name, system in builds.items():
+            for target in ("safe", "throughput"):
+                cfg, safe_context, exact_trial = window._benchmark_config_for_target(
+                    model,
+                    profile,
+                    system,
+                    target,
+                    options,
+                    desired_context=0,
+                    enable_yarn=False,
+                    real_validation=False,
+                    benchmark_backend=(
+                        "hip" if build_name == "compact-hip" else "vulkan"
+                    ),
+                    ignore_saved_profile=True,
+                )
+                assert exact_trial is False
+                assert cfg.ctx == safe_context
+                assert safe_context <= max(
+                    2048, int(model.native_context or profile.max_context)
+                )
+                contexts[(model.name, build_name, target)] = safe_context
+
+    assert len(contexts) == len(models) * len(builds) * 2
+    assert len(set(contexts.values())) > 1
+    for model in models:
+        for build_name in builds:
+            assert (
+                contexts[(model.name, build_name, "safe")]
+                >= contexts[(model.name, build_name, "throughput")]
+            )
+    window.close()
+
+
 def test_performance_suite_selects_and_reports_fastest_mode(
     tmp_path, monkeypatch
 ) -> None:
@@ -1463,12 +1537,8 @@ def test_performance_suite_selects_and_reports_fastest_mode(
         winner_candidate = BenchmarkCandidate(
             f"winner-{target}", f"Winner {target}", 8, 8, 1024, 512
         )
-        baseline_sample = BenchmarkSample(
-            100.0, 20.0, prompt_tokens, 256, 1.0
-        )
-        winner_sample = BenchmarkSample(
-            prompt, decode, prompt_tokens, 256, 1.0
-        )
+        baseline_sample = BenchmarkSample(100.0, 20.0, prompt_tokens, 256, 1.0)
+        winner_sample = BenchmarkSample(prompt, decode, prompt_tokens, 256, 1.0)
         measured = BenchmarkResult(
             desired_context=context,
             baseline_id="baseline",
@@ -1517,7 +1587,9 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     assert messages
     assert "safe: PP" in messages[-1]
     assert "★ throughput:" in messages[-1]
-    assert "Selected model now uses the fastest measured mode: throughput" in messages[-1]
+    assert (
+        "Selected model now uses the fastest measured mode: throughput" in messages[-1]
+    )
 
     # Per-model choice is restored when returning to a model, not just kept as
     # a one-session global combo value.
@@ -1544,9 +1616,7 @@ def test_performance_suite_selects_and_reports_fastest_mode(
     )
     window._on_performance_tuning_finished(mismatched)
     assert window._perf_combo.currentText() == "safe"
-    assert (
-        qt_launcher.app_settings.get_model_performance_target(model.path) == "safe"
-    )
+    assert qt_launcher.app_settings.get_model_performance_target(model.path) == "safe"
     assert messages
     assert "No auto-selection" in messages[-1]
     window.close()
@@ -1609,9 +1679,7 @@ def test_completed_benchmark_matching_is_exact_to_environment_workload_and_model
         sampling={},
     )
     system = _fake_system()
-    monkeypatch.setattr(
-        qt_launcher, "probe_binary_build_number", lambda _binary: 10572
-    )
+    monkeypatch.setattr(qt_launcher, "probe_binary_build_number", lambda _binary: 10572)
     stat = model.path.stat()
     record = {
         "model_size": stat.st_size,
@@ -1652,9 +1720,7 @@ def test_completed_benchmark_matching_is_exact_to_environment_workload_and_model
         runtime_binary="llama-server",
         system=system,
     )
-    monkeypatch.setattr(
-        qt_launcher, "probe_binary_build_number", lambda _binary: 10679
-    )
+    monkeypatch.setattr(qt_launcher, "probe_binary_build_number", lambda _binary: 10679)
     assert not qt_launcher.MainWindow._completed_benchmark_matches(
         record,
         model,
@@ -1683,9 +1749,7 @@ def test_measured_profile_is_applied_only_to_matching_environment(
         sampling={},
     )
     system = _fake_system()
-    monkeypatch.setattr(
-        qt_launcher, "probe_binary_build_number", lambda _binary: 10572
-    )
+    monkeypatch.setattr(qt_launcher, "probe_binary_build_number", lambda _binary: 10572)
     fake_window = types.SimpleNamespace(
         _system=system,
         _active_llama_binary=lambda: "llama-server",
@@ -1742,9 +1806,7 @@ def test_completed_external_drafters_are_reused_when_rerun_is_off(
     )
     stat = model.path.stat()
     system = _fake_system()
-    monkeypatch.setattr(
-        qt_launcher, "probe_binary_build_number", lambda _binary: 10572
-    )
+    monkeypatch.setattr(qt_launcher, "probe_binary_build_number", lambda _binary: 10572)
     snapshot = {"mode": "auto", "values": {}}
     drafter_keys = []
     for index, quant in enumerate(("Q4_K_M", "Q8_0", "BF16"), start=1):
@@ -1817,11 +1879,21 @@ def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
     qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
     _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
 
-    setup = qt_launcher._PerformanceTuneSetupDialog(
-        "Example", 32768, 131072, 2
-    )
+    setup = qt_launcher._PerformanceTuneSetupDialog("Example", 32768, 131072, 2)
     assert setup.benchmark_type() == "fast"
     assert setup.prompt_context_fraction() == pytest.approx(0.03125)
+    assert setup.desired_context() == 0
+    assert not setup.context_spin.isEnabled()
+    assert not setup.real_validation.isEnabled()
+    fixed_index = setup.context_mode_combo.findData("fixed")
+    setup.context_mode_combo.setCurrentIndex(fixed_index)
+    assert setup.context_spin.isEnabled()
+    assert setup.real_validation.isEnabled()
+    assert setup.desired_context() == 32768
+    setup.context_mode_combo.setCurrentIndex(
+        setup.context_mode_combo.findData("adaptive")
+    )
+    assert setup.desired_context() == 0
     assert not setup.custom_percent_spin.isEnabled()
     assert not setup.try_best_settings.isEnabled()
     assert not setup.rerun_all_models.isEnabled()
@@ -1830,19 +1902,56 @@ def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
     assert not setup.test_external_drafters.isEnabled()
     setup.tune_mtp.setChecked(True)
     assert setup.test_external_drafters.isEnabled()
-    setup.test_length_combo.setCurrentIndex(
-        setup.test_length_combo.findData("quick")
-    )
+    setup.test_length_combo.setCurrentIndex(setup.test_length_combo.findData("quick"))
     assert setup.prompt_context_fraction() == pytest.approx(0.125)
     assert setup.try_best_settings.isEnabled()
-    setup.test_length_combo.setCurrentIndex(
-        setup.test_length_combo.findData("custom")
-    )
+    setup.test_length_combo.setCurrentIndex(setup.test_length_combo.findData("custom"))
     setup.custom_percent_spin.setValue(87.65)
     assert setup.benchmark_type() == "custom"
     assert setup.custom_percent_spin.isEnabled()
     assert setup.prompt_context_fraction() == pytest.approx(0.8765)
     setup.close()
+
+    runtimes = [
+        qt_launcher._PerformanceRuntimeOption(
+            "b10690_hip_llama.cpp",
+            str(tmp_path / "hip" / "llama-server.exe"),
+            tmp_path / "hip",
+            "hip",
+            True,
+        ),
+        qt_launcher._PerformanceRuntimeOption(
+            "b10691_hip_llama.cpp",
+            str(tmp_path / "hip2" / "llama-server.exe"),
+            tmp_path / "hip2",
+            "hip",
+            False,
+        ),
+        qt_launcher._PerformanceRuntimeOption(
+            "b10690_vulkan_llama.cpp",
+            str(tmp_path / "vulkan" / "llama-server.exe"),
+            tmp_path / "vulkan",
+            "vulkan",
+            False,
+        ),
+    ]
+    multi_setup = qt_launcher._PerformanceTuneSetupDialog(
+        "Model",
+        32768,
+        131072,
+        2,
+        runtime_options=runtimes,
+    )
+    assert multi_setup.selected_runtime_options() == [runtimes[0]]
+    multi_setup.runtime_scope_combo.setCurrentIndex(
+        multi_setup.runtime_scope_combo.findData("multiple")
+    )
+    multi_setup.runtime_list.item(1).setCheckState(qt_launcher.Qt.CheckState.Checked)
+    multi_setup.runtime_list.item(2).setCheckState(qt_launcher.Qt.CheckState.Checked)
+    # Multiple installed builds of the same backend remain independently
+    # selectable; runtime-qualified evidence keeps both results.
+    assert multi_setup.selected_runtime_options() == runtimes
+    multi_setup.close()
 
     def record(name: str, test_type: str, value: float) -> dict:
         winner_id = f"{name}-{test_type}"
@@ -1857,10 +1966,31 @@ def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
             "candidates": [
                 {
                     "id": winner_id,
+                    "label": f"Winner {name}",
+                    "settings": {
+                        "threads": 8,
+                        "batch_threads": 8,
+                        "batch": 512,
+                        "ubatch": 256,
+                        "draft_n_max": 2,
+                    },
                     "prompt_tps": value * 4,
                     "generation_tps": value,
                     "overall_tps": value * 2,
-                }
+                    "samples": [{"prompt_tokens": 1024, "generated_tokens": 128}],
+                },
+                {
+                    "id": f"failed-{name}-{test_type}",
+                    "label": "Oversized batch",
+                    "settings": {
+                        "threads": 16,
+                        "batch_threads": 16,
+                        "batch": 4096,
+                        "ubatch": 2048,
+                    },
+                    "error": "backend allocation failed",
+                    "log_tail": "out of device memory",
+                },
             ],
         }
 
@@ -1875,28 +2005,127 @@ def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
         html_path=html_path,
     )
     assert dialog.record_count_by_test == {"fast": 1, "quick": 1, "custom": 1}
+    assert dialog.candidate_count_by_test == {"fast": 2, "quick": 2, "custom": 2}
+    assert dialog.failed_candidate_count_by_test == {
+        "fast": 1,
+        "quick": 1,
+        "custom": 1,
+    }
     assert dialog.model_names_by_test["fast"] == ["QuickModel"]
     assert dialog.model_names_by_test["quick"] == ["StandardModel"]
     assert dialog.model_names_by_test["custom"] == ["CustomModel"]
     assert dialog.test_tiles["fast"].property("benchmarkType") == "fast"
     assert dialog.test_tiles["quick"].property("benchmarkType") == "quick"
     assert dialog.test_tiles["custom"].property("benchmarkType") == "custom"
-    assert dialog.findChild(
-        qt_widgets.QPushButton, "openPerformanceHtmlReport"
-    ) is not None
+    assert (
+        dialog.findChild(qt_widgets.QPushButton, "openPerformanceHtmlReport")
+        is not None
+    )
     # Each tile normalizes its own PP/decode/end-to-end scales. With one model
     # in each tile every non-zero bar reaches that tile's maximum.
     for tile in dialog.test_tiles.values():
         bars = tile.findChildren(qt_widgets.QProgressBar)
         assert len(bars) == 3
         assert all(bar.value() == 1000 for bar in bars)
-    text = " ".join(
-        label.text() for label in dialog.findChildren(qt_widgets.QLabel)
-    )
+    text = " ".join(label.text() for label in dialog.findChildren(qt_widgets.QLabel))
     assert "Prompt processing (PP)" in text
     assert "n_decode" in text
     assert "End-to-end" in text
+    candidate_trees = dialog.findChildren(qt_widgets.QTreeWidget)
+    assert len(candidate_trees) == 3
+    assert all(tree.topLevelItemCount() == 2 for tree in candidate_trees)
+    statuses = {
+        tree.topLevelItem(row).text(0)
+        for tree in candidate_trees
+        for row in range(tree.topLevelItemCount())
+    }
+    assert statuses == {"Winner", "Failed"}
+    assert any(
+        tree.topLevelItem(1).text(7) == "backend allocation failed"
+        for tree in candidate_trees
+    )
+    assert any("batch=4096" in tree.topLevelItem(1).text(2) for tree in candidate_trees)
     dialog.close()
+
+
+def test_performance_analysis_filters_dialog_but_keeps_html_global(
+    tmp_path, monkeypatch
+) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    selected = _fake_model(tmp_path, "Selected", 4.0)
+    moved_path = tmp_path / "moved" / selected.path.name
+    moved_path.parent.mkdir()
+    exact_record = {
+        "model_path": str(selected.path),
+        "model_name": selected.name,
+        "model_size": 0,
+        "candidates": [{"id": "exact", "error": "failed exact"}],
+    }
+    moved_record = {
+        "model_path": str(moved_path),
+        "model_name": selected.name,
+        "model_size": selected.size_bytes,
+        "candidates": [{"id": "moved"}],
+    }
+    moved_primary_shard_record = {
+        "model_path": str(moved_path),
+        "model_name": selected.name,
+        "model_size": selected.path.stat().st_size,
+        "candidates": [{"id": "moved-primary-shard"}],
+    }
+    other_record = {
+        "model_path": str(tmp_path / "other" / selected.path.name),
+        "model_name": selected.name,
+        "model_size": selected.size_bytes + 1,
+        "candidates": [{"id": "other"}],
+    }
+    all_records = {
+        "fast": [exact_record, other_record],
+        "quick": [moved_record, moved_primary_shard_record],
+        "custom": [],
+    }
+    filtered = qt_launcher._performance_records_for_model(all_records, selected)
+    assert filtered == {
+        "fast": [exact_record],
+        "quick": [moved_record, moved_primary_shard_record],
+        "custom": [],
+    }
+    assert filtered["fast"][0]["candidates"][0]["error"] == "failed exact"
+
+    written: list[dict] = []
+    shown: list[dict] = []
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "list_performance_run_results",
+        lambda: all_records,
+    )
+    monkeypatch.setattr(
+        qt_launcher,
+        "write_performance_report",
+        lambda records: written.append(records) or (tmp_path / "global.html"),
+    )
+
+    class FakeDialog:
+        def __init__(self, records, _parent, **kwargs):
+            shown.append({"records": records, **kwargs})
+
+        def exec(self):
+            shown[-1]["executed"] = True
+
+    monkeypatch.setattr(qt_launcher, "_PerformanceAnalysisDialog", FakeDialog)
+    fake_window = types.SimpleNamespace(
+        _current_entry=selected,
+        _log=lambda _message: None,
+    )
+    qt_launcher.MainWindow._show_performance_analysis(fake_window)
+    assert written == [all_records]
+    assert shown[0]["records"] == filtered
+    assert shown[0]["selected_model_name"] == selected.name
+    assert shown[0]["executed"] is True
 
 
 def test_performance_dialog_exposes_graceful_stop_controls() -> None:
@@ -2005,20 +2234,26 @@ def test_model_expert_settings_copy_and_paste_is_target_scoped(
     window._expert_panel._sp_threads.setValue(7)
     assert window._expert_panel._save_timer.isActive()
     window._show_config(target)
-    assert qt_launcher.app_settings.get_setting_profile_snapshot(
-        source.name,
-        source.path,
-        "balanced",
-        "custom1",
-        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
-    )["values"]["threads"] == 7
-    assert qt_launcher.app_settings.get_setting_profile_snapshot(
-        target.name,
-        target.path,
-        "balanced",
-        "custom1",
-        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
-    )["values"]["threads"] == 6
+    assert (
+        qt_launcher.app_settings.get_setting_profile_snapshot(
+            source.name,
+            source.path,
+            "balanced",
+            "custom1",
+            qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+        )["values"]["threads"]
+        == 7
+    )
+    assert (
+        qt_launcher.app_settings.get_setting_profile_snapshot(
+            target.name,
+            target.path,
+            "balanced",
+            "custom1",
+            qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+        )["values"]["threads"]
+        == 6
+    )
     window.close()
 
 
@@ -2046,7 +2281,19 @@ def test_settings_profile_selector_preserves_auto_perform_and_custom(
     window._show_config(model)
 
     combo = window._setting_profile_combo
-    assert combo.count() == 6
+    assert combo.count() == (
+        2
+        + len(qt_launcher.app_settings.PROFILE_PERFORM_SLOTS)
+        + len(qt_launcher.app_settings.CUSTOM_PROFILE_SLOTS)
+    )
+    assert {
+        combo.itemData(index)
+        for index in range(combo.count())
+        if qt_launcher.app_settings.is_perform_profile_slot(combo.itemData(index))
+    } == {
+        qt_launcher.app_settings.PROFILE_PERFORM,
+        *qt_launcher.app_settings.PROFILE_PERFORM_SLOTS,
+    }
     assert combo.currentData() == qt_launcher.app_settings.PROFILE_AUTO
     perform_index = combo.findData(qt_launcher.app_settings.PROFILE_PERFORM)
     assert not combo.model().item(perform_index).isEnabled()
@@ -2102,13 +2349,16 @@ def test_settings_profile_selector_preserves_auto_perform_and_custom(
     profile = match_profile(model.name, window._profiles, model.architecture)
     assert window._effective_config(model, profile).threads == 11
     # The measured slot did not overwrite the custom experiment.
-    assert qt_launcher.app_settings.get_setting_profile_snapshot(
-        model.name,
-        model.path,
-        "balanced",
-        "custom1",
-        qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
-    )["values"]["threads"] == 7
+    assert (
+        qt_launcher.app_settings.get_setting_profile_snapshot(
+            model.name,
+            model.path,
+            "balanced",
+            "custom1",
+            qt_launcher.app_settings.NO_DRAFTER_PROFILE_KEY,
+        )["values"]["threads"]
+        == 7
+    )
     window.close()
 
 
@@ -3364,6 +3614,118 @@ def test_qwen38_dual_gpu_preserves_full_context_with_q4_default(
         assert footprint * parts[1] <= large_cap + 0.05
 
 
+def test_qwen4exp_smaller_weight_quant_never_gets_less_safe_context(
+    tmp_path, monkeypatch
+) -> None:
+    """Reserve final KV/workspace headroom before MoE expert placement.
+
+    The real 67.564-GiB IQ1_S Flash-Next quant used to remain fully offloaded
+    and fall to ~98k context, while the larger 73.453-GiB Q2_K_XL quant spilled
+    experts and reached ~133k. A smaller placement with identical metadata and
+    lazy table must provide at least as much safe context on the same system.
+    """
+    import tuner
+    from performance_target import PERFORMANCE_TARGETS
+
+    metadata = {
+        "general.architecture": "qwen4exp",
+        "qwen4exp.block_count": 48,
+        "qwen4exp.context_length": 262144,
+        "qwen4exp.embedding_length": 2560,
+        "qwen4exp.attention.head_count": 24,
+        "qwen4exp.attention.head_count_kv": 2,
+        "qwen4exp.attention.key_length": 256,
+        "qwen4exp.attention.value_length": 256,
+        "qwen4exp.attention.indexer.key_length": 128,
+        "qwen4exp.expert_count": 512,
+        "qwen4exp.expert_used_count": 10,
+        "qwen4exp.ssm.conv_kernel": 4,
+        "qwen4exp.ssm.state_size": 128,
+        "qwen4exp.ssm.group_count": 16,
+        "qwen4exp.ssm.time_step_rank": 48,
+        "qwen4exp.ssm.inner_size": 6144,
+        "qwen4exp.full_attention_interval": 4,
+        "__read_lazy_tensor_bytes__": 28_800_138_240,
+    }
+    iq1 = _fake_model_md(
+        tmp_path / "iq1",
+        "Qwen3.8-Flash-Next-UD-IQ1_S",
+        67.564157158,
+        metadata,
+    )
+    q2 = _fake_model_md(
+        tmp_path / "q2",
+        "Qwen3.8-Flash-Next-UD-Q2_K_XL",
+        73.452600151,
+        metadata,
+    )
+    mmproj = types.SimpleNamespace(
+        stat=lambda: types.SimpleNamespace(st_size=int(0.845 * 1024**3))
+    )
+    iq1.mmproj = mmproj
+    q2.mmproj = mmproj
+    monkeypatch.setattr(tuner.platform, "system", lambda: "Windows")
+    system = _fake_dual_gpu_system_with_vk_order(
+        large_free=31.71,
+        small_free=15.77,
+        ram_total=48,
+        ram_free=35.69,
+    )
+    profiles = load_profiles(SETTINGS_DIR)
+    contexts = {}
+    for model in (iq1, q2):
+        profile = match_profile(model.name, profiles, model.architecture)
+        cfg = compute_config(
+            model,
+            system,
+            profile,
+            perf_target=PERFORMANCE_TARGETS["safe"],
+            prompt_cache_ram_mib=2048,
+        )
+        contexts[model.name] = cfg.ctx
+
+    assert contexts[iq1.name] >= 131072
+    assert contexts[iq1.name] >= contexts[q2.name]
+
+
+def test_qwen4exp_rejects_exhausted_fixed_runtime_budget(tmp_path, monkeypatch) -> None:
+    import tuner
+    from performance_target import PERFORMANCE_TARGETS
+
+    model = _fake_model_md(
+        tmp_path,
+        "Qwen3.8-Flash-Next-UD-IQ1_S",
+        8.0,
+        {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "qwen4exp.context_length": 262144,
+            "qwen4exp.embedding_length": 2560,
+            "qwen4exp.attention.head_count": 24,
+            "qwen4exp.attention.head_count_kv": 2,
+            "qwen4exp.expert_count": 512,
+            "qwen4exp.expert_used_count": 10,
+            "qwen4exp.ssm.state_size": 128,
+            "qwen4exp.full_attention_interval": 4,
+        },
+    )
+    monkeypatch.setattr(tuner.platform, "system", lambda: "Windows")
+    profile = match_profile(model.name, load_profiles(SETTINGS_DIR), model.architecture)
+    starved = _fake_dual_gpu_system_with_vk_order(
+        large_free=3,
+        small_free=2,
+        ram_total=8,
+        ram_free=1,
+    )
+    with pytest.raises(MemoryError, match="minimum 2,048-token context"):
+        compute_config(
+            model,
+            starved,
+            profile,
+            perf_target=PERFORMANCE_TARGETS["safe"],
+        )
+
+
 def test_qwen4exp_plans_130k_with_lazy_ple_active_residency(
     tmp_path, monkeypatch
 ) -> None:
@@ -3414,9 +3776,7 @@ def test_qwen4exp_plans_130k_with_lazy_ple_active_residency(
     assert cfg.ctx == 130000
     assert cfg.ubatch == 64
     assert cfg.mapped_model_ram_gb == pytest.approx(model.read_lazy_size_gb)
-    assert cfg.mapped_model_resident_gb == pytest.approx(
-        model.read_lazy_size_gb * 0.05
-    )
+    assert cfg.mapped_model_resident_gb == pytest.approx(model.read_lazy_size_gb * 0.05)
     assert cfg.estimated_model_vram_gb + cfg.estimated_model_ram_gb == pytest.approx(
         model.placement_size_gb
     )
@@ -3835,15 +4195,11 @@ def test_force_gpu_unknown_name_falls_back_to_auto(tmp_path) -> None:
 
 def test_prerelease_build_recipes_keep_truthful_backend_qualified_identity() -> None:
     build_dir = ROOT / "building llama.cpp"
-    common = (build_dir / "windows_llama_build_common.ps1").read_text(
-        encoding="utf-8"
-    )
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(encoding="utf-8")
     vulkan = (build_dir / "llama_prerelease_vulkan_build.ps1").read_text(
         encoding="utf-8"
     )
-    hip = (build_dir / "llama_prerelease_hip_build.ps1").read_text(
-        encoding="utf-8"
-    )
+    hip = (build_dir / "llama_prerelease_hip_build.ps1").read_text(encoding="utf-8")
 
     assert "Get-LatestLlamaPrereleaseTag" in common
     assert "Get-ExactRemotePrereleaseTag" in common
@@ -3851,7 +4207,7 @@ def test_prerelease_build_recipes_keep_truthful_backend_qualified_identity() -> 
     assert '"${folderVersion}_${backendToken}_llama.cpp"' in common
     assert 'return "bUNKNOWN"' not in common
     assert '-BuildIsDev "ON"' in common
-    assert "$expectedRuntime = \"$semantic-dev\"" in common
+    assert '$expectedRuntime = "$semantic-dev"' in common
     assert "-ExpectedBuild $build" in common
     assert "--single-branch" in common and "--depth" not in common
     assert "-Backend Vulkan" in vulkan
@@ -3862,12 +4218,8 @@ def test_prerelease_build_recipes_keep_truthful_backend_qualified_identity() -> 
 
 def test_stable_build_recipes_resolve_latest_and_preserve_build_number() -> None:
     build_dir = ROOT / "building llama.cpp"
-    common = (build_dir / "windows_llama_build_common.ps1").read_text(
-        encoding="utf-8"
-    )
-    vulkan = (build_dir / "llama_stable_vulkan_build.ps1").read_text(
-        encoding="utf-8"
-    )
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(encoding="utf-8")
+    vulkan = (build_dir / "llama_stable_vulkan_build.ps1").read_text(encoding="utf-8")
     hip = (build_dir / "llama_stable_hip_build.ps1").read_text(encoding="utf-8")
 
     assert "Get-LatestStableSemanticTag" in common
@@ -3913,9 +4265,7 @@ def test_windows_vulkan_and_hip_recipe_matrix_is_complete_and_pinned() -> None:
         if vulkan_commit is not None:
             assert vulkan_commit.replace("Vulkan", "HIP") == hip_commit
 
-    common = (build_dir / "windows_llama_build_common.ps1").read_text(
-        encoding="utf-8"
-    )
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(encoding="utf-8")
     assert '"-DGGML_VULKAN=ON"' in common
     assert '"-DGGML_HIP=OFF"' in common
     assert '"-DGGML_HIP=ON"' in common
@@ -3929,7 +4279,7 @@ def test_windows_vulkan_and_hip_recipe_matrix_is_complete_and_pinned() -> None:
     assert "Get-HipCompatibilityResourceDir" in common
     assert "llvm-pr201563" in common
     assert "Copy-HipRuntimeDependencies" in common
-    assert 'New-Item -ItemType Junction' in common
+    assert "New-Item -ItemType Junction" in common
     for runtime_dll in (
         "amdhip64_7.dll",
         "amd_comgr_3.dll",
@@ -3963,12 +4313,8 @@ def test_cuda_setup_never_updates_a_stale_versioned_folder_in_place() -> None:
 
 def test_windows_build_recipes_tolerate_native_stderr_and_older_powershell() -> None:
     build_dir = ROOT / "building llama.cpp"
-    common = (build_dir / "windows_llama_build_common.ps1").read_text(
-        encoding="utf-8"
-    )
-    build_all = (build_dir / "build_all_windows_llama.ps1").read_text(
-        encoding="utf-8"
-    )
+    common = (build_dir / "windows_llama_build_common.ps1").read_text(encoding="utf-8")
+    build_all = (build_dir / "build_all_windows_llama.ps1").read_text(encoding="utf-8")
 
     # git/cmake progress on stderr is not a failure; the checked helper restores
     # the caller's preference and decides from the native exit code instead.
@@ -3994,9 +4340,7 @@ def test_windows_build_recipes_tolerate_native_stderr_and_older_powershell() -> 
 
 def test_legacy_cuda_recipes_use_safe_staging_and_ui_fallbacks() -> None:
     build_dir = ROOT / "building llama.cpp"
-    cuda = (build_dir / "setup_llamacpp_cuda.ps1").read_text(
-        encoding="utf-8-sig"
-    )
+    cuda = (build_dir / "setup_llamacpp_cuda.ps1").read_text(encoding="utf-8-sig")
     turbo = (build_dir / "setup_llamacpp_turboquant_cuda.ps1").read_text(
         encoding="utf-8-sig"
     )
@@ -4121,9 +4465,7 @@ def test_discovery_lists_backend_twins_only_after_server_build(
     assert "ocr_cli_only_llama.cpp" not in gui_map
 
 
-def test_dflash2_launch_finds_compatible_sibling_build(
-    tmp_path, monkeypatch
-) -> None:
+def test_dflash2_launch_finds_compatible_sibling_build(tmp_path, monkeypatch) -> None:
     import auto_tuner
 
     regular_root = tmp_path / "b10590_llama.cpp"
@@ -4239,9 +4581,7 @@ def test_resolver_matches_backend_qualified_fork_twins(tmp_path, monkeypatch) ->
     auto_dir.mkdir()
     container = tmp_path / "ai-local"
     mainline_hip = _fake_llama_server_path(container / "b10678_hip_llama.cpp")
-    fork2b_vulkan = _fake_llama_server_path(
-        container / "2b_b9551_vulkan_llama.cpp"
-    )
+    fork2b_vulkan = _fake_llama_server_path(container / "2b_b9551_vulkan_llama.cpp")
     fork2b_hip = _fake_llama_server_path(container / "2b_b9551_hip_llama.cpp")
     fork1b = _fake_llama_server_path(container / "1b_llama.cpp")
     for server in (mainline_hip, fork2b_vulkan, fork2b_hip, fork1b):
@@ -4305,12 +4645,42 @@ def test_gui_auto_select_preserves_backend_for_required_family() -> None:
     assert applied == [2]
 
     combo.index = 0
-    explicit = types.SimpleNamespace(
-        server_binary="2b_vulkan_llama/llama-server"
-    )
+    explicit = types.SimpleNamespace(server_binary="2b_vulkan_llama/llama-server")
     MainWindow._auto_select_fork(fake_window, explicit)
     assert combo.index == 1
     assert applied[-1] == 1
+
+
+def test_applying_fork_updates_exact_active_runtime(tmp_path, monkeypatch) -> None:
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    hip_root = tmp_path / "b10690_hip_llama.cpp"
+    vulkan_root = tmp_path / "b10690_vulkan_llama.cpp"
+    hip_binary = _fake_llama_server_path(hip_root)
+    vulkan_binary = _fake_llama_server_path(vulkan_root)
+    _write_fake_server(hip_binary)
+    _write_fake_server(vulkan_binary)
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(hip_root))
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window._fork_combo.blockSignals(True)
+    window._fork_combo.clear()
+    window._fork_combo.addItem(hip_root.name, hip_root)
+    window._fork_combo.addItem(vulkan_root.name, vulkan_root)
+    window._fork_path = hip_root
+    window._fork_combo.setCurrentIndex(1)
+    window._fork_combo.blockSignals(False)
+    window._apply_fork(1)
+
+    assert window._fork_path == vulkan_root
+    assert Path(window._active_llama_binary()).resolve() == vulkan_binary.resolve()
+    options = window._performance_runtime_options()
+    assert [option.backend_hint for option in options] == ["vulkan", "hip"]
+    assert options[0].active
+    window.close()
 
 
 def test_eagle3_dflash_and_dspark_drafter_detection(tmp_path) -> None:
@@ -5684,6 +6054,10 @@ def test_known_moe_architecture_survives_missing_expert_count(tmp_path) -> None:
         "kimi_k3",
         "ernie4_5_moe",
         "hunyuan_moe",
+        "hyv4",
+        "hy_v4",
+        "glm5next",
+        "glm5-next",
         "llada_moe",
         "nemotron-h-moe",
         "granitemoehybrid",
@@ -5702,6 +6076,20 @@ def test_known_moe_architecture_survives_missing_expert_count(tmp_path) -> None:
     }
     assert metadata_is_hybrid_architecture(bailing_md)
     assert metadata_attention_layer_count(bailing_md) == 8
+    glm_next_md = {
+        "general.architecture": "glm5next",
+        "glm5next.block_count": 45,
+    }
+    assert metadata_is_hybrid_architecture(glm_next_md)
+    # Fork-only KDA/DSA pool bytes are not yet exposed precisely, so every
+    # layer remains context-budgeted rather than applying a risky 11/45 guess.
+    assert metadata_attention_layer_count(glm_next_md) == 45
+    hy4_md = {
+        "general.architecture": "hyv4",
+        "hyv4.block_count": 78,
+    }
+    assert metadata_is_hybrid_architecture(hy4_md)
+    assert metadata_attention_layer_count(hy4_md) == 78
 
 
 def test_moe_alias_diagnostic_is_not_called_filename_fallback(tmp_path) -> None:
@@ -7262,12 +7650,46 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         == "kimi-k2.yaml"
     )
 
+    hy4 = match_profile("Hy4-preview-STQ1_0.gguf", profiles, "hyv4")
+    assert hy4.source_file == "hy4-preview.yaml"
+    assert hy4.max_context == 1048576
+    assert hy4.required_runtime_markers == ["hyv4"]
+    assert hy4.sampling["chat"] == {
+        "temperature": 0.9,
+        "top_k": 0,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+    }
+    assert "--jinja" in hy4.extra_args
+    assert "stock upstream llama.cpp does not yet" in hy4.notes
+    assert "cannot use embedded speculative decoding" in hy4.notes
+    assert match_profile("opaque-hy4.gguf", profiles, "hy_v4") is hy4
+
     glm52 = match_profile("GLM-5.2-UD-Q4_K_XL.gguf", profiles, "glm-dsa")
     assert glm52.source_file == "glm-5_2.yaml"
     assert glm52.max_context == 1048576
     assert glm52.min_llama_build == 10174
     assert glm52.ngram_method == "ngram-map-k4v"
+    glm53 = match_profile("GLM-5.3-UD-Q3_K_XL.gguf", profiles, "glm-dsa")
+    assert glm53 is glm52
+    assert "5.2 / 5.3" in glm53.display_name
+    assert "share the glm-dsa" in glm53.notes
     assert match_profile("opaque-glm.gguf", profiles, "glm-dsa") is glm52
+
+    glm53_flash = match_profile("GLM-5.3-Flash-UD-IQ4_XS.gguf", profiles, "glm5next")
+    assert glm53_flash.source_file == "glm-5_3_flash.yaml"
+    assert glm53_flash.max_context == 262140
+    assert glm53_flash.required_runtime_markers == ["glm5next"]
+    assert glm53_flash.sampling["chat"]["temperature"] == 1.0
+    assert glm53_flash.sampling["chat"]["top_p"] == 0.95
+    assert glm53_flash.draft_max == 3
+    assert glm53_flash.ngram_method == "ngram-map-k4v"
+    assert "still in open upstream" in glm53_flash.notes
+    assert "IQ3 or higher" in glm53_flash.notes
+    assert match_profile("opaque-flash.gguf", profiles, "glm5-next") is glm53_flash
+
     glm51 = match_profile("GLM-5.1-Q4_K_M.gguf", profiles, "glm5")
     assert glm51.source_file == "glm-5.yaml"
     assert glm51.min_llama_build == 0
@@ -7295,6 +7717,10 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         ("opaque-c.gguf", "kimi-k3", "kimi-k3.yaml"),
         ("opaque-c2.gguf", "bailingmoe3", "ling-3.yaml"),
         ("opaque-d.gguf", "glm-dsa", "glm-5_2.yaml"),
+        ("opaque-d2.gguf", "hyv4", "hy4-preview.yaml"),
+        ("opaque-d3.gguf", "hy_v4", "hy4-preview.yaml"),
+        ("opaque-d4.gguf", "glm5next", "glm-5_3_flash.yaml"),
+        ("opaque-d5.gguf", "glm5-next", "glm-5_3_flash.yaml"),
         ("opaque-e.gguf", "deepseek4", "deepseek-v4.yaml"),
         ("opaque-f.gguf", "graniteswitch", "granite-switch-4_1.yaml"),
         ("opaque-g.gguf", "qwen4exp", "qwen3_8_flash_next.yaml"),
@@ -7332,6 +7758,28 @@ def test_profile_minimum_build_gate(monkeypatch) -> None:
     assert allowed is True
     assert detected is None
     assert "Could not verify" in message
+
+
+def test_profile_runtime_capability_marker_gate(tmp_path) -> None:
+    """Fork-only architectures fail closed unless code is in the runtime."""
+    import tuner
+    from settings_loader import ModelProfile
+
+    server = tmp_path / ("llama-server.exe" if os.name == "nt" else "llama-server")
+    server.write_bytes(b"stock llama runtime")
+    if os.name != "nt":
+        server.chmod(0o755)
+    profile = ModelProfile(
+        display_name="GLM-5.3-Flash",
+        required_runtime_markers=["glm5next"],
+    )
+    allowed, message, detected = tuner.check_profile_build(profile, str(server))
+    assert allowed is False
+    assert detected is None
+    assert "glm5next" in message
+
+    (tmp_path / "llama.dll").write_bytes(b"patched arch GLM5NEXT loader")
+    assert tuner.check_profile_build(profile, str(server)) == (True, "", None)
 
 
 def test_new_big_profiles_have_jinja_where_required() -> None:
@@ -8562,9 +9010,7 @@ def test_update_worker_archive_overlay_preserves_settings(
         "_settings_file",
         lambda: app / "autotuner_settings.json",
     )
-    monkeypatch.setattr(
-        qt_launcher.app_settings, "app_data_dir", lambda: shared_data
-    )
+    monkeypatch.setattr(qt_launcher.app_settings, "app_data_dir", lambda: shared_data)
     worker = qt_launcher._UpdateWorker(app)
     # Force the release-ZIP path regardless of where pytest's tmpdir lives.
     worker._repo_root = None
