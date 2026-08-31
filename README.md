@@ -125,9 +125,10 @@ Performance Test Result:
   threads, and batch settings immediately.
 - **Measured performance suite with resumable short and full searches** — select a
   normal text/chat GGUF and click **🚀 Performance test**. The default **Quick
-  pass** uses at most 3.125% context, 16,384 prompt tokens, 128 decode tokens, and
-  a shared 20-minute execution budget per model. **Standard** validates 12.5% with
-  a 65,536 prompt cap; **Custom** accepts 0.01–100% uncapped. Optional **Try only
+  pass** uses at most 3.125% context, 16,384 prompt tokens, and 128 decode tokens,
+  with no overall model/suite deadline; startup, HTTP, and user-cancellation
+  safeguards remain active. **Standard** validates 12.5% with a 65,536 prompt cap;
+  **Custom** accepts 0.01–100% uncapped. Optional **Try only
   best Settings** remeasures a conservative shortlist from stable two-sample Quick
   evidence and falls back to the full search when evidence is missing or noisy.
   A provisional Quick pass never overwrites an existing validated Standard or
@@ -849,6 +850,7 @@ matches. See `settings/_default.yaml`.
 | `mellum.yaml` | JetBrains Mellum2-12B-A2.5B (Base/Instruct/Thinking), MoE | `mellum` |
 | `exaone-4_5.yaml` | LG EXAONE 4.5 33B VLM (dense, non-commercial license) | `exaone4` |
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
+| `granite-4_2.yaml` | IBM Granite 4.2 3B/8B/30B dense reasoning + tools | `granite` (filename-gated) |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
 | `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash | `muse-glimmer` |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
@@ -913,6 +915,13 @@ Notes on the new profiles:
   these exceed this machine's 48 GB (VRAM+RAM) — realistically need heavy
   `--n-cpu-moe` offload or are not runnable; the profile is for
   correctness/future smaller builds.
+- **Granite 4.2** adds IBM's dense 3B/8B/30B reasoning family with Jinja tool
+  calling and the required temp 1.0/top-p 0.95 sampling in every mode. All
+  checkpoint configs expose 131,072 native tokens; IBM separately advertises a
+  512k long-context extension only for 30B, so AutoTuner stays at the published
+  native serving limit until an explicit GGUF scaling recipe is validated. The
+  profile is filename-gated because its `granite` architecture is shared with
+  Granite 4.1.
 - **Granite Embedding R2** is an *embedding* model — it runs as an embedding
   endpoint (`--embeddings --pooling cls`, set via `extra_args`), not a
   chat/completion model. Sampling/draft fields are inert in that mode.
@@ -1028,10 +1037,11 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10679)
+## Server features (compatible through llama.cpp b10717)
 
 Build/version probing, complete profile-command matrices, and backend smoke
-checks are validated through exact stock **b10679** (`50f068fff`). The following
+checks are validated through exact stock **b10717** (`a32af33de`) on the local
+Windows Vulkan and HIP builds. The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
 
@@ -1069,6 +1079,29 @@ checks are validated through exact stock **b10679** (`50f068fff`). The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.5 — responsive hardware, complete Quick runs, Granite 4.2
+
+- **Responsive hardware strip:** long CPU/GPU names no longer become a hidden
+  minimum-width contract. The four fields use height-for-width wrapping and
+  reflow from one row to a two-column grid (or one column at compact widths),
+  while wide windows retain the original single row.
+- **Quick suites finish every selected job:** the shared 20-minute model budget
+  and per-run Quick deadline are removed. Startup, individual HTTP-request, and
+  explicit cancellation safeguards remain bounded, so a stuck server still
+  fails safely without discarding later modes merely because earlier models
+  were slow.
+- **IBM Granite 4.2:** a dedicated filename-gated 3B/8B/30B reasoning profile
+  adds the official temp 1.0/top-p 0.95 sampling, 131,072 native context,
+  embedded Jinja thinking/tool template support, and generic ngram speculation
+  without falsely claiming MTP. Granite 4.1 remains isolated despite the shared
+  `granite` architecture.
+- **llama.cpp b10717 validation:** exact stock Vulkan and HIP builds at commit
+  `a32af33de` loaded the official Granite 4.2 8B Q8_0 GGUF on GPU. Both returned
+  final content plus structured `reasoning_content`; Vulkan additionally
+  returned a structured `get_current_weather` tool call. The full 444-test
+  regression, Ruff, compileall, source/frozen smokes, and rebuilt Windows binary
+  evidence are in [`docs/v5.3.5-validation.md`](docs/v5.3.5-validation.md).
 
 ### v5.3.4 — aligned reports, multilingual UI, secure model control
 

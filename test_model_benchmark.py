@@ -285,6 +285,55 @@ def test_staged_search_is_bounded_and_combines_best_axes(monkeypatch) -> None:
     assert result.score(result.winner) > 1.03
 
 
+def test_nonpositive_total_timeout_keeps_full_runner_unlimited(monkeypatch) -> None:
+    runner = _runner(
+        BenchmarkLimits(
+            max_candidates=1,
+            confirmation_runs=0,
+            samples_per_candidate=2,
+            total_timeout_s=0.0,
+        )
+    )
+    calls: list[str] = []
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        calls.append(candidate.id)
+        # Deadline checks stay callable throughout an unlimited run.
+        runner._check_cancelled()
+        return _measured(candidate, 100.0, 100.0)
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: 10717
+    )
+    result = runner.run()
+
+    assert runner._deadline == 0.0
+    assert calls == ["baseline"]
+    assert result.runtime_build == 10717
+
+
+def test_unlimited_runner_still_waits_for_bounded_startup(monkeypatch) -> None:
+    runner = _runner(BenchmarkLimits(total_timeout_s=0.0, startup_timeout_s=30.0))
+    runner._deadline = 0.0
+    process = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: None),
+        get_logs=lambda: [],
+    )
+    requests: list[tuple[str, float]] = []
+
+    def fake_request(_port, _method, path, **kwargs):
+        requests.append((path, float(kwargs["timeout"])))
+        if path == "/health":
+            return 200, {}
+        return 200, {"data": [{"id": "benchmark-model"}]}
+
+    monkeypatch.setattr(runner, "_request_json", fake_request)
+    runner._wait_ready(process, 12345, "benchmark-model")
+
+    assert requests == [("/health", 2.0), ("/v1/models", 5.0)]
+
+
 def test_staged_search_checks_batch_interactions_for_two_thread_finalists(
     monkeypatch,
 ) -> None:
@@ -525,6 +574,48 @@ def test_suite_runs_jobs_sequentially_and_keeps_individual_failures(
     with pytest.raises(Exception, match="unexpected"):
         suite.run()
     assert order == ["first", "second"]
+
+
+def test_suite_ignores_legacy_shared_model_time_budget(monkeypatch) -> None:
+    """No mode is skipped merely because earlier modes/models were slow."""
+    first = _runner()
+    second = _runner()
+    order: list[str] = []
+    monkeypatch.setattr(
+        first,
+        "run",
+        lambda: order.append("first") or SimpleNamespace(name="first"),
+    )
+    monkeypatch.setattr(
+        second,
+        "run",
+        lambda: order.append("second") or SimpleNamespace(name="second"),
+    )
+    obsolete_budget = {"model_key": "same-model", "model_time_budget_s": 1e-9}
+    suite = BenchmarkSuiteRunner(
+        [
+            BenchmarkSuiteJob(
+                "same-model::safe",
+                "Model [safe]",
+                "safe",
+                first,
+                metadata=dict(obsolete_budget),
+            ),
+            BenchmarkSuiteJob(
+                "same-model::throughput",
+                "Model [throughput]",
+                "throughput",
+                second,
+                metadata=dict(obsolete_budget),
+            ),
+        ]
+    )
+
+    result = suite.run()
+
+    assert order == ["first", "second"]
+    assert len(result.successful) == 2
+    assert not result.failed
 
 
 def test_suite_continues_after_bounded_model_failure(monkeypatch) -> None:

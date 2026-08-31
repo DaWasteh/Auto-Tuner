@@ -93,6 +93,7 @@ def test_all_profiles_load() -> None:
         ),
         ("Gemma-4-26B-A4B-IQ3_M", "Gemma 4 (Google)"),
         ("gemma-4-E2B-it-BF16", "Gemma 4 (Google)"),
+        ("granite-4.2-30b-Q4_K_M", "Granite 4.2 (IBM reasoning)"),
         ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
         ("Ministral-3-14B-Reasoning-2512-Q6_K", "Ministral 3 (Mistral, reasoning)"),
         ("Mistral-Medium-3.5-128B-UD-IQ3_XXS", "Mistral Medium 3.x"),
@@ -1247,6 +1248,81 @@ def test_launch_button_recovers_after_selection_and_benchmark_cleanup(
     window.close()
 
 
+def test_hardware_bar_wraps_without_widening_main_window(
+    tmp_path, monkeypatch
+) -> None:
+    """Long CPU/GPU descriptions reflow into two rows instead of fixing width."""
+    global _QT_TEST_APP
+
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    _QT_TEST_APP = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    monkeypatch.setattr(
+        qt_launcher.app_settings,
+        "_settings_file",
+        lambda: tmp_path / "autotuner_settings.json",
+    )
+
+    window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
+    window.show()
+    _QT_TEST_APP.processEvents()
+    baseline_minimum_width = window.minimumSizeHint().width()
+    baseline_minimum_height = window.minimumSizeHint().height()
+
+    system = SystemInfo(
+        os_name="Windows",
+        cpu_name="AMD Ryzen Threadripper PRO 7995WX 96-Cores Processor",
+        cpu_cores_physical=96,
+        cpu_cores_logical=192,
+        total_ram_gb=128.0,
+        free_ram_gb=100.0,
+        gpus=[
+            GPUInfo(
+                index=0,
+                name="AMD Radeon RX 9070 XT Primary Graphics Adapter",
+                vendor="amd",
+                total_vram_mb=16 * 1024,
+                free_vram_mb=12 * 1024,
+            ),
+            GPUInfo(
+                index=1,
+                name="AMD Radeon AI PRO R9700 Secondary Graphics Adapter",
+                vendor="amd",
+                total_vram_mb=32 * 1024,
+                free_vram_mb=28 * 1024,
+            ),
+        ],
+        ignored_gpus=[
+            GPUInfo(
+                index=2,
+                name="Intel Very Long Integrated Graphics Controller",
+                vendor="intel",
+                total_vram_mb=1024,
+                free_vram_mb=512,
+            )
+        ],
+    )
+    window._update_sysinfo_labels(system)
+    _QT_TEST_APP.processEvents()
+
+    assert window.minimumSizeHint().width() <= baseline_minimum_width
+    assert window.minimumSizeHint().height() <= baseline_minimum_height + 100
+    assert window._sysbar.column_count == 2
+    assert 24 < window._sysbar.height() < 100
+    assert window._sysbar.sizeHint().height() < 100
+    positions = [
+        window._sysbar._grid.getItemPosition(index)[:2]
+        for index in range(window._sysbar._grid.count())
+    ]
+    assert positions == [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+    wide_width = window._sysbar._single_row_width() + 100
+    window.resize(wide_width, window.height())
+    _QT_TEST_APP.processEvents()
+    assert window._sysbar.column_count == 4
+    window.close()
+
+
 def test_ngram_defaults_on_but_explicit_model_off_survives(
     tmp_path, monkeypatch
 ) -> None:
@@ -1882,6 +1958,12 @@ def test_performance_analysis_keeps_quick_standard_and_custom_tiles_separate(
     setup = qt_launcher._PerformanceTuneSetupDialog("Example", 32768, 131072, 2)
     assert setup.benchmark_type() == "fast"
     assert setup.prompt_context_fraction() == pytest.approx(0.03125)
+    quick_limits = qt_launcher._benchmark_limits_for_workload(
+        setup.benchmark_type(), setup.prompt_context_fraction()
+    )
+    assert quick_limits.total_timeout_s == 0.0
+    assert quick_limits.startup_timeout_s > 0.0
+    assert quick_limits.request_timeout_s > 0.0
     assert setup.desired_context() == 0
     assert not setup.context_spin.isEnabled()
     assert not setup.real_validation.isEnabled()
@@ -5542,8 +5624,35 @@ def test_thinking_detection_falls_back_to_filename_when_no_template() -> None:
     assert metadata_supports_thinking({}, "Gemma-3-27B-it") is True
     assert metadata_supports_thinking({}, "DeepSeek-R1-Distill-Llama-70B") is True
     assert metadata_supports_thinking({}, "QwQ-32B-Preview") is True
+    assert metadata_supports_thinking({}, "granite-4.2-30b-Q4_K_M.gguf") is True
     # Pure non-thinking
     assert metadata_supports_thinking({}, "Mistral-7B-Instruct") is False
+
+
+def test_granite42_template_detects_reasoning_and_tool_calling() -> None:
+    from scanner import metadata_supports_thinking, metadata_supports_tool_use
+
+    metadata = {
+        "tokenizer.chat_template": (
+            "{%- set enable_thinking = enable_thinking if enable_thinking is defined "
+            "else True %}{%- if tools is iterable %}<tool_call>{{ tool_calls }}"
+            "</tool_call>{% endif %}<think>{{ reasoning_content }}</think>"
+        )
+    }
+    filename = "granite-4.2-8b-Q8_0.gguf"
+    assert metadata_supports_thinking(metadata, filename)
+    assert metadata_supports_tool_use(metadata, filename)
+    # Every filename spelling accepted by the profile remains useful when a
+    # community quant strips the tokenizer template from GGUF metadata.
+    for stripped_name in (
+        "granite-4.2-8b-Q8_0.gguf",
+        "granite4.2-8b-Q8_0.gguf",
+        "granite-4-2-8b-Q8_0.gguf",
+        "granite4_2-8b-Q8_0.gguf",
+    ):
+        assert metadata_supports_thinking({}, stripped_name)
+        assert metadata_supports_tool_use({}, stripped_name)
+
 
 
 def test_thinking_detection_excludes_qwen3_2507_instruct() -> None:
@@ -7771,6 +7880,32 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         == "deepseek-r1-v3.yaml"
     )
 
+    granite42 = match_profile(
+        "granite-4.2-30b-Q6_K.gguf", profiles, "granite"
+    )
+    assert granite42.source_file == "granite-4_2.yaml"
+    assert granite42.max_context == 131072
+    assert granite42.arch_fallback == []
+    assert granite42.sampling["chat"] == granite42.sampling["coding"] == {
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 0.95,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+    }
+    assert "--jinja" in granite42.extra_args
+    assert granite42.ngram_method == "ngram-mod"
+    # The shared `granite` architecture must not steal older checkpoints.
+    assert (
+        match_profile("granite-4.1-30b-Q4_K_M.gguf", profiles, "granite").source_file
+        == "granite-4_1.yaml"
+    )
+    assert (
+        match_profile("opaque-granite.gguf", profiles, "granite").source_file
+        == "_default.yaml"
+    )
+
     switch = match_profile("opaque-adapter-model.gguf", profiles, "graniteswitch")
     assert switch.source_file == "granite-switch-4_1.yaml"
     assert switch.min_llama_build == 10342
@@ -7857,6 +7992,7 @@ def test_new_big_profiles_have_jinja_where_required() -> None:
     for fname in (
         "glm-5.yaml",
         "glm-5_2.yaml",
+        "granite-4_2.yaml",
         "granite-switch-4_1.yaml",
         "seed-oss.yaml",
         "qwen3-vl.yaml",

@@ -314,6 +314,32 @@ def _benchmark_environment_fingerprint(
     }
 
 
+def _benchmark_limits_for_workload(
+    benchmark_type: str, prompt_context_fraction: float
+) -> BenchmarkLimits:
+    """Return the bounded workload while keeping Quick's total runtime unlimited."""
+    if benchmark_type == "fast":
+        return BenchmarkLimits(
+            max_candidates=7,
+            confirmation_runs=1,
+            samples_per_candidate=2,
+            # A Quick suite may contain many slow models. Keep startup/request
+            # safeguards but never abandon remaining candidates due to wall time.
+            total_timeout_s=0.0,
+            generated_tokens=128,
+            min_prompt_tokens=1024,
+            max_prompt_tokens=16384,
+            prompt_context_fraction=prompt_context_fraction,
+            max_draft_tokens=8,
+        )
+    custom = benchmark_type == "custom"
+    return BenchmarkLimits(
+        prompt_context_fraction=prompt_context_fraction,
+        min_prompt_tokens=1 if custom else 4096,
+        max_prompt_tokens=None if custom else 65536,
+    )
+
+
 def _application_theme_manager(
     app: QApplication, builtin_dir: Optional[Path] = None
 ) -> ThemeManager:
@@ -1493,8 +1519,9 @@ class _PerformanceTuneSetupDialog(QDialog):
             "build, and performance mode uses its own safe maximum context, so a "
             "smaller next model cannot inherit an unsafe context from the first. "
             "Quick pass uses at most 3.125% context and a 128-token decode window "
-            "with a shared 20-minute-per-model budget. Standard uses 12.5% (capped "
-            "at 65,536 prompt tokens); Custom accepts 0.01–100% without that cap."
+            "without a global runtime cutoff, so every selected model and mode can "
+            "finish. Standard uses 12.5% (capped at 65,536 prompt tokens); Custom "
+            "accepts 0.01–100% without that cap."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1541,9 +1568,10 @@ class _PerformanceTuneSetupDialog(QDialog):
             _setting_tooltip(
                 "Quick pass is the default short search; Standard validates the "
                 "12.5% workload; Custom uses the exact percentage below.",
-                "Quick pass uses at most 16,384 prompt tokens, 128 decode tokens, "
-                "and a 20-minute model budget. Standard uses a 65,536 prompt cap. "
-                "Custom values from 0.01% through 100% deliberately ignore it.",
+                "Quick pass uses at most 16,384 prompt tokens and 128 decode tokens "
+                "with no overall model/suite deadline. Startup and individual HTTP "
+                "timeouts still detect stuck servers. Standard uses a 65,536 prompt "
+                "cap. Custom values from 0.01% through 100% deliberately ignore it.",
             )
         )
         context_layout.addWidget(self.test_length_combo, 2, 1)
@@ -5496,6 +5524,142 @@ class ExpertPanel(QWidget):
 # Main window
 
 
+class _ResponsiveSystemBar(QWidget):
+    """Wrap hardware details without imposing their full text width on the window."""
+
+    _COMPACT_MIN_WIDTH = 640
+
+    def __init__(self, labels: Sequence[QLabel], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._labels = list(labels)
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(6, 2, 6, 2)
+        self._grid.setHorizontalSpacing(12)
+        self._grid.setVerticalSpacing(2)
+        self._columns = 0
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        for label in self._labels:
+            label.setWordWrap(True)
+            label.setMinimumWidth(0)
+            # Hardware names are informative text, not a window-width contract.
+            # Ignoring their horizontal size hint lets the grid give each label
+            # a narrower cell; QLabel's height-for-width support then wraps it.
+            label.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
+        self._reflow(len(self._labels))
+        # Reserve the initial one-line height before the first style/layout
+        # polish pass. Otherwise Qt can initially collapse a zero-width hint to
+        # height 0, then steal space from the user's splitters on the next theme
+        # refresh when the same bar becomes visible.
+        self.setMinimumHeight(self.minimumSizeHint().height())
+
+    @property
+    def column_count(self) -> int:
+        """Current number of hardware fields per row (used by UI regression tests)."""
+        return self._columns
+
+    def _single_row_width(self) -> int:
+        margins = self._grid.contentsMargins()
+        spacing = max(0, self._grid.horizontalSpacing())
+        text_width = sum(
+            label.fontMetrics().horizontalAdvance(label.text()) for label in self._labels
+        )
+        return (
+            margins.left()
+            + margins.right()
+            + text_width
+            + spacing * max(0, len(self._labels) - 1)
+        )
+
+    def _columns_for_width(self, width: int) -> int:
+        if width >= self._single_row_width():
+            return max(1, len(self._labels))
+        if width >= self._COMPACT_MIN_WIDTH:
+            return min(2, max(1, len(self._labels)))
+        return 1
+
+    def _reflow(self, columns: int) -> None:
+        columns = max(1, min(int(columns), max(1, len(self._labels))))
+        if columns == self._columns:
+            return
+        for label in self._labels:
+            self._grid.removeWidget(label)
+        for index, label in enumerate(self._labels):
+            self._grid.addWidget(label, index // columns, index % columns)
+        for column in range(max(1, len(self._labels))):
+            self._grid.setColumnStretch(column, 1 if column < columns else 0)
+        self._columns = columns
+        self._grid.invalidate()
+        self.updateGeometry()
+
+    def _wrapped_height(self, width: int, columns: Optional[int] = None) -> int:
+        columns = columns or self._columns_for_width(width)
+        margins = self._grid.contentsMargins()
+        horizontal_spacing = max(0, self._grid.horizontalSpacing())
+        vertical_spacing = max(0, self._grid.verticalSpacing())
+        cell_width = max(
+            1,
+            (
+                width
+                - margins.left()
+                - margins.right()
+                - horizontal_spacing * max(0, columns - 1)
+            )
+            // columns,
+        )
+        row_heights: List[int] = []
+        for start in range(0, len(self._labels), columns):
+            row_heights.append(
+                max(
+                    label.heightForWidth(cell_width)
+                    if label.hasHeightForWidth()
+                    else label.sizeHint().height()
+                    for label in self._labels[start : start + columns]
+                )
+            )
+        return (
+            margins.top()
+            + margins.bottom()
+            + sum(row_heights)
+            + vertical_spacing * max(0, len(row_heights) - 1)
+        )
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._wrapped_height(max(1, width))
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        # QWidget/QGridLayout otherwise asks every horizontally-Ignored label
+        # for its height at an almost-zero width. That can produce a bogus
+        # hundreds-of-pixels vertical hint even though the real two-column bar
+        # needs only a few lines at its current width.
+        width = max(1, self.width())
+        return QSize(0, self._wrapped_height(width, self._columns_for_width(width)))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        margins = self._grid.contentsMargins()
+        line_height = max(
+            (label.fontMetrics().height() for label in self._labels), default=0
+        )
+        return QSize(0, margins.top() + margins.bottom() + line_height)
+
+    def refresh_layout(self) -> None:
+        """Re-evaluate wrapping after hardware text or font metrics change."""
+        self._reflow(self._columns_for_width(max(0, self.width())))
+        self.updateGeometry()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._reflow(self._columns_for_width(event.size().width()))
+        super().resizeEvent(event)
+
+
 class MainWindow(QMainWindow):
     # Signal carrying SystemInfo updates from the background sysinfo thread.
     # Qt widgets are NOT thread-safe — touching a QLabel from a daemon
@@ -5955,19 +6119,20 @@ class MainWindow(QMainWindow):
         more.hide()
 
         # ── Sysinfo bar ────────────────────────────────────────────────
-        sysbar = QWidget()
-        sl = QHBoxLayout(sysbar)
-        sl.setContentsMargins(6, 1, 6, 1)
         self._cpu_lbl = QLabel("CPU: —")
         self._vram_lbl = QLabel("VRAM: —")
         self._ram_lbl = QLabel("RAM: —")
         self._gpu_lbl = QLabel("GPU: —")
-        for lbl in (self._cpu_lbl, self._vram_lbl, self._ram_lbl, self._gpu_lbl):
+        hardware_labels = (
+            self._cpu_lbl,
+            self._vram_lbl,
+            self._ram_lbl,
+            self._gpu_lbl,
+        )
+        for lbl in hardware_labels:
             lbl.setProperty("themeRole", "sysbar")
-            sl.addWidget(lbl)
-        sl.addStretch()
-        sysbar.setMaximumHeight(24)
-        sysbar.setProperty("themeRole", "sysbar")
+        self._sysbar = _ResponsiveSystemBar(hardware_labels)
+        self._sysbar.setProperty("themeRole", "sysbar")
 
         # ── Filter + model list ────────────────────────────────────────
         fr = QWidget()
@@ -6588,7 +6753,7 @@ class MainWindow(QMainWindow):
         root_l = QVBoxLayout(root)
         root_l.setContentsMargins(4, 0, 4, 0)
         root_l.setSpacing(0)
-        root_l.addWidget(sysbar)
+        root_l.addWidget(self._sysbar)
         root_l.addWidget(main_split, 1)
         root_l.addWidget(btn_row)
         self.setCentralWidget(root)
@@ -11541,28 +11706,9 @@ class MainWindow(QMainWindow):
                                     "full search retained"
                                 )
 
-                        if benchmark_type == "fast":
-                            limits = BenchmarkLimits(
-                                max_candidates=7,
-                                confirmation_runs=1,
-                                samples_per_candidate=2,
-                                total_timeout_s=1200.0,
-                                generated_tokens=128,
-                                min_prompt_tokens=1024,
-                                max_prompt_tokens=16384,
-                                prompt_context_fraction=prompt_context_fraction,
-                                max_draft_tokens=8,
-                            )
-                        else:
-                            limits = BenchmarkLimits(
-                                prompt_context_fraction=prompt_context_fraction,
-                                min_prompt_tokens=(
-                                    1 if benchmark_type == "custom" else 4096
-                                ),
-                                max_prompt_tokens=(
-                                    None if benchmark_type == "custom" else 65536
-                                ),
-                            )
+                        limits = _benchmark_limits_for_workload(
+                            benchmark_type, prompt_context_fraction
+                        )
                         runner = BenchmarkRunner(
                             model=cast(ModelEntry, options["model"]),
                             profile=candidate_profile,
@@ -11615,9 +11761,6 @@ class MainWindow(QMainWindow):
                                     "drafter_key": drafter_key,
                                     "drafter_label": drafter_label,
                                     "try_best_only": bool(candidate_plan),
-                                    "model_time_budget_s": (
-                                        1200.0 if benchmark_type == "fast" else 0.0
-                                    ),
                                 },
                             )
                         )
@@ -11681,7 +11824,7 @@ class MainWindow(QMainWindow):
         if benchmark_type == "fast":
             test_label = (
                 "Quick pass (≤3.125% context, 16,384-token cap, 128 decode tokens, "
-                "20-minute budget per model)"
+                "no overall runtime cutoff)"
             )
         elif benchmark_type == "quick":
             test_label = "Standard test (12.5% context, 65,536-token prompt cap)"
@@ -12622,6 +12765,8 @@ class MainWindow(QMainWindow):
             self._gpu_lbl.setText(txt)
         else:
             self._gpu_lbl.setText("GPU: keine")
+
+        self._sysbar.refresh_layout()
 
         self._log(
             f"[SysInfo] CPU={s.cpu_name}, VRAM={s.free_vram_gb:.1f}/{s.total_vram_gb:.1f}GB, RAM={s.free_ram_gb:.1f}/{s.total_ram_gb:.1f}GB, GPU={[g.name for g in s.gpus]}"

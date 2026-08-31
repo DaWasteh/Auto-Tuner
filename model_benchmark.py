@@ -64,6 +64,8 @@ class BenchmarkLimits:
     samples_per_candidate: int = 2
     startup_timeout_s: float = 300.0
     request_timeout_s: float = 900.0
+    # Zero or a negative value disables only the overall sweep deadline;
+    # startup and per-request timeouts plus explicit cancellation stay active.
     total_timeout_s: float = 7200.0
     generated_tokens: int = 256
     min_prompt_tokens: int = 4096
@@ -759,7 +761,6 @@ class BenchmarkRunner:
             candidate_runs + self.limits.confirmation_runs + max(0, draft_runs)
         )
         self._deadline = 0.0
-        self._deadline_cap = 0.0
 
     def _sample_spread_limit(self) -> float:
         # Speculative acceptance legitimately varies across the deliberately
@@ -806,7 +807,7 @@ class BenchmarkRunner:
     def _check_cancelled(self) -> None:
         if self._cancel.is_set():
             raise BenchmarkCancelled("Performance tuning cancelled")
-        if self._deadline and time.monotonic() >= self._deadline:
+        if self._deadline > 0.0 and time.monotonic() >= self._deadline:
             raise BenchmarkFailure("Performance tuning reached its total time limit")
 
     def _emit(self, message: str) -> None:
@@ -824,7 +825,7 @@ class BenchmarkRunner:
     ) -> Tuple[int, dict]:
         self._check_cancelled()
         request_timeout = float(timeout or self.limits.request_timeout_s)
-        if self._deadline:
+        if self._deadline > 0.0:
             request_timeout = min(
                 request_timeout, max(0.1, self._deadline - time.monotonic())
             )
@@ -862,8 +863,11 @@ class BenchmarkRunner:
                 pass
 
     def _wait_ready(self, process: ServerProcess, port: int, alias: str) -> None:
-        timeout_at = min(
-            self._deadline, time.monotonic() + self.limits.startup_timeout_s
+        startup_deadline = time.monotonic() + self.limits.startup_timeout_s
+        timeout_at = (
+            min(self._deadline, startup_deadline)
+            if self._deadline > 0.0
+            else startup_deadline
         )
         last_error = "server still loading"
         while time.monotonic() < timeout_at:
@@ -1149,9 +1153,8 @@ class BenchmarkRunner:
 
     def run(self) -> BenchmarkResult:
         started = time.monotonic()
-        self._deadline = started + self.limits.total_timeout_s
-        if self._deadline_cap > 0.0:
-            self._deadline = min(self._deadline, self._deadline_cap)
+        total_timeout_s = float(self.limits.total_timeout_s)
+        self._deadline = started + total_timeout_s if total_timeout_s > 0.0 else 0.0
         if self.base_config.ctx <= 0:
             raise BenchmarkFailure("desired context must be positive")
         if self.limits.max_candidates < 1:
@@ -1489,7 +1492,6 @@ class BenchmarkSuiteRunner:
         completed = 0
         outcomes: List[BenchmarkSuiteJobResult] = []
         stop_reason = ""
-        model_deadlines: Dict[str, float] = {}
         for index, job in enumerate(self.jobs, start=1):
             if self._cancel.is_set():
                 raise BenchmarkCancelled("Performance tuning cancelled")
@@ -1505,34 +1507,6 @@ class BenchmarkSuiteRunner:
                 break
             allocation = max(1, job.runner._total_runs)
             prefix = f"[{index}/{len(self.jobs)}] {job.label}"
-            model_key = self._job_model_key(job)
-            try:
-                model_budget_s = max(
-                    0.0,
-                    float(str(job.metadata.get("model_time_budget_s", 0.0) or 0.0)),
-                )
-            except (TypeError, ValueError):
-                model_budget_s = 0.0
-            if model_budget_s > 0.0:
-                deadline = model_deadlines.setdefault(
-                    model_key, time.monotonic() + model_budget_s
-                )
-                if time.monotonic() >= deadline:
-                    budget_outcome = BenchmarkSuiteJobResult(
-                        job=job,
-                        error="quick-pass model time budget exhausted before this mode",
-                    )
-                    outcomes.append(budget_outcome)
-                    completed += allocation
-                    self.progress(
-                        min(total, completed), total, f"{prefix}: skipped (time budget)"
-                    )
-                    if self.checkpoint is not None:
-                        self.checkpoint(budget_outcome)
-                    continue
-                job.runner._deadline_cap = deadline
-            else:
-                job.runner._deadline_cap = 0.0
 
             def relay(done: int, _job_total: int, message: str) -> None:
                 self.progress(

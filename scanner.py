@@ -1151,6 +1151,10 @@ _THINKING_NAME_HINTS = (
     "gemma",
     "deepseek-r",
     "qwq",
+    "granite-4.2",
+    "granite4.2",
+    "granite-4-2",
+    "granite4_2",
     "reasoning",
     "thinking",
 )
@@ -1220,6 +1224,10 @@ _TOOLUSE_TEMPLATE_MARKERS = (
 _TOOLUSE_NAME_HINTS = (
     "hermes",
     "functionary",
+    "granite-4.2",
+    "granite4.2",
+    "granite-4-2",
+    "granite4_2",
     "tool",
 )
 

@@ -1,0 +1,51 @@
+display_name: "Granite 4.2 (IBM reasoning)"
+patterns:
+  - granite-4.2
+  - granite4.2
+  - granite-4-2
+  - granite4_2
+
+# Granite 4.2 reuses general.architecture=granite from earlier generations.
+# Do not claim it as an architecture fallback: an opaque Granite 4.1 requant
+# is indistinguishable from 4.2 without an explicit filename marker.
+
+# Every official Transformers config and serving recipe uses 131,072 native
+# tokens. IBM separately advertises a long-context extension to 512K for the
+# 30B checkpoint; do not enable an unverified generic YaRN recipe for 3B/8B.
+max_context: 131072
+recommended_kv_quant: q8_0
+
+# IBM requires these values across chat, reasoning, coding, and tool calling.
+# No top-k cutoff is specified, so top_k=0 leaves nucleus sampling authoritative.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+# Granite 4.2 does not publish an embedded MTP/NextN head. Keep generic
+# draftless speculation rather than falsely selecting draft-mtp.
+ngram_method: ngram-mod
+
+notes: >
+  IBM Granite 4.2 is a dense 3B/8B/30B reasoning family with default full
+  thinking, optional non-thinking and low-effort modes, reasoning-augmented
+  tool calling, coding, and multilingual chat. The embedded Jinja template
+  accepts enable_thinking, low_effort, and reasoning_effort=low; AutoTuner's
+  Expert reasoning controls can pass the matching template kwargs. All three
+  checkpoints are natively 128k. IBM advertises a 512k long-context extension
+  only for 30B, while its published serving commands and checkpoint config use
+  131,072; this profile therefore keeps the safe native limit. Apache 2.0.
