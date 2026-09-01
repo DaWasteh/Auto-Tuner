@@ -891,13 +891,19 @@ def test_source_and_frozen_settings_merge_into_shared_user_data(
         '{"fork_path": "frozen-fork", "nested": {"frozen": 2, "same": "new"}}',
         encoding="utf-8",
     )
-    # Deterministically make the frozen file the newer conflict winner.
-    source_stat = source_settings.stat()
-    frozen_mtime = source_stat.st_mtime_ns + 10_000_000
-    source_settings.touch()
+    # Deterministically make the frozen file the newer conflict winner. Set
+    # both sides explicitly: touching source *after* deriving frozen_mtime made
+    # source newer on slower macOS/Python 3.10 runners.
     import os
 
+    source_mtime = max(
+        source_settings.stat().st_mtime_ns,
+        frozen_settings.stat().st_mtime_ns,
+    )
+    frozen_mtime = source_mtime + 1_000_000_000
+    os.utime(source_settings, ns=(source_mtime, source_mtime))
     os.utime(frozen_settings, ns=(frozen_mtime, frozen_mtime))
+    assert source_settings.stat().st_mtime_ns < frozen_settings.stat().st_mtime_ns
     monkeypatch.setenv("AUTOTUNER_DATA_DIR", str(data_dir))
     monkeypatch.setattr(
         app_settings,
