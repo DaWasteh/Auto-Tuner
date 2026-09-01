@@ -151,7 +151,7 @@ def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
     assert profile.ngram_method == "ngram-map-k4v"
     assert profile.recommended_kv_quant == "q4_0"
     assert profile.performance_target == "safe"
-    assert profile.min_llama_build == 10666
+    assert profile.min_llama_build == 10737
     assert match_profile("opaque-preview.gguf", profiles, "qwen4exp") is profile
 
     model = ModelEntry(
@@ -803,6 +803,40 @@ def test_build_command_dedupes_value_flag_pair_in_extras(tmp_path) -> None:
     assert "dio" not in cmd[idx + 1 :]
 
 
+@pytest.mark.parametrize(
+    ("model_name", "flag", "profile_value", "override_value"),
+    (
+        (
+            "Gemma-4-12B-Q8_0",
+            "--samplers",
+            "temperature;top_p;top_k",
+            "top_k;temperature",
+        ),
+        (
+            "granite-embedding-311m-multilingual-r2-Q8_0",
+            "--pooling",
+            "cls",
+            "mean",
+        ),
+    ),
+)
+def test_build_command_dedupes_profile_value_flags_without_orphans(
+    tmp_path, model_name, flag, profile_value, override_value
+) -> None:
+    """Profile-owned value flags consume a rejected override's value too."""
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, model_name, size_gb=4.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile)
+
+    cmd = build_command(model, cfg, profile, extra_args=[flag, override_value])
+
+    assert cmd.count(flag) == 1
+    index = cmd.index(flag)
+    assert cmd[index + 1] == profile_value
+    assert override_value not in cmd
+
+
 def test_load_mode_b10151_compatibility_adaptation(monkeypatch) -> None:
     import tuner
 
@@ -839,6 +873,113 @@ def test_load_mode_b10151_compatibility_adaptation(monkeypatch) -> None:
     )
     assert current == ["llama-server", "--load-mode", "mmap+mlock"]
     assert notes == []
+
+
+def test_lazy_mode_b10700_compatibility_adaptation() -> None:
+    import tuner
+
+    current = ["llama-server", "--lazy-mode", "auto", "-m", "model.gguf"]
+    legacy, notes = tuner._adapt_lazy_mode_for_binary(
+        current, {"--tensor-read-lazy"}
+    )
+    assert legacy[1:3] == ["--tensor-read-lazy", "auto"]
+    assert "b10700 option rename" in notes[0]
+
+    old_inline = ["llama-server", "--tensor-read-lazy=auto", "-m", "model.gguf"]
+    modern, notes = tuner._adapt_lazy_mode_for_binary(
+        old_inline, {"-lzm", "--lazy-mode"}
+    )
+    assert modern[1] == "--lazy-mode=auto"
+    assert "--tensor-read-lazy -> --lazy-mode" in notes[0]
+
+    unchanged, notes = tuner._adapt_lazy_mode_for_binary(
+        current, {"-lzm", "--lazy-mode"}
+    )
+    assert unchanged == current
+    assert notes == []
+
+
+def test_b10743_nextn_regression_disables_only_mtp(monkeypatch) -> None:
+    import tuner
+
+    cmd = [
+        "llama-server",
+        "-m",
+        "target.gguf",
+        "-md",
+        "mtp-head.gguf",
+        "--spec-type",
+        "draft-mtp,ngram-map-k4v",
+        "--spec-draft-n-max",
+        "2",
+        "--spec-draft-p-min",
+        "0.75",
+        "--spec-ngram-map-k4v-size-n",
+        "16",
+    ]
+    monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _binary: 10743)
+    adapted, notes = tuner._adapt_nextn_regression_for_binary(cmd)
+
+    assert "-md" not in adapted and "mtp-head.gguf" not in adapted
+    assert "draft-mtp" not in " ".join(adapted)
+    assert adapted[adapted.index("--spec-type") + 1] == "ngram-map-k4v"
+    assert not any(token.startswith("--spec-draft-") for token in adapted)
+    assert "--spec-ngram-map-k4v-size-n" in adapted
+    assert "fixed in b10749+" in notes[0]
+
+    # Numeric build probing is enough for this known crash even when an unusual
+    # wrapper cannot provide parseable --help output.
+    monkeypatch.setattr(tuner, "_probe_supported_flags", lambda _binary: None)
+    no_help, notes = tuner.prepare_command_for_binary(cmd)
+    assert "draft-mtp" not in " ".join(no_help)
+    assert no_help[no_help.index("--spec-type") + 1] == "ngram-map-k4v"
+    assert "fixed in b10749+" in notes[0]
+
+    for build in (10740, 10749):
+        monkeypatch.setattr(
+            tuner, "_probe_binary_build_number", lambda _binary, build=build: build
+        )
+        unchanged, notes = tuner._adapt_nextn_regression_for_binary(cmd)
+        assert unchanged == cmd
+        assert notes == []
+
+
+def test_b10743_rejects_array_backed_nextn_target_but_allows_scalar_qwen(
+    tmp_path, monkeypatch
+) -> None:
+    import tuner
+
+    model = _fake_model(tmp_path, "GLM-5-MTP-Q4_K_M", size_gb=30.0)
+    model.metadata = {
+        "general.architecture": "glm-dsa",
+        "glm-dsa.block_count": 46,
+        "glm-dsa.nextn_predict_layers": 1,
+        "glm-dsa.attention.head_count_kv": [4] * 46,
+        "__mtp_scan__": "found",
+    }
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10743)
+
+    allowed, message, detected = tuner.check_model_build(model, "b10743-server")
+    assert not allowed
+    assert detected == 10743
+    assert "array has 46 entries" in message
+    assert "expects 45" in message
+    assert "b10749+" in message
+
+    scalar_model = copy.deepcopy(model)
+    scalar_model.metadata["glm-dsa.attention.head_count_kv"] = 4
+    allowed, message, detected = tuner.check_model_build(
+        scalar_model, "b10743-server"
+    )
+    assert allowed
+    assert message == ""
+    assert detected == 10743
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10749)
+    allowed, message, detected = tuner.check_model_build(model, "b10749-server")
+    assert allowed
+    assert message == ""
+    assert detected == 10749
 
 
 def test_effective_load_mode_normalizes_legacy_and_garbage(tmp_path) -> None:
@@ -1251,7 +1392,7 @@ def test_launch_button_recovers_after_selection_and_benchmark_cleanup(
 def test_hardware_bar_wraps_without_widening_main_window(
     tmp_path, monkeypatch
 ) -> None:
-    """Long CPU/GPU descriptions reflow into two rows instead of fixing width."""
+    """Long hardware text stays width-neutral and wraps below its measured fit."""
     global _QT_TEST_APP
 
     qt_launcher = pytest.importorskip("qt_launcher")
@@ -1266,6 +1407,7 @@ def test_hardware_bar_wraps_without_widening_main_window(
     window = qt_launcher.MainWindow(tmp_path, SETTINGS_DIR, start_background=False)
     window.show()
     _QT_TEST_APP.processEvents()
+    baseline_width = window.width()
     baseline_minimum_width = window.minimumSizeHint().width()
     baseline_minimum_height = window.minimumSizeHint().height()
 
@@ -1305,20 +1447,32 @@ def test_hardware_bar_wraps_without_widening_main_window(
     window._update_sysinfo_labels(system)
     _QT_TEST_APP.processEvents()
 
+    assert window.width() <= baseline_width + 2
     assert window.minimumSizeHint().width() <= baseline_minimum_width
-    assert window.minimumSizeHint().height() <= baseline_minimum_height + 100
+
+    # Font metrics differ across Qt/platform packages (Fedora 44's metrics fit
+    # this text at the default 1320 px while Windows' do not). Exercise the
+    # responsive contract relative to the measured threshold instead of
+    # assuming that a particular distro must choose two columns at 1320 px.
+    single_row_width = window._sysbar._single_row_width()
+    compact_width = max(window._sysbar._COMPACT_MIN_WIDTH, single_row_width - 1)
+    assert compact_width < single_row_width
+    window._sysbar.resize(compact_width, window._sysbar.height())
+    window._sysbar.refresh_layout()
+
     assert window._sysbar.column_count == 2
-    assert 24 < window._sysbar.height() < 100
-    assert window._sysbar.sizeHint().height() < 100
+    compact_height = window._sysbar.heightForWidth(compact_width)
+    assert window._sysbar.minimumSizeHint().height() < compact_height < 200
+    assert window.minimumSizeHint().height() <= baseline_minimum_height + compact_height
     positions = [
         window._sysbar._grid.getItemPosition(index)[:2]
         for index in range(window._sysbar._grid.count())
     ]
     assert positions == [(0, 0), (0, 1), (1, 0), (1, 1)]
 
-    wide_width = window._sysbar._single_row_width() + 100
-    window.resize(wide_width, window.height())
-    _QT_TEST_APP.processEvents()
+    wide_width = single_row_width + 100
+    window._sysbar.resize(wide_width, window._sysbar.height())
+    window._sysbar.refresh_layout()
     assert window._sysbar.column_count == 4
     window.close()
 
@@ -3346,6 +3500,32 @@ def test_qwen38_dflash2_uses_trained_depth_and_requires_capable_build(
     assert detected == 10658
 
 
+def test_b10743_rejects_standalone_mtp_draft_head(tmp_path, monkeypatch) -> None:
+    import tuner
+
+    draft = _fake_model(tmp_path, "mtp-gemma-4-12b-it-v2", size_gb=0.5)
+    draft.metadata = {
+        "general.architecture": "gemma4-assistant",
+        "gemma4-assistant.block_count": 4,
+        "gemma4-assistant.nextn_predict_layers": 4,
+        "__mtp_scan__": "found",
+    }
+    assert draft.drafter_spec_type == "mtp"
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10743)
+    allowed, message, detected = tuner.check_draft_model_build(draft, "server")
+    assert not allowed
+    assert detected == 10743
+    assert "NextN loader regression" in message
+    assert "b10749+" in message
+
+    monkeypatch.setattr(tuner, "probe_binary_build_number", lambda _binary: 10749)
+    allowed, message, detected = tuner.check_draft_model_build(draft, "server")
+    assert allowed
+    assert message == ""
+    assert detected is None
+
+
 def test_plain_dflash_uses_block_size_minus_anchor(tmp_path) -> None:
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Qwen3.6-27B-Q4_K_M", size_gb=15.0)
@@ -3935,7 +4115,7 @@ def test_qwen4exp_plans_130k_with_lazy_ple_active_residency(
     assert "file-backed" in (cfg.warning or "")
 
     cmd = build_command(model, cfg, profile)
-    lazy_index = cmd.index("--tensor-read-lazy")
+    lazy_index = cmd.index("--lazy-mode")
     assert cmd[lazy_index + 1] == "auto"
 
 

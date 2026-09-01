@@ -9,6 +9,7 @@ import app_settings
 from model_benchmark import (
     BenchmarkCancelled,
     BenchmarkCandidate,
+    BenchmarkFailure,
     BenchmarkLimits,
     BenchmarkRunner,
     BenchmarkSample,
@@ -80,6 +81,49 @@ def test_candidate_generation_is_deterministic_and_valid() -> None:
     drafts = draft_candidates(batches[0], maximum=4)
     assert [item.draft_n_max for item in drafts] == [1, 3, 4]
     assert all(item.batch == batches[0].batch for item in drafts)
+
+
+def test_benchmark_refuses_mtp_variant_disabled_by_binary_compatibility(
+    monkeypatch,
+) -> None:
+    import model_benchmark
+
+    runner = _runner()
+    runner.enable_speculative = True
+    runner.process_factory = lambda *_args, **_kwargs: pytest.fail(
+        "disabled MTP benchmark must not start a process"
+    )
+    candidate = baseline_candidate(_config(), effective_draft_n_max=2)
+
+    monkeypatch.setattr(
+        model_benchmark,
+        "build_command",
+        lambda **_kwargs: ["b10743-server", "-m", "model.gguf"],
+    )
+    monkeypatch.setattr(
+        model_benchmark,
+        "check_profile_build",
+        lambda *_args: (True, "", 10743),
+    )
+    monkeypatch.setattr(
+        model_benchmark,
+        "check_model_build",
+        lambda *_args: (True, "", 10743),
+    )
+    monkeypatch.setattr(
+        model_benchmark,
+        "prepare_command_for_binary",
+        lambda cmd: (
+            cmd,
+            [
+                "draft-mtp disabled for llama.cpp b10743 "
+                "(upstream NextN regression; fixed in b10749+)"
+            ],
+        ),
+    )
+
+    with pytest.raises(BenchmarkFailure, match="Cannot benchmark.*MTP variant"):
+        runner._benchmark_candidate(candidate)
 
 
 def test_standard_measurement_uses_twelve_and_a_half_percent() -> None:

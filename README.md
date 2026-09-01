@@ -1037,11 +1037,13 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10717)
+## Server features (compatible through llama.cpp b10743)
 
 Build/version probing, complete profile-command matrices, and backend smoke
-checks are validated through exact stock **b10717** (`a32af33de`) on the local
-Windows Vulkan and HIP builds. The following
+checks are validated through exact stock **b10743** (`8887a48f0`) on the local
+Windows Vulkan and HIP builds. AutoTuner quarantines the upstream NextN
+regression in b10741-b10748 and points affected users to b10749+ rather than
+letting llama-server abort during model or draft-context loading. The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
 
@@ -1050,7 +1052,7 @@ Windows Vulkan and HIP builds. The following
 | `-fa [on\|off\|auto]` | ✅ Emits `-fa on` **or** `-fa off` explicitly; model profiles such as Unlimited-OCR can require the reference non-FA path |
 | `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ All in the dropdown |
 | `--fit off` | ✅ Always emitted so llama.cpp's own auto-fit pass (default `on`) doesn't silently re-adjust the computed values (AutoTuner is the authority) |
-| `--tensor-read-lazy auto` | ✅ Explicit for giant architecture-marked row tables (qwen4exp/Gemma 4); safely pruned on pre-b10653 builds. Lazy bytes are budgeted as host mappings, not GPU-splittable layer weights. |
+| `--lazy-mode auto` / `-lzm` | ✅ Current b10700+ spelling, explicit for giant architecture-marked row tables (qwen4exp/Gemma 4). Compatibility preparation translates it to legacy `--tensor-read-lazy` when that is what the selected binary advertises, or prunes the complete pair when lazy reads are unavailable. Lazy bytes remain budgeted as host mappings, not GPU-splittable layer weights. |
 | `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s; users can append `--no-perf` |
 | `--metrics` | ✅ Prometheus endpoint `GET /metrics`, including b10282+ speculative draft/accept counters (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
@@ -1062,7 +1064,7 @@ Windows Vulkan and HIP builds. The following
 | `--jinja` | ✅ Ticked visibly |
 | `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
 | `-md` external drafter | ✅ Without `--spec-type` — the presence of `-md` enables the draft path automatically in mainline (verified b9442) |
-| `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.) |
+| `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.). On broken b10741-b10748 runtimes, command preparation disables only MTP while preserving compatible ngram speculation; standalone MTP heads and array-backed NextN targets are rejected before launch. Full MTP resumes on b10749+. |
 | `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. Generic DSpark is emitted on b10164+; Nemotron3.5 uses its b10665 profile gate. DFlash2 reuses `draft-dflash` and accepts mainline b10658+ (reviewed PR #27342 builds remain a legacy fallback). |
 | `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
@@ -1079,6 +1081,36 @@ Windows Vulkan and HIP builds. The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.6 — llama.cpp b10743 compatibility and Fedora-safe responsiveness
+
+- **Current lazy-row CLI:** generated commands now use b10700+'s
+  `--lazy-mode auto`. Binary-aware preparation translates to the legacy
+  `--tensor-read-lazy` spelling only when an older runtime advertises it, so
+  Qwen3.8-Flash-Next and Gemma 4 do not silently lose their lazy-table memory
+  contract on current llama.cpp.
+- **NextN regression quarantine:** b10741-b10748 can abort on integrated MTP,
+  standalone Gemma 4 assistant heads, or per-layer metadata arrays. AutoTuner
+  now removes only `draft-mtp` and its draft-only arguments while retaining
+  compatible ngram methods, blocks model/draft shapes that cannot fall back,
+  refuses to record a disabled MTP benchmark under the wrong label, and
+  identifies b10749+ (PRs #28173/#28183) as the fixed boundary.
+- **Qwen3.8-Flash-Next correctness gate:** the qwen4exp profile now requires
+  b10737+, which includes the QSA sequence-copy, block-position, multimodal
+  input, and CUDA-abort fixes from PR #27941. Existing measured lazy-weight and
+  context×ubatch memory accounting is intentionally unchanged.
+- **Value-bearing profile flags stay atomic:** `--samplers`, `--pooling`, and
+  current reasoning/lazy aliases are classified correctly, preventing rejected
+  duplicate overrides from leaving orphan values in the final argv.
+- **Fedora-responsive UI test:** hardware-strip wrapping is tested immediately
+  below and above its measured Qt font-metric threshold instead of assuming
+  distro-specific text widths at 1320 px. The full source suite passes with
+  451 tests and 7 platform/environment skips.
+- **Validation:** exact b10743 Vulkan loaded and generated from the real
+  Qwen3.8-Flash-Next split GGUF with `--lazy-mode auto`; the Qwen3.6 embedded
+  MTP model loaded and decoded through the guarded base-model fallback. Source,
+  runtime, Fedora, and release evidence is recorded in
+  [`docs/v5.3.6-validation.md`](docs/v5.3.6-validation.md).
 
 ### v5.3.5 — responsive hardware, complete Quick runs, Granite 4.2
 

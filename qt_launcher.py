@@ -114,6 +114,7 @@ from tuner import (
     _visibility_env_for_gpus,
     build_command,
     check_draft_model_build,
+    check_model_build,
     check_profile_build,
     compute_config,
     effective_load_mode,
@@ -13581,8 +13582,21 @@ class MainWindow(QMainWindow):
             self._log(f"[Draft compatibility] {draft_message}")
         if not draft_allowed:
             launch_warning(
-                "DFlash2-capable llama.cpp build required",
+                "Compatible llama.cpp draft runtime required",
                 draft_message,
+            )
+            return None
+
+        model_allowed, model_message, _model_build = check_model_build(
+            entry,
+            runtime_binary,
+        )
+        if model_message:
+            self._log(f"[Model compatibility] {model_message}")
+        if not model_allowed:
+            launch_warning(
+                "Compatible llama.cpp build required",
+                model_message,
             )
             return None
 

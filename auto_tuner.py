@@ -42,6 +42,7 @@ from tuner import (
     build_diffusion_command,
     build_diffusion_server_command,
     check_draft_model_build,
+    check_model_build,
     check_profile_build,
     compute_config,
     effective_load_mode,
@@ -2112,6 +2113,16 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         if not draft_allowed:
             return 2
 
+        model_allowed, model_message, _model_build = check_model_build(
+            model,
+            tuning_binary,
+        )
+        if model_message:
+            level = "Warning" if model_allowed else "Error"
+            print(f"[AutoTuner] {level}: {model_message}")
+        if not model_allowed:
+            return 2
+
         system = detect_system(tuning_binary)
 
         # Resolve performance target: CLI > YAML profile > "balanced".
@@ -2300,8 +2311,8 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         cmd, removed_args = prepare_command_for_binary(cmd)
         if removed_args:
             print(
-                "[AutoTuner] Compatibility: selected llama.cpp binary does not "
-                "advertise these argument(s); removed them: " + "; ".join(removed_args)
+                "[AutoTuner] Compatibility adjustments for the selected "
+                "llama.cpp binary: " + "; ".join(removed_args)
             )
 
         if args.dry_run:

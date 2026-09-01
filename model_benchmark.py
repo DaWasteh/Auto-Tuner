@@ -34,6 +34,7 @@ from settings_loader import ModelProfile
 from tuner import (
     TunedConfig,
     build_command,
+    check_model_build,
     check_profile_build,
     prepare_command_for_binary,
     probe_binary_build_number,
@@ -1044,7 +1045,24 @@ class BenchmarkRunner:
         allowed, message, _build = check_profile_build(self.profile, cmd[0])
         if not allowed:
             raise BenchmarkFailure(message or "selected llama.cpp build is too old")
-        cmd, _removed = prepare_command_for_binary(cmd)
+        allowed, message, _build = check_model_build(self.model, cmd[0])
+        if not allowed:
+            raise BenchmarkFailure(
+                message or "selected llama.cpp build is incompatible"
+            )
+        cmd, adjustments = prepare_command_for_binary(cmd)
+        mtp_disabled = next(
+            (
+                adjustment
+                for adjustment in adjustments
+                if adjustment.startswith("draft-mtp disabled")
+            ),
+            None,
+        )
+        if mtp_disabled is not None:
+            raise BenchmarkFailure(
+                "Cannot benchmark the requested MTP variant because " + mtp_disabled
+            )
         process = self.process_factory(cmd, env_overrides=cfg.env_overrides)
         result = CandidateResult(candidate=candidate)
         try:

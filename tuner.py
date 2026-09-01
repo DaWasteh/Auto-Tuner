@@ -91,8 +91,9 @@ _QWEN4EXP_GPU_COMPUTE_BYTES = 72
 _QWEN4EXP_HOST_COMPUTE_BYTES = 215
 _QWEN4EXP_FIXED_HOST_RUNTIME_GB = 5.5
 
-# ``--tensor-read-lazy`` maps the complete row table into the process address
-# space, but untouched file-backed pages are reclaimable and do not consume
+# ``--lazy-mode auto`` (``--tensor-read-lazy`` before b10700) maps the complete
+# row table into the process address space, but untouched file-backed pages are
+# reclaimable and do not consume
 # committed/physical RAM merely because MapViewOfFile/mmap spans them. Budget
 # the measured active-row working set (upstream observed about 4.4%) rather
 # than the full virtual mapping. Keep the full mapping visible separately so
@@ -145,6 +146,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-ngl",
     "-np",
     "-p",
+    "-rea",
     "-sm",
     "-t",
     "-tb",
@@ -193,17 +195,20 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--n-gpu-layers",
     "--numa",
     "--parallel",
+    "--pooling",
     "--port",
     "--predict",
     "--presence-penalty",
     "--prompt",
     "--repeat-last-n",
+    "--reasoning",
     "--reasoning-budget",
     "--reasoning-budget-message",
     "--reasoning-effort",
     "--repeat-penalty",
     "--rope-scale",
     "--rope-scaling",
+    "--samplers",
     "--spec-draft-model",
     "--spec-draft-n-max",
     "--spec-draft-n-min",
@@ -220,6 +225,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--slot-prompt-similarity",
     "--split-mode",
     "--temp",
+    "--lazy-mode",
     "--tensor-read-lazy",
     "--tensor-split",
     "--threads",
@@ -229,6 +235,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--top-k",
     "--top-p",
     "--ubatch-size",
+    "-lzm",
 }
 
 _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
@@ -243,6 +250,7 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-md", "--model-draft"},
     {"-mmdev", "--mmproj-device"},
     {"-lm", "--load-mode"},
+    {"-lzm", "--lazy-mode"},
     {"-n", "--predict"},
     {"-ngl", "--gpu-layers", "--n-gpu-layers"},
     {"-np", "--parallel"},
@@ -252,6 +260,7 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-tb", "--threads-batch"},
     {"-ub", "--ubatch-size"},
     {"-cram", "--cache-ram"},
+    {"-rea", "--reasoning"},
 )
 
 _FLAG_RE = re.compile(r"(?<![\w-])-{1,2}[A-Za-z][A-Za-z0-9_-]*")
@@ -401,6 +410,11 @@ _MIN_DSPARK_BUILD = 10164
 # compatible legacy fallbacks for users who deliberately keep an older fork.
 _DFLASH2_PR_COMMITS = ("5ecbe1ac", "1deefcca")
 _MIN_MAINLINE_DFLASH2_BUILD = 10658
+# b10741 hoisted NextN metadata before per-layer array loading, but the matching
+# array-length and all-NextN fixes did not land until b10749. Builds in between
+# abort on Qwen MTP graphs and Gemma 4 assistant heads (PRs #28173/#28183).
+_BROKEN_NEXTN_BUILD_START = 10741
+_FIXED_NEXTN_BUILD = 10749
 
 
 def _parse_llama_build_number(version_output: str) -> Optional[int]:
@@ -594,6 +608,62 @@ def check_profile_build(
     return True, build_warning, detected
 
 
+def check_model_build(
+    model: ModelEntry, binary: str
+) -> Tuple[bool, str, Optional[int]]:
+    """Reject target GGUFs that b10741-b10748 cannot load safely.
+
+    PR #28159 made ``n_layer()`` exclude NextN before the generic per-layer
+    arrays were read. Standard GGUFs that store FF/head metadata as arrays of
+    ``block_count`` entries then fail during hparam loading because those builds
+    expect only the main-layer count. Scalar-metadata Qwen targets remain usable
+    with MTP disabled by :func:`prepare_command_for_binary`; array-backed
+    targets must use b10749+ (PRs #28173/#28183) or a pre-regression build.
+    """
+    if not model.has_embedded_mtp:
+        return True, "", None
+
+    detected = probe_binary_build_number(binary)
+    if (
+        detected is None
+        or detected < _BROKEN_NEXTN_BUILD_START
+        or detected >= _FIXED_NEXTN_BUILD
+    ):
+        return True, "", detected
+
+    metadata = model.metadata or {}
+    arch = str(metadata.get("general.architecture", "") or "").strip()
+    if not arch:
+        return True, "", detected
+    try:
+        block_count = int(metadata.get(f"{arch}.block_count", 0) or 0)
+        nextn_count = int(metadata.get(f"{arch}.nextn_predict_layers", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "", detected
+    main_count = block_count - nextn_count
+    if block_count <= 0 or nextn_count <= 0 or main_count < 0:
+        return True, "", detected
+
+    for suffix in (
+        "feed_forward_length",
+        "attention.head_count",
+        "attention.head_count_kv",
+    ):
+        key = f"{arch}.{suffix}"
+        value = metadata.get(key)
+        if isinstance(value, list) and len(value) != main_count:
+            return (
+                False,
+                f"{model.name} cannot load on llama.cpp b{detected}: its "
+                f"{key} array has {len(value)} entries while that regressed "
+                f"runtime expects {main_count}. Use b{_FIXED_NEXTN_BUILD}+ or "
+                f"b{_BROKEN_NEXTN_BUILD_START - 1} and earlier (upstream PRs "
+                "#28159/#28173).",
+                detected,
+            )
+    return True, "", detected
+
+
 def resolve_draft_n_max(
     profile: ModelProfile,
     draft_model: Optional[ModelEntry] = None,
@@ -627,15 +697,33 @@ def check_draft_model_build(
 ) -> Tuple[bool, str, Optional[int]]:
     """Preflight draft formats whose support is not visible in ``--help``.
 
-    DFlash2 intentionally reuses the ``dflash`` architecture and
-    ``draft-dflash`` enum, so pre-b10658 stock builds advertise the right CLI
-    while instantiating the older 58-tensor graph. The published Qwen3.8
-    sidecar contains 81 tensors and then aborts with the otherwise opaque
-    ``expected 81, got 58`` error. Accept b10658+ mainline and reviewed legacy
-    PR commits, reject older identified stock builds, and retain warning-only
-    behavior for wrappers whose version cannot be inspected.
+    b10741-b10748 contain an upstream NextN loader regression that aborts on
+    standalone MTP heads. DFlash2 also intentionally reuses the ``dflash``
+    architecture and ``draft-dflash`` enum, so pre-b10658 stock builds
+    advertise the right CLI while instantiating the older 58-tensor graph.
+    Reject either known-incompatible runtime before it can crash; retain the
+    existing warning-only behavior for wrappers whose version cannot be read.
     """
-    if draft_model is None or not draft_model.is_dflash2_drafter:
+    if draft_model is None:
+        return True, "", None
+
+    if draft_model.drafter_spec_type == "mtp":
+        detected = probe_binary_build_number(binary)
+        if (
+            detected is not None
+            and _BROKEN_NEXTN_BUILD_START <= detected < _FIXED_NEXTN_BUILD
+        ):
+            return (
+                False,
+                "This MTP draft head cannot load on llama.cpp "
+                f"b{detected}: b{_BROKEN_NEXTN_BUILD_START}-b{_FIXED_NEXTN_BUILD - 1} "
+                "contain the upstream NextN loader regression from PR #28159. "
+                f"Use b{_FIXED_NEXTN_BUILD}+ or b{_BROKEN_NEXTN_BUILD_START - 1} "
+                "and earlier.",
+                detected,
+            )
+
+    if not draft_model.is_dflash2_drafter:
         return True, "", None
 
     detected = probe_binary_build_number(binary)
@@ -740,6 +828,38 @@ def _adapt_load_mode_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     return adapted, notes
 
 
+def _adapt_lazy_mode_for_binary(
+    cmd: List[str], supported_flags: Set[str]
+) -> Tuple[List[str], List[str]]:
+    """Translate the b10700 lazy-row-table option rename in either direction.
+
+    ``--tensor-read-lazy`` was replaced (not aliased) by ``--lazy-mode`` /
+    ``-lzm``. Generic alias expansion cannot handle that across builds because
+    retaining the wrong spelling would still abort. Rewrite to an option the
+    selected binary actually advertises so memory planning and runtime loading
+    stay aligned on both old and current llama.cpp versions.
+    """
+    if not cmd or not supported_flags:
+        return list(cmd), []
+
+    spellings = ("--lazy-mode", "-lzm", "--tensor-read-lazy")
+    target = next((flag for flag in spellings if flag in supported_flags), None)
+    if target is None:
+        return list(cmd), []
+
+    adapted = list(cmd)
+    notes: List[str] = []
+    for index in range(1, len(adapted)):
+        token = adapted[index]
+        flag = _flag_name(token)
+        if flag not in spellings or flag in supported_flags:
+            continue
+        suffix = token[len(flag) :] if token.startswith(flag) else ""
+        adapted[index] = target + suffix
+        notes.append(f"{flag} -> {target} (llama.cpp b10700 option rename)")
+    return adapted, notes
+
+
 def _adapt_spec_types_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     """Remove DSpark's whole external-draft path on pre-b10164 builds.
 
@@ -824,23 +944,109 @@ def _adapt_spec_types_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     return cleaned, notes
 
 
+def _adapt_nextn_regression_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
+    """Disable only MTP drafting on llama.cpp's b10741-b10748 regression.
+
+    Those builds abort while constructing integrated Qwen MTP graphs and while
+    loading standalone NextN heads. Preserve the target model and any compatible
+    n-gram method, but remove ``draft-mtp`` plus its model/tuning arguments.
+    The upstream fixes are PRs #28173 and #28183, first tagged in b10749.
+    """
+    if not cmd:
+        return [], []
+    build = _probe_binary_build_number(cmd[0])
+    if (
+        build is None
+        or build < _BROKEN_NEXTN_BUILD_START
+        or build >= _FIXED_NEXTN_BUILD
+    ):
+        return list(cmd), []
+
+    adapted = list(cmd)
+    found_mtp = False
+    i = 1
+    while i < len(adapted):
+        token = adapted[i]
+        if _flag_name(token) != "--spec-type":
+            i += 1
+            continue
+        inline = "=" in token
+        if inline:
+            raw = token.split("=", 1)[1]
+        elif i + 1 < len(adapted):
+            raw = adapted[i + 1]
+        else:
+            i += 1
+            continue
+        values = [value.strip() for value in raw.split(",") if value.strip()]
+        if "draft-mtp" not in values:
+            i += 1 if inline else 2
+            continue
+        found_mtp = True
+        kept = [value for value in values if value != "draft-mtp"]
+        if kept:
+            replacement = ",".join(kept)
+            if inline:
+                adapted[i] = f"--spec-type={replacement}"
+            else:
+                adapted[i + 1] = replacement
+            i += 1 if inline else 2
+        else:
+            del adapted[i : i + (1 if inline else 2)]
+
+    if not found_mtp:
+        return adapted, []
+
+    draft_value_flags = {
+        "-md",
+        "--model-draft",
+        "--spec-draft-model",
+        "--spec-draft-ngl",
+        "--spec-draft-n-max",
+        "--spec-draft-n-min",
+        "--spec-draft-p-min",
+        "--spec-draft-p-split",
+    }
+    cleaned: List[str] = [adapted[0]]
+    i = 1
+    while i < len(adapted):
+        token = adapted[i]
+        if _flag_name(token) in draft_value_flags:
+            i += 1
+            if "=" not in token and i < len(adapted):
+                i += 1
+            continue
+        cleaned.append(token)
+        i += 1
+    return cleaned, [
+        "draft-mtp disabled for llama.cpp "
+        f"b{build} (upstream NextN regression in b{_BROKEN_NEXTN_BUILD_START}-"
+        f"b{_FIXED_NEXTN_BUILD - 1}; fixed in b{_FIXED_NEXTN_BUILD}+)"
+    ]
+
+
 def prepare_command_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     """Return ``cmd`` adapted/pruned for the selected binary plus changes.
 
-    If the binary cannot be probed (missing, not executable, or --help times
-    out), the command is returned unchanged. This keeps explicit user paths and
-    very unusual forks working while still protecting normal launches from
-    older binaries that would crash on unknown arguments or changed mode values.
+    If ``--help`` cannot be probed, unsupported optional flags are left
+    unchanged so explicit wrappers and unusual forks keep working. A separately
+    probeable numeric b10741-b10748 runtime still receives the narrow NextN/MTP
+    safety adaptation because that known crash does not depend on help parsing.
     """
     if not cmd:
         return [], []
     flags = _probe_supported_flags(cmd[0])
     if not flags:
-        return list(cmd), []
+        return _adapt_nextn_regression_for_binary(cmd)
     adapted, mode_changes = _adapt_load_mode_for_binary(cmd)
+    adapted, lazy_changes = _adapt_lazy_mode_for_binary(adapted, flags)
     adapted, spec_changes = _adapt_spec_types_for_binary(adapted)
+    adapted, nextn_changes = _adapt_nextn_regression_for_binary(adapted)
     filtered, removed = _filter_command_for_supported_flags(adapted, flags)
-    return filtered, mode_changes + spec_changes + removed
+    return (
+        filtered,
+        mode_changes + lazy_changes + spec_changes + nextn_changes + removed,
+    )
 
 
 def gemma_draft_needs_ik_fork(
@@ -1560,7 +1766,8 @@ class TunedConfig:
 
     estimated_model_vram_gb: float = 0.0
     estimated_model_ram_gb: float = 0.0
-    # Giant row-gather weights left mmap-backed by --tensor-read-lazy auto.
+    # Giant row-gather weights left mmap-backed by current --lazy-mode auto
+    # (legacy --tensor-read-lazy auto).
     # ``mapped_model_ram_gb`` is the full file-backed virtual mapping;
     # ``mapped_model_resident_gb`` is the conservative active working-set
     # reservation used for physical-memory planning. They are not ordinary
@@ -4807,18 +5014,19 @@ def build_command(
     cmd += ["--fit", "off"]
 
     # b10653+ reads giant architecture-marked row tables on demand. Assert
-    # Auto explicitly for reproducibility; compatibility pruning removes the
-    # complete flag/value pair on older builds. qwen4exp's 26.8 GiB PLE table
-    # is the motivating case and must never be treated as GPU layer weights.
+    # Auto explicitly for reproducibility; compatibility adaptation translates
+    # this b10700 spelling back to --tensor-read-lazy on older builds and prunes
+    # the complete pair when the feature is absent. qwen4exp's 26.8 GiB PLE
+    # table is the motivating case and must never be treated as GPU layer weights.
     if model.read_lazy_size_bytes > 0 or model.architecture.lower() in {
         "qwen4exp",
         "gemma4",
     }:
-        cmd += ["--tensor-read-lazy", "auto"]
+        cmd += ["--lazy-mode", "auto"]
 
     # ---- Performance timings + optional diagnostics endpoints ----------
-    # Performance timings are enabled by default in current llama.cpp.
-    # Assert --perf explicitly so fork defaults cannot hide prompt/eval timing
+    # b10743 defaults performance timings off. Assert --perf explicitly so
+    # fork/current defaults cannot hide prompt/eval timing
     # and tokens/s. Users can still append --no-perf for a quieter server.
     # --metrics exposes GET /metrics on the SAME host:port as inference.
     # Current mainline defaults /slots ON, so emit the positive or negative

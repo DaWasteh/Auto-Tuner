@@ -9,9 +9,11 @@ patterns:
 arch_fallback:
   - qwen4exp
 
-# qwen4exp loader support landed in b10660 (PR #27742), but AutoTuner's
-# context×ubatch QSA safety coefficients are validated from b10666 onward.
-min_llama_build: 10666
+# qwen4exp loader support landed in b10660 (PR #27742) and AutoTuner's
+# context×ubatch coefficients were measured on b10666. Require b10737 because
+# PR #27941 fixed sequence copies, block-position keying, multimodal QSA input,
+# and a CUDA abort; those are correctness requirements, not optional tuning.
+min_llama_build: 10737
 
 # The supplied GGUF metadata is authoritative for this checkpoint:
 # qwen4exp.context_length=262144, 48 blocks, and full attention every fourth
@@ -59,8 +61,10 @@ ngram_method: ngram-map-k4v
 
 notes: >
   Dedicated profile for Qwen3.8-Flash-Next GGUFs declaring qwen4exp. Mainline
-  llama.cpp added the loader in b10660; AutoTuner requires b10666+ because its
-  QSA graph-memory safety contract was validated against that allocator. The
+  llama.cpp added the loader in b10660 and AutoTuner's QSA graph-memory safety
+  contract was measured on b10666. AutoTuner requires b10737+ because the
+  follow-up QSA sequence-copy, block-keying, multimodal-input, and CUDA-abort
+  fixes in PR #27941 are required for correct serving. The
   model has 48 hybrid MoE blocks,
   512 experts with 10 active, full attention every fourth block (12 normal KV
   layers), an additional QSA indexer cache, and 262,144 native context. Its PLE
