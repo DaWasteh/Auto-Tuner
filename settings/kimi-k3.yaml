@@ -12,7 +12,7 @@ arch_fallback:
 max_context: 1048576
 recommended_kv_quant: q8_0
 performance_target: throughput
-min_llama_build: 10448
+min_llama_build: 10749
 
 # Official evaluations use top_p 0.95 for single-step work and 1.0 for
 # agentic tasks. A compatible local GGUF may also embed recommendations;
@@ -45,6 +45,8 @@ notes: >
   support must not be presented as local K3 vision support. K3 cannot be
   routed through the older kimi-linear or Kimi-K2/deepseek2 loaders. Official
   settings use temp 1.0 with top_p 0.95 for single-step work and 1.0 for
-  agentic tasks. Thinking stays enabled and complete reasoning/tool-call
+  agentic tasks. The profile requires b10749 because that is the first tagged
+  build with corrected no-scan SSM state tensors for Kimi-K3/Kimi-Linear.
+  Thinking stays enabled and complete reasoning/tool-call
   history is preserved. At this scale it remains a cluster or very-high-RAM
   model, not a practical 48 GB workstation checkpoint.

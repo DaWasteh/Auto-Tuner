@@ -57,6 +57,37 @@ def test_windows_hip_recipe_blocks_peer_copy_and_checks_decoded_text() -> None:
     assert "Get-TaskTextBounded" in common
 
 
+def test_windows_hip_recipe_keeps_actionable_warnings_and_consumed_flags() -> None:
+    common = _common_recipe()
+
+    # llama.cpp's Windows HIP path uses ROCm clang as C/C++ compilers and
+    # GGML_HIP as the backend switch. CMAKE_HIP_COMPILER is ignored upstream
+    # (CMake caches it as UNINITIALIZED), so do not pass the noisy dead option.
+    assert '"-DCMAKE_C_COMPILER=$clang"' in common
+    assert '"-DCMAKE_CXX_COMPILER=$clangxx"' in common
+    assert "-DCMAKE_HIP_COMPILER=" not in common
+
+    for contract in (
+        '"-DGGML_HIP=ON"',
+        '"-DGGML_VULKAN=OFF"',
+        '"-DGPU_TARGETS=gfx1201"',
+        '"-DGGML_HIP_GRAPHS=ON"',
+        '"-DGGML_HIP_NO_VMM=ON"',
+        '"-DGGML_HIP_RCCL=OFF"',
+        '"-DGGML_CUDA_NO_PEER_COPY=ON"',
+        '"-DGGML_CUDA_FA=ON"',
+        '"-DGGML_CUDA_FA_ALL_QUANTS=ON"',
+    ):
+        assert contract in common
+
+    # Keep upstream/compiler diagnostics visible. Third-party code must not
+    # become release-blocking through a blanket Werror policy either.
+    assert "LLAMA_ALL_WARNINGS=OFF" not in common
+    assert "GGML_ALL_WARNINGS=OFF" not in common
+    assert "-Werror" not in common
+    assert "/WX" not in common
+
+
 def test_common_recipe_parses_in_powershell() -> None:
     result = _run_pwsh(
         """

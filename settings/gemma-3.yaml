@@ -1,0 +1,36 @@
+display_name: "Gemma 3 (Google)"
+patterns:
+  - gemma-3
+  - gemma3
+arch_fallback:
+  - gemma3
+
+# 4B/12B/27B expose 128k; the 1B checkpoint exposes 32k and is capped by
+# general.architecture metadata before AutoTuner builds the command.
+max_context: 131072
+recommended_kv_quant: q8_0
+performance_target: balanced
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+draft_max: 2
+draft_p_min: 0.75
+
+notes: >
+  Google's Gemma 3 family. The 1B model is text-only with 32k context;
+  4B/12B/27B support text and image input with 128k context. AutoTuner uses
+  the GGUF context metadata to distinguish the 1B limit and attaches a matching
+  sibling mmproj when present. Official instruction-tuned sampling is temp 1.0,
+  top_k 64, top_p 0.95, with repetition penalty left at 1.0.

@@ -1034,7 +1034,10 @@ function Invoke-LlamaCMakeBuild {
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_C_COMPILER=$clang",
             "-DCMAKE_CXX_COMPILER=$clangxx",
-            "-DCMAKE_HIP_COMPILER=$clang",
+            # Upstream enables HIP through GGML_HIP and compiles HIP sources
+            # with the selected C/C++ ROCm clang drivers. CMAKE_HIP_COMPILER
+            # is not consumed by llama.cpp's Windows HIP configuration and
+            # only creates CMake's "unused variable" warning.
             "-DGGML_HIP=ON",
             "-DGGML_VULKAN=OFF",
             "-DGPU_TARGETS=gfx1201",

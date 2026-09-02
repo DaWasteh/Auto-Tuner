@@ -16,7 +16,7 @@ arch_fallback:
 max_context: 262144
 recommended_kv_quant: q8_0
 performance_target: throughput
-min_llama_build: 10460
+min_llama_build: 10749
 
 sampling:
   chat:
@@ -47,6 +47,8 @@ notes: >
   Flash is 124B-A5.1B with 256k context; Tiny is the smaller 7.9B-A1.3B
   sibling. Official sampling is temp 0.6 / top_p 0.95 / top_k 20 with
   thinking enabled. llama.cpp b10460 added conversion, inference, integrated
-  and separate NEXTN/MTP support for this architecture. Compatible MTP weights
+  and separate NEXTN/MTP support; this profile requires b10749 because that is
+  the first tagged build with corrected no-scan BailingMoE3 SSM state tensors.
+  Compatible MTP weights
   can use up to three speculative tokens. Do not route these checkpoints
   through the older Ling 2.6 bailingmoe2.5/bailing_hybrid fork profile.

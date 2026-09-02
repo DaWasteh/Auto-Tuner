@@ -1,0 +1,34 @@
+display_name: "Gemma 3n (Google, on-device multimodal)"
+patterns:
+  - gemma-3n
+  - gemma3n
+arch_fallback:
+  - gemma3n
+
+max_context: 32768
+recommended_kv_quant: q8_0
+performance_target: balanced
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+draft_max: 2
+draft_p_min: 0.75
+
+notes: >
+  Gemma 3n E2B/E4B has a native 32k context and official temp 1.0,
+  top_k 64, top_p 0.95 sampling. llama.cpp b10760 supports its text and vision
+  paths, but the MTMD code still intentionally skips Gemma 3n audio tensors;
+  do not present a current stock build as local audio-capable. A matching
+  sibling mmproj is attached automatically when available.

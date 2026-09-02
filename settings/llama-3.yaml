@@ -1,0 +1,30 @@
+display_name: "Llama 3.x (Meta)"
+patterns:
+  - llama-3
+
+max_context: 131072
+recommended_kv_quant: q8_0
+
+# Sampling-Profile pro Modus.
+sampling:
+  chat:
+    temperature: 0.75
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.05
+    repeat_penalty: 1.05
+  coding:
+    # Meta nennt für Code-Tasks keine offiziellen Werte, aber
+    # 0.2 ist der Community-Konsens für Llama-basierte Code-Workflows.
+    temperature: 0.2
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.05
+
+notes: >
+  Standard-Profil für Metas Llama-3-Serie. Llama 3.1+ unterstützt nativ
+  128k Kontext; ältere und kleinere Varianten werden über GGUF-Metadata auf
+  ihr tatsächliches Limit begrenzt. Llama 4 hat wegen seiner abweichenden
+  offiziellen Sampling- und 1M/10M-Kontextgrenzen ein eigenes Profil.
+  Chat ist der Allround-Default, Coding ist stark deterministisch.

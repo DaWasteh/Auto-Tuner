@@ -1,0 +1,30 @@
+display_name: "Kimi Linear 48B-A3B (Moonshot AI)"
+patterns:
+  - kimi-linear
+  - kimi_linear
+  - kimilinear
+arch_fallback:
+  - kimi-linear
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+min_llama_build: 10749
+
+# The official checkpoint publishes no fixed sampling contract. Leaving this
+# block absent lets GGUF general.sampling metadata win field by field, followed
+# by AutoTuner's generic defaults.
+
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Moonshot's 48B-A3B hybrid model uses three KDA layers for every global MLA
+  layer and supports a 1M context with a much smaller recurrent-state footprint.
+  Mainline architecture support began at b7957, but b10749 is required here for
+  the corrected no-scan treatment of Kimi Linear SSM state tensors; older builds
+  can silently use the wrong allocation/lifetime contract. This profile is
+  separate from Kimi-K2 (deepseek2) and Kimi-K3 (kimi-k3). The official model
+  card does not prescribe temperature/top-k/top-p, so embedded GGUF sampling
+  metadata remains authoritative when present.

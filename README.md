@@ -850,7 +850,12 @@ matches. See `settings/_default.yaml`.
 
 | Profile file | Models | llama.cpp arch |
 |--------------|--------|----------------|
+| `gemma-3.yaml` / `gemma-3n.yaml` | Gemma 3 1B/4B/12B/27B and Gemma 3n E2B/E4B, with their separate 128k/32k limits | `gemma3` / `gemma3n` |
 | `gemma-4.yaml` | Gemma 4 E2B/E4B/**12B**/26B-A4B/31B | `gemma4` |
+| `llama-3.yaml` / `llama-4.yaml` | Llama 3.x plus Llama 4 Scout/Maverick with metadata-capped 10M/1M Instruct limits | `llama` / `llama4` |
+| `mistral-small-3.yaml` | Mistral Small 3.1/3.2 24B text + vision, 128k | `mistral3` |
+| `ornith-1_5.yaml` | Ornith 1.5 9B/35B-A3B agentic coding (filename-gated) | `qwen35` / `qwen35moe` |
+| `paddleocr-vl.yaml` | PaddleOCR-VL 0.9B deterministic element recognition | `paddleocr` |
 | `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
 | `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
@@ -869,11 +874,20 @@ matches. See `settings/_default.yaml`.
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
-| `ling-3.yaml` | Ling 3.0 Flash/Tiny (mainline b10460+) | `bailingmoe3` |
-| `kimi-k3.yaml` | Kimi-K3 text path (mainline b10448+) | `kimi-k3` |
+| `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+) | `bailingmoe3` |
+| `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
+| `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
 
+- **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
+  128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
+  low-temperature recommendation; Llama 4 uses Meta's temp 0.6/top-p 0.9 and
+  lets GGUF metadata distinguish Scout's 10M, Maverick's 1M, and base 256k
+  limits. PaddleOCR-VL gets deterministic OCR/table/formula/chart prompts, and
+  Ornith 1.5 overrides the older 1.0 filename profile with its current
+  general/coding contract. Kimi Linear is isolated from K2/K3 and, together
+  with Ling 3 and Kimi-K3, requires b10749's corrected no-scan SSM tensors.
 - **GLM-5.3** (non-Flash) deliberately extends the GLM-5.2 profile because
   both publish `glm-dsa`, 1M context, temp 1.0/top-p 0.95, IndexShare, and a
   NextN head. **GLM-5.3-Flash** is separate: it is a 320B-A18B multimodal
@@ -1015,6 +1029,10 @@ ROCm HIP SDK 7.2.3, and compile only `gfx1201`, shared by the RX 9070 XT and
 AI PRO R9700. `-RocmPath` remains caller-selectable and the chosen SDK is
 probed before each build. They use upstream's required Windows combination of
 Ninja plus ROCm `clang`/`clang++`; Vulkan remains a separate Visual Studio tree.
+The recipes deliberately do not pass `CMAKE_HIP_COMPILER`: current llama.cpp's
+Windows HIP path does not consume it, and CMake otherwise reports a misleading
+unused-variable warning. Compiler diagnostics remain enabled (no blanket
+warning suppression and no `/WX`/`-Werror` policy for upstream/template code).
 The installed SDK still lacks LLVM PR #201563, so the helper applies that exact
 HIP/MSVC `<cmath>` include-order fix to a workspace-local clang resource copy.
 It also places matching ROCm 7 DLLs beside each executable and links the SDK's
@@ -1048,12 +1066,14 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10743)
+## Server features (compatible through llama.cpp b10760)
 
 Build/version probing, complete profile-command matrices, and backend smoke
-checks are validated through exact stock **b10743** (`8887a48f0`) on the local
-Windows Vulkan and HIP builds. AutoTuner quarantines the upstream NextN
-regression in b10741-b10748 and points affected users to b10749+ rather than
+checks are validated through exact stock **b10760** (`0f3a71be1`) on the local
+Windows Vulkan and HIP builds. The b10743→b10760 help diff adds or removes no
+long option, so existing command generation remains current. AutoTuner still
+quarantines the upstream NextN regression in b10741-b10748 and points affected
+users to b10749+ rather than
 letting llama-server abort during model or draft-context loading. The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
@@ -1092,6 +1112,27 @@ letting llama-server abort during model or draft-context loading. The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.8 — llama.cpp b10760, current model profiles, cleaner HIP builds
+
+- **Exact b10760 compatibility:** stock Vulkan and HIP binaries at commit
+  `0f3a71be1` expose the same 331 long options as b10743; every directly
+  profile-emitted option remains accepted. b10749's NextN repairs preserve the
+  existing quarantine boundary, while its no-scan SSM correction now gates
+  Ling 3, Kimi-K3, and the new Kimi Linear profile.
+- **Popular-family coverage:** dedicated Gemma 3/3n, Mistral Small 3.1/3.2,
+  Llama 4, Kimi Linear, PaddleOCR-VL, and Ornith 1.5 profiles add official
+  context/sampling/runtime contracts. Llama 3 and Llama 4 no longer share the
+  inaccurate 128k ceiling.
+- **HIP warning audit:** the unused `CMAKE_HIP_COMPILER` argument is removed.
+  A clean 630-target ROCm 7.2/gfx1201 build kept warnings visible, completed,
+  exposed both AMD GPUs, and passed the deterministic two-GPU
+  `HIP MULTI GPU OK` semantic gate. The remaining diagnostics are upstream
+  HIP/CUDA template and Windows-portability warnings, not recipe failures.
+- **Validation and binary:** full source, exact-runtime, warning-classification,
+  and rebuilt Windows artifact evidence is recorded in
+  [`docs/v5.3.8-validation.md`](docs/v5.3.8-validation.md); the upstream review
+  is in [`docs/llama-b10760-audit.md`](docs/llama-b10760-audit.md).
 
 ### v5.3.7 — diagram-first benchmarks and a live hardware dashboard
 

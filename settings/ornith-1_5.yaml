@@ -1,0 +1,50 @@
+display_name: "Ornith 1.5 (agentic coding)"
+patterns:
+  - ornith-1.5
+  - ornith_1.5
+  - ornith-1_5
+
+# No arch_fallback: Ornith shares qwen35/qwen35moe with generic Qwen3.5/3.6.
+max_context: 262144
+recommended_kv_quant: q5_0
+performance_target: throughput
+
+rope_scale:
+  enabled: false
+  max_context: 1000000
+  scale_factor: 4.0
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    # The card lists 1.5 for pure general chat. Keep tool-capable AutoTuner
+    # sessions at 0.0 because repeated JSON keys/tool names must not be taxed.
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Ornith 1.5 is a Qwen3.5-based reasoning/tool-calling family with 256k native
+  context and validated YaRN extension to about 1M. Official general sampling
+  is temp 1.0 / top_p 0.95 / top_k 20 (presence 1.5), while precise coding uses
+  temp 0.6 and presence 0.0. AutoTuner keeps presence at 0.0 in both modes so
+  OpenAI-style tool JSON remains stable; pure chat users can override it to 1.5.
+  Filename-only matching avoids stealing opaque qwen35/qwen35moe re-quants from
+  the generic Qwen profile. The older Ornith 1.0 profile remains unchanged.

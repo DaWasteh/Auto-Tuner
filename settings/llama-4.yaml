@@ -1,0 +1,34 @@
+display_name: "Llama 4 Scout / Maverick (Meta)"
+patterns:
+  - llama-4
+  - llama4
+arch_fallback:
+  - llama4
+
+# Instruct checkpoints: Scout = 10,485,760; Maverick = 1,048,576.
+# Base checkpoints expose 262,144. GGUF native_context applies the per-file cap.
+max_context: 10485760
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 0.6
+    top_p: 0.9
+    repeat_penalty: 1.0
+  coding:
+    temperature: 0.6
+    top_p: 0.9
+    repeat_penalty: 1.0
+
+draft_max: 2
+draft_p_min: 0.75
+
+notes: >
+  Meta's multimodal Llama 4 MoE family. Official Instruct limits are 10M for
+  Scout and 1M for Maverick; base checkpoints are 256k. AutoTuner always caps
+  this family maximum with each GGUF's native context metadata and the actual
+  RAM/VRAM budget, so Maverick is never promoted to Scout's limit. Official
+  reference generation defaults are temp 0.6 / top_p 0.9. Image input needs a
+  matching mmproj; llama.cpp b10760 still warns that Llama 4 vision quality is
+  known to be degraded, so validate vision-critical workloads independently.

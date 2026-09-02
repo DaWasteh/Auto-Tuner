@@ -1,0 +1,32 @@
+display_name: "Mistral Small 3.1 / 3.2 24B"
+patterns:
+  - mistral-small-3.2
+  - mistral-small-3.1
+  - mistral-small-3
+arch_fallback:
+  - mistral3
+
+max_context: 131072
+recommended_kv_quant: q8_0
+performance_target: balanced
+
+# Mistral explicitly recommends a low temperature (0.15) for Small 3.2.
+# Other truncation fields remain metadata/default-driven instead of inventing
+# model-card values that Mistral does not publish as a required contract.
+sampling:
+  chat:
+    temperature: 0.15
+    repeat_penalty: 1.0
+  coding:
+    temperature: 0.15
+    repeat_penalty: 1.0
+
+draft_max: 2
+draft_p_min: 0.75
+
+notes: >
+  Dense 24B Mistral Small 3.1/3.2 instruction models with 128k context and
+  Pixtral vision. Mistral recommends temperature 0.15 and a tailored system
+  prompt. Current llama.cpp uses the mistral3 text architecture and requires a
+  matching mmproj for image input; for Mistral Small 3.1 MTMD recommends the
+  mistral-v7 chat template when a converted checkpoint does not embed it.

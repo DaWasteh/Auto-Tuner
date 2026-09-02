@@ -1,0 +1,41 @@
+display_name: "PaddleOCR-VL (PaddlePaddle)"
+patterns:
+  - paddleocr-vl
+  - paddleocr_vl
+  - paddleocrvl
+  - paddleocr
+arch_fallback:
+  - paddleocr
+
+max_context: 131072
+recommended_kv_quant: f16
+performance_target: balanced
+draft_max: 0
+
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  Compact 0.9B multilingual document VLM (109 languages), supported by
+  llama.cpp's paddleocr text architecture and MTMD projector path. Official
+  element prompts are "OCR:", "Table Recognition:", "Formula Recognition:",
+  and "Chart Recognition:"; generation is deterministic. AutoTuner attaches a
+  compatible sibling mmproj when present. This exposes element recognition via
+  llama-server; it does not reproduce PaddleOCR's separate full page-layout
+  pipeline or post-processing stages.

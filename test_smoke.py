@@ -75,7 +75,14 @@ def test_all_profiles_load() -> None:
     files = {p.source_file for p in profiles}
     assert "_default.yaml" in files
     assert "qwen2_5-3.yaml" in files
+    assert "gemma-3.yaml" in files
+    assert "gemma-3n.yaml" in files
     assert "gemma-4.yaml" in files
+    assert "llama-4.yaml" in files
+    assert "mistral-small-3.yaml" in files
+    assert "kimi-linear.yaml" in files
+    assert "paddleocr-vl.yaml" in files
+    assert "ornith-1_5.yaml" in files
     assert "devstral.yaml" in files
 
 
@@ -91,8 +98,16 @@ def test_all_profiles_load() -> None:
             "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003",
             "Qwen3.8 Flash Next (Alibaba)",
         ),
+        ("Gemma-3-27B-it-Q4_K_M", "Gemma 3 (Google)"),
+        ("Gemma-3n-E4B-it-Q8_0", "Gemma 3n (Google, on-device multimodal)"),
         ("Gemma-4-26B-A4B-IQ3_M", "Gemma 4 (Google)"),
         ("gemma-4-E2B-it-BF16", "Gemma 4 (Google)"),
+        ("Llama-3.1-8B-Instruct-Q8_0", "Llama 3.x (Meta)"),
+        ("Llama-4-Scout-17B-16E-Instruct", "Llama 4 Scout / Maverick (Meta)"),
+        ("Mistral-Small-3.2-24B-Instruct-2506", "Mistral Small 3.1 / 3.2 24B"),
+        ("Kimi-Linear-48B-A3B-Instruct", "Kimi Linear 48B-A3B (Moonshot AI)"),
+        ("PaddleOCR-VL-0.9B", "PaddleOCR-VL (PaddlePaddle)"),
+        ("Ornith-1.5-35B-A3B-GGUF", "Ornith 1.5 (agentic coding)"),
         ("granite-4.2-30b-Q4_K_M", "Granite 4.2 (IBM reasoning)"),
         ("Devstral-Small-2-24B-Instruct-2512-Q3_K_L", "Devstral (Mistral, code)"),
         ("Ministral-3-14B-Reasoning-2512-Q6_K", "Ministral 3 (Mistral, reasoning)"),
@@ -238,6 +253,48 @@ def test_new_b10666_model_profiles_are_present() -> None:
     assert nemotron.min_llama_build == 10665
     assert nemotron.draft_max == 7
     assert nemotron.draft_p_min == pytest.approx(0.0)
+
+
+def test_b10760_profile_contracts_and_ssm_correctness_gates() -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+
+    gemma3 = match_profile("opaque-gemma.gguf", profiles, "gemma3")
+    gemma3n = match_profile("opaque-gemma-n.gguf", profiles, "gemma3n")
+    mistral = match_profile("Mistral-Small-3.1-24B-Instruct", profiles, "mistral3")
+    llama3 = match_profile("Llama-3.3-70B-Instruct", profiles, "llama")
+    llama4 = match_profile("Llama-4-Maverick-17B-128E-Instruct", profiles, "llama4")
+    kimi_linear = match_profile("opaque-kda.gguf", profiles, "kimi-linear")
+    kimi_k3 = match_profile("Kimi-K3", profiles, "kimi-k3")
+    ling3 = match_profile("Ling-3.0-flash", profiles, "bailingmoe3")
+    paddle = match_profile("opaque-ocr.gguf", profiles, "paddleocr")
+    ornith15 = match_profile("Ornith-1.5-9B-GGUF", profiles, "qwen35")
+
+    assert gemma3.source_file == "gemma-3.yaml"
+    assert gemma3.max_context == 131072
+    assert gemma3n.source_file == "gemma-3n.yaml"
+    assert gemma3n.max_context == 32768
+    assert mistral.source_file == "mistral-small-3.yaml"
+    assert mistral.max_context == 131072
+    assert mistral.sampling["chat"]["temperature"] == pytest.approx(0.15)
+    assert llama3.source_file == "llama-3.yaml"
+    assert llama4.source_file == "llama-4.yaml"
+    assert llama4.max_context == 10485760
+    assert llama4.sampling["chat"]["temperature"] == pytest.approx(0.6)
+    assert kimi_linear.source_file == "kimi-linear.yaml"
+    assert kimi_linear.max_context == 1048576
+    assert kimi_linear.sampling == {}
+    assert paddle.source_file == "paddleocr-vl.yaml"
+    assert paddle.max_context == 131072
+    assert paddle.draft_max == 0
+    assert paddle.sampling["chat"]["temperature"] == pytest.approx(0.0)
+    assert ornith15.source_file == "ornith-1_5.yaml"
+    assert ornith15.sampling["coding"]["temperature"] == pytest.approx(0.6)
+
+    # b10749 is the first tagged build with the corrected no-scan SSM tensor
+    # contract for BailingMoE3, Kimi-K3, and Kimi-Linear.
+    assert ling3.min_llama_build == 10749
+    assert kimi_k3.min_llama_build == 10749
+    assert kimi_linear.min_llama_build == 10749
 
 
 def test_ministral_does_not_collide_with_mistral_medium() -> None:
@@ -4602,8 +4659,9 @@ def test_windows_vulkan_and_hip_recipe_matrix_is_complete_and_pinned() -> None:
     assert '"-DGGML_AVX_VNNI=ON"' in common
     assert '"-DGGML_BMI2=ON"' in common
     assert '"-G", "Ninja"' in common
+    assert '"-DCMAKE_C_COMPILER=$clang"' in common
     assert '"-DCMAKE_CXX_COMPILER=$clangxx"' in common
-    assert '"-DCMAKE_HIP_COMPILER=$clang"' in common
+    assert '"-DCMAKE_HIP_COMPILER=' not in common
     assert "Get-HipCompatibilityResourceDir" in common
     assert "llvm-pr201563" in common
     assert "Copy-HipRuntimeDependencies" in common
@@ -7966,9 +8024,10 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
     ling3 = match_profile("Ling-3.0-flash-int4.gguf", profiles, "bailingmoe3")
     assert ling3.source_file == "ling-3.yaml"
     assert ling3.max_context == 262144
-    assert ling3.min_llama_build == 10460
+    assert ling3.min_llama_build == 10749
     assert ling3.sampling["coding"]["temperature"] == 0.6
     assert "b10460" in ling3.notes
+    assert "b10749" in ling3.notes
     assert "bailingmoe3" in ling3.arch_fallback
     # Ling 2.6 keeps its separate filename profile despite the broad shared
     # HF model_type; neither generation may steal the other's named GGUF.
@@ -7997,8 +8056,9 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
     kimi3 = match_profile("Kimi-K3-UD-Q2_K-00001-of-00034.gguf", profiles, "kimi-k3")
     assert kimi3.source_file == "kimi-k3.yaml"
     assert kimi3.max_context == 1048576
-    assert kimi3.min_llama_build == 10448
+    assert kimi3.min_llama_build == 10749
     assert "b10448" in kimi3.notes
+    assert "b10749" in kimi3.notes
     assert "TEXT loader" in kimi3.notes
     assert (
         match_profile("Kimi-K2.5-Q4_K_M.gguf", profiles, "deepseek2").source_file
