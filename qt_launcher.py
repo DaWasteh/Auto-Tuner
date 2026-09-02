@@ -12184,6 +12184,7 @@ class MainWindow(QMainWindow):
                 "cpu": system.cpu_name,
                 "physical_cores": system.cpu_cores_physical,
                 "logical_cores": system.cpu_cores_logical,
+                "total_ram_gb": system.total_ram_gb,
                 "gpus": [
                     {
                         "name": gpu.name,

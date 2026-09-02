@@ -1,0 +1,77 @@
+name: Deploy benchmark page
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "benchmark-site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Repository code only runs in the build job with read-only source access. The
+# deployment job never checks out or executes repository code and alone receives
+# GitHub Pages' OIDC publishing permissions.
+permissions: {}
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and package static dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate public report
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from performance_report import validate_public_report_html
+
+          page = Path("benchmark-site/index.html")
+          if not page.is_file() or page.stat().st_size == 0:
+              raise SystemExit("benchmark-site/index.html is missing or empty")
+          html = page.read_text(encoding="utf-8")
+          if not html.startswith("<!doctype html>"):
+              raise SystemExit("benchmark page is not a complete HTML document")
+          if "Content-Security-Policy" not in html:
+              raise SystemExit("benchmark page is missing its restrictive CSP")
+          validate_public_report_html(html)
+          print(f"Validated {page} ({page.stat().st_size:,} bytes)")
+          PY
+
+      - name: Upload benchmark site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: benchmark-site
+
+  deploy:
+    name: Publish static benchmark dashboard
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

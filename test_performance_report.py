@@ -3,8 +3,16 @@ from __future__ import annotations
 import copy
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
-from performance_report import build_performance_report_html, write_performance_report
+import pytest
+
+from performance_report import (
+    build_performance_report_html,
+    validate_public_report_html,
+    write_performance_report,
+    write_public_performance_report,
+)
 
 
 def _record() -> dict:
@@ -29,6 +37,14 @@ def _record() -> dict:
         "search_strategy": "full-staged-search",
         "profile_confidence": "validated",
         "quality_frozen": {"cache_k": "q4_0", "cache_v": "q4_0", "ngl": 99},
+        "hardware": {
+            "os": "Windows 11",
+            "cpu": "Example CPU",
+            "physical_cores": 8,
+            "logical_cores": 16,
+            "total_ram_gb": 48.0,
+            "gpus": [{"name": "Example GPU", "vram_mb": 16384}],
+        },
         "candidates": [
             {
                 "id": "winner",
@@ -183,6 +199,146 @@ def test_html_uses_vertical_side_by_side_model_bars_and_unique_chart_ids() -> No
     for references in re.findall(r'aria-labelledby="([^"]+)"', html):
         for reference in references.split():
             assert reference in ids
+
+
+def test_html_places_all_diagrams_before_tables_and_expandable_details() -> None:
+    html = build_performance_report_html(
+        {"fast": [], "quick": [_record()], "custom": []}
+    )
+    charts_at = html.index('id="visual-dashboard"')
+    run_chart_at = html.index('class="run-chart-card"')
+    table_at = html.index('id="winner-overview"')
+    details_at = html.index('<details class="run"')
+    assert charts_at < run_chart_at < table_at < details_at
+    assert 'id="hardware"' in html
+    assert "Example CPU" in html
+    assert "48.0 GiB" in html
+    assert "Example GPU" in html
+    assert 'class="chart-pair"' not in html[details_at:]
+
+
+def test_overview_collapses_many_lanes_to_fastest_lane_per_model() -> None:
+    first = _record()
+    second = copy.deepcopy(first)
+    second["performance_target"] = "balanced"
+    second["runtime_label"] = "HIP · b10743"
+    second["candidates"][0]["overall_tps"] = 220.0
+    html = build_performance_report_html(
+        {"fast": [], "quick": [first, second], "custom": []}
+    )
+    metric_panels = re.findall(
+        r'<section class="metric-panel">(.*?)</section>', html, re.DOTALL
+    )
+    assert len(metric_panels) == 3
+    for panel in metric_panels:
+        assert panel.count("Unsafe &lt;Model&gt;") == 2  # label + title attribute
+        assert "balanced" in panel
+
+
+def test_public_report_redacts_paths_and_keeps_static_hosting_metadata(
+    tmp_path,
+) -> None:
+    record = _record()
+    record["model_name"] += " /root/private/model.gguf"
+    record["performance_target"] = "balanced /opt/private/target.txt"
+    record["runtime_binary"] = r"C:\\Users\\Example\\llama builds\\llama-server.exe"
+    record["runtime_label"] = "HIP /var/private/runtime.txt"
+    record["runtime_build"] = "/etc/private/build.txt"
+    record["reason"] = r"Selected after L:\\private\\benchmarks\\winner.json"
+    record["search_strategy"] = "staged /mnt/private/search.txt"
+    record["profile_confidence"] = "validated /run/private/confidence.txt"
+    record["drafter_label"] = r"\\server\share\draft.gguf"
+    record["quality_frozen"]["cache_k"] = "/usr/local/private/cache.txt"
+    record["candidates"][0]["label"] = "file:///Volumes/private/winner.json"
+    record["candidates"][0]["settings"]["threads"] = "/dev/private/thread.txt"
+    record["candidates"][1]["id"] = "/proc/private/candidate.txt"
+    record["candidates"][1]["label"] = ""
+    record["candidates"][1]["error"] = r"Failed under /home/example/private/run.log"
+    record["hardware"]["os"] = "/boot/private/os.txt"
+    record["hardware"]["cpu"] = "/srv/private/cpu.txt"
+    record["hardware"]["gpus"][0]["name"] = "/tmp/private/gpu.txt"
+    destination = tmp_path / "site" / "index.html"
+    path = write_public_performance_report(
+        {"fast": [], "quick": [record], "custom": []}, destination
+    )
+    html = path.read_text(encoding="utf-8")
+    assert path == destination
+    assert "Public benchmark snapshot" in html
+    assert "Public-safe export" in html
+    assert "https://github.com/DaWasteh/Auto-Tuner" in html
+    assert "Model file" in html
+    assert "&lt;unsafe&gt;.gguf" in html
+    assert "llama-server.exe" in html
+    assert "C:/models" not in html
+    assert "C:\\Users" not in html
+    assert "L:\\private" not in html
+    assert "/home/example" not in html
+    for local_prefix in (
+        "/root/private",
+        "/opt/private",
+        "/var/private",
+        "/etc/private",
+        "/mnt/private",
+        "/run/private",
+        "/usr/local/private",
+        "/dev/private",
+        "/proc/private",
+        "/boot/private",
+        "/srv/private",
+        "/tmp/private",
+    ):
+        assert local_prefix not in html
+    assert "file:///" not in html
+    assert r"\\server\share" not in html
+    assert "[local path omitted]" in html
+    assert "<script" not in html
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "/root/private/run.log",
+        "/tmp/private/run.log",
+        "/srv/private/run.log",
+        "/Volumes/private/run.log",
+        "file:///private/run.log",
+        "file:/private/run.log",
+        r"\\server\share\run.log",
+        "//server/share/run.log",
+        r"C:\\private\\run.log",
+    ],
+)
+def test_public_validator_rejects_every_absolute_path_form(local_path: str) -> None:
+    with pytest.raises(ValueError, match="machine-local path"):
+        validate_public_report_html(
+            f"<!doctype html><html><body>{local_path}</body></html>"
+        )
+
+
+def test_committed_pages_snapshot_and_workflow_stay_public_safe() -> None:
+    root = Path(__file__).resolve().parent
+    page = root / "benchmark-site" / "index.html"
+    workflow = root / ".github" / "workflows" / "pages.yml"
+    html = page.read_text(encoding="utf-8")
+    validate_public_report_html(html)
+    assert html.startswith("<!doctype html>")
+    assert "Public benchmark snapshot" in html
+    assert "Content-Security-Policy" in html
+    assert "<script" not in html
+
+    workflow_text = workflow.read_text(encoding="utf-8")
+    assert "pages: write" in workflow_text
+    assert "id-token: write" in workflow_text
+    assert "contents: read" in workflow_text
+    assert "contents: write" not in workflow_text
+    assert "path: benchmark-site" in workflow_text
+    assert "actions/deploy-pages@v4" in workflow_text
+    build_job, deploy_job = workflow_text.split("\n  deploy:", maxsplit=1)
+    assert "pages: write" not in build_job
+    assert "id-token: write" not in build_job
+    assert "from performance_report" in build_job
+    assert "actions/checkout" not in deploy_job
+    assert "from performance_report" not in deploy_job
 
 
 def test_report_writer_uses_shared_autotuner_report_folder(

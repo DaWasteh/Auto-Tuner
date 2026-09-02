@@ -13,6 +13,8 @@ GUI:
 Performance Test Result:
 ![Test](image1.png)
 
+**Live benchmark dashboard:** [See how the tested models run on the maintainer's hardware](https://dawasteh.github.io/Auto-Tuner/).
+
 ## Features
 
 - **Interactive terminal menu** — pick from whatever GGUFs are in your
@@ -143,14 +145,20 @@ Performance Test Result:
   candidates use fresh private `llama-server` processes and an excluded warm-up,
   and every completed mode/head is atomically checkpointed. **Stop after Model**
   and **Stop after Performance Mode** remain graceful resume boundaries.
-- **Detailed graphical performance report** — **📊 Performance report** keeps a
-  compact in-app Quick/Standard/Custom comparison and writes a self-contained HTML
-  report under `~/.autotuner/reports`. It expands every candidate and sample with
-  complete runtime settings, PP/decode/end-to-end speeds, errors, drafter identity,
-  and native llama.cpp drafted/accepted token counters, plus inline throughput and
-  acceptance graphics. Legacy fixed-25% results are classified as Custom; the old
-  legacy tile is gone. Standard search now checks batch families for its top two
-  thread finalists, MTP depth stops only after two meaningful regressions, and a
+- **Diagram-first graphical performance report + public benchmark page** —
+  **📊 Performance report** keeps a compact in-app Quick/Standard/Custom
+  comparison and writes a self-contained HTML report under
+  `~/.autotuner/reports`. The redesigned dashboard starts with the captured test
+  hardware, fastest result cards, aligned per-model winner charts, speculative
+  acceptance, and every successful candidate diagram. The winner table, method
+  text, and expandable per-run candidate/sample evidence now stay together below
+  the graphics. `python publish_benchmarks.py` creates a path-redacted static
+  snapshot under `benchmark-site/`; pushes to `main` deploy that snapshot to the
+  [public GitHub Pages dashboard](https://dawasteh.github.io/Auto-Tuner/). See the
+  [publishing guide](docs/benchmark-pages.md). Legacy fixed-25% results are
+  classified as Custom; the old legacy tile is gone. Standard search now checks
+  batch families for its top two thread finalists, MTP depth stops only after
+  two meaningful regressions, and a
   candidate must clear 3% in every paired prompt variant before promotion. The
   fastest performance mode is remembered only when context, token mix, test tier,
   and drafter are directly comparable. Exact contexts above the static estimate are
@@ -959,6 +967,9 @@ auto_tuner/
 ├── qt_launcher.py       # Qt GUI (model picker + sticky options + OCR dialog)
 ├── ocr_workflow.py      # shared GUI/TUI PDF/Office/image OCR pipeline
 ├── model_benchmark.py   # bounded real-server performance search + scoring
+├── performance_report.py # diagram-first local/public HTML report renderer
+├── publish_benchmarks.py # path-redacted benchmark-site exporter for Pages
+├── benchmark-site/      # committed static GitHub Pages snapshot
 ├── hardware.py          # CPU + multi-vendor GPU detection
 ├── scanner.py           # GGUF scanner: mmproj/draft pairing, capability detection
 ├── settings_loader.py   # YAML profile loader and matcher
@@ -1081,6 +1092,36 @@ letting llama-server abort during model or draft-context loading. The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.7 — diagram-first benchmarks and a live hardware dashboard
+
+- **Charts before detail:** the self-contained performance report now opens with
+  the stored hardware snapshot, fastest-result cards, one aligned fastest lane
+  per model, drafted-token acceptance, and every successful candidate chart.
+  The compact winner table, methodology, and native expandable run evidence are
+  grouped below the visual dashboard, with sticky navigation and responsive,
+  keyboard-focusable overflow regions.
+- **Public benchmark snapshot:** `python publish_benchmarks.py` exports all local
+  Quick pass, Standard, and Custom evidence to `benchmark-site/index.html` while
+  removing Windows, POSIX, UNC, and `file:` paths from every public dynamic
+  field. A script-free CSP and a final parsed-HTML path scan fail closed before
+  an unsafe snapshot can be written.
+- **GitHub Pages deployment:** pushes that change the static site run a dedicated
+  Pages workflow. Repository validation receives read-only source access; the
+  separate deployment-only job executes no repository code and alone receives
+  `pages: write` plus OIDC permission. The live result is linked at
+  [dawasteh.github.io/Auto-Tuner](https://dawasteh.github.io/Auto-Tuner/), with
+  setup and refresh steps in
+  [`docs/benchmark-pages.md`](docs/benchmark-pages.md).
+- **Richer future hardware evidence:** new successful benchmark records retain
+  total system RAM alongside OS, CPU/core, GPU, and VRAM data. Existing records
+  remain compatible and display every hardware field they already captured.
+- **Validation and local binary:** 464 source tests pass with 7 optional/platform
+  skips; the committed 227-run public snapshot has 992 unique element IDs, 146
+  candidate chart cards, no scripts or local paths, and was inspected in desktop
+  and narrow browser layouts. The tracked Windows x64 `dist/AutoTuner.exe` was
+  rebuilt for v5.3.7 and passed frozen and visible-window/icon smokes. Full
+  evidence is in [`docs/v5.3.7-validation.md`](docs/v5.3.7-validation.md).
 
 ### v5.3.6 — llama.cpp b10743 compatibility and Fedora-safe responsiveness
 
