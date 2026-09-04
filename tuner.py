@@ -52,6 +52,12 @@ MOE_KV_RESERVE_FRAC = 0.06
 # fallbacks. Expert/manual pins remain authoritative, and runner-specific
 # exceptions (currently DiffusionGemma) still report the cache they really use.
 DEFAULT_KV_CACHE_TYPE = "q4_0"
+# Denser symmetric K/V pairs Auto may take instead of the Q4_0 baseline when
+# they reach the very same context (see ``_pick_kv_quant``). Highest first.
+KV_PRECISION_UPGRADE_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("f16", "f16"),
+    ("q8_0", "q8_0"),
+)
 
 # Default host-RAM prompt-cache size in MiB (``--cache-ram``). A bounded,
 # computed default replaces the previous unlimited/uncomputed value so the
@@ -62,6 +68,17 @@ PROMPT_CACHE_RAM_MIB_DEFAULT = 2048
 # requested, so the RAM budget never under-provisions against an unbounded
 # host-RAM cache.
 PROMPT_CACHE_UNLIMITED_RESERVE_GB = 2.0
+# Minimum chunk (tokens) llama-server may salvage from a cached prompt by KV
+# shifting (``--cache-reuse N``). Upstream defaults to 0 (exact-prefix reuse
+# only). Coding agents and chat UIs constantly edit the middle of an otherwise
+# identical prompt (tool results, file snapshots, a trimmed history), which
+# invalidates the plain prefix cache and re-processes tens of thousands of
+# tokens. With shifting enabled, every unchanged chunk of at least this many
+# tokens is re-used after a RoPE position shift, so only the edited span is
+# recomputed. 256 is the value from the llama.cpp server documentation; the
+# server itself disables the feature for memory types that cannot shift (SWA,
+# recurrent and MLA layouts), so emitting it is safe for every architecture.
+PROMPT_CACHE_REUSE_MIN_CHUNK = 256
 # Extra VRAM the DiffusionGemma diffusion-server (PR #24427) reserves for its
 # diffusion-runtime buffers beyond weights + KV. The PR server parses common
 # args but ignores cache_type_k/v and n_cpu_moe overrides, so this overhead
@@ -154,6 +171,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--alias",
     "--batch-size",
     "--cache-ram",
+    "--cache-reuse",
     "--cache-type-k",
     "--cache-type-v",
     "--chat-template",
@@ -2506,15 +2524,26 @@ def _pick_kv_quant(
 ) -> Tuple[str, str]:
     """Return the capacity-first automatic K/V cache pair.
 
-    v5.3.2 intentionally standardises stock llama.cpp Auto mode on symmetric
-    Q4_0 for every normal model. This avoids spending otherwise usable context
-    on an automatic F16/Q8 upgrade and avoids mixed K/V FlashAttention fallback
-    differences across Vulkan, HIP, and default CUDA builds. The historical
-    ``profile_recommended`` and ``asymmetric`` parameters remain in the public
-    signature for compatibility, but no longer raise automatic precision.
+    Symmetric Q4_0 (``DEFAULT_KV_CACHE_TYPE``) remains the capacity baseline:
+    it is what every placement step reserves for and it never sacrifices
+    context to precision. Since v5.4.1 Auto additionally takes a *free*
+    precision upgrade: when F16 or Q8_0 still reaches exactly the context that
+    Q4_0 would deliver (the requested/native limit, or the budget-limited
+    value), the denser cache is chosen. That never changes placement, never
+    pulls in a second GPU, and never shrinks the context; it only spends VRAM
+    that would otherwise stay idle.
 
-    Manual Expert pins remain untouched by :func:`compute_config`. With
-    ``turbo=True`` the Q4_0 baseline maps to the fork-only TurboQuant default.
+    Why it matters: measured on b10797 Vulkan (R9700), a symmetric Q4_0 cache
+    costs 4–9 % decode speed on a fully offloaded 27B hybrid and up to 24 %
+    prompt-processing speed at 16k depth on a full-attention 24B model versus
+    F16, while Q8_0 is within 1–3 % of F16. The quantised cache also lowers
+    long-context recall quality. Symmetric F16/Q8_0 pairs are supported by
+    every FlashAttention backend, so no mixed K/V fallback differences arise.
+
+    The historical ``profile_recommended`` and ``asymmetric`` parameters remain
+    in the public signature for compatibility, but do not raise precision on
+    their own. Manual Expert pins remain untouched by :func:`compute_config`.
+    With ``turbo=True`` the chosen pair maps to the fork-only TurboQuant tiers.
     Runner-specific paths that cannot apply cache quantisation bypass this
     helper and report their real F16 cache.
     """
@@ -2561,6 +2590,20 @@ def _pick_kv_quant(
     else:
         # Nothing in the table fit — fall back to the most aggressive entry.
         chosen_k, chosen_v = pairs[-1]
+
+    # Free precision upgrade: the context the Q4_0 baseline delivers is the
+    # contract; any denser symmetric pair that still reaches it wins.
+    baseline_per_tok = _per_token_for_pair(chosen_k, chosen_v)
+    if baseline_per_tok > 0 and target_ctx > 0:
+        baseline_ctx = min(int(budget_mb / baseline_per_tok), target_ctx)
+        if baseline_ctx > 0:
+            for k, v in KV_PRECISION_UPGRADE_PAIRS:
+                per_tok = _per_token_for_pair(k, v)
+                if per_tok <= 0:
+                    continue
+                if int(budget_mb / per_tok) >= baseline_ctx:
+                    chosen_k, chosen_v = k, v
+                    break
 
     if turbo:
         chosen_k = _turbo_quant_for(chosen_k)
@@ -5200,6 +5243,11 @@ def build_command(
     )
     if enable_prompt_cache and vision_cache_ok:
         cmd += ["--cache-ram", str(resolved_cache_ram_mib)]
+        if resolved_cache_ram_mib != 0:
+            # Partial-prefix reuse via KV shifting (see the constant's note).
+            # Older binaries without the flag drop it in the compatibility
+            # filter, and llama-server ignores it for non-shiftable caches.
+            cmd += ["--cache-reuse", str(PROMPT_CACHE_REUSE_MIN_CHUNK)]
     else:
         cmd += ["--cache-ram", "0"]
 

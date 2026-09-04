@@ -85,9 +85,13 @@ def test_ocr_profile_metadata_does_not_override_global_q4_auto_default() -> None
     assert profile.min_llama_build == 10287
     assert profile.flash_attn is False
     assert profile.recommended_kv_quant == "f16"
-    assert _pick_kv_quant(" f16 ", 32768, 0.01, 64.0) == ("q4_0", "q4_0")
-    assert _pick_kv_quant("q4_1", 1024, 0.001, 64.0) == ("q4_0", "q4_0")
-    assert _pick_kv_quant("", 1024, 0.001, 64.0) == ("q4_0", "q4_0")
+    # The profile recommendation never steers Auto: only the KV budget does.
+    # A tight budget keeps the Q4_0 capacity baseline despite " f16 "...
+    assert _pick_kv_quant(" f16 ", 32768, 0.01, 0.1) == ("q4_0", "q4_0")
+    # ...and idle memory takes the free F16 upgrade whatever the profile says.
+    assert _pick_kv_quant(" f16 ", 1024, 0.001, 64.0) == ("f16", "f16")
+    assert _pick_kv_quant("q4_1", 1024, 0.001, 64.0) == ("f16", "f16")
+    assert _pick_kv_quant("", 1024, 0.001, 64.0) == ("f16", "f16")
 
 
 def test_profile_loader_accepts_numeric_flash_attention(tmp_path) -> None:

@@ -1,6 +1,6 @@
 # AutoTuner language packs
 
-AutoTuner v5.3.4 includes these validated interface packs:
+AutoTuner v5.4.1 includes these validated interface packs:
 
 - English (UK), the fallback and default
 - Deutsch
@@ -10,10 +10,44 @@ AutoTuner v5.3.4 includes these validated interface packs:
 - Français
 - Ελληνικά
 - Polski
+- Русский (new in v5.4.1)
 
 Open the persistent **⋯** toolbar and use **Language** to change the interface
 immediately. Missing translations always fall back to English (UK), so an older
 custom pack remains usable when a later AutoTuner version adds controls.
+
+## What is translated (v5.4.1)
+
+Every built-in pack carries 427 strings:
+
+- toolbar, launch-options, server, and settings labels (the original 83);
+- the two-level hover help of every control: the **In short:** and
+  **Technical details:** section labels and both texts;
+- the Expert panel sections and labels, the performance-test dialog, the OCR
+  dialog, the performance analysis window, and the path-manager dialog;
+- message boxes (update, folder and launch errors, Expert copy/paste);
+- the model context menu, the **★ Favourites** tree section, and the
+  list/tree row tooltips (favourite state, vision, draft, thinking, tool use);
+- the performance-target descriptions shown in the Performance tooltip and in
+  the performance-test dialog;
+- the metric explanations of the performance analysis.
+
+Hover help is stored as plain text. `localization.setting_tooltip_html()`
+builds the HTML that Qt shows; `LanguageManager.translate_tooltip()` takes it
+apart again, translates the section labels and both texts, and rebuilds it.
+Lines the application composes at runtime keep their dynamic part: a pack
+translates `Active build:` and `Resolved path:` once, and the tier bullet list
+`• balanced: …` is translated through the tier description. Texts that Qt
+widgets cannot retranslate live (item tooltips, dynamic labels, message boxes)
+go through `localization.translate()` when they are created, and switching the
+language rebuilds the model list.
+
+`test_localization.py` extracts every help constant from `qt_launcher.py` with
+the `ast` module (`_setting_tooltip(...)` arguments, `_tr(...)` arguments, the
+model-row tooltip constants, the metric help, the fork tooltip constants, and
+the performance-target descriptions) and fails when any built-in pack lacks a
+key or leaves a long text untranslated. Adding a control with hover help
+therefore means adding its two texts to all nine packs.
 
 ## Model profile explanations (v5.3.9)
 
@@ -39,7 +73,7 @@ through an optional `profile_notes` object keyed by the profile file name:
   the interface language immediately.
 - Lookup order: the active pack, then the English (UK) pack, then the YAML
   `notes` text. A pack may translate any subset of profiles.
-- All eight bundled packs translate every shipped profile (76 in v5.3.9).
+- All nine bundled packs translate every shipped profile (76 in v5.4.1).
   The YAML `notes` text is the English source; a custom pack may translate any
   subset through `profile_notes`.
 - Keys must be profile file names (`name.yaml`, letters, digits, `.`, `_`, `-`);
@@ -51,8 +85,8 @@ through an optional `profile_notes` object keyed by the profile file name:
 Choose **Open language folder** once. AutoTuner opens
 `~/.autotuner/languages` and creates
 `custom-language-template.json` if it does not already exist. The template is a
-complete copy of the English catalogue, including `profile_notes`, and is never
-overwritten after creation.
+complete copy of the English catalogue, including the hover help and
+`profile_notes`, and is never overwritten after creation.
 
 A pack is UTF-8 JSON:
 
@@ -64,7 +98,9 @@ A pack is UTF-8 JSON:
   "locale": "xx-XX",
   "strings": {
     "⚙ Settings": "⚙ My translation",
-    "Language:": "My language label:"
+    "Language:": "My language label:",
+    "In short:": "Briefly:",
+    "Changes AutoTuner's interface language immediately.": "My hover text"
   },
   "profile_notes": {
     "qwen3_8.yaml": "My explanation for Qwen3.8"
@@ -79,7 +115,8 @@ Rules:
 - `name` is the native display name shown in the dropdown.
 - `locale` documents the intended locale.
 - `strings` maps the exact English (UK) source text to its translation. Entries
-  may be omitted; English is then used for those strings.
+  may be omitted; English is then used for those strings. Hover-help texts are
+  keyed by their plain English text, not by the generated HTML.
 - `profile_notes` is optional and follows the rules above.
 - A pack is limited to 2 MiB and 2,000 strings.
 

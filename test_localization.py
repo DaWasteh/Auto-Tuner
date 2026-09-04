@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -8,8 +9,11 @@ import pytest
 
 from localization import (
     DEFAULT_LANGUAGE_ID,
+    TOOLTIP_SUMMARY_LABEL,
+    TOOLTIP_TECHNICAL_LABEL,
     LanguageManager,
     LanguagePackError,
+    setting_tooltip_html,
 )
 
 
@@ -29,6 +33,7 @@ def test_builtin_language_packs_are_complete_and_grammatically_named(tmp_path) -
         "builtin:fr-FR",
         "builtin:el-GR",
         "builtin:pl-PL",
+        "builtin:ru-RU",
     ]
     assert [pack.name for pack in packs] == [
         "English (UK)",
@@ -39,9 +44,10 @@ def test_builtin_language_packs_are_complete_and_grammatically_named(tmp_path) -
         "Français",
         "Ελληνικά",
         "Polski",
+        "Русский",
     ]
     english_keys = set(manager.packs[DEFAULT_LANGUAGE_ID].strings)
-    assert len(english_keys) >= 80
+    assert len(english_keys) >= 400
     assert all(set(pack.strings) == english_keys for pack in packs)
     assert not manager.errors
 
@@ -53,6 +59,7 @@ def test_builtin_language_packs_are_complete_and_grammatically_named(tmp_path) -
         "builtin:fr-FR": ("⚙ Paramètres", "Langue :"),
         "builtin:el-GR": ("⚙ Ρυθμίσεις", "Γλώσσα:"),
         "builtin:pl-PL": ("⚙ Ustawienia", "Język:"),
+        "builtin:ru-RU": ("⚙ Настройки", "Язык:"),
     }
     for pack_id, (settings, language) in expected.items():
         manager.select(pack_id)
@@ -98,7 +105,7 @@ def test_invalid_custom_pack_is_ignored_without_disabling_builtins(tmp_path) -> 
     (user_dir / "broken.json").write_text('{"schema_version": 1}', encoding="utf-8")
     manager = LanguageManager(BUILTIN_LANGUAGES, user_dir)
     assert manager.current_id == DEFAULT_LANGUAGE_ID
-    assert len(manager.available()) == 8
+    assert len(manager.available()) == 9
     assert manager.errors and "broken.json" in manager.errors[0]
     with pytest.raises(LanguagePackError):
         manager.import_pack(user_dir / "broken.json", replace=True)
@@ -215,3 +222,139 @@ def test_profile_notes_are_validated_in_custom_packs(tmp_path) -> None:
         )
         with pytest.raises(LanguagePackError):
             manager.import_pack(custom, replace=True)
+
+
+def _gui_help_strings() -> set[str]:
+    """Every English help/tooltip/dialog string the GUI builds from constants.
+
+    Mirrors the catalogue rule: two-level tooltips (``_setting_tooltip``),
+    strings passed through ``_tr``/``translate``, the model-row tooltip
+    constants, metric help, fork tooltip constants, and the performance
+    target descriptions must all be translatable.
+    """
+    source = (ROOT / "qt_launcher.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    found: set[str] = set()
+
+    def is_const(node: ast.AST) -> bool:
+        return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else (func.attr if isinstance(func, ast.Attribute) else None)
+            )
+            if name == "_setting_tooltip":
+                found.update(a.value for a in node.args if is_const(a))
+            elif name in ("_tr", "translate", "tr") and node.args and is_const(node.args[0]):
+                found.add(node.args[0].value)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            target = node.targets[0].id
+            if (
+                target.startswith("MODEL_TOOLTIP_")
+                or target in ("_FORK_TOOLTIP_SUMMARY", "_FORK_TOOLTIP_TECHNICAL")
+            ) and is_const(node.value):
+                found.add(node.value.value)
+            if target == "_METRIC_HELP" and isinstance(node.value, ast.Dict):
+                found.update(v.value for v in node.value.values if is_const(v))
+    from performance_target import PERFORMANCE_TARGETS
+
+    found.update(target.description for target in PERFORMANCE_TARGETS.values())
+    found.update({TOOLTIP_SUMMARY_LABEL, TOOLTIP_TECHNICAL_LABEL})
+    return {text for text in found if text.strip()}
+
+
+def test_every_gui_help_string_is_translated_in_every_builtin_pack(tmp_path) -> None:
+    manager = LanguageManager(BUILTIN_LANGUAGES, tmp_path / "languages")
+    assert not manager.errors
+    required = _gui_help_strings()
+    assert len(required) >= 250
+    for pack in manager.available():
+        missing = sorted(text for text in required if text not in pack.strings)
+        assert missing == [], f"{pack.qualified_id} lacks {len(missing)} strings: {missing[:5]}"
+        if pack.qualified_id != DEFAULT_LANGUAGE_ID:
+            untranslated = [
+                text
+                for text in required
+                if pack.strings[text] == text and len(text) > 40
+            ]
+            assert untranslated == [], f"{pack.qualified_id}: {untranslated[:3]}"
+
+
+def test_two_level_tooltips_are_translated_as_plain_text(tmp_path) -> None:
+    manager = LanguageManager(BUILTIN_LANGUAGES, tmp_path / "languages")
+    summary = "Changes AutoTuner's interface language immediately."
+    technical = (
+        "Built-in JSON packs fall back to English (UK) for unknown strings. "
+        "Custom packs are validated and copied into ~/.autotuner/languages."
+    )
+    html = setting_tooltip_html(summary, technical)
+    assert "<b>In short:</b>" in html and "&#x27;" in html  # escaped apostrophe
+
+    manager.select("builtin:de-DE")
+    translated = manager.translate_tooltip(html)
+    assert translated.startswith("<html><body style='max-width:520px'><p><b>Kurz gesagt:</b> ")
+    assert "Technische Details:" in translated
+    assert "Oberflächensprache" in translated
+    assert "Built-in JSON" not in translated
+    # Translating the translated HTML again is stable (idempotent on non-English).
+    assert manager.translate_tooltip(translated) == translated
+
+    # Dynamic suffixes and runtime-composed lines survive with translated prefixes.
+    dynamic = setting_tooltip_html(
+        summary, technical + "\nActive build: b10797_vulkan\nResolved path: L:\\x"
+    )
+    out = manager.translate_tooltip(dynamic)
+    assert "Aktiver Build: b10797_vulkan" in out
+    assert "Aufgelöster Pfad: L:\\x" in out
+    suffixed = html + "<br><br>AUTOTUNER_CONTROL_API_KEY currently overrides this value."
+    assert manager.translate_tooltip(suffixed).endswith(
+        "<br><br>AUTOTUNER_CONTROL_API_KEY currently overrides this value."
+    )
+
+    # Bullet lines built from the performance-target registry are translated too.
+    from performance_target import PERFORMANCE_TARGETS
+
+    bullet = f"• balanced: {PERFORMANCE_TARGETS['balanced'].description}"
+    assert manager.translate_text(bullet).startswith("• balanced: Standard.")
+
+    # English selection restores the exact original HTML.
+    manager.select(DEFAULT_LANGUAGE_ID)
+    assert manager.translate_tooltip(html) == html
+
+
+def test_widget_tooltips_follow_the_language_live(tmp_path) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    app = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    manager = LanguageManager(BUILTIN_LANGUAGES, tmp_path / "languages")
+    root = qt_widgets.QWidget()
+    button = qt_widgets.QPushButton("Rename", root)
+    button.setToolTip(
+        setting_tooltip_html(
+            "Rename the selected Custom profile for this model and performance mode.",
+            "Rename the selected Custom profile for this model and performance mode.",
+        )
+    )
+    plain = qt_widgets.QLabel("x", root)
+    plain.setToolTip("Hover for how this metric is collected.")
+
+    manager.select("builtin:ru-RU")
+    manager.apply_to(root)
+    assert "Кратко:" in button.toolTip()
+    assert "Переименовать выбранный пользовательский профиль" in button.toolTip()
+    assert plain.toolTip() == "Наведите курсор, чтобы узнать, как собирается эта метрика."
+
+    manager.select("builtin:fr-FR")
+    manager.apply_to(root)
+    assert "En bref :" in button.toolTip()
+    assert plain.toolTip() == "Survolez pour savoir comment cette métrique est collectée."
+    root.close()
+    assert app is qt_widgets.QApplication.instance()

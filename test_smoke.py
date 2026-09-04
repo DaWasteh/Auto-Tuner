@@ -1371,6 +1371,50 @@ def test_vision_prompt_cache_is_build_gated(tmp_path, monkeypatch) -> None:
     assert disabled_cmd[disabled_idx + 1] == "0"
 
 
+def test_prompt_cache_reuse_follows_cache_ram(tmp_path) -> None:
+    """--cache-reuse rides along whenever the host prompt cache is active."""
+    from tuner import (
+        PROMPT_CACHE_REUSE_MIN_CHUNK,
+        _filter_command_for_supported_flags,
+    )
+
+    profiles = load_profiles(SETTINGS_DIR)
+    model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
+    profile = match_profile(model.name, profiles)
+    cfg = compute_config(model, _fake_system(), profile)
+
+    cmd = build_command(model, cfg, profile, enable_prompt_cache=True)
+    idx = cmd.index("--cache-ram")
+    assert cmd[idx + 1] == "2048"
+    assert cmd[idx + 2 : idx + 4] == ["--cache-reuse", str(PROMPT_CACHE_REUSE_MIN_CHUNK)]
+    assert PROMPT_CACHE_REUSE_MIN_CHUNK == 256
+
+    # Disabled cache → no reuse flag either.
+    off = build_command(model, cfg, profile, enable_prompt_cache=False)
+    assert "--cache-reuse" not in off
+    cfg.prompt_cache_ram_mib = 0
+    zero = build_command(model, cfg, profile, enable_prompt_cache=True)
+    assert "--cache-reuse" not in zero
+    cfg.prompt_cache_ram_mib = -1
+    unlimited = build_command(model, cfg, profile, enable_prompt_cache=True)
+    assert "--cache-reuse" in unlimited
+
+    # An Expert/profile override wins and never duplicates the flag.
+    custom = build_command(
+        model, cfg, profile, enable_prompt_cache=True, extra_args=["--cache-reuse", "512"]
+    )
+    assert custom.count("--cache-reuse") == 1
+    assert custom[custom.index("--cache-reuse") + 1] == "256"
+
+    # Old binaries without the flag lose flag AND value in the compat filter.
+    supported = {"--cache-ram", "-m", "-c", "--host", "--port"}
+    filtered, removed = _filter_command_for_supported_flags(
+        ["srv", "--cache-ram", "2048", "--cache-reuse", "256", "--host", "x"], supported
+    )
+    assert filtered == ["srv", "--cache-ram", "2048", "--host", "x"]
+    assert "--cache-reuse" in " ".join(removed)
+
+
 def test_mmproj_cpu_offload_moves_memory_and_emits_flag(tmp_path, monkeypatch) -> None:
     """--no-mmproj-offload moves the projector estimate from VRAM to RAM,
     and the command flag is emitted only while a projector is loaded."""
@@ -3041,6 +3085,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     assert window._language_combo.findData("builtin:fr-FR") >= 0
     assert window._language_combo.findData("builtin:el-GR") >= 0
     assert window._language_combo.findData("builtin:pl-PL") >= 0
+    assert window._language_combo.findData("builtin:ru-RU") >= 0
     assert window._language_combo.findData(
         qt_launcher.CUSTOM_LANGUAGE_ACTION
     ) >= 0
@@ -3104,7 +3149,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
         qt_launcher.app_settings.favorite_model_key(alibaba.path)
     }
     window._populate_list(window._all_entries)
-    assert window._model_tree.topLevelItem(0).text(0) == "★ Favoriten (1)"
+    assert window._model_tree.topLevelItem(0).text(0) == "★ Favourites (1)"
     assert (
         window._model_tree.topLevelItem(0)
         .child(0)
@@ -4116,13 +4161,19 @@ def _fake_dual_gpu_system(
 
 
 def test_multi_gpu_pins_to_largest_when_model_and_q4_kv_fit(tmp_path) -> None:
-    """Keep the peer GPU free when requested context and Q4 KV fit."""
+    """Keep the peer GPU free when requested context and Q4 KV fit.
+
+    The single-GPU decision is made against the Q4_0 capacity baseline. The
+    free precision upgrade may then pick F16 for the 32k request because it
+    still fits the pinned card; it must never re-open the peer GPU.
+    """
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
     profile = match_profile(model.name, profiles)
     cfg = compute_config(model, _fake_dual_gpu_system(), profile, user_ctx=32768)
 
-    assert cfg.cache_k == cfg.cache_v == "q4_0"
+    assert cfg.ctx == 32768
+    assert cfg.cache_k == cfg.cache_v == "f16"
     assert cfg.tensor_split is not None, "Expected tensor_split to be set"
     assert cfg.main_gpu == 0, f"Expected main_gpu=0 (largest), got {cfg.main_gpu}"
 
@@ -4171,7 +4222,12 @@ def _fake_qwen38_27b_model(tmp_path, name: str, size_gb: float):
 def test_qwen38_dual_gpu_preserves_full_context_with_q4_default(
     tmp_path, name, size_gb
 ) -> None:
-    """Every weight quant keeps native context with the global Q4 KV pair."""
+    """Every weight quant keeps native context; precision is a free bonus.
+
+    Placement and the single-card decision are still planned against the
+    Q4_0 baseline. When idle VRAM lets Q8_0/F16 hold the same 262k window,
+    Auto takes it without spreading a variant that used to stay pinned.
+    """
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_qwen38_27b_model(tmp_path, name, size_gb)
     profile = match_profile(model.name, profiles, model.architecture)
@@ -4192,7 +4248,12 @@ def test_qwen38_dual_gpu_preserves_full_context_with_q4_default(
     )
 
     assert cfg.ctx == 262144
-    assert (cfg.cache_k, cfg.cache_v) == ("q4_0", "q4_0")
+    assert cfg.cache_k == cfg.cache_v
+    assert cfg.cache_k in {"f16", "q8_0", "q4_0"}
+    if size_gb < 20:
+        # Q3/Q4/Q5 fit the R9700 alone with the Q4 baseline; the precision
+        # upgrade must not pull the RX 9070 XT in.
+        assert cfg.tensor_split is None
 
     # Small variants may now stay on the R9700 because Auto no longer spreads
     # solely to upgrade KV precision. Larger variants still use both cards.
@@ -6515,21 +6576,40 @@ def test_alternate_kv_head_key_is_used_by_sizing() -> None:
     assert not any(w.id == "KV-HEAD-COUNT-MISSING" for w in audit_model_metadata(model))
 
 
-def test_auto_kv_uses_q4_even_when_full_precision_fits() -> None:
-    """Unused memory no longer upgrades Auto beyond the Q4 capacity default."""
+def test_auto_kv_upgrades_precision_only_when_context_is_free() -> None:
+    """Q4_0 stays the capacity baseline; denser caches are taken only when they
+    reach exactly the same context (measured: Q4_0 costs 4–24 % speed)."""
     from tuner import _pick_kv_quant
 
-    pair = _pick_kv_quant(
-        "q5_0",
-        262144,
-        0.0625,
-        20.0,
-        262144,
-        asymmetric=True,
-        base_k_per_token_mb=0.03125,
-        base_v_per_token_mb=0.03125,
+    def pick(budget_gb: float, target_ctx: int = 262144):
+        return _pick_kv_quant(
+            "q5_0",
+            target_ctx,
+            0.0625,
+            budget_gb,
+            262144,
+            asymmetric=True,
+            base_k_per_token_mb=0.03125,
+            base_v_per_token_mb=0.03125,
+        )
+
+    # 20 GB holds 262k tokens at F16 (16.0 GB): full precision is free.
+    assert pick(20.0) == ("f16", "f16")
+    # 10 GB holds 262k only at Q8_0 (~8.5 GB); F16 would cost context.
+    assert pick(10.0) == ("q8_0", "q8_0")
+    # 5 GB reaches 262k only with Q4_0 (~4.5 GB).
+    assert pick(5.0) == ("q4_0", "q4_0")
+    # Budget-limited case: Q4_0 delivers ~35k here, and no denser pair can
+    # match that, so context wins over precision.
+    assert pick(0.6) == ("q4_0", "q4_0")
+    # A small explicit request that every pair satisfies takes F16.
+    assert pick(0.6, target_ctx=4096) == ("f16", "f16")
+    # TurboQuant forks map the chosen pair to their tiers.
+    turbo = _pick_kv_quant(
+        "q5_0", 262144, 0.0625, 20.0, 262144, turbo=True,
+        base_k_per_token_mb=0.03125, base_v_per_token_mb=0.03125,
     )
-    assert pair == ("q4_0", "q4_0")
+    assert turbo == ("turbo4", "turbo4")
 
 
 def test_auto_kv_stays_symmetric_with_unequal_kv_dimensions() -> None:

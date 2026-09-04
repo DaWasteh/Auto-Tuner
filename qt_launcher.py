@@ -170,6 +170,8 @@ from performance_report import write_performance_report
 from theme_dialog import ThemeEditorDialog
 from theme_manager import SYSTEM_THEME_ID, ThemeDefinition, ThemeManager
 from localization import (
+    setting_tooltip_html,
+    translate as _tr,
     CUSTOM_LANGUAGE_ACTION,
     LanguageManager,
     LanguagePackError,
@@ -378,15 +380,13 @@ def _theme_replace_id(
 
 
 def _setting_tooltip(summary: str, technical: str) -> str:
-    """Build consistent two-level hover help for beginner and expert users."""
-    summary_html = escape(summary).replace("\n", "<br>")
-    technical_html = escape(technical).replace("\n", "<br>")
-    return (
-        "<html><body style='max-width:520px'>"
-        f"<p><b>In short:</b> {summary_html}</p>"
-        f"<p><b>Technical details:</b> {technical_html}</p>"
-        "</body></html>"
-    )
+    """Build consistent two-level hover help for beginner and expert users.
+
+    The English (UK) text is the translation key. ``LanguageManager`` takes
+    the generated HTML apart again and translates both sections live, so
+    keep the two arguments plain text (no markup).
+    """
+    return setting_tooltip_html(summary, technical)
 
 
 def _open_local_folder(path: Path) -> bool:
@@ -732,7 +732,7 @@ class _PathListDialog(QDialog):
         self.resize(720, 420)
 
         layout = QVBoxLayout(self)
-        self._master = QCheckBox("Alle aktivieren")
+        self._master = QCheckBox("Enable all")
         self._master.setToolTip(
             _setting_tooltip(
                 "Includes or excludes every saved folder from scanning in one step.",
@@ -758,9 +758,9 @@ class _PathListDialog(QDialog):
         layout.addWidget(self._list, 1)
 
         buttons_row = QHBoxLayout()
-        self._btn_add = QPushButton("Hinzufügen…")
-        self._btn_edit = QPushButton("Bearbeiten…")
-        self._btn_remove = QPushButton("Entfernen")
+        self._btn_add = QPushButton("Add…")
+        self._btn_edit = QPushButton("Edit…")
+        self._btn_remove = QPushButton("Remove")
         self._btn_add.setToolTip(
             _setting_tooltip(
                 "Adds another folder to this list and enables it immediately.",
@@ -861,13 +861,13 @@ class _PathListDialog(QDialog):
         try:
             self._master.setChecked(total > 0 and enabled == total)
             if total == 0:
-                self._master.setText("Alle aktivieren")
+                self._master.setText(_tr("Enable all"))
             elif enabled == total:
-                self._master.setText(f"Alle aktiv ({enabled}/{total})")
+                self._master.setText(f"{_tr('All enabled')} ({enabled}/{total})")
             elif enabled == 0:
-                self._master.setText(f"Alle deaktiviert (0/{total})")
+                self._master.setText(f"{_tr('All disabled')} (0/{total})")
             else:
-                self._master.setText(f"Teilweise aktiv ({enabled}/{total})")
+                self._master.setText(f"{_tr('Partially enabled')} ({enabled}/{total})")
         finally:
             self._updating_master = False
 
@@ -3739,22 +3739,36 @@ def _model_display_text(entry: ModelEntry) -> str:
     return f"{entry.name}  {marks}{tail}" if marks else f"{entry.name}{tail}"
 
 
-def _model_tooltip(entry: ModelEntry, favorite: bool) -> str:
-    """Describe favorite state and paired capabilities for one model row."""
-    state = (
-        "Favorit — anklicken zum Entfernen"
-        if favorite
-        else "Kein Favorit — Stern anklicken zum Markieren"
-    )
+MODEL_TOOLTIP_FAVORITE = "Favourite: click the star to remove it"
+MODEL_TOOLTIP_NOT_FAVORITE = "Not a favourite: click the star to mark it"
+MODEL_TOOLTIP_THINKING = "Thinking: the chat template emits <think>"
+MODEL_TOOLTIP_TOOL_USE = "Tool use: the chat template supports tool_calls"
+MODEL_TOOLTIP_VISION = "Vision:"
+MODEL_TOOLTIP_DRAFT = "Draft:"
+
+
+def _model_tooltip(
+    entry: ModelEntry,
+    favorite: bool,
+    translate: Optional[Callable[[str], str]] = None,
+) -> str:
+    """Describe favorite state and paired capabilities for one model row.
+
+    Item tooltips are plain strings on ``QListWidgetItem``/``QTreeWidgetItem``
+    rows, which the live widget retranslation cannot reach, so the caller
+    passes the active language's ``translate`` callable.
+    """
+    tr = translate or (lambda text: text)
+    state = tr(MODEL_TOOLTIP_FAVORITE) if favorite else tr(MODEL_TOOLTIP_NOT_FAVORITE)
     lines = [entry.name, str(entry.path), "", f"★  {state}"]
     if entry.mmproj is not None:
-        lines.append(f"👁  Vision      {entry.mmproj.name}")
+        lines.append(f"👁  {tr(MODEL_TOOLTIP_VISION)} {entry.mmproj.name}")
     if entry.draft is not None:
-        lines.append(f"⚡  Draft       {entry.draft.name}")
+        lines.append(f"⚡  {tr(MODEL_TOOLTIP_DRAFT)} {entry.draft.name}")
     if entry.supports_thinking:
-        lines.append("🧠  Thinking    chat template emits <think>")
+        lines.append(f"🧠  {tr(MODEL_TOOLTIP_THINKING)}")
     if entry.supports_tool_use:
-        lines.append("🛠  Tool use    chat template supports tool_calls")
+        lines.append(f"🛠  {tr(MODEL_TOOLTIP_TOOL_USE)}")
     return "\n".join(lines)
 
 
@@ -4461,7 +4475,7 @@ class ExpertPanel(QWidget):
         # landed. Hidden until the first real edit; never shown for
         # programmatic load / restore / reset (those bypass
         # `_emit_state_changed` via the `_populating` guard).
-        self._saved_lbl = QLabel("✓ gespeichert")
+        self._saved_lbl = QLabel("✓ saved")
         self._saved_lbl.setProperty("themeRole", "saved")
         self._saved_lbl.setVisible(False)
         mode_row.addWidget(self._saved_lbl)
@@ -6955,6 +6969,13 @@ class MainWindow(QMainWindow):
                 self._show_config(entry)
             except Exception as exc:
                 self._log(f"[Language] Could not refresh the preview: {exc}")
+        # List/tree rows carry plain-string tooltips and the Favourites label,
+        # which the widget event filter cannot retranslate.
+        if getattr(self, "_all_entries", None):
+            try:
+                self._apply_filter(self._search.text())
+            except Exception as exc:
+                self._log(f"[Language] Could not refresh the model list: {exc}")
         self._status.showMessage(
             self._language_manager.translate("Language changed."), 3000
         )
@@ -9115,9 +9136,9 @@ class MainWindow(QMainWindow):
                     initial = [(Path(env_fork).expanduser(), True)]
         dlg = _PathListDialog(
             self,
-            "llama.cpp-Build-Pfade verwalten",
+            _tr("Manage llama.cpp build paths"),
             initial,
-            "llama.cpp-Build- oder Container-Ordner auswählen",
+            _tr("Select a llama.cpp build or container folder"),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -9162,7 +9183,9 @@ class MainWindow(QMainWindow):
         """
         if not path.is_dir():
             QMessageBox.warning(
-                self, "Ungültiger Ordner", f"Der Ordner existiert nicht:\n{path}"
+                self,
+                _tr("Invalid folder"),
+                f"{_tr('The folder does not exist:')}\n{path}",
             )
             return
 
@@ -9236,10 +9259,10 @@ class MainWindow(QMainWindow):
 
     def _models_label(self, paths: List[Path]) -> str:
         if not paths:
-            return "keine aktiven Model-Pfade"
+            return "no active model paths"
         if len(paths) == 1:
             return str(paths[0])
-        return f"{len(paths)} Model-Pfade"
+        return f"{len(paths)} model paths"
 
     def _start_scan(self) -> None:
         try:
@@ -9348,13 +9371,15 @@ class MainWindow(QMainWindow):
 
         reply = QMessageBox.question(
             self,
-            "AutoTuner update",
-            f"GitHub nach Source-Updates für AutoTuner v{VERSION} prüfen und "
-            "installieren?\n\n"
-            "Bei Git-Klonen nutzt AutoTuner git pull --ff-only auf dem aktuellen "
-            "Branch; bei heruntergeladenen Ordnern wird das aktuelle GitHub-Source-ZIP "
-            "eingespielt. Dieser Source-Updater lädt keine Release-Assets.\n\n"
-            "autotuner_settings.json wird vorher gesichert und danach wiederhergestellt.",
+            _tr("AutoTuner update"),
+            f"{_tr('Check GitHub for source updates and install them?')} (v{VERSION})\n\n"
+            + _tr(
+                "Git clones use git pull --ff-only on the current branch; downloaded "
+                "folders receive the current GitHub source ZIP. This source updater "
+                "does not download release assets."
+            )
+            + "\n\n"
+            + _tr("autotuner_settings.json is backed up first and restored afterwards."),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -9382,12 +9407,14 @@ class MainWindow(QMainWindow):
         """Frozen-build update path: OS-aware release-asset swap."""
         reply = QMessageBox.question(
             self,
-            "AutoTuner update",
-            f"GitHub nach einer neuen AutoTuner-Version suchen?\n\n"
-            f"Läuft: v{VERSION} auf {platform.system()}. Bei einem neuen "
-            "Release wird das passende Binary (.exe / Linux / macOS) geladen "
-            "und nach dem Neustart ausgetauscht. Deine Einstellungen "
-            "(autotuner_settings.json) bleiben erhalten.",
+            _tr("AutoTuner update"),
+            f"{_tr('Check GitHub for a newer AutoTuner version?')}\n\n"
+            f"{_tr('Running:')} v{VERSION} ({platform.system()}). "
+            + _tr(
+                "A newer release downloads the matching binary (.exe / Linux / macOS) "
+                "and swaps it in after a restart. Your settings "
+                "(autotuner_settings.json) are kept."
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -9430,9 +9457,13 @@ class MainWindow(QMainWindow):
         if needs_restart:
             QMessageBox.information(
                 self,
-                "AutoTuner update",
-                msg + "\n\nKlicke OK — AutoTuner beendet sich jetzt und "
-                "startet automatisch mit der neuen Version neu.",
+                _tr("AutoTuner update"),
+                msg
+                + "\n\n"
+                + _tr(
+                    "Click OK: AutoTuner closes now and restarts automatically with "
+                    "the new version."
+                ),
             )
             # Stop child servers so VRAM is freed before the swap/relaunch.
             try:
@@ -9546,7 +9577,9 @@ class MainWindow(QMainWindow):
         favorite = app_settings.favorite_model_key(entry.path) in self._favorite_models
         item.setData(0, Qt.ItemDataRole.UserRole, entry)
         item.setData(0, _FAVORITE_ROLE, favorite)
-        item.setToolTip(0, _model_tooltip(entry, favorite))
+        item.setToolTip(
+            0, _model_tooltip(entry, favorite, self._language_manager.translate)
+        )
         return item
 
     def _populate_tree(
@@ -9559,7 +9592,8 @@ class MainWindow(QMainWindow):
             if app_settings.favorite_model_key(entry.path) in self._favorite_models
         ]
         favorite_root = QTreeWidgetItem(
-            self._model_tree, [f"★ Favoriten ({len(favorites)})"]
+            self._model_tree,
+            [f"{self._language_manager.translate('★ Favourites')} ({len(favorites)})"],
         )
         favorite_root.setData(0, _TREE_PATH_ROLE, "favorites")
         favorite_font = favorite_root.font(0)
@@ -9567,8 +9601,10 @@ class MainWindow(QMainWindow):
         favorite_root.setFont(0, favorite_font)
         favorite_root.setToolTip(
             0,
-            "Favorisierte Modelle bleiben hier unabhängig von ihrer Ordnerposition "
-            "direkt erreichbar.",
+            self._language_manager.translate(
+                "Favourite models stay directly reachable here regardless of their "
+                "folder location."
+            ),
         )
         for entry in _sort_model_entries(favorites, self._favorite_models):
             item = self._add_tree_model_item(favorite_root, entry)
@@ -9658,7 +9694,9 @@ class MainWindow(QMainWindow):
                 )
                 item.setData(Qt.ItemDataRole.UserRole, entry)
                 item.setData(_FAVORITE_ROLE, favorite)
-                item.setToolTip(_model_tooltip(entry, favorite))
+                item.setToolTip(
+                    _model_tooltip(entry, favorite, self._language_manager.translate)
+                )
                 self._model_list.addItem(item)
                 if selected_path is not None and entry.path == selected_path:
                     selected_list_item = item
@@ -9716,10 +9754,11 @@ class MainWindow(QMainWindow):
         # keeping the menu action tied to this exact item.
         view.setCurrentItem(item)
         menu = QMenu(view)
-        open_folder = menu.addAction("📂 GGUF-Ordner öffnen")
+        tr = self._language_manager.translate
+        open_folder = menu.addAction(tr("📂 Open GGUF folder"))
         menu.addSeparator()
-        copy_expert = menu.addAction("📋 Expert Settings kopieren")
-        paste_expert = menu.addAction("📌 Expert Settings einfügen")
+        copy_expert = menu.addAction(tr("📋 Copy Expert settings"))
+        paste_expert = menu.addAction(tr("📌 Paste Expert settings"))
         clipboard = self._expert_settings_clipboard
         paste_expert.setEnabled(clipboard is not None)
         if clipboard is not None:
@@ -9746,8 +9785,8 @@ class MainWindow(QMainWindow):
         if not folder.is_dir() or not _open_local_folder(folder):
             QMessageBox.warning(
                 self,
-                "Ordner konnte nicht geöffnet werden",
-                f"Der GGUF-Ordner konnte nicht geöffnet werden:\n{folder}",
+                _tr("Could not open folder"),
+                f"{_tr('The GGUF folder could not be opened:')}\n{folder}",
             )
 
     def _copy_expert_settings(self, entry: ModelEntry) -> None:
@@ -9776,10 +9815,11 @@ class MainWindow(QMainWindow):
         ):
             QMessageBox.information(
                 self,
-                "Expert Settings kopieren",
-                "Für dieses Modell sind noch keine kopierbaren Expert Settings "
-                "verfügbar. Warte auf die Hardware-Erkennung oder öffne zuerst "
-                "Expert Settings.",
+                _tr("Copy Expert settings"),
+                _tr(
+                    "No copyable Expert settings exist for this model yet. Wait for "
+                    "hardware detection to finish or open Expert settings first."
+                ),
             )
             return
         self._expert_settings_clipboard = {
@@ -9861,8 +9901,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(
                 self,
-                "Expert Settings einfügen",
-                f"Die Expert Settings konnten nicht gespeichert werden:\n{exc}",
+                _tr("Paste Expert settings"),
+                f"{_tr('The Expert settings could not be saved:')}\n{exc}",
             )
             return
 
@@ -9892,9 +9932,9 @@ class MainWindow(QMainWindow):
     def _browse_models(self) -> None:
         dlg = _PathListDialog(
             self,
-            "Model-Pfade verwalten",
+            _tr("Manage model paths"),
             self.model_paths,
-            "Model-Ordner auswählen",
+            _tr("Select a model folder"),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -9946,9 +9986,11 @@ class MainWindow(QMainWindow):
             self._current_entry = entry
             self._btn_diagnose.setEnabled(True)
             self._config_preview.setPlainText(
-                "Hardware-Erkennung laeuft noch...\n\n"
-                "Bitte warten Sie, bis die Systeminformationen geladen sind.\n"
-                "Die Konfiguration wird automatisch aktualisiert."
+                _tr("Hardware detection is still running…")
+                + "\n\n"
+                + _tr("Please wait until the system information has been loaded.")
+                + "\n"
+                + _tr("The configuration is updated automatically.")
             )
             return
         # Switching models drops the Expert state — the panel's pins were
@@ -13296,7 +13338,7 @@ class MainWindow(QMainWindow):
                 f"RAM: {s.free_ram_gb:.1f} / {s.total_ram_gb:.1f} GB free"
             )
         else:
-            self._vram_lbl.setText("VRAM: keine GPU")
+            self._vram_lbl.setText("VRAM: no GPU")
             self._ram_lbl.setText(
                 f"RAM: {s.free_ram_gb:.1f} / {s.total_ram_gb:.1f} GB free"
             )
@@ -13333,7 +13375,7 @@ class MainWindow(QMainWindow):
                 txt += "  ·  " + ", ".join(ign_parts)
             self._gpu_lbl.setText(txt)
         else:
-            self._gpu_lbl.setText("GPU: keine")
+            self._gpu_lbl.setText("GPU: none")
 
         self._sysbar.refresh_layout()
 
@@ -14330,12 +14372,17 @@ class MainWindow(QMainWindow):
                     f"[Diffusion-Server] Binary nicht gefunden: {gemma_server_bin}"
                 )
                 launch_warning(
-                    "llama-diffusion-gemma-server nicht gefunden",
-                    "DiffusionGemma benötigt llama-diffusion-gemma-server aus "
-                    "einem DiffusionGemma-Fähigen Build (PR #24427).\n\n"
-                    "Wähle im Fork-Dropdown den Build, der "
-                    "llama-diffusion-gemma-server enthält (z.B. "
-                    "d_bXXXX_vulkan_llama.cpp / d_bXXXX_hip_llama.cpp).",
+                    _tr("llama-diffusion-gemma-server not found"),
+                    _tr(
+                        "DiffusionGemma needs llama-diffusion-gemma-server from a "
+                        "DiffusionGemma-capable build (PR #24427)."
+                    )
+                    + "\n\n"
+                    + _tr(
+                        "Select the build that contains llama-diffusion-gemma-server "
+                        "in the Fork dropdown (for example d_bXXXX_vulkan_llama.cpp / "
+                        "d_bXXXX_hip_llama.cpp)."
+                    ),
                 )
                 return None
             cmd = build_diffusion_server_command(
@@ -14458,10 +14505,12 @@ class MainWindow(QMainWindow):
                 "and is executable."
             )
             launch_warning(
-                "llama-server konnte nicht starten",
+                _tr("llama-server could not start"),
                 f"{cmd[0]}\n\n{exc}\n\n"
-                "Prüfe, ob der gewählte llama.cpp-Build zu diesem Betriebssystem "
-                "passt und ausführbar ist.",
+                + _tr(
+                    "Check that the selected llama.cpp build matches this operating "
+                    "system and is executable."
+                ),
             )
             return None
 
@@ -14648,10 +14697,12 @@ class MainWindow(QMainWindow):
             self._log(f"[Error] Could not start binary: {cmd[0]} ({exc})")
             QMessageBox.warning(
                 self,
-                "Diffusion-Binary konnte nicht starten",
+                _tr("Diffusion binary could not start"),
                 f"{cmd[0]}\n\n{exc}\n\n"
-                "Prüfe, ob der gewählte llama.cpp-Build zu diesem Betriebssystem "
-                "passt und ausführbar ist.",
+                + _tr(
+                    "Check that the selected llama.cpp build matches this operating "
+                    "system and is executable."
+                ),
             )
             return
 

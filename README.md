@@ -542,7 +542,9 @@ that only make sense with persistent state:
   and Settings now stay under **⋯**, leaving the primary model/runtime row
   wider. The second row remains open until **⋯** is clicked again. Its language
   selector includes English (UK), German, Dutch, Swedish, Japanese, French,
-  Greek, and Polish. Validated custom JSON packs live under
+  Greek, Polish, and Russian. Every hover explanation ("In short" / "Technical
+  details"), dialog, Expert label, and model-row tooltip follows the selected
+  language live. Validated custom JSON packs live under
   `~/.autotuner/languages`, fall back to English for missing strings, and can be
   created from the generated template described in
   [`docs/languages.md`](docs/languages.md).
@@ -775,12 +777,18 @@ When you start the tuner, you can choose between:
 
 #### KV precision and TurboQuant options
 
-Auto mode uses symmetric `q4_0` K/V as one capacity-first contract across
-normal llama.cpp model families. It does not spend spare memory on an implicit
-F16/Q8/Q5 upgrade, and it avoids mixed-cache FlashAttention fallbacks that vary
-by backend/build. On multi-GPU systems, a peer GPU is used when Q4 plus the
-requested/native context does not fit the primary card; otherwise the peer
-stays free. Expert mode can still pin any supported K/V types explicitly.
+Auto mode plans every placement against symmetric `q4_0` K/V as the
+capacity-first baseline across normal llama.cpp model families: context is
+never traded for precision, and a peer GPU is used only when Q4 plus the
+requested/native context does not fit the primary card. Since v5.4.1 Auto then
+takes a *free* precision upgrade: when symmetric `f16` or `q8_0` still reaches
+exactly the context that Q4 delivers within the same VRAM plan, the denser cache
+is chosen. Measured on b10797 Vulkan (R9700), Q4_0 K/V costs 4–9 % decode speed
+on a fully offloaded 27B hybrid and up to 24 % prompt speed at 16k depth on a
+full-attention 24B model versus F16, while Q8_0 is within 1–3 % of F16, so the
+upgrade is pure speed and recall quality on otherwise idle VRAM. Mixed K/V
+pairs are still avoided because their FlashAttention fallbacks vary by
+backend/build. Expert mode can still pin any supported K/V types explicitly.
 Dedicated non-llama-server runners that do not expose quantized KV (currently
 DiffusionGemma) continue to report their real F16 runtime contract.
 
@@ -965,8 +973,10 @@ Notes on the new profiles:
    offload using the GGUF's exact `n_layers`, else CPU only.
 3. **Compute the KV budget**: free VRAM (after the model) plus free
    RAM (minus a safety reserve).
-4. **Pick KV quant + context**: use symmetric Q4_0 by default and allocate
-   the resulting memory headroom to the largest safe context. Explicit Expert
+4. **Pick KV quant + context**: reserve for symmetric Q4_0, allocate the
+   resulting memory headroom to the largest safe context, then upgrade to
+   symmetric F16 or Q8_0 only when that exact context still fits (idle VRAM
+   becomes speed and recall quality, never less context). Explicit Expert
    pins can choose another K/V type. Round automatic context down to a bounded
    alignment.
 5. **Threads / batch**: scale with placement (full GPU offload needs
@@ -1124,6 +1134,45 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
 
+### v5.4.1 — translated hover help, Русский, free KV precision, prompt-cache reuse
+
+- **Every explanation follows the interface language:** the two-level hover
+  help ("In short" / "Technical details") on all controls, the Expert panel
+  labels and sections, the performance-test and OCR dialogs, message boxes,
+  the model context menu, and the list/tree row tooltips are now translation
+  keys. The language manager takes the generated tooltip HTML apart,
+  translates each section as plain text, and rebuilds it, including
+  runtime-composed lines such as `Active build:` or the per-tier bullet list.
+  Formerly hard-coded German strings (`Favoriten`, `Hinzufügen…`,
+  `GGUF-Ordner öffnen`, update/error dialogs) are English source text now, so
+  the English (UK) interface is fully English. A test extracts every help
+  constant from `qt_launcher.py` with the `ast` module and fails when any
+  built-in pack lacks or leaves one untranslated.
+- **Русский:** a ninth complete built-in pack (all 427 strings and all 76
+  profile explanations). A Dutch sentence in the control-API help was reworded;
+  the other packs were reviewed and kept.
+- **Free KV precision upgrade:** Auto still plans placement and context
+  against the symmetric Q4_0 baseline, but takes symmetric F16 or Q8_0 when
+  that exact context still fits the same VRAM plan. Real `llama-bench` runs on
+  b10797 Vulkan (R9700, Qwen3.8-27B Q4_K_XL and Devstral-Small-2 24B Q4_K_XL)
+  showed Q4_0 K/V costing 4–9 % decode and 4–24 % prompt speed versus F16, with
+  Q8_0 within 1–3 % of F16; the evidence is in
+  [`docs/v5.4.1-validation.md`](docs/v5.4.1-validation.md). A 9B model with a
+  32k request now runs F16 K/V and stays pinned to one card; a 27B Q4 on the
+  32 GB card keeps its 262k context at Q8_0 without waking the second GPU.
+- **Prompt-cache reuse:** whenever the host prompt cache (`--cache-ram`) is
+  on, AutoTuner also emits `--cache-reuse 256`, so coding agents and chat
+  clients that edit the middle of an otherwise identical prompt re-use every
+  unchanged chunk through KV shifting instead of re-processing the whole
+  prompt. llama-server disables it on caches that cannot shift; older binaries
+  drop the flag in the compatibility filter.
+- **Where the memory reserves go (checked, unchanged):** the per-card
+  headroom (6 %/10 % of VRAM, floored at 1–1.5 GB), the 0.15–0.30 GB safety
+  band, the 0.6 GB/slot workspace, and the 3–15 % long-context guard cost
+  context, not speed, on fully offloaded models; they cost speed only where
+  they move dense layers or MoE experts to the CPU, which is exactly the
+  Safe/Balanced/Throughput trade-off the tier selector exposes.
+
 ### v5.4.0 — llama.cpp b10797, MTP sidecar preflight, readable performance summary
 
 - **Exact b10797 compatibility:** the stock Vulkan binary at commit
@@ -1173,8 +1222,9 @@ rather than letting llama-server abort during model or draft-context loading. Th
   bounded regex scan. See [`docs/control-api.md`](docs/control-api.md).
 - **Profile explanations follow the interface language:** every profile's
   `notes` is now English in YAML, language packs carry an optional
-  `profile_notes` map, and all eight bundled packs (English, German, Dutch,
-  Swedish, Japanese, French, Greek, Polish) translate all 76 profiles;
+  `profile_notes` map, and all bundled packs (English, German, Dutch,
+  Swedish, Japanese, French, Greek, Polish; Russian since v5.4.1) translate
+  all 76 profiles;
   switching the language re-renders the configuration preview. Missing
   entries in custom packs fall back to English. See
   [`docs/languages.md`](docs/languages.md).

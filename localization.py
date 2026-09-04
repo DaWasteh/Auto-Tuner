@@ -8,6 +8,7 @@ override any exposed label without compiling Qt ``.qm`` resources.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -40,6 +41,63 @@ _MAX_PROFILE_NOTES = 500
 _MAX_NOTE_CHARS = 20_000
 _PROFILE_NOTE_KEY_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\.ya?ml$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+#: Section labels of the two-level hover help built by :func:`setting_tooltip_html`.
+#: They are translation keys like any other English (UK) source string.
+TOOLTIP_SUMMARY_LABEL = "In short:"
+TOOLTIP_TECHNICAL_LABEL = "Technical details:"
+_TOOLTIP_HTML_RE = re.compile(
+    r"^<html><body style='max-width:520px'>"
+    r"<p><b>(?P<summary_label>[^<]*)</b> (?P<summary>.*?)</p>"
+    r"<p><b>(?P<technical_label>[^<]*)</b> (?P<technical>.*?)</p>"
+    r"</body></html>(?P<suffix>.*)$",
+    re.DOTALL,
+)
+_BULLET_LINE_RE = re.compile(r"^(?P<prefix>\s*[•\-\*]\s+[^:]{1,40}:\s+)(?P<rest>.+)$")
+_PREFIX_LINE_RE = re.compile(r"^(?P<prefix>[^:\n]{1,60}:)\s+(?P<rest>.+)$")
+
+
+def setting_tooltip_html(
+    summary: str,
+    technical: str,
+    *,
+    summary_label: str = TOOLTIP_SUMMARY_LABEL,
+    technical_label: str = TOOLTIP_TECHNICAL_LABEL,
+) -> str:
+    """Build the consistent two-level hover help for beginner and expert users.
+
+    The result is deliberately regular so :meth:`LanguageManager.translate_tooltip`
+    can take it apart again, translate each plain-text section, and rebuild it.
+    """
+    summary_html = html.escape(summary).replace("\n", "<br>")
+    technical_html = html.escape(technical).replace("\n", "<br>")
+    return (
+        "<html><body style='max-width:520px'>"
+        f"<p><b>{html.escape(summary_label)}</b> {summary_html}</p>"
+        f"<p><b>{html.escape(technical_label)}</b> {technical_html}</p>"
+        "</body></html>"
+    )
+
+
+def _tooltip_html_to_text(fragment: str) -> str:
+    return html.unescape(fragment.replace("<br>", "\n"))
+
+
+#: The manager most recently installed on the running QApplication.
+_ACTIVE_MANAGER: Optional["LanguageManager"] = None
+
+
+def translate(source_text: str) -> str:
+    """Translate *source_text* through the installed manager (English otherwise).
+
+    Text that the application composes at runtime (message boxes, dynamic
+    labels, item tooltips) cannot rely on the widget event filter, so it is
+    translated at construction time through this module-level helper.
+    """
+    manager = _ACTIVE_MANAGER
+    if manager is None:
+        return source_text
+    return manager.translate(source_text)
 
 
 class LanguagePackError(ValueError):
@@ -232,6 +290,82 @@ class LanguageManager(QObject):
             return source_text
         return self.current.strings.get(source_text, source_text)
 
+    def translate_text(self, text: str) -> str:
+        """Translate plain (possibly multi-line) text with line-level fallbacks.
+
+        Whole-text matches win.  Otherwise every line is translated on its
+        own, and lines that the application composes at runtime, such as
+        ``• balanced: <description>`` or ``Active build: <name>``, are
+        matched by their translatable part so the dynamic remainder survives.
+        """
+        if not isinstance(text, str) or not text:
+            return text
+        strings = self.current.strings
+        direct = strings.get(text)
+        if direct is not None:
+            return direct
+        if "\n" not in text:
+            return self._translate_line(text, strings)
+        return "\n".join(self._translate_line(line, strings) for line in text.split("\n"))
+
+    @staticmethod
+    def _translate_line(line: str, strings: Dict[str, str]) -> str:
+        if not line:
+            return line
+        direct = strings.get(line)
+        if direct is not None:
+            return direct
+        stripped = line.strip()
+        direct = strings.get(stripped)
+        if direct is not None:
+            return line.replace(stripped, direct, 1)
+        bullet = _BULLET_LINE_RE.match(line)
+        if bullet is not None:
+            translated = strings.get(bullet.group("rest"))
+            if translated is not None:
+                return f"{bullet.group('prefix')}{translated}"
+        prefixed = _PREFIX_LINE_RE.match(line)
+        if prefixed is not None:
+            translated_prefix = strings.get(prefixed.group("prefix"))
+            translated_rest = strings.get(prefixed.group("rest"))
+            if translated_prefix is not None or translated_rest is not None:
+                return (
+                    f"{translated_prefix or prefixed.group('prefix')} "
+                    f"{translated_rest or prefixed.group('rest')}"
+                )
+        return line
+
+    def translate_tooltip(self, text: str) -> str:
+        """Translate a widget tooltip, including the two-level HTML help.
+
+        Tooltips built by :func:`setting_tooltip_html` are split into their
+        "In short" and "Technical details" sections, translated as plain
+        text, and reassembled with translated section labels.  Any other
+        tooltip is translated as plain text.
+        """
+        if not isinstance(text, str) or not text:
+            return text
+        match = _TOOLTIP_HTML_RE.match(text)
+        if match is None:
+            return self.translate_text(text)
+        summary = self.translate_text(_tooltip_html_to_text(match.group("summary")))
+        technical = self.translate_text(
+            _tooltip_html_to_text(match.group("technical"))
+        )
+        rebuilt = setting_tooltip_html(
+            summary,
+            technical,
+            summary_label=self.translate(match.group("summary_label")),
+            technical_label=self.translate(match.group("technical_label")),
+        )
+        suffix = match.group("suffix")
+        if suffix:
+            rebuilt += "<br>".join(
+                html.escape(self.translate_text(html.unescape(part))) if part else ""
+                for part in suffix.split("<br>")
+            )
+        return rebuilt
+
     def profile_notes(self, profile: object, fallback: str = "") -> str:
         """Return the active language's explanation for a model profile.
 
@@ -261,6 +395,8 @@ class LanguageManager(QObject):
 
     def install(self, app: QApplication) -> None:
         """Translate newly shown dialogs as well as the already-built main window."""
+        global _ACTIVE_MANAGER
+        _ACTIVE_MANAGER = self
         if self._installed_app is app:
             return
         if self._installed_app is not None:
@@ -269,6 +405,9 @@ class LanguageManager(QObject):
         app.installEventFilter(self)
 
     def uninstall(self) -> None:
+        global _ACTIVE_MANAGER
+        if _ACTIVE_MANAGER is self:
+            _ACTIVE_MANAGER = None
         if self._installed_app is not None:
             self._installed_app.removeEventFilter(self)
         self._installed_app = None
@@ -301,6 +440,7 @@ class LanguageManager(QObject):
         key: str,
         getter: Callable[[], str],
         setter: Callable[[str], None],
+        translator: Optional[Callable[[str], str]] = None,
     ) -> None:
         try:
             current = getter()
@@ -318,7 +458,7 @@ class LanguageManager(QObject):
         source, previous_translation = state.get(key, (current, None))
         if previous_translation is not None and current != previous_translation:
             source = current
-        translated = self.translate(source)
+        translated = (translator or self.translate)(source)
         if current != translated:
             try:
                 setter(translated)
@@ -334,7 +474,13 @@ class LanguageManager(QObject):
                 self._translate_property(
                     obj, "windowTitle", obj.windowTitle, obj.setWindowTitle
                 )
-                self._translate_property(obj, "toolTip", obj.toolTip, obj.setToolTip)
+                self._translate_property(
+                    obj,
+                    "toolTip",
+                    obj.toolTip,
+                    obj.setToolTip,
+                    self.translate_tooltip,
+                )
                 self._translate_property(
                     obj, "accessibleName", obj.accessibleName, obj.setAccessibleName
                 )
@@ -362,7 +508,9 @@ class LanguageManager(QObject):
                 self._translate_property(obj, "title", obj.title, obj.setTitle)
             if isinstance(obj, QAction):
                 self._translate_property(obj, "text", obj.text, obj.setText)
-                self._translate_property(obj, "toolTip", obj.toolTip, obj.setToolTip)
+                self._translate_property(
+                    obj, "toolTip", obj.toolTip, obj.setToolTip, self.translate_tooltip
+                )
 
     def import_pack(self, source_path: Path, *, replace: bool = False) -> LanguagePack:
         """Validate and atomically copy a custom pack into the user directory."""
