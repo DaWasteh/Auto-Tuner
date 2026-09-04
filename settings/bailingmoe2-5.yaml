@@ -59,12 +59,12 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  InclusionAI (Ant Group) Ling-2.6-flash — MoE mit Hybrid-Attention,
-  Architektur "bailingmoe2.5" / "bailing_hybrid". ACHTUNG (Stand b9739):
-  NICHT in Vanilla-llama.cpp — braucht einen Ling-2.6-fähigen Fork (z.B.
-  ik_llama.cpp). Im Fork-Dropdown der GUI auswählen; die GGUF deklariert die
-  Architektur bereits und läuft ohne Re-Download auf Mainline, sobald
-  BailingMoeV2.5 dort gemerged ist. Normales autoregressives Server-Modell.
-  Sampling = InclusionAI-Empfehlung temp=0.7 / top_p=0.8 / rep=1.05; Coding
-  deterministischer. --jinja für Template/Reasoning. Für Ling/Ring 2.0
-  ("bailingmoe2", Mainline) ist ling-ring.yaml zuständig.
+  InclusionAI (Ant Group) Ling-2.6-flash is a MoE with hybrid attention,
+  architecture "bailingmoe2.5" / "bailing_hybrid". CAUTION (as of b9739): NOT
+  in vanilla llama.cpp; it needs a Ling-2.6-capable fork (for example
+  ik_llama.cpp). Select that fork in the GUI's fork dropdown; the GGUF already
+  declares the architecture and will run on mainline without re-downloading
+  once BailingMoeV2.5 is merged there. Normal autoregressive server model.
+  Sampling follows the InclusionAI recommendation temp=0.7 / top_p=0.8 /
+  rep=1.05; coding is more deterministic. --jinja for template/reasoning.
+  Ling/Ring 2.0 ("bailingmoe2", mainline) is handled by ling-ring.yaml.

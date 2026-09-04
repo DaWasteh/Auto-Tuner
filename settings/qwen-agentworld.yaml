@@ -82,21 +82,22 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  Alibaba Qwen-AgentWorld-35B-A3B — erstes Language World Model (CPT+SFT+RL
-  auf Environment-Simulation über 7 Domänen: MCP/Tool, Search, Terminal, SWE,
-  Android, Web, OS), Apache-2.0. KEINE eigene Architektur: es ist
-  Qwen3.5-35B-A3B weitertrainiert, general.architecture "qwen35moe" (Hybrid
-  GatedDeltaNet + Attention, 256 Experten / 8+1, nativer 262k-Kontext). Eigenes
-  Profil per Filename-Pattern "agentworld" (KEIN arch_fallback, weil die Arch
-  identisch zu regulärem Qwen3.5/3.6-A3B ist und ein doppelter qwen35moe-
-  Fallback ordnungsabhängig würde), weil die AgentWorld-Sampling-Empfehlung (temp=0.6 / top_p=0.95
-  / top_k=20, in BEIDEN Modi) bewusst von den generischen Qwen3.5-Coder/Chat-
-  Settings (temp 1.0 Thinking) abweicht — ein World Model soll konsistente,
-  faktentreue State-Übergänge simulieren. Thinking-Mode per Default (<think>),
-  qwen3-Reasoning-Parser, --jinja Pflicht. Qwen rät zu >=128k Kontext (bei OOM
-  KV quantisieren statt Kontext unter 128k senken); empfohlene Output-Länge
-  32k. Domänen-spezifische System-Prompts liegen im GitHub-Repo (prompts/) —
-  AgentWorld als Environment-Simulator braucht diese System-Prompts, um
-  sinnvolle Observations zu liefern. Mit 3B aktiv + --n-cpu-moe gut auf einer
-  32-GB-Karte lauffähig; läuft auf Mainline-llama-server (kein Fork). Für
-  reguläre Qwen3.5/3.6-Modelle bleibt qwen3_5-3_6.yaml zuständig.
+  Alibaba Qwen-AgentWorld-35B-A3B: the first language world model (CPT+SFT+RL
+  on environment simulation across 7 domains: MCP/tool, search, terminal, SWE,
+  Android, web, OS), Apache-2.0. NO separate architecture: it is
+  Qwen3.5-35B-A3B further trained, general.architecture "qwen35moe" (hybrid
+  GatedDeltaNet + attention, 256 experts / 8+1, native 262k context). Separate
+  profile by filename pattern "agentworld" (NO arch_fallback, because the
+  architecture is identical to regular Qwen3.5/3.6-A3B and a duplicate
+  qwen35moe fallback would become order-dependent), because the AgentWorld
+  sampling recommendation (temp=0.6 / top_p=0.95 / top_k=20 in BOTH modes)
+  deliberately differs from the generic Qwen3.5 coder/chat settings (temp 1.0
+  thinking): a world model should simulate consistent, factual state
+  transitions. Thinking mode by default (<think>), qwen3 reasoning parser,
+  --jinja mandatory. Qwen advises >=128k context (on OOM quantise the KV cache
+  instead of lowering context below 128k); recommended output length 32k.
+  Domain-specific system prompts live in the GitHub repository (prompts/);
+  AgentWorld as an environment simulator needs these system prompts to deliver
+  meaningful observations. With 3B active plus --n-cpu-moe it runs well on a
+  32 GB card; it runs on mainline llama-server (no fork). Regular Qwen3.5/3.6
+  models remain covered by qwen3_5-3_6.yaml.

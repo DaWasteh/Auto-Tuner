@@ -507,6 +507,20 @@ def probe_binary_build_number(binary: str) -> Optional[int]:
     return _probe_binary_build_number(binary)
 
 
+def probe_binary_build_info(binary: str) -> str:
+    """Return ``b<build>-<commit>`` (or ``b<build>``) for external clients.
+
+    Uses the same bounded, cached ``--version`` probe as the build gate, so
+    the control API never spawns an extra process per request.
+    """
+    output = _probe_binary_version_output(binary) or ""
+    build = _parse_llama_build_number(output)
+    commit = _parse_llama_commit(output)
+    if build is None:
+        return ""
+    return f"b{build}-{commit}" if commit else f"b{build}"
+
+
 @lru_cache(maxsize=32)
 def _runtime_markers_present_cached(
     files: Tuple[Tuple[str, int, int], ...], markers: Tuple[bytes, ...]

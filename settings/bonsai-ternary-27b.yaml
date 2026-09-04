@@ -40,9 +40,9 @@ sampling:
     presence_penalty: 0.0
 
 notes: >
-  PrismML Ternary-Bonsai 27B auf Qwen3.6-27B-Basis: multimodal, Thinking-
-  und Tool-Calling-fähig, 262k nativer Kontext. Die Q2_0-g128-Gewichte
-  ({-1, 0, +1}) belegen rund 7.2 GB; der optionale Vision-Projektor weitere
-  rund 0.63 GB. Für die veröffentlichte Q2_0-g128-Datei den PrismML-prism-
-  Fork verwenden. Die separate Q2_0_g64-Datei ist für aktuelles Mainline-
-  llama.cpp (derzeit CPU/Metal; weitere Backends folgen) vorgesehen.
+  PrismML Ternary-Bonsai 27B on a Qwen3.6-27B base: multimodal, thinking- and
+  tool-calling-capable, 262k native context. The Q2_0-g128 weights ({-1, 0,
+  +1}) take about 7.2 GB; the optional vision projector another roughly 0.63
+  GB. Use the PrismML prism fork for the published Q2_0-g128 file. The
+  separate Q2_0_g64 file is intended for current mainline llama.cpp (currently
+  CPU/Metal; further backends follow).

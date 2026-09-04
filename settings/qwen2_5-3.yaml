@@ -50,16 +50,14 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  Hervorragendes Allround-Modell. Coding-Profil laeuft mit temp=0.2
-  (vs. 0.7 chat) - die Coder-Varianten koennen auch mit noch niedrigerer
-  Temperatur (0.1) betrieben werden. Ueber GUI-Mode auswaehlbar.
-  Faengt auch Qwen3-Coder-30B-A3B-Instruct (arch qwen3moe) und
-  Qwen3-Coder-Next (arch qwen3next) ueber das Pattern "qwen3-coder".
-  Beide haben 256k nativen Kontext - daher max_context 262144 (vorher
-  faelschlich auf 131072 gedeckelt). Qwen3-Coder-Next ist ein Hybrid
-  (Gated DeltaNet + Gated Attention) und braucht eine aktuelle
-  llama.cpp-Version mit den DeltaNet-Operatoren - auf b9310 vorhanden.
-  Hinweis: Qwen3-Coder-Instruct ist ein reines Instruct-Modell ohne
-  Thinking; Alibaba empfiehlt dafuer temp 0.7 / top_p 0.8 (Chat-Modus
-  liegt mit 0.7/0.9 nah dran). Fuer deterministisches Code-Editing den
-  Coding-Modus (temp 0.2) verwenden.
+  Excellent all-round model. The coding profile runs at temp=0.2 (vs. 0.7
+  chat); the Coder variants can also be run at an even lower temperature
+  (0.1). Selectable through the GUI mode. Also catches
+  Qwen3-Coder-30B-A3B-Instruct (architecture qwen3moe) and Qwen3-Coder-Next
+  (architecture qwen3next) through the pattern "qwen3-coder". Both have 256k
+  native context, hence max_context 262144 (previously wrongly capped at
+  131072). Qwen3-Coder-Next is a hybrid (Gated DeltaNet + gated attention) and
+  needs a current llama.cpp version with the DeltaNet operators, present on
+  b9310. Note: Qwen3-Coder-Instruct is a pure instruct model without thinking;
+  Alibaba recommends temp 0.7 / top_p 0.8 for it (chat mode at 0.7/0.9 is
+  close). For deterministic code editing use coding mode (temp 0.2).

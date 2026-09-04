@@ -32,12 +32,11 @@ sampling:
     repeat_penalty: 1.0
 
 notes: >
-  Ministral 3 (3B/8B/14B), Mistrals Edge-Familie, alle mit Vision (mmproj).
-  14B Reasoning ist vergleichbar mit Mistral Small 3.2 24B in Reasoning-
-  Benchmarks (85% AIME '25). Architektur teilt RoPE-Scaling mit Devstral
-  Small 2 / Llama 4. Apache 2.0.
-  Chat-Profil = Reasoning-Variante (temp 1.0, Mistral-Empfehlung).
-  Coding-Profil passt auch für die Instruct-Varianten (temp ~0.1).
-  Hinweis: Pattern matched alle Varianten - bei Instruct-Modellen
-  einfach den Coding-Modus auch für Chat verwenden, oder per CLI
-  überschreiben:  -- --temp 0.0
+  Ministral 3 (3B/8B/14B), Mistral's edge family, all with vision (mmproj).
+  The 14B Reasoning variant is comparable to Mistral Small 3.2 24B in
+  reasoning benchmarks (85% AIME '25). The architecture shares RoPE scaling
+  with Devstral Small 2 / Llama 4. Apache 2.0. Chat profile = Reasoning
+  variant (temp 1.0, Mistral recommendation). The coding profile also suits
+  the Instruct variants (temp ~0.1). Note: the pattern matches all variants;
+  for Instruct models simply use coding mode for chat as well, or override via
+  CLI: -- --temp 0.0

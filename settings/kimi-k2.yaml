@@ -56,14 +56,14 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  Moonshot Kimi-K2 — 1T total / 32B aktiv MoE mit MLA, Architektur
-  "deepseek2" (DeepSeek-V3-artig). Daher KEIN arch_fallback: würde sonst
-  DeepSeek-V3/V3.2 und GLM-4.7-Flash mitfangen — Match nur über Dateiname
-  "kimi". Varianten: K2-Instruct(-0905, Text), K2.5/K2.6 (Vision via mmproj,
-  in Mainline gemerged), K2.7-Code. Sampling: chat = Moonshot/Unsloth
-  temp=0.6 / min_p=0.01 (gegen Repetition); coding = Thinking-Defaults
-  temp=1.0 / top_p=0.95 (K2.5+/K2.7 nutzen Thinking, "instant" wird dort
-  nicht unterstützt). --jinja Pflicht (Tool-Calls). Datacenter-Klasse:
-  Q2 ~250-380 GB, Q4 ~620 GB — Cluster oder Workstation mit sehr viel RAM.
-  Hinweis: einige ubergarm/ik-Quants brauchen den ik_llama.cpp-Fork; die
-  Standard-Unsloth/bartowski-Quants laufen auf Mainline.
+  Moonshot Kimi-K2: 1T total / 32B active MoE with MLA, architecture
+  "deepseek2" (DeepSeek-V3-like). Therefore NO arch_fallback: it would
+  otherwise also catch DeepSeek-V3/V3.2 and GLM-4.7-Flash; matching only
+  through the filename "kimi". Variants: K2-Instruct(-0905, text), K2.5/K2.6
+  (vision via mmproj, merged in mainline), K2.7-Code. Sampling: chat =
+  Moonshot/Unsloth temp=0.6 / min_p=0.01 (against repetition); coding =
+  thinking defaults temp=1.0 / top_p=0.95 (K2.5+/K2.7 use thinking; "instant"
+  is not supported there). --jinja is mandatory (tool calls). Datacenter
+  class: Q2 ~250-380 GB, Q4 ~620 GB; a cluster or a workstation with a very
+  large amount of RAM. Note: some ubergarm/ik quants need the ik_llama.cpp
+  fork; the standard Unsloth/bartowski quants run on mainline.

@@ -840,6 +840,12 @@ _HYBRID_ARCHS = frozenset(
         "bailingmoe2_5",
         "bailingmoe3",  # Ling 3.0: KDA + gated MLA (b10460)
         "falcon_h1",
+        "falcon-h1",  # exact llama.cpp arch string (LLM_ARCH_FALCON_H1)
+        "granitehybrid",  # exact llama.cpp arch string (LLM_ARCH_GRANITE_HYBRID)
+        "deepseek4",  # DeepSeek-V4: llm_arch_is_hybrid() since the hashed
+        # sliding-window/recurrent-state design; KV accounting stays
+        # full-layer because no recurrent_layers key is written (see
+        # metadata_attention_layer_count).
         "plamo2",  # Plamo-2 hybrid
         "zamba2",  # Zamba2 hybrid
         "lfm2",  # LFM2 dense hybrid (short-conv + attention)

@@ -89,21 +89,19 @@ extra_args:
   - temperature;top_p;top_k
 
 notes: >
-  Gemma ist empfindlich gegenüber repeat_penalty > 1.0.
-  Multimodalität nach Größe: E2B/E4B = Text+Bild+Audio, 12B = Text+Bild+Audio
-  (NEU, "Unified"-Variante: encoder-free, Vision/Audio über direkte
-  Linear-Projektionen statt separater Encoder), 26B-A4B + 31B = Text+Bild.
-  Kontext: E2B/E4B = 128k, 12B/26B-A4B/31B = 256k.
-  Arch-Hinweis: das 12B-Sprachmodell-GGUF lädt unter general.architecture
-  "gemma4" (identisch zur restlichen Familie); die Strings gemma4uv/gemma4ua
-  sind nur Projector-Typen auf der separaten mmproj-Datei. Scanner, KV-Logik
-  und match_profile behandeln das 12B daher wie jedes andere Gemma-4-Modell.
-  Thinking-Modus aktivierbar durch <|think|> am Anfang des System-Prompts.
-  Coding-Profil nutzt temp=1.5 (vs. 1.0 chat) entsprechend Community-Tests
-  die zeigen, dass Gemma 4 für Coding mit höherer Temperatur kreativere
-  und korrektere Lösungen liefert — bei Bedarf mit `-- --temp 1.0`
-  überschreiben falls die höhere Temperatur in deinem Workflow stört.
-  Sampler-Reihenfolge wird über extra_args explizit als
-  "temperature;top_p;top_k" gesetzt (Gemma-4-Empfehlung; siehe Kommentar
-  oben) — wichtig, weil die Default-Sampler-Chain die hohe Coding-Temp
-  sonst verfälscht.
+  Gemma is sensitive to repeat_penalty > 1.0. Multimodality by size: E2B/E4B =
+  text+image+audio, 12B = text+image+audio (NEW "Unified" variant:
+  encoder-free, vision/audio through direct linear projections instead of
+  separate encoders), 26B-A4B + 31B = text+image. Context: E2B/E4B = 128k,
+  12B/26B-A4B/31B = 256k. Architecture note: the 12B language-model GGUF loads
+  under general.architecture "gemma4" (identical to the rest of the family);
+  the strings gemma4uv/gemma4ua are only projector types on the separate
+  mmproj file. Scanner, KV logic, and match_profile therefore treat the 12B
+  like any other Gemma 4 model. Thinking mode can be enabled with <|think|> at
+  the start of the system prompt. The coding profile uses temp=1.5 (vs. 1.0
+  chat) following community tests showing that Gemma 4 produces more creative
+  and more correct coding solutions at a higher temperature; override with `--
+  --temp 1.0` if the higher temperature disturbs your workflow. The sampler
+  order is set explicitly through extra_args as "temperature;top_p;top_k"
+  (Gemma 4 recommendation; see the comment above), which matters because the
+  default sampler chain would otherwise distort the high coding temperature.

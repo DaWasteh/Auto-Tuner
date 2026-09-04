@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -35,6 +35,10 @@ DEFAULT_LANGUAGE_ID = "builtin:en-GB"
 CUSTOM_LANGUAGE_ACTION = "__custom_language_pack__"
 _MAX_PACK_BYTES = 2 * 1024 * 1024
 _MAX_STRINGS = 2000
+#: Translated model-profile ``notes`` keyed by the profile's YAML file name.
+_MAX_PROFILE_NOTES = 500
+_MAX_NOTE_CHARS = 20_000
+_PROFILE_NOTE_KEY_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\.ya?ml$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -52,6 +56,10 @@ class LanguagePack:
     strings: Dict[str, str]
     source: str
     path: Path
+    # Optional translated explanations for model profiles. Keys are YAML file
+    # names from ``settings/`` (for example ``gemma-4.yaml``); values replace
+    # the English ``notes`` text while this pack is active.
+    profile_notes: Dict[str, str] = field(default_factory=dict)
 
     @property
     def qualified_id(self) -> str:
@@ -105,6 +113,32 @@ def _read_language_pack(path: Path, source: str) -> LanguagePack:
             )
         strings[key] = value
 
+    raw_notes = payload.get("profile_notes", {})
+    if raw_notes is None:
+        raw_notes = {}
+    if not isinstance(raw_notes, dict):
+        raise LanguagePackError("profile_notes must be an object")
+    if len(raw_notes) > _MAX_PROFILE_NOTES:
+        raise LanguagePackError(
+            f"profile_notes may contain at most {_MAX_PROFILE_NOTES} entries"
+        )
+    profile_notes: Dict[str, str] = {}
+    for key, value in raw_notes.items():
+        if not isinstance(key, str) or not _PROFILE_NOTE_KEY_RE.fullmatch(key):
+            raise LanguagePackError(
+                "every profile_notes key must be a profile file name such as "
+                "'gemma-4.yaml'"
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise LanguagePackError(
+                f"profile note for {key!r} must be a non-empty string"
+            )
+        if len(value) > _MAX_NOTE_CHARS:
+            raise LanguagePackError(
+                f"profile note for {key!r} exceeds {_MAX_NOTE_CHARS} characters"
+            )
+        profile_notes[key] = value.strip()
+
     return LanguagePack(
         id=pack_id,
         name=name.strip(),
@@ -112,6 +146,7 @@ def _read_language_pack(path: Path, source: str) -> LanguagePack:
         strings=strings,
         source=source,
         path=path,
+        profile_notes=profile_notes,
     )
 
 
@@ -196,6 +231,33 @@ class LanguageManager(QObject):
         if not isinstance(source_text, str) or not source_text:
             return source_text
         return self.current.strings.get(source_text, source_text)
+
+    def profile_notes(self, profile: object, fallback: str = "") -> str:
+        """Return the active language's explanation for a model profile.
+
+        *profile* may be a ``ModelProfile`` (its ``source_file`` and
+        ``notes`` are used), a file name such as ``gemma-4.yaml``, or
+        ``None``. Missing translations fall back to the English (UK) pack and
+        finally to the YAML ``notes`` text so no model loses its explanation.
+        """
+        source_file = ""
+        default_notes = str(fallback or "")
+        if isinstance(profile, str):
+            source_file = profile
+        elif profile is not None:
+            source_file = str(getattr(profile, "source_file", "") or "")
+            if not default_notes:
+                default_notes = str(getattr(profile, "notes", "") or "")
+        if source_file:
+            translated = self.current.profile_notes.get(source_file)
+            if translated:
+                return translated
+            english = self.packs.get(DEFAULT_LANGUAGE_ID)
+            if english is not None:
+                translated = english.profile_notes.get(source_file)
+                if translated:
+                    return translated
+        return default_notes
 
     def install(self, app: QApplication) -> None:
         """Translate newly shown dialogs as well as the already-built main window."""
@@ -358,6 +420,7 @@ class LanguageManager(QObject):
             "name": "My language",
             "locale": "xx-XX",
             "strings": english.strings,
+            "profile_notes": english.profile_notes,
         }
         fd, temp_name = tempfile.mkstemp(
             dir=self.user_dir, prefix=".custom-language-template.", suffix=".tmp"

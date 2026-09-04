@@ -23,8 +23,8 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  Standard-Profil für Metas Llama-3-Serie. Llama 3.1+ unterstützt nativ
-  128k Kontext; ältere und kleinere Varianten werden über GGUF-Metadata auf
-  ihr tatsächliches Limit begrenzt. Llama 4 hat wegen seiner abweichenden
-  offiziellen Sampling- und 1M/10M-Kontextgrenzen ein eigenes Profil.
-  Chat ist der Allround-Default, Coding ist stark deterministisch.
+  Standard profile for Meta's Llama 3 series. Llama 3.1+ natively supports
+  128k context; older and smaller variants are limited to their real limit
+  through GGUF metadata. Llama 4 has its own profile because of its different
+  official sampling and 1M/10M context limits. Chat is the all-round default;
+  coding is strongly deterministic.

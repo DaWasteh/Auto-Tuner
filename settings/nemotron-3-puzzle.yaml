@@ -1,0 +1,57 @@
+display_name: "Nemotron Labs 3 Puzzle 75B-A9B (NVIDIA)"
+patterns:
+  - nemotron-labs-3-puzzle
+  - nemotron-3-puzzle
+  - nemotron3-puzzle
+  - nemotron-3_puzzle
+  - puzzle-75b-a9b
+
+# Puzzle is a compressed derivative of Nemotron 3 Super and keeps the
+# nemotron_h_moe GGUF architecture, so the same "no arch fallback" rule
+# applies: only explicit filename patterns select this profile.
+
+# b10786 (PR #25444) is the first tagged llama.cpp build that loads the
+# per-layer expert_feed_forward_length and expert_used_count arrays this
+# checkpoint requires. Older builds read a scalar and abort at tensor
+# creation because the expert FFN width differs from layer to layer.
+min_llama_build: 10786
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+# Same official decoding contract as the parent model.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 3
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  Text-only 75.3B-total/9.3B-active compression of Nemotron 3 Super with the
+  same 88-block Mamba-2/latent-MoE/attention layout, integrated multi-token
+  prediction, and up to 1,048,576 context (262,144 default). Puzzle prunes
+  expert channels per layer (expert FFN widths 1280-2688), routes 4 to 18
+  experts depending on the layer, and shrinks the Mamba state from 128 to 96
+  channels. The profile requires llama.cpp b10786 because that build first
+  reads the per-layer expert arrays; AutoTuner refuses older binaries before
+  launch instead of letting tensor creation abort. Sampling, thinking
+  control, and MTP settings follow the Super profile.

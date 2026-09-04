@@ -32,9 +32,8 @@ sampling:
     repeat_penalty: 1.1
 
 notes: >
-  Merges haben oft inkonsistente Context-Limits und Sampling-Sweet-Spots.
-  Chat-Profil ist für Roleplay/Creative-Writing optimiert (höhere Temp,
-  stärkere Repeat-Penalty gegen Loops in langen RP-Sessions).
-  Coding-Profil ist defensiv - diese Modelle sind nicht primär für Code
-  trainiert; falls Code-Performance schlecht ist, lieber ein dediziertes
-  Coder-Profil verwenden.
+  Merges often have inconsistent context limits and sampling sweet spots. The
+  chat profile is optimised for roleplay/creative writing (higher temperature,
+  stronger repeat penalty against loops in long RP sessions). The coding
+  profile is defensive: these models are not primarily trained for code; if
+  code performance is poor, prefer a dedicated coder profile.

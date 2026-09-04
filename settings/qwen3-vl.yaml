@@ -61,14 +61,14 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  Alibaba Qwen3-VL — Vision-Language-Modelle, Dense (2B/4B/8B/32B) und MoE
-  (30B-A3B / 235B-A22B), Instruct + Thinking, Architektur "qwen3vl" bzw.
-  "qwen3vlmoe" (beide in llama.cpp-Mainline). Braucht eine mmproj-Datei für
-  den Vision-Encoder — in der GUI als mmproj zuordnen; ohne mmproj läuft nur
-  der Text-Pfad. Sampling unterscheidet Instruct (chat: temp 0.7 / top_p 0.8)
-  und Thinking (coding: temp 1.0 / top_p 0.95), analog zu Qwen3.5/3.6.
-  presence_penalty steht auf 0.0 statt Qwens 1.5, weil 1.5 Tool-Calling-
-  Schleifen erzeugt; für reine Bildbeschreibung ohne Tools:
-  `-- --presence-penalty 1.5`. Hinweis: Bei Vulkan/ROCm wurde berichtet, dass
-  Qwen3-VL die GPU nicht voll auslastet (~80%) und etwas langsamer ist als
-  das reine Qwen3-Textmodell (llama.cpp #16895) — kein Fehler dieses Profils.
+  Alibaba Qwen3-VL: vision-language models, dense (2B/4B/8B/32B) and MoE
+  (30B-A3B / 235B-A22B), Instruct + Thinking, architecture "qwen3vl" or
+  "qwen3vlmoe" (both in llama.cpp mainline). Needs an mmproj file for the
+  vision encoder; assign it as mmproj in the GUI; without mmproj only the text
+  path runs. Sampling distinguishes Instruct (chat: temp 0.7 / top_p 0.8) and
+  Thinking (coding: temp 1.0 / top_p 0.95), analogous to Qwen3.5/3.6.
+  presence_penalty is set to 0.0 instead of Qwen's 1.5 because 1.5 causes
+  tool-calling loops; for pure image description without tools: `--
+  --presence-penalty 1.5`. Note: on Vulkan/ROCm it has been reported that
+  Qwen3-VL does not fully utilise the GPU (~80%) and is somewhat slower than
+  the plain Qwen3 text model (llama.cpp #16895); not a fault of this profile.

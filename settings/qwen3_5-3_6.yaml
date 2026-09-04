@@ -109,19 +109,17 @@ draft_p_min: 0.75
 
 
 notes: >
-  Qwen3.5 (Feb 2026) und Qwen3.6 (April 2026) sind Thinking-by-default
-  Multimodal-Modelle mit 256k nativem Kontext (erweiterbar bis 1.01M via
-  YaRN). Original Qwen3 hat nur 32k - wird automatisch über
-  GGUF-native_context begrenzt.
-  Chat-Profil entspricht dem offiziellen Thinking-Setup; Coding-Profil
-  spiegelt das offizielle QwenClawBench-Setting (temp=0.6) wider.
-  presence_penalty steht hier auf 0.0 statt der offiziellen Qwen-Empfehlung
-  von 1.5, weil 1.5 reproduzierbar Tool-Calling-Schleifen erzeugt
-  (strukturierte Ausgabe braucht repeated tokens, die ein hohes
-  presence_penalty bestraft). Für reinen Chat ohne Tools: `-- --presence-penalty 1.5`.
-  Qwen3.6 Neu: `preserve_thinking` API-Flag hält Thinking-Content über
-  Multi-Turn-Konversationen hinweg → bessere agentische Konsistenz.
-  Tipp: `--jinja` als Extra-Arg beim Start aktiviert die saubere
-  Trennung von <think>-Blöcken ins reasoning_content-API-Feld
-  (statt sie inline im content zu lassen):
-    -- --jinja
+  Qwen3.5 (February 2026) and Qwen3.6 (April 2026) are thinking-by-default
+  multimodal models with 256k native context (extendable to 1.01M via YaRN).
+  The original Qwen3 has only 32k and is automatically limited through the
+  GGUF native_context. The chat profile corresponds to the official thinking
+  setup; the coding profile mirrors the official QwenClawBench setting
+  (temp=0.6). presence_penalty is set to 0.0 here instead of the official Qwen
+  recommendation of 1.5 because 1.5 reproducibly causes tool-calling loops
+  (structured output needs repeated tokens, which a high presence_penalty
+  punishes). For pure chat without tools: `-- --presence-penalty 1.5`. New in
+  Qwen3.6: the `preserve_thinking` API flag keeps thinking content across
+  multi-turn conversations for better agentic consistency. Tip: `--jinja` as
+  an extra arg at start enables the clean separation of <think> blocks into
+  the reasoning_content API field (instead of leaving them inline in content):
+  -- --jinja

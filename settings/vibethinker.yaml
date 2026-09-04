@@ -57,13 +57,12 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  WeiboAI VibeThinker — dichtes Reasoning-Modell (3B auf Qwen2.5-Coder-3B,
-  bzw. 1.5B), MIT-Lizenz, spezialisiert auf verifizierbares Reasoning
-  (Mathe/Code/STEM). Architektur "qwen2" — daher KEIN arch_fallback
-  (würde sonst generische Qwen2-Modelle fangen), Match nur über
-  Dateiname. Sampling = offizielle WeiboAI-Empfehlung temp=1.0 /
-  top_p=0.95 / top_k=-1 in BEIDEN Modi: niedrigere Temperatur
-  verschlechtert hier dokumentiert die Reasoning-Qualität, das Modell ist
-  nicht für andere Temperatur-Regime trainiert. <think>-Block: downstream
-  parsen. Kein General-Purpose-Modell — für breites Weltwissen ein
-  größeres Modell nehmen.
+  WeiboAI VibeThinker: dense reasoning model (3B on Qwen2.5-Coder-3B, or
+  1.5B), MIT licence, specialised in verifiable reasoning (maths/code/STEM).
+  Architecture "qwen2", therefore NO arch_fallback (it would otherwise catch
+  generic Qwen2 models); matching only by filename. Sampling follows the
+  official WeiboAI recommendation temp=1.0 / top_p=0.95 / top_k=-1 in BOTH
+  modes: a lower temperature demonstrably worsens reasoning quality here; the
+  model is not trained for other temperature regimes. <think> block: parse
+  downstream. Not a general-purpose model; take a larger model for broad world
+  knowledge.

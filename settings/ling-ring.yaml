@@ -61,13 +61,13 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  InclusionAI (Ant Group) Ling / Ring 2.x — MoE-Familie, Architektur
-  "bailingmoe2" (Mainline via PR #16063). Ling = Instruct/General, Ring =
-  Reasoning (aus Ling abgeleitet, <think>-Ketten). Größen: Ling/Ring-mini-2.0
-  (~17B / 1.4B aktiv, lokal gut lauffähig), -flash, und die 1T-Flaggschiffe
-  (Ling-2.5-1T / Ring-1T, 1T total / ~63B aktiv, hybride Linear-Attention,
-  bis 1M Kontext — reine Datacenter/Cluster-Modelle, Q4 ~500 GB). Sampling =
-  InclusionAI-Empfehlung temp=0.7 / top_p=0.8 / rep=1.05; Coding
-  deterministischer. --jinja für Template/Reasoning. WICHTIG: Ling-2.6-flash
-  nutzt das neuere "bailingmoe2.5" und läuft NICHT auf Vanilla-llama.cpp —
-  dafür bailingmoe2-5.yaml (Fork).
+  InclusionAI (Ant Group) Ling / Ring 2.x: MoE family, architecture
+  "bailingmoe2" (mainline via PR #16063). Ling = instruct/general, Ring =
+  reasoning (derived from Ling, <think> chains). Sizes: Ling/Ring-mini-2.0
+  (~17B / 1.4B active, runs well locally), -flash, and the 1T flagships
+  (Ling-2.5-1T / Ring-1T, 1T total / ~63B active, hybrid linear attention, up
+  to 1M context; pure datacenter/cluster models, Q4 ~500 GB). Sampling follows
+  the InclusionAI recommendation temp=0.7 / top_p=0.8 / rep=1.05; coding is
+  more deterministic. --jinja for template/reasoning. IMPORTANT:
+  Ling-2.6-flash uses the newer "bailingmoe2.5" and does NOT run on vanilla
+  llama.cpp; use bailingmoe2-5.yaml (fork) for it.

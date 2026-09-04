@@ -103,21 +103,20 @@ draft_max: 2
 draft_p_min: 0.75
 
 notes: >
-  Ornith 1.0 (DeepReinforce, Juni 2026, MIT) — self-improving Modell-Familie
-  für agentisches Coding, post-trained auf Qwen-3.5-Basis. GGUF-Arch ist
-  "qwen35" (9B/31B Dense) bzw. "qwen35moe" (35B-A3B / 397B-A17B MoE) — exakt
-  die Qwen3.5/3.6-Hybrid-Familie (GatedDeltaNet + Full-Attention), der Scanner
-  zählt den KV-Cache korrekt über recurrent_layers. Dieses Profil greift nur
-  per Filename-Pattern ("ornith"); Re-Quants ohne "ornith" im Namen landen
-  korrekt bei qwen3_5-3_6.yaml.
-  Reasoning-Modell: Antwort öffnet per Default mit <think>...</think>. Beim
-  Start `--jinja` als Extra-Arg setzen, damit der <think>-Block sauber ins
-  reasoning_content-Feld getrennt und <tool_call>-Blöcke als OpenAI-style
-  tool_calls geparst werden (Ornith ist primär ein Tool-Calling-Agent):
-    -- --jinja
-  Sampling: einheitlich temp=0.6 / top_p=0.95 / top_k=20 für Chat UND Coding
-  (Ornith-Empfehlung); temp=1.0 ist nur der Bench-Reproduktionswert
-  (-- --temp 1.0). Anders als generisches Qwen3.5 (Chat temp=1.0) — das ist
-  der Grund für dieses eigene Profil trotz identischer Architektur.
-  Tipp: das 9B-Dense eignet sich als externes Draft-Modell (Path A) für das
-  35B-MoE; die GGUFs selbst bringen keinen integrierten MTP-Head mit.
+  Ornith 1.0 (DeepReinforce, June 2026, MIT): self-improving model family for
+  agentic coding, post-trained on a Qwen 3.5 base. The GGUF architecture is
+  "qwen35" (9B/31B dense) or "qwen35moe" (35B-A3B / 397B-A17B MoE), exactly
+  the Qwen3.5/3.6 hybrid family (GatedDeltaNet + full attention); the scanner
+  counts the KV cache correctly through recurrent_layers. This profile matches
+  only by the filename pattern ("ornith"); re-quants without "ornith" in the
+  name correctly land at qwen3_5-3_6.yaml. Reasoning model: the answer opens
+  with <think>...</think> by default. Set `--jinja` as an extra arg at start
+  so that the <think> block is cleanly separated into the reasoning_content
+  field and <tool_call> blocks are parsed as OpenAI-style tool_calls (Ornith
+  is primarily a tool-calling agent): -- --jinja. Sampling: uniformly temp=0.6
+  / top_p=0.95 / top_k=20 for chat AND coding (Ornith recommendation);
+  temp=1.0 is only the benchmark reproduction value (-- --temp 1.0). Unlike
+  generic Qwen3.5 (chat temp=1.0), which is the reason for this separate
+  profile despite the identical architecture. Tip: the 9B dense model is
+  suitable as an external draft model (Path A) for the 35B MoE; the GGUFs
+  themselves ship no integrated MTP head.

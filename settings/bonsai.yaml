@@ -35,11 +35,10 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  PrismML Bonsai 8B - das erste kommerziell tragfähige 1-bit LLM (Q1_0 GGUF,
-  ~1.15 GB). Konkurrenzfähig mit full-precision 8B Modellen, dabei 14x
-  kleiner und 8x schneller auf Edge-Hardware.
-  Braucht den PrismML-Fork von llama.cpp (1b_llama.cpp), nicht Mainline.
-  Q1_0 Quant ist in Upstream gemerged für CPU/Metal/CUDA/Vulkan, aber für
-  AMD ROCm + optimierte x86 Pfade braucht man noch den Fork.
-  Coding-Profil ist nur leicht abgesenkt (0.3) statt aggressiv 0.15 -
-  bei extrem niedrigen Temperaturen tendieren 1-bit Quants zu Loops.
+  PrismML Bonsai 8B is the first commercially viable 1-bit LLM (Q1_0 GGUF,
+  ~1.15 GB). Competitive with full-precision 8B models while 14x smaller and
+  8x faster on edge hardware. Requires the PrismML fork of llama.cpp
+  (1b_llama.cpp), not mainline. The Q1_0 quant is merged upstream for
+  CPU/Metal/CUDA/Vulkan, but AMD ROCm and the optimised x86 paths still need
+  the fork. The coding profile is only slightly lowered (0.3) instead of an
+  aggressive 0.15: at extremely low temperatures 1-bit quants tend to loop.

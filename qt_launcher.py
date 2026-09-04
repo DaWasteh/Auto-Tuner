@@ -14,6 +14,7 @@ import base64
 import copy
 import hashlib
 import json
+import dataclasses
 import os
 import platform
 import re
@@ -23,6 +24,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.error
@@ -118,9 +120,11 @@ from tuner import (
     check_profile_build,
     compute_config,
     effective_load_mode,
+    extract_params_billion,
     gemma_draft_needs_ik_fork,
     match_gpu_by_token,
     prepare_command_for_binary,
+    probe_binary_build_info,
     probe_binary_build_number,
     veto_unsafe_mlock,
     TunedConfig,
@@ -169,7 +173,15 @@ from localization import (
     LanguageManager,
     LanguagePackError,
 )
-from control_api import ApiModel, ControlApiServer, ControlRequest
+from control_api import (
+    ApiModel,
+    ApiRuntime,
+    ControlApiServer,
+    ControlRequest,
+    DISCOVERY_FILE_NAME,
+    discovery_payload,
+    write_discovery_file,
+)
 
 
 def _get_fork_tools():
@@ -3857,8 +3869,66 @@ def _control_model_id(entry: ModelEntry) -> str:
     return f"{slug}--{digest}"
 
 
+_CONTROL_QUANT_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:UD-)?(?:i\d+-)?(?:IQ\d+(?:_[A-Z0-9]+)*|Q\d+(?:_[A-Z0-9]+)*"
+    r"|MXFP4(?:_MOE)?|NVFP4|TQ\d+_\d+|BF16|F16|F32))(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _control_quant_label(name: str) -> str:
+    """Return the trailing quantisation token of a model name, if any."""
+    matches = _CONTROL_QUANT_RE.findall(str(name or ""))
+    return matches[-1].upper() if matches else ""
+
+
+def _control_runtime_id(label: str) -> str:
+    """Return the stable slug external clients use to select a llama build."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(label or "").lower()).strip("-")
+    return slug[:96].rstrip("-") or "runtime"
+
+
+def _control_runtime_backend(label: str, binary: str) -> str:
+    """Classify a build by its directory/binary identity without probing it."""
+    identity = f"{label} {binary}".lower()
+    aliases = (
+        ("hip", ("_hip_", "-hip-", "rocm", "hip_llama", "hip/")),
+        ("vulkan", ("_vulkan_", "-vulkan-", "vulkan")),
+        ("cuda", ("_cuda_", "-cuda-", "cuda")),
+        ("sycl", ("_sycl_", "-sycl-", "oneapi", "sycl")),
+        ("metal", ("_metal_", "-metal-", "metal")),
+        ("opencl", ("_opencl_", "-opencl-", "opencl")),
+        ("cpu", ("_cpu_", "-cpu-", "cpu-only", "cpu_only")),
+    )
+    for backend, tokens in aliases:
+        if any(token in identity for token in tokens):
+            return backend
+    return "unknown"
+
+
+def _command_value(command: Sequence[object], *flags: str) -> Optional[str]:
+    """Return the argument following the last occurrence of any *flags*."""
+    args = [str(value) for value in command]
+    found: Optional[str] = None
+    for index, arg in enumerate(args):
+        if arg in flags and index + 1 < len(args):
+            found = args[index + 1]
+        else:
+            for flag in flags:
+                if arg.startswith(flag + "="):
+                    found = arg[len(flag) + 1 :]
+    return found
+
+
+def _redacted_command_list(command: Sequence[object]) -> List[str]:
+    """List form of :func:`_redacted_command` for JSON consumers."""
+    return _redacted_command(command).split(" ") if command else []
+
+
 def _control_api_catalogue(
-    entries: Sequence[ModelEntry], profiles: Sequence[ModelProfile]
+    entries: Sequence[ModelEntry],
+    profiles: Sequence[ModelProfile],
+    default_runtime_id: str = "",
 ) -> List[ApiModel]:
     """Describe every scanned model and mark non-server runners explicitly."""
     models: List[ApiModel] = []
@@ -3914,6 +3984,12 @@ def _control_api_catalogue(
                 input_types=("text", "image") if vision else ("text",),
                 runnable=not reason,
                 unavailable_reason=reason,
+                size_bytes=int(entry.size_bytes or 0),
+                quant=_control_quant_label(entry.name),
+                params_b=float(extract_params_billion(entry.name) or 0.0),
+                family=str(profile.display_name or ""),
+                architecture=str(getattr(entry, "architecture", "") or ""),
+                default_runtime_id=str(default_runtime_id or ""),
             )
         )
     return models
@@ -4918,7 +4994,10 @@ class ExpertPanel(QWidget):
                 "Passed as --reasoning-preserve. Compatible chat templates retain "
                 "reasoning content in conversation history instead of stripping it. "
                 "This can improve continuity but increases prompt/context usage and "
-                "may expose prior reasoning to clients.",
+                "may expose prior reasoning to clients. Since llama.cpp b10786 the "
+                "server enables preserved reasoning by default whenever the template "
+                "supports it; unticked leaves that default alone. Add "
+                "--no-reasoning-preserve to Extra CLI flags to force it off.",
             ),
         )
 
@@ -5744,6 +5823,7 @@ class MainWindow(QMainWindow):
         self._all_entries: List[ModelEntry] = []
         self._control_api: Optional[ControlApiServer] = None
         self._control_model_paths: Dict[str, Path] = {}
+        self._control_runtime_paths: Dict[str, Path] = {}
         self._control_api_record: Optional[dict] = None
         self._control_closing = False
         self._system: Optional[SystemInfo] = None
@@ -6809,6 +6889,14 @@ class MainWindow(QMainWindow):
         app_settings.set_language_id(selected)
         self._populate_language_combo()
         self._language_manager.apply_all()
+        # The configuration preview embeds the model profile's explanation,
+        # so re-render it in the newly selected language.
+        entry = getattr(self, "_current_entry", None)
+        if entry is not None:
+            try:
+                self._show_config(entry)
+            except Exception as exc:
+                self._log(f"[Language] Could not refresh the preview: {exc}")
         self._status.showMessage(
             self._language_manager.translate("Language changed."), 3000
         )
@@ -6915,10 +7003,12 @@ class MainWindow(QMainWindow):
                 stop_callback=self._control_stop_from_http,
                 log_callback=self._control_log_ready.emit,
                 switch_timeout_s=900.0,
+                runtime_probe=self._control_probe_runtime,
             )
             self._control_api = api
             self._refresh_control_api_catalogue()
             endpoint = api.start()
+            self._write_control_discovery(api)
             self._log(
                 f"[Control API] OpenAI endpoint ready: {endpoint}/v1 "
                 "(bearer authentication required)."
@@ -6926,6 +7016,7 @@ class MainWindow(QMainWindow):
             return True
         except (OSError, ValueError) as exc:
             self._control_api = None
+            self._write_control_discovery(None)
             self._log(f"[Control API] Could not start on port {port}: {exc}")
             return False
 
@@ -6934,24 +7025,138 @@ class MainWindow(QMainWindow):
         self._control_api = None
         if api is not None:
             api.stop()
+        self._write_control_discovery(None)
+
+    def _control_discovery_path(self) -> Path:
+        # Next to the settings file, so test/portable overrides of the settings
+        # location automatically relocate the discovery document as well.
+        return Path(app_settings._settings_file()).parent / DISCOVERY_FILE_NAME
+
+    def _write_control_discovery(self, api: Optional[ControlApiServer]) -> None:
+        """Publish (or retract) the small client-discovery document.
+
+        Pi and benchmark clients read ``control_api.json`` instead of parsing
+        the complete settings file. The token is written only while the
+        gateway is enabled and is rewritten immediately after regeneration.
+        """
+        try:
+            if api is not None and api.running:
+                payload = discovery_payload(
+                    enabled=True,
+                    port=api.port,
+                    token=api.token,
+                    version=VERSION,
+                    pid=os.getpid(),
+                    started_at=datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    host=api.host,
+                )
+            else:
+                payload = discovery_payload(
+                    enabled=False,
+                    port=app_settings.get_control_api_port(),
+                    version=VERSION,
+                    pid=os.getpid(),
+                )
+            if not write_discovery_file(self._control_discovery_path(), payload):
+                self._log(
+                    "[Control API] Could not write the discovery file "
+                    f"{self._control_discovery_path()}"
+                )
+        except Exception as exc:
+            self._log(f"[Control API] Discovery file error: {exc}")
+
+    def _control_runtime_catalogue(
+        self,
+    ) -> Tuple[List[ApiRuntime], str, Dict[str, Path]]:
+        """Snapshot the toolbar's llama builds without probing any binary."""
+        runtimes: List[ApiRuntime] = []
+        paths: Dict[str, Path] = {}
+        default_id = ""
+        try:
+            from auto_tuner import _server_binary_in_fork
+        except Exception:
+            return runtimes, default_id, paths
+        combo = getattr(self, "_fork_combo", None)
+        if combo is None:
+            return runtimes, default_id, paths
+        current = combo.currentIndex()
+        used: set[str] = set()
+        for index in range(combo.count()):
+            path = combo.itemData(index)
+            if path is None:
+                continue
+            label = str(combo.itemText(index)).strip()
+            root = Path(path)
+            runtime_id = _control_runtime_id(label)
+            if runtime_id in used:
+                suffix = 2
+                while f"{runtime_id}-{suffix}" in used:
+                    suffix += 1
+                runtime_id = f"{runtime_id}-{suffix}"
+            used.add(runtime_id)
+            binary = _server_binary_in_fork(root) or ""
+            available = bool(binary)
+            runtimes.append(
+                ApiRuntime(
+                    id=runtime_id,
+                    label=label,
+                    server_binary=binary,
+                    backend=_control_runtime_backend(label, binary or str(root)),
+                    is_default=index == current,
+                    available=available,
+                    unavailable_reason=(
+                        "" if available else "No runnable llama-server found in this build."
+                    ),
+                )
+            )
+            paths[runtime_id] = root
+            if index == current:
+                default_id = runtime_id
+        return runtimes, default_id, paths
+
+    @staticmethod
+    def _control_probe_runtime(runtime: ApiRuntime) -> ApiRuntime:
+        """Fill build identity on the HTTP thread using the cached probes."""
+        if not runtime.server_binary:
+            return runtime
+        build = probe_binary_build_number(runtime.server_binary)
+        info = probe_binary_build_info(runtime.server_binary)
+        return dataclasses.replace(runtime, build=build, build_info=info)
 
     def _refresh_control_api_catalogue(self) -> None:
         try:
-            models = _control_api_catalogue(self._all_entries, self._profiles)
+            runtimes, default_runtime_id, runtime_paths = (
+                self._control_runtime_catalogue()
+            )
+            models = _control_api_catalogue(
+                self._all_entries, self._profiles, default_runtime_id
+            )
             model_paths = {
                 model.id: Path(model.path) for model in models if model.runnable
             }
             if self._control_api is not None:
+                self._control_api.update_runtimes(runtimes, default_runtime_id)
                 self._control_api.update_models(models)
             self._control_model_paths = model_paths
+            self._control_runtime_paths = runtime_paths
         except Exception as exc:
             self._log(f"[Control API] Could not refresh model catalogue: {exc}")
 
     def _control_switch_from_http(
-        self, model_id: str, timeout_s: float
+        self,
+        model_id: str,
+        timeout_s: float,
+        options: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
+        runtime_id = str((options or {}).get("runtime_id") or "")
         request = ControlRequest(
-            action="switch", model_id=model_id, timeout_s=timeout_s
+            action="switch",
+            model_id=model_id,
+            timeout_s=timeout_s,
+            runtime_id=runtime_id,
         )
         self._control_request_ready.emit(request)
         return request.wait()
@@ -7029,9 +7234,34 @@ class MainWindow(QMainWindow):
             )
             return
 
+        requested_runtime = str(request.runtime_id or "")
+        if requested_runtime:
+            runtime_root = self._control_runtime_paths.get(requested_runtime)
+            if runtime_root is None:
+                request.fail(
+                    f"The llama-server runtime {requested_runtime!r} is not "
+                    "available; read GET /api/v1/runtimes.",
+                    status=409,
+                    code="runtime_unavailable",
+                )
+                return
+            if not self._select_control_runtime(runtime_root):
+                request.fail(
+                    f"The llama-server runtime {requested_runtime!r} could not "
+                    "be selected in the toolbar.",
+                    status=409,
+                    code="runtime_unavailable",
+                )
+                return
+        else:
+            requested_runtime = self._current_control_runtime_id()
+
         active = self._control_api_record
         if active is not None and active in self._servers:
-            if active.get("control_model_id") == request.model_id:
+            if active.get("control_model_id") == request.model_id and (
+                not requested_runtime
+                or str(active.get("control_runtime_id") or "") == requested_runtime
+            ):
                 if active.get("ready"):
                     request.complete(self._control_record_result(active))
                 else:
@@ -7116,6 +7346,7 @@ class MainWindow(QMainWindow):
             )
             return
         record["control_model_id"] = request.model_id
+        record["control_runtime_id"] = self._current_control_runtime_id()
         record["control_requests"] = [request]
         # Expire slightly before the HTTP wait so Qt can stop an alive but
         # never-ready backend and deliver a structured timeout response.
@@ -7126,14 +7357,255 @@ class MainWindow(QMainWindow):
         if record.get("ready"):
             self._complete_control_record(record)
 
-    @staticmethod
-    def _control_record_result(record: dict) -> Dict[str, object]:
+    def _current_control_runtime_id(self) -> str:
+        combo = getattr(self, "_fork_combo", None)
+        if combo is None or combo.currentData() is None:
+            return ""
+        current = Path(combo.currentData())
+        for runtime_id, root in self._control_runtime_paths.items():
+            try:
+                if root.resolve(strict=False) == current.resolve(strict=False):
+                    return runtime_id
+            except (OSError, RuntimeError):
+                if root == current:
+                    return runtime_id
+        return _control_runtime_id(str(combo.currentText()))
+
+    def _select_control_runtime(self, root: Path) -> bool:
+        """Select *root* in the toolbar build dropdown, exactly like a click."""
+        combo = getattr(self, "_fork_combo", None)
+        if combo is None:
+            return False
+        try:
+            wanted = root.resolve(strict=False)
+        except (OSError, RuntimeError):
+            wanted = root
+        for index in range(combo.count()):
+            path = combo.itemData(index)
+            if path is None:
+                continue
+            try:
+                same = Path(path).resolve(strict=False) == wanted
+            except (OSError, RuntimeError):
+                same = Path(path) == root
+            if not same:
+                continue
+            if index != combo.currentIndex():
+                self._log(
+                    f"[Control API] Selecting llama build {combo.itemText(index)!r}"
+                )
+                combo.setCurrentIndex(index)
+            return True
+        return False
+
+    def _control_record_result(self, record: dict) -> Dict[str, object]:
         return {
             "backend_url": str(
                 record.get("client_base_url") or record.get("base_url") or ""
             ),
             "backend_api_key": _extract_server_api_key(record.get("command", [])),
             "alias": str(record.get("alias") or record.get("model") or ""),
+            "detail": self._control_status_detail(record),
+        }
+
+    def _control_status_detail(self, record: dict) -> Dict[str, object]:
+        """Describe the API-managed server for ``/api/v1/status`` consumers."""
+        command = [str(value) for value in record.get("command", []) or []]
+        cfg = record.get("cfg")
+        entry = record.get("entry")
+        if entry is None:
+            # Records created outside _launch_server (tests, legacy sessions)
+            # still resolve the scanned entry through the stable control ID.
+            path = self._control_model_paths.get(
+                str(record.get("control_model_id") or "")
+            )
+            entry = next(
+                (
+                    model
+                    for model in self._all_entries
+                    if path is not None and model.path == path
+                ),
+                None,
+            )
+        proc = record.get("proc")
+        pid: Optional[int] = None
+        log_path: Optional[str] = None
+        try:
+            raw_proc = getattr(proc, "proc", None)
+            if raw_proc is not None and getattr(raw_proc, "pid", None):
+                pid = int(raw_proc.pid)
+            if getattr(proc, "log_path", None):
+                log_path = str(proc.log_path)
+        except Exception:
+            pid, log_path = None, None
+
+        binary = str(record.get("runtime_binary") or (command[0] if command else ""))
+        runtime_id = str(record.get("control_runtime_id") or "")
+        runtime_label = str(record.get("fork_label") or "")
+        build = record.get("llama_build")
+        backend = ""
+        if self._system is not None and self._system.gpus:
+            backends = {
+                app_settings.normalise_performance_backend(gpu.runtime_backend)
+                for gpu in self._system.gpus
+                if gpu.runtime_backend
+            }
+            backends.discard("")
+            if len(backends) == 1:
+                backend = next(iter(backends))
+        if not backend:
+            backend = _control_runtime_backend(runtime_label, binary)
+        runtime = {
+            "id": runtime_id or None,
+            "label": runtime_label or None,
+            "server_binary": binary or None,
+            "backend": backend,
+            "build": f"b{int(build)}" if build else None,
+            "build_number": int(build) if build else None,
+            "build_info": probe_binary_build_info(binary) if binary else None,
+        }
+
+        model: Dict[str, object] = {
+            "id": str(record.get("control_model_id") or "") or None,
+            "name": str(record.get("model") or "") or None,
+            "path": None,
+            "quant": None,
+            "ftype": None,
+            "params_b": None,
+            "size_bytes": None,
+            "architecture": None,
+            "draft_model_path": _command_value(command, "-md", "--model-draft"),
+            "mmproj_path": _command_value(command, "--mmproj"),
+            "profile": str(record.get("profile_name") or "") or None,
+            "profile_file": str(record.get("profile_file") or "") or None,
+        }
+        if entry is not None:
+            try:
+                model["path"] = str(entry.path)
+                model["quant"] = _control_quant_label(entry.name) or None
+                model["ftype"] = model["quant"]
+                params = float(extract_params_billion(entry.name) or 0.0)
+                model["params_b"] = params if params > 0 else None
+                model["size_bytes"] = int(entry.size_bytes or 0) or None
+                model["architecture"] = str(entry.architecture or "") or None
+            except Exception:
+                pass
+        if model["path"] is None:
+            model["path"] = _command_value(command, "-m", "--model")
+
+        launch: Dict[str, object] = {
+            "ctx_size": None,
+            "gpu_layers": None,
+            "threads": None,
+            "batch_threads": None,
+            "batch": None,
+            "ubatch": None,
+            "kv_type_k": None,
+            "kv_type_v": None,
+            "flash_attention": _command_value(command, "-fa", "--flash-attn"),
+            "spec_type": _command_value(command, "--spec-type"),
+            "draft_n_max": None,
+            "main_gpu": None,
+            "tensor_split": None,
+            "parallel": None,
+            "thinking": record.get("thinking"),
+            "profile": model["profile"],
+            "performance_target": str(record.get("performance_target") or "")
+            or None,
+            "mode": str(record.get("mode") or "") or None,
+            "load_mode": None,
+            "n_cpu_moe": None,
+            "port": record.get("port"),
+        }
+        for key, flags in (
+            ("draft_n_max", ("--spec-draft-n-max",)),
+            ("parallel", ("-np", "--parallel")),
+        ):
+            raw = _command_value(command, *flags)
+            if raw is not None:
+                try:
+                    launch[key] = int(raw)
+                except ValueError:
+                    launch[key] = raw
+        if cfg is not None:
+            try:
+                launch.update(
+                    {
+                        "ctx_size": int(cfg.ctx),
+                        "gpu_layers": int(cfg.ngl),
+                        "threads": int(cfg.threads),
+                        "batch_threads": int(cfg.batch_threads),
+                        "batch": int(cfg.batch),
+                        "ubatch": int(cfg.ubatch),
+                        "kv_type_k": str(cfg.cache_k),
+                        "kv_type_v": str(cfg.cache_v),
+                        "main_gpu": cfg.main_gpu,
+                        "tensor_split": cfg.tensor_split,
+                        "load_mode": str(cfg.load_mode),
+                        "n_cpu_moe": cfg.n_cpu_moe,
+                    }
+                )
+                if launch["flash_attention"] is None:
+                    launch["flash_attention"] = "on" if cfg.flash_attn else "off"
+            except Exception:
+                pass
+        else:
+            for key, flags in (
+                ("ctx_size", ("-c", "--ctx-size")),
+                ("gpu_layers", ("-ngl", "--gpu-layers", "--n-gpu-layers")),
+                ("threads", ("-t", "--threads")),
+                ("batch_threads", ("-tb", "--threads-batch")),
+                ("batch", ("-b", "--batch-size")),
+                ("ubatch", ("-ub", "--ubatch-size")),
+                ("kv_type_k", ("-ctk", "--cache-type-k")),
+                ("kv_type_v", ("-ctv", "--cache-type-v")),
+                ("main_gpu", ("-mg", "--main-gpu")),
+                ("tensor_split", ("-ts", "--tensor-split")),
+            ):
+                raw = _command_value(command, *flags)
+                if raw is None:
+                    continue
+                try:
+                    launch[key] = int(raw)
+                except ValueError:
+                    launch[key] = raw
+
+        devices: List[Dict[str, object]] = []
+        if self._system is not None:
+            for gpu in self._system.gpus:
+                devices.append(
+                    {
+                        "index": int(gpu.index),
+                        "name": str(gpu.name),
+                        "vendor": str(gpu.vendor),
+                        "backend": app_settings.normalise_performance_backend(
+                            gpu.runtime_backend
+                        )
+                        or None,
+                        "device": gpu.runtime_device,
+                        "vram_mb": int(gpu.total_vram_mb),
+                        "free_vram_mb": int(gpu.free_vram_mb),
+                    }
+                )
+
+        env: Dict[str, str] = {}
+        overrides = getattr(cfg, "env_overrides", None) if cfg is not None else None
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                upper = str(key).upper()
+                if any(secret in upper for secret in ("KEY", "TOKEN", "SECRET", "PASS")):
+                    continue
+                env[str(key)] = str(value)
+
+        return {
+            "pid": pid,
+            "log_path": log_path,
+            "runtime": runtime,
+            "model": model,
+            "launch": launch,
+            "devices": devices,
+            "env": env,
+            "command_line": _redacted_command_list(command),
         }
 
     def _complete_control_record(self, record: dict) -> None:
@@ -7889,6 +8361,7 @@ class MainWindow(QMainWindow):
         self._fork_path = forks[selected_idx][1]
         self._fork_combo.blockSignals(False)
         self._apply_fork(selected_idx)
+        self._refresh_control_runtimes()
 
     def _active_llama_binary(self) -> Optional[str]:
         """Resolve the selected fork's server for backend-aware detection."""
@@ -8208,9 +8681,15 @@ class MainWindow(QMainWindow):
             _setting_tooltip(self._FORK_TOOLTIP_SUMMARY, technical)
         )
 
+    def _refresh_control_runtimes(self) -> None:
+        """Republish the selectable builds after the toolbar list changed."""
+        if getattr(self, "_control_api", None) is not None:
+            self._refresh_control_api_catalogue()
+
     def _on_fork_changed(self, index: int) -> None:
         self._fork_manual_override = True
         self._apply_fork(index)
+        self._refresh_control_runtimes()
         # Persist the active build choice without touching the
         # container — switching combos within a container should NOT
         # collapse the container to a single fork.
@@ -8674,6 +9153,7 @@ class MainWindow(QMainWindow):
 
         self._fork_combo.blockSignals(False)
         self._apply_fork(0)
+        self._refresh_control_runtimes()
 
     # ------------------------------------------------------------------
     # Background model scan
@@ -10112,10 +10592,19 @@ class MainWindow(QMainWindow):
             f"Profile : {profile.display_name}"
             + (f"  ({profile.source_file})" if profile.source_file else "")
         )
-        if profile.notes:
-            for i in range(0, len(profile.notes.strip()), W - 10):
+        # Profile explanations follow the interface language; English (UK)
+        # and finally the YAML text remain the fallbacks.
+        profile_notes = self._language_manager.profile_notes(profile).strip()
+        if profile_notes:
+            wrapped = textwrap.wrap(
+                profile_notes,
+                width=W - 10,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            for i, chunk in enumerate(wrapped):
                 prefix = "Notes   : " if i == 0 else "          "
-                lines.append(f"{prefix}{profile.notes.strip()[i : i + W - 10]}")
+                lines.append(f"{prefix}{chunk}")
         if entry.mmproj:
             vis = "✓" if use_vision else "✗"
             placement = "RAM" if cfg.no_mmproj_offload else "VRAM"
@@ -13937,6 +14426,20 @@ class MainWindow(QMainWindow):
             "slots_api_enabled": slots_active,
             "slots_summary": "",
             "slots_next_probe": 0.0,
+            # Snapshot for the external control API's status document.
+            "cfg": cfg,
+            "entry": entry,
+            "runtime_binary": str(cmd[0]) if cmd else "",
+            "profile_name": profile.display_name,
+            "profile_file": profile.source_file or "",
+            "fork_label": (
+                str(self._fork_combo.currentText()).strip()
+                if hasattr(self, "_fork_combo")
+                else ""
+            ),
+            "performance_target": self._current_performance_target_name(),
+            "mode": self._current_mode(),
+            "thinking": bool(use_thinking),
         }
         self._next_server_id += 1
         self._servers.append(record)

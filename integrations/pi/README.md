@@ -18,22 +18,30 @@ that: it is read as configuration and does not fetch newly scanned GGUF files.
 4. Start Pi or run `/reload`, then choose provider **AutoTuner** under `/model`.
 
 Pi's extension loader runs the async factory before normal startup. The factory
-reads `~/.autotuner/autotuner_settings.json`, authenticates to `/v1/models`, and
-calls `pi.registerProvider("autotuner", …)`. Pi's model refresh invokes the same
-live catalogue endpoint through `refreshModels`.
+locates the gateway credentials, authenticates to `/v1/models`, and calls
+`pi.registerProvider("autotuner", …)`. Pi's model refresh invokes the same live
+catalogue endpoint through `refreshModels`.
 
-If you do not want the extension to read AutoTuner's settings file, set both:
+## Credential discovery
 
-```text
-AUTOTUNER_API_URL=http://127.0.0.1:1233
-AUTOTUNER_API_KEY=<key copied from AutoTuner Settings>
-```
+The extension resolves the gateway in this order; the first hit wins:
 
-The Settings dialog's **Copy Pi setup** button copies exactly those two
-newline-separated assignments. `AUTOTUNER_DATA_DIR` is respected for portable
-or test installations. `AUTOTUNER_CONTROL_API_PORT` and
-`AUTOTUNER_CONTROL_API_KEY` are also accepted as shared gateway overrides;
-`AUTOTUNER_API_URL` has the highest endpoint precedence.
+1. `AUTOTUNER_API_URL` + `AUTOTUNER_API_KEY` (the Settings dialog's
+   **Copy Pi setup** button copies exactly these two assignments).
+2. `AUTOTUNER_CONTROL_API_PORT` + `AUTOTUNER_CONTROL_API_KEY`, the shared
+   gateway overrides also honoured by AutoTuner itself.
+3. `~/.autotuner/control_api.json`, the small discovery document AutoTuner
+   v5.3.9+ rewrites whenever the gateway starts, stops, or the token is
+   regenerated. It carries the token only while `enabled` is `true`, so a
+   disabled gateway is reported as disabled instead of as a missing key.
+4. `~/.autotuner/autotuner_settings.json` for older AutoTuner versions. The
+   file can hold tens of megabytes of benchmark evidence, so only a bounded
+   window is scanned with a targeted regex and it is never `JSON.parse`d.
+5. `http://127.0.0.1:1233` without a key: the provider registers empty and
+   prints a credential-free warning.
+
+`AUTOTUNER_DATA_DIR` relocates the folder used in steps 3 and 4 (portable or
+test installations). `AUTOTUNER_API_URL` has the highest endpoint precedence.
 
 ## Behaviour
 
@@ -42,7 +50,9 @@ or test installations. `AUTOTUNER_CONTROL_API_PORT` and
 - Base URL: `http://127.0.0.1:1233/v1` by default
 - Catalogue: dynamic, from AutoTuner's scanned models
 - Switching: the request's `model` ID triggers AutoTuner's serialized model
-  transition and waits for a successful llama-server health check
+  transition and waits for a successful llama-server health check. Clients that
+  want a progress indicator can call `POST /api/v1/switch` first; it is
+  idempotent and returns the full `/api/v1/status` snapshot.
 - Costs: zero, because inference is local
 - Pi-level `reasoning_effort`: disabled for broad llama.cpp compatibility;
   AutoTuner's saved thinking/reasoning launch setting remains authoritative

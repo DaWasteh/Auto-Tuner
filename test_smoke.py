@@ -17,6 +17,8 @@ import sys
 import types
 from pathlib import Path
 
+import re
+
 import pytest
 
 # Widget-level GUI checks run without requiring a real display server.
@@ -295,6 +297,75 @@ def test_b10760_profile_contracts_and_ssm_correctness_gates() -> None:
     assert ling3.min_llama_build == 10749
     assert kimi_k3.min_llama_build == 10749
     assert kimi_linear.min_llama_build == 10749
+
+
+def test_b10786_nemotron_profiles_and_exact_hybrid_names() -> None:
+    profiles = load_profiles(SETTINGS_DIR)
+
+    super_model = match_profile(
+        "NVIDIA-Nemotron-3-Super-120B-A12B-BF16-UD-Q4_K_XL", profiles, "nemotron_h_moe"
+    )
+    puzzle = match_profile(
+        "NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-Q4_K_M", profiles, "nemotron_h_moe"
+    )
+    lightning = match_profile(
+        "Nemotron-3.5-Lightning-30B-A3B-Q8_0", profiles, "nemotron_h_moe"
+    )
+    nano = match_profile("Nemotron-3-Nano-Omni-30B-A3B", profiles, "nemotron_h_moe")
+    opaque = match_profile("opaque-hybrid.gguf", profiles, "nemotron_h_moe")
+
+    assert super_model.source_file == "nemotron-3-super.yaml"
+    assert super_model.max_context == 1048576
+    assert super_model.min_llama_build == 8295
+    assert super_model.draft_max == 3
+    assert super_model.sampling["chat"]["temperature"] == pytest.approx(1.0)
+    assert super_model.sampling["chat"]["top_p"] == pytest.approx(0.95)
+    # Puzzle needs the b10786 per-layer expert arrays (PR #25444).
+    assert puzzle.source_file == "nemotron-3-puzzle.yaml"
+    assert puzzle.min_llama_build == 10786
+    assert "b10786" in puzzle.notes and "per-layer expert arrays" in puzzle.notes
+    # The smaller family members keep their own profiles; the shared
+    # nemotron_h_moe architecture is never claimed as a fallback.
+    assert lightning.source_file == "nemotron-3_5.yaml"
+    assert nano.source_file == "nemotron-3-nano-omni.yaml"
+    assert opaque.source_file not in {"nemotron-3-super.yaml", "nemotron-3-puzzle.yaml"}
+    assert not super_model.arch_fallback and not puzzle.arch_fallback
+
+    deepseek4 = match_profile("opaque-v4.gguf", profiles, "deepseek4")
+    assert deepseek4.source_file == "deepseek-v4.yaml"
+    assert "b10786" in deepseek4.notes and "deepseek4v" in deepseek4.notes
+
+    # Exact llama.cpp b10786 hybrid architecture strings are recognised
+    # even when a GGUF omits *.ssm.* keys.
+    from scanner import _HYBRID_ARCHS, metadata_is_hybrid_architecture
+
+    for arch in ("falcon-h1", "granitehybrid", "deepseek4", "nemotron_h_moe", "qwen4exp"):
+        assert arch in _HYBRID_ARCHS
+        assert metadata_is_hybrid_architecture({"general.architecture": arch})
+    assert not metadata_is_hybrid_architecture({"general.architecture": "llama"})
+
+
+def test_b10786_server_help_advertises_every_profile_flag() -> None:
+    """Every long option emitted directly by a shipped profile exists in the
+    exact b10786 llama-server help captured during the audit."""
+    help_file = ROOT / ".pi" / "b10786-llama-server-help.txt"
+    if not help_file.is_file():
+        pytest.skip("exact b10786 help capture is not present")
+    advertised = set(
+        re.findall(r"(?<![\w-])(--[a-z0-9][a-z0-9-]*)", help_file.read_text(encoding="utf-8", errors="replace"))
+    )
+    assert len(advertised) >= 300
+    emitted: set[str] = set()
+    for profile in load_profiles(SETTINGS_DIR):
+        for arg in profile.extra_args:
+            if arg.startswith("--"):
+                emitted.add(arg.split("=", 1)[0])
+    assert emitted
+    missing = sorted(flag for flag in emitted if flag not in advertised)
+    assert missing == [], missing
+    # b10786 keeps both spellings of the reasoning-preserve switch and the
+    # server now defaults it to enabled for templates that support it.
+    assert {"--reasoning-preserve", "--no-reasoning-preserve"} <= advertised
 
 
 def test_ministral_does_not_collide_with_mistral_medium() -> None:

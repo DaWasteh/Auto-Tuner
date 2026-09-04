@@ -40,9 +40,8 @@ sampling:
     repeat_penalty: 1.0
 
 notes: >
-  Kleines, aber extrem mächtiges Modell. Läuft am stabilsten mit
-  Greedy-Decoding (Temp 0) für logische Aufgaben - das ist deshalb der
-  Coding-Default. Chat-Modus erlaubt etwas Variation (temp 0.5), bleibt
-  aber deutlich konservativer als bei größeren Modellen, weil Phi bei
-  hoher Temperatur schneller halluziniert als 30B+ Modelle.
-  
+  Small but extremely capable model. Runs most stably with greedy decoding
+  (temp 0) for logical tasks, which is therefore the coding default. Chat mode
+  allows some variation (temp 0.5) but stays clearly more conservative than
+  with larger models because Phi hallucinates faster at high temperature than
+  30B+ models.

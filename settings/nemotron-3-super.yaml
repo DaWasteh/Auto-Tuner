@@ -1,0 +1,64 @@
+display_name: "Nemotron 3 Super 120B-A12B (NVIDIA)"
+patterns:
+  - nemotron-3-super
+  - nemotron3-super
+  - nemotron-3_super
+  - nemotron_3_super
+  - super-120b-a12b
+
+# Nemotron 3 Super shares the nemotron_h_moe GGUF architecture with the
+# 30B Lightning/Nano checkpoints. Do not claim that architecture as a
+# fallback here: only the explicit filename patterns above select this
+# 120B-total profile, so the smaller family members keep their own files.
+
+# llama.cpp b8295 added the 88-layer 120B.A12B type mapping for the
+# nemotron_h_moe loader. Integrated MTP (NextN) still follows AutoTuner's
+# generic b10741-b10748 quarantine and resumes fully on b10749+.
+min_llama_build: 8295
+
+# Up to 1,048,576 tokens; NVIDIA ships 262,144 as the deployment default
+# because of VRAM. The scanner caps this to the GGUF native context.
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+# NVIDIA: temperature 1.0 and top-p 0.95 across all tasks and serving
+# backends (reasoning, tool calling, general chat).
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# NVIDIA recommends three speculative MTP tokens for throughput serving.
+# The confidence threshold keeps AutoTuner's conservative Vulkan/HIP
+# default; ngram-map-k4v coexists with draft-mtp.
+draft_max: 3
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  Text-only 120B-total/12B-active Mamba-2 + latent-MoE + attention hybrid
+  (88 blocks: 40 Mamba, 40 MoE, 8 attention) with integrated multi-token
+  prediction and up to 1,048,576 context; NVIDIA deploys 262,144 by default.
+  Official sampling is temp 1.0/top-p 0.95 for every task. Thinking is
+  controlled through the chat template (enable_thinking, low_effort, and a
+  reasoning budget), which AutoTuner drives with its reasoning dropdown and
+  --reasoning-budget. The profile enables the integrated MTP head with three
+  draft tokens as NVIDIA recommends and keeps MTP-compatible n-gram
+  speculation. At roughly 60 GB in Q4 this is a two-GPU or CPU-expert-offload
+  workstation model, not a 16 GB single-card checkpoint.

@@ -33,21 +33,18 @@ sampling:
     repeat_penalty: 1.0
 
 notes: >
-  Mistral Medium 3.5 (128B Dense, multimodal Text+Bild, 29.04.2026) ist
-  Mistrals erstes vereintes Modell - ersetzt Medium 3.1, Magistral UND
-  Devstral 2 in einem (Mistral selbst: "supersedes all our previous
-  coding models, namely Devstral, across all benchmarks"). Hybrid-Reasoning
-  mit per-Request konfigurierbarem reasoning_effort (none/high). Modified
-  MIT License. Vibe CLI (Mistral's Coding-Agent) läuft jetzt auf
-  Medium 3.5 statt Devstral 2.
-  Lokal: ~64 GB RAM für UD-Q4_K_XL via llama.cpp.
-  Chat-Profil = Mistral's Default (temp 0.7, funktioniert für beide
-  Reasoning-Modi). Coding-Profil = deterministischer (temp 0.2) für
-  agentische Code-Tasks.
-  Reasoning-Modus aktivieren via:
-    -- --chat-template-kwargs '{"reasoning_effort":"high"}'
-  WICHTIG: Verwende GGUFs vom 1. Mai 2026 oder neuer - frühere Versionen
-  hatten einen YaRN-Bug (mscale_all_dim) der long-context-Performance
-  ruinierte (Mistral hat selbst bestätigt, dass die ursprüngliche
-  Transformers-Config einen Long-Context-Performance-Bug hatte). Bei
-  Unsloth heißt der gefixte Build z.B. UD-Q4_K_XL.
+  Mistral Medium 3.5 (128B dense, multimodal text+image, 29 April 2026) is
+  Mistral's first unified model, replacing Medium 3.1, Magistral AND Devstral
+  2 in one (Mistral itself: "supersedes all our previous coding models, namely
+  Devstral, across all benchmarks"). Hybrid reasoning with per-request
+  configurable reasoning_effort (none/high). Modified MIT License. Vibe CLI
+  (Mistral's coding agent) now runs on Medium 3.5 instead of Devstral 2.
+  Locally: ~64 GB RAM for UD-Q4_K_XL via llama.cpp. Chat profile = Mistral's
+  default (temp 0.7, works for both reasoning modes). Coding profile = more
+  deterministic (temp 0.2) for agentic code tasks. Enable reasoning mode via:
+  -- --chat-template-kwargs '{"reasoning_effort":"high"}'. IMPORTANT: use
+  GGUFs from 1 May 2026 or newer; earlier versions had a YaRN bug
+  (mscale_all_dim) that ruined long-context performance (Mistral itself
+  confirmed that the original Transformers config had a long-context
+  performance bug). At Unsloth the fixed build is called, for example,
+  UD-Q4_K_XL.

@@ -74,22 +74,20 @@ draft_max: 2
 draft_p_min: 0.75
 
 notes: >
-  Agents-A1 (InternScience, 2026, Apache 2.0) — 35B-A3B-MoE-Agentenmodell,
-  post-trained auf Qwen3.5-35B-A3B (GGUF-Arch "qwen35moe", Hybrid
-  GatedDeltaNet + Full-Attention; der Scanner zählt den KV-Cache korrekt
-  über recurrent_layers). Dieses Profil greift nur per Filename-Pattern
-  ("agents-a1"); Re-Quants ohne den Namen landen korrekt beim
-  qwen3_5-3_6-arch_fallback. Nativer 256k-Kontext (YaRN bis ~1M).
-  Sampling = offizielle Card-Werte temp=0.85 / top_p=0.95 / top_k=20 /
-  rep=1.0; presence_penalty steht auf 0.0 statt der offiziellen 1.1, weil
-  presence_penalty beim Tool-Calling reproduzierbar Schleifen erzeugt
-  (siehe qwen3_5-3_6.yaml) — für reinen Chat: -- --presence-penalty 1.1.
-  Reasoning-Modell (<think>-Blöcke, Qwen3-Parser) mit nativem
-  Function-Calling. Tipp: `--jinja` beim Start trennt <think> sauber ins
-  reasoning_content-Feld und parst <tool_call>-Blöcke als OpenAI-style
-  tool_calls:
-    -- --jinja
-  ACHTUNG beim Download: InternScience/Agents-A1 selbst ist Safetensors —
-  für den Tuner die GGUF-Repos nehmen (z.B. InternScience/Agents-A1-Q4_K_M-GGUF
-  oder LordNeel/Agents-A1-GGUF); aktuelle llama.cpp-Mainline mit
-  qwen35moe-Support nötig (b9963 ok).
+  Agents-A1 (InternScience, 2026, Apache 2.0) is a 35B-A3B MoE agent model
+  post-trained on Qwen3.5-35B-A3B (GGUF architecture "qwen35moe", hybrid
+  GatedDeltaNet + full attention; the scanner counts the KV cache correctly
+  through recurrent_layers). This profile matches only by the filename pattern
+  ("agents-a1"); re-quants without that name correctly fall back to the
+  qwen3_5-3_6 architecture fallback. Native 256k context (YaRN up to ~1M).
+  Sampling uses the official card values temp=0.85 / top_p=0.95 / top_k=20 /
+  rep=1.0; presence_penalty is set to 0.0 instead of the official 1.1 because
+  presence_penalty reproducibly causes loops during tool calling (see
+  qwen3_5-3_6.yaml); for pure chat use: -- --presence-penalty 1.1. Reasoning
+  model (<think> blocks, Qwen3 parser) with native function calling. Tip:
+  `--jinja` at start cleanly separates <think> into the reasoning_content
+  field and parses <tool_call> blocks as OpenAI-style tool_calls: -- --jinja.
+  CAUTION when downloading: InternScience/Agents-A1 itself is Safetensors; use
+  the GGUF repositories for the tuner (for example
+  InternScience/Agents-A1-Q4_K_M-GGUF or LordNeel/Agents-A1-GGUF). A current
+  llama.cpp mainline with qwen35moe support is required (b9963 is fine).

@@ -70,17 +70,16 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  LG AI Research EXAONE 4.5 — erstes Open-Weight VLM von LG, 33B total
-  (31.7B Core + 1.29B Vision), DENSE, Text+Bild, 256k Kontext.
-  Hybrid-Attention (3x SWA-4096 + 1x Global-NoPE, 16x), 64 Layer.
-  WICHTIG Lizenz: nicht-kommerziell — nur Research/Academic, keine
-  Produktion (anders als die meisten anderen Profile hier).
-  LG-Launch-Command nutzt `-fa on -sm row -c 262144 --no-context-shift`;
-  `-sm row` (row-split) statt layer-split kann bei dieser Hybrid-Attention
-  auf Multi-GPU stabiler sein — bei Bedarf via Expert-Panel/Extra-Args.
-  Vision braucht die separate mmproj-Datei (mmproj-EXAONE-4.5-*.gguf).
-  Integrierte MTP/NextN-Layer existieren im GGUF, werden von llama.cpp
-  (b9500) aber NICHT ausgeführt — daher kein draft-mtp, sondern draftless
-  ngram-mod. presence_penalty steht auf 0.0 statt LGs offizieller 1.5,
-  weil 1.5 bei Tool-Calling/strukturierter Ausgabe Schleifen erzeugt; für
-  reinen Chat ohne Tools: `-- --presence-penalty 1.5`.
+  LG AI Research EXAONE 4.5: LG's first open-weight VLM, 33B total (31.7B core
+  + 1.29B vision), DENSE, text+image, 256k context. Hybrid attention (3x
+  SWA-4096 + 1x global NoPE, 16x), 64 layers. IMPORTANT licence:
+  non-commercial, research/academic only, no production use (unlike most other
+  profiles here). LG's launch command uses `-fa on -sm row -c 262144
+  --no-context-shift`; `-sm row` (row split) instead of layer split can be
+  more stable on multi-GPU with this hybrid attention; apply via the Expert
+  panel / extra args if needed. Vision needs the separate mmproj file
+  (mmproj-EXAONE-4.5-*.gguf). Integrated MTP/NextN layers exist in the GGUF
+  but are NOT executed by llama.cpp (b9500), so no draft-mtp; draftless
+  ngram-mod is used instead. presence_penalty is set to 0.0 instead of LG's
+  official 1.5 because 1.5 causes loops in tool calling / structured output;
+  for pure chat without tools: `-- --presence-penalty 1.5`.

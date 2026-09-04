@@ -83,13 +83,13 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  Cohere North-Mini-Code-1.0 — 30B total / 3B aktiv MoE, agentisches
-  Coding (Tool-Use, Repo-Tasks, Browser-Automation), Apache-2.0,
-  Architektur "cohere2moe" (cohere2-iSWA-Attention + glm4moe-Style
-  Sigmoid-Gating, 1 leading-dense + 48 MoE-Layer, 128 Experten / 8 aktiv).
-  HINWEIS: cohere2moe ist seit b9626 in llama.cpp-Mainline (PR #24260) —
-  auf b9829 also ohne Fork/PR-Branch lauffähig; nur Builds vor b9626
-  brauchen noch den PR-Branch. Normales autoregressives Server-Modell (kein
-  Diffusionspfad). Sampling = Cohere/Unsloth-Empfehlung (temp 1.0 /
-  top_p 0.95) im Chat; Coding-Profil deterministischer (0.6) für stabile
-  Tool-Calls. --jinja ist Pflicht (Chat-Template + Tool-Parsing).
+  Cohere North-Mini-Code-1.0: 30B total / 3B active MoE for agentic coding
+  (tool use, repository tasks, browser automation), Apache-2.0, architecture
+  "cohere2moe" (cohere2 iSWA attention + glm4moe-style sigmoid gating, 1
+  leading dense + 48 MoE layers, 128 experts / 8 active). NOTE: cohere2moe has
+  been in llama.cpp mainline since b9626 (PR #24260), so on b9829 it runs
+  without a fork or PR branch; only builds before b9626 still need the PR
+  branch. Normal autoregressive server model (no diffusion path). Sampling
+  follows the Cohere/Unsloth recommendation (temp 1.0 / top_p 0.95) in chat;
+  the coding profile is more deterministic (0.6) for stable tool calls.
+  --jinja is mandatory (chat template + tool parsing).

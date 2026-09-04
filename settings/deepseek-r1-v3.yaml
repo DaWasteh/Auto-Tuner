@@ -42,9 +42,8 @@ extra_args:
   - --jinja
 
 notes: >
-  DeepSeek-V3.2 (671B MoE / 37B aktiv) mit DSA für effiziente long-context
-  attention, oder R1 (Reasoning). Die R1- und V3.2-Modelle nutzen
-  <think>-Tags für Chain-of-Thought. Coding-Profil mit temp=0.3 (vs. 1.0
-  chat) für deterministischeren finalen Code; Reasoning-Kette bleibt
-  "kreativ". ACHTUNG: Speciale-Variante (V3.2-Speciale) unterstützt
-  KEIN Tool-Calling.
+  DeepSeek-V3.2 (671B MoE / 37B active) with DSA for efficient long-context
+  attention, or R1 (reasoning). The R1 and V3.2 models use <think> tags for
+  chain-of-thought. The coding profile uses temp=0.3 (vs. 1.0 chat) for more
+  deterministic final code while the reasoning chain stays "creative".
+  CAUTION: the Speciale variant (V3.2-Speciale) does NOT support tool calling.

@@ -201,6 +201,34 @@ def test_html_uses_vertical_side_by_side_model_bars_and_unique_chart_ids() -> No
             assert reference in ids
 
 
+def test_html_offers_recommended_settings_and_collapsed_candidate_diagrams() -> None:
+    html = build_performance_report_html(
+        {"fast": [], "quick": [_record()], "custom": []}
+    )
+    # The one-glance section names the winning runtime settings explicitly.
+    assert 'id="best-settings"' in html
+    assert "Recommended settings per model" in html
+    best_at = html.index('id="best-settings"')
+    charts_at = html.index('id="charts-quick"')
+    assert html.index('id="visual-dashboard"') < best_at < charts_at
+    best_section = html[best_at:charts_at]
+    assert "Unsafe &lt;Model&gt;" in best_section
+    assert "<b>8 / 8</b>" in best_section  # threads / batch threads
+    assert "<b>1024 / 512</b>" in best_section  # batch / ubatch
+    assert "<b>7</b>" in best_section  # draft n-max
+    assert "73%" in best_section
+    # Candidate diagrams stay in the document but are collapsed by default.
+    assert '<details class="candidate-diagrams">' in html
+    assert "Candidate comparison diagrams · 1 run(s)" in html
+    assert 'class="run-chart-card"' in html
+    # The winner table repeats the applied settings for scanning.
+    assert "Applied settings" in html
+    assert "threads 8 / batch threads 8 · batch 1024 / ubatch 512 · draft n-max 7" in html
+    # Metric legend and settings captions under chart columns.
+    assert "PP = prompt processing tok/s" in html
+    assert "threads 8 / 8 · batch 1024 / 512 · draft 7" in html
+
+
 def test_html_places_all_diagrams_before_tables_and_expandable_details() -> None:
     html = build_performance_report_html(
         {"fast": [], "quick": [_record()], "custom": []}

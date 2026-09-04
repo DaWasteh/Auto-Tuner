@@ -44,14 +44,12 @@ extra_args:
   - --jinja
 
 notes: >
-  Flagship 358B MoE Coding-Modell oder 30B-Flash-Variante. Drei-stufige
-  Thinking-Architektur (Interleaved/Preserved/Turn-level Thinking).
-  Sehr stark in SWE-Bench (~73.8% beim Full-Modell, 59.2% beim Flash)
-  und Tool-Use.
-  Chat-Profil = Z.ai's offizielle "general evaluation"-Empfehlung
-  (temp 1.0). Coding-Profil ist deterministischer (0.6) für stabile
-  Tool-Calls und reproduzierbare Code-Outputs.
-  Hinweis: Inzwischen gibt es auch GLM-5.1 (Z.ai's neuestes Coding-Modell,
-  256k Kontext) - dafür braucht es perspektivisch ein eigenes Profil.
-  Tipp: Für Coding `thinking=enabled` setzen — interne Reasoning-Traces
-  verbessern Code-Qualität spürbar.
+  Flagship 358B MoE coding model or the 30B Flash variant. Three-level
+  thinking architecture (interleaved / preserved / turn-level thinking). Very
+  strong in SWE-Bench (~73.8% for the full model, 59.2% for Flash) and tool
+  use. The chat profile is Z.ai's official "general evaluation" recommendation
+  (temp 1.0). The coding profile is more deterministic (0.6) for stable tool
+  calls and reproducible code output. Note: GLM-5.1 (Z.ai's newest coding
+  model, 256k context) now exists as well and will eventually need its own
+  profile. Tip: set `thinking=enabled` for coding; internal reasoning traces
+  noticeably improve code quality.

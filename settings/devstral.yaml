@@ -29,6 +29,6 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  Optimiert für Code-Completion (Cline, Aider, VS Code).
-  Coding-Profil (temp=0.15) für deterministische Completion;
-  Chat-Profil (temp=0.4) für Code-Erklärungen und Diskussion.
+  Optimised for code completion (Cline, Aider, VS Code). The coding profile
+  (temp=0.15) gives deterministic completion; the chat profile (temp=0.4)
+  suits code explanations and discussion.

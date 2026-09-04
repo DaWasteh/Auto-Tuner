@@ -67,16 +67,17 @@ extra_args:
 
 notes: >
   OpenAI gpt-oss (20B: 21B total / 3.6B active; 120B: 117B / 5.1B active),
-  Architektur "gpt-oss", nativ MXFP4-MoE (in llama.cpp-Mainline). Das 20B
-  läuft in 16 GB VRAM. ZWINGEND mit harmony-Format betreiben — `--jinja` ist
-  hier Pflicht, sonst wirres Output. Sampling ist bewusst untypisch
-  (temp 1.0 / top_p 1.0 / KEIN top_k / KEIN repeat_penalty): top_k und Penalty
-  beschneiden bzw. brechen die harmony-Steuertokens und zerstören den
-  Chain-of-Thought. Reasoning-Effort wird NICHT per Sampler, sondern über den
-  System-Prompt gesteuert ("Reasoning: low|medium|high"); in der AutoTuner-GUI
-  pro Modell als reasoning_effort (low/medium/high) setzbar — llama-server
-  reicht das via `--chat-template-kwargs '{"reasoning_effort":"high"}'` durch.
-  Voller Chain-of-Thought ist über die API sichtbar, aber laut OpenAI NICHT
-  für Endnutzer gedacht. Native Tool-/Function-Calling-Fähigkeiten vorhanden.
-  Quant-Stufen ändern beim MXFP4-MoE fast nichts an der Dateigröße — die
-  Experten liegen immer in MXFP4; q8_0/F16 betreffen nur Embeddings/Attention.
+  architecture "gpt-oss", native MXFP4 MoE (in llama.cpp mainline). The 20B
+  runs in 16 GB VRAM. MUST be run with the harmony format: `--jinja` is
+  mandatory here, otherwise the output is garbled. Sampling is deliberately
+  unusual (temp 1.0 / top_p 1.0 / NO top_k / NO repeat_penalty): top_k and
+  penalties truncate or break the harmony control tokens and destroy the
+  chain-of-thought. Reasoning effort is NOT controlled by a sampler but
+  through the system prompt ("Reasoning: low|medium|high"); in the AutoTuner
+  GUI it can be set per model as reasoning_effort (low/medium/high), which
+  llama-server passes through via `--chat-template-kwargs
+  '{"reasoning_effort":"high"}'`. The full chain-of-thought is visible through
+  the API but, according to OpenAI, NOT intended for end users. Native
+  tool/function-calling capabilities are present. Quant levels change almost
+  nothing about the file size of the MXFP4 MoE: the experts are always MXFP4;
+  q8_0/F16 only affect embeddings/attention.

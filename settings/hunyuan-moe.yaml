@@ -54,12 +54,12 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  Tencent Hunyuan-A13B-Instruct — fine-grained MoE, 80B total / 13B aktiv,
-  Architektur "hunyuan_moe" (NICHT "hunyuan-dense"!). Hybrid Reasoning
-  (Fast/Slow Thinking, CoT-Tiefe dynamisch), nativer 256k-Kontext. Sampling
-  = Tencents offizielle CHAT-Werte temp=0.7 / top_k=20 / top_p=0.8 /
-  rep=1.05 — bewusst getrennt vom Hunyuan-MT-Übersetzerprofil (top_p 0.6),
-  das für ein A13B-Chat-Modell falsch wäre. --jinja Pflicht. Mit 13B aktiven
-  Parametern auf einer 32-GB-Karte + --n-cpu-moe gut lauffähig. Hinweis:
-  einige frühe GGUF-Quants hatten eine kaputt hohe Perplexity — auf
-  geprüfte Quants (z.B. Unsloth Dynamic) achten.
+  Tencent Hunyuan-A13B-Instruct: fine-grained MoE, 80B total / 13B active,
+  architecture "hunyuan_moe" (NOT "hunyuan-dense"!). Hybrid reasoning
+  (fast/slow thinking, dynamic CoT depth), native 256k context. Sampling uses
+  Tencent's official CHAT values temp=0.7 / top_k=20 / top_p=0.8 / rep=1.05,
+  deliberately separated from the Hunyuan-MT translator profile (top_p 0.6),
+  which would be wrong for an A13B chat model. --jinja is mandatory. With 13B
+  active parameters it runs well on a 32 GB card plus --n-cpu-moe. Note: some
+  early GGUF quants had a broken, very high perplexity; prefer verified quants
+  (for example Unsloth Dynamic).

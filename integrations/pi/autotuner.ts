@@ -6,20 +6,33 @@
  * the current GGUF catalogue and sends each request through AutoTuner's
  * authenticated loopback gateway; selecting a different model therefore
  * performs one serialized stop/configure/start/health-check transition.
+ *
+ * Credential discovery order (first hit wins):
+ *   1. AUTOTUNER_API_URL / AUTOTUNER_API_KEY
+ *   2. AUTOTUNER_CONTROL_API_PORT / AUTOTUNER_CONTROL_API_KEY
+ *   3. <AUTOTUNER_DATA_DIR|~/.autotuner>/control_api.json (AutoTuner >= 5.3.9,
+ *      a tiny sidecar rewritten whenever the gateway starts, stops, or the
+ *      token is regenerated)
+ *   4. <AUTOTUNER_DATA_DIR|~/.autotuner>/autotuner_settings.json (older
+ *      AutoTuner versions; scanned with a bounded regex because the file can
+ *      hold tens of megabytes of benchmark evidence and must never be
+ *      JSON.parse'd on Pi's startup path)
+ *   5. http://127.0.0.1:1233 without a key (provider stays empty)
  */
 
 import type {
   ExtensionAPI,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import { readFile } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-interface AutoTunerSettings {
-  control_api_port?: unknown;
-  control_api_token?: unknown;
+interface Discovery {
+  port?: number;
+  token?: string;
+  enabled?: boolean;
 }
 
 interface AutoTunerModel {
@@ -37,21 +50,15 @@ interface ModelList {
 const PROVIDER_ID = "autotuner";
 const DEFAULT_PORT = 1233;
 const MAX_CATALOGUE_BYTES = 4 * 1024 * 1024;
+const MAX_SIDECAR_BYTES = 64 * 1024;
+// Only the head of the settings file is scanned; AutoTuner writes the small
+// control_api_* keys in the same top-level object as its benchmark evidence,
+// so a bounded window plus a targeted regex is enough and stays fast.
+const MAX_SETTINGS_SCAN_BYTES = 8 * 1024 * 1024;
 const COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-async function readSettings(): Promise<AutoTunerSettings> {
-  const root =
-    process.env.AUTOTUNER_DATA_DIR?.trim() || join(homedir(), ".autotuner");
-  try {
-    const raw = await readFile(join(root, "autotuner_settings.json"), "utf8");
-    if (raw.length > 2 * 1024 * 1024) return {};
-    const value: unknown = JSON.parse(raw);
-    return value && typeof value === "object"
-      ? (value as AutoTunerSettings)
-      : {};
-  } catch {
-    return {};
-  }
+function dataDir(): string {
+  return process.env.AUTOTUNER_DATA_DIR?.trim() || join(homedir(), ".autotuner");
 }
 
 function validPort(value: unknown): number | undefined {
@@ -59,6 +66,56 @@ function validPort(value: unknown): number | undefined {
   return Number.isInteger(port) && port >= 1024 && port <= 65535
     ? port
     : undefined;
+}
+
+function validToken(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length >= 16
+    ? value.trim()
+    : undefined;
+}
+
+async function readSidecar(): Promise<Discovery> {
+  try {
+    const path = join(dataDir(), "control_api.json");
+    const info = await stat(path);
+    if (!info.isFile() || info.size > MAX_SIDECAR_BYTES) return {};
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (!value || typeof value !== "object") return {};
+    const doc = value as Record<string, unknown>;
+    return {
+      enabled: doc.enabled === true,
+      port: validPort(doc.port),
+      token: doc.enabled === true ? validToken(doc.token) : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function scanLegacySettings(): Promise<Discovery> {
+  // Fallback for AutoTuner < 5.3.9. The settings file may be very large, so
+  // read a bounded window and look only for the two scalar keys.
+  const path = join(dataDir(), "autotuner_settings.json");
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) return {};
+    handle = await open(path, "r");
+    const size = Math.min(info.size, MAX_SETTINGS_SCAN_BYTES);
+    const buffer = Buffer.alloc(size);
+    const { bytesRead } = await handle.read(buffer, 0, size, 0);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    const port = /"control_api_port"\s*:\s*(\d{4,5})/.exec(text);
+    const token = /"control_api_token"\s*:\s*"([^"\\]{16,512})"/.exec(text);
+    return {
+      port: validPort(port?.[1]),
+      token: validToken(token?.[1]),
+    };
+  } catch {
+    return {};
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 function normalizeRoot(value: string): string {
@@ -207,22 +264,29 @@ async function fetchModels(
 }
 
 export default async function (pi: ExtensionAPI) {
-  const settings = await readSettings();
-  const port =
-    validPort(process.env.AUTOTUNER_CONTROL_API_PORT?.trim()) ??
-    validPort(settings.control_api_port) ??
-    DEFAULT_PORT;
+  const envPort = validPort(process.env.AUTOTUNER_CONTROL_API_PORT?.trim());
+  const envToken =
+    validToken(process.env.AUTOTUNER_API_KEY) ??
+    validToken(process.env.AUTOTUNER_CONTROL_API_KEY);
+  let discovered: Discovery = {};
+  if (envPort === undefined || envToken === undefined) {
+    discovered = await readSidecar();
+    if (discovered.token === undefined && discovered.enabled !== false) {
+      const legacy = await scanLegacySettings();
+      discovered = {
+        enabled: discovered.enabled,
+        port: discovered.port ?? legacy.port,
+        token: legacy.token,
+      };
+    }
+  }
+  const port = envPort ?? discovered.port ?? DEFAULT_PORT;
   // Explicit URL has highest precedence; otherwise the shared control-port
   // environment override wins over the persisted setting, exactly as in Python.
   const root = normalizeRoot(
     process.env.AUTOTUNER_API_URL?.trim() || `http://127.0.0.1:${port}`,
   );
-  const token =
-    process.env.AUTOTUNER_API_KEY?.trim() ||
-    process.env.AUTOTUNER_CONTROL_API_KEY?.trim() ||
-    (typeof settings.control_api_token === "string"
-      ? settings.control_api_token
-      : "");
+  const token = envToken ?? discovered.token ?? "";
 
   let models: ProviderModelConfig[] = [];
   if (token.length >= 16) {
@@ -237,6 +301,10 @@ export default async function (pi: ExtensionAPI) {
         }`,
       );
     }
+  } else if (discovered.enabled === false) {
+    console.warn(
+      "[AutoTuner] The External control API is disabled. Enable it in AutoTuner Settings, then /reload Pi.",
+    );
   } else {
     console.warn(
       "[AutoTuner] No API key found. Enable External control API in AutoTuner Settings, then /reload Pi.",

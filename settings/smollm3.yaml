@@ -40,9 +40,9 @@ extra_args:
   - --jinja
 
 notes: >
-  HuggingFace SmolLM3-3B — dichtes 3B-Modell, Apache-2.0, Architektur
-  "smollm3", Dual-Mode-Reasoning (Think/No-Think über /think bzw. /no_think
-  im Chat-Template), nativer 64k-Kontext (128k via YaRN). Sampling = HF-Card
-  temp=0.6 / top_p=0.95 / top_k=40; Coding leicht deterministischer. --jinja
-  für Template + Reasoning-Trennung. Klein und schnell — gut als Draft-Modell
-  oder für leichte Edge-Workloads.
+  HuggingFace SmolLM3-3B: dense 3B model, Apache-2.0, architecture "smollm3",
+  dual-mode reasoning (think/no-think via /think or /no_think in the chat
+  template), native 64k context (128k via YaRN). Sampling follows the HF card
+  temp=0.6 / top_p=0.95 / top_k=40; coding slightly more deterministic.
+  --jinja for template + reasoning separation. Small and fast; good as a draft
+  model or for light edge workloads.

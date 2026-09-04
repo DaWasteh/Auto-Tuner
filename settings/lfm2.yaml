@@ -31,13 +31,12 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  LiquidAI LFM2 / LFM2.5 Edge-Familie (Kurz-Conv + GQA). Sampling entspricht
-  LiquidAI's offizieller Empfehlung (temp 0.3, min_p 0.15, rep 1.05) - kleine
-  Modelle, daher bewusst niedrige Temperatur gegen Inkohärenz.
-  WICHTIG (LFM2.5-Audio): Das ist ein Audio-In/Audio-Out-Sprachmodell. Dieses
-  Profil liefert nur sinnvolle Text-seitige Defaults - die eigentliche
-  Audio-Pipeline (Audio-Encoder/Decoder) läuft über die dedizierten
-  llama.cpp-Audio-Pfade, nicht über den reinen Text-Chat-Server. Als
-  Text-Chat-Modell geladen funktioniert es, gibt aber keine Sprache aus.
-  LFM2 ist technisch ein Conv/Attention-Hybrid; bei diesem 1.5B-Modell ist
-  die KV-Cache-Überschätzung des Tuners vernachlässigbar (winziges Modell).
+  LiquidAI LFM2 / LFM2.5 edge family (short conv + GQA). Sampling follows
+  LiquidAI's official recommendation (temp 0.3, min_p 0.15, rep 1.05): small
+  models, hence a deliberately low temperature against incoherence. IMPORTANT
+  (LFM2.5-Audio): this is an audio-in/audio-out speech model. This profile
+  only provides sensible text-side defaults; the actual audio pipeline (audio
+  encoder/decoder) runs through the dedicated llama.cpp audio paths, not
+  through the plain text chat server. Loaded as a text chat model it works but
+  produces no speech. LFM2 is technically a conv/attention hybrid; for this
+  1.5B model the tuner's KV-cache overestimate is negligible (tiny model).

@@ -81,14 +81,13 @@ ngram_k4v_size_m: 24
 ngram_k4v_min_hits: 1
 
 notes: >
-  StepFun Step 3.5 Flash (Text) + Step 3.7 Flash (VLM, +Bild/Video), beide
-  Sparse-MoE ~196-198B total / ~11B aktiv, 3:1 SWA/Full-Attention, MTP-3,
-  256k Kontext. Beide laden unter arch "step35".
-  GRÖSSEN-WARNUNG: ~196-198B MoE übersteigt 48 GB (VRAM+RAM) dieses Systems
-  bei Weitem — realistisch nur mit massivem CPU-MoE-Offload und langsamer
-  Generierung, oder nicht lauffähig. Profil dient der Korrektheit/Zukunft.
-  Reasoning-Level (low/medium/high) werden via Chat-Template/API gesteuert.
-  draft_max steht auf 3 (native MTP-3-Tiefe); auf Vulkan ggf. instabil →
-  im Expert-Panel auf 2 reduzieren. Bei Step-3.7-Flash separate mmproj-Datei
-  für Vision. `--jinja` aktiviert saubere Reasoning-Trennung:
-    -- --jinja
+  StepFun Step 3.5 Flash (text) + Step 3.7 Flash (VLM, +image/video), both
+  sparse MoE ~196-198B total / ~11B active, 3:1 SWA/full attention, MTP-3,
+  256k context. Both load under architecture "step35". SIZE WARNING: a
+  ~196-198B MoE far exceeds this system's 48 GB (VRAM+RAM); realistically it
+  runs only with massive CPU MoE offload and slow generation, or not at all.
+  The profile exists for correctness/the future. Reasoning levels
+  (low/medium/high) are controlled via the chat template/API. draft_max is set
+  to 3 (native MTP-3 depth); possibly unstable on Vulkan, then reduce to 2 in
+  the Expert panel. Step-3.7-Flash needs a separate mmproj file for vision.
+  `--jinja` enables clean reasoning separation: -- --jinja

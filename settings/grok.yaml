@@ -37,9 +37,9 @@ sampling:
     repeat_penalty: 1.0
 
 notes: >
-  xAI Grok-2 — großes MoE, Open-Weights, Architektur "grok" (in
-  llama.cpp-Mainline). Native Kontext bis 131072. xAI nennt keine prominente
-  llama.cpp-Sampler-Empfehlung, daher konservativ-mittige Defaults (temp 0.7
-  chat / 0.3 coding) — bei Bedarf anpassen. Datacenter/Cluster-Klasse
-  (mehrere 100 GB je nach Quant); auf einer einzelnen Workstation nur mit
-  sehr viel RAM + --n-cpu-moe.
+  xAI Grok-2: large MoE, open weights, architecture "grok" (in llama.cpp
+  mainline). Native context up to 131072. xAI gives no prominent llama.cpp
+  sampler recommendation, so conservative defaults are used (temp 0.7 chat /
+  0.3 coding); adjust if needed. Datacenter/cluster class (several hundred GB
+  depending on quant); on a single workstation only with a lot of RAM plus
+  --n-cpu-moe.

@@ -60,7 +60,10 @@ BENCHMARK_SEARCH_SCHEMA = 3
 class BenchmarkLimits:
     """Hard bounds that keep a thorough tuning run finite."""
 
-    max_candidates: int = 14
+    # v5.3.9 raised the Standard budget from 14 to 18 so the batch stage can
+    # fund the classic family for two thread finalists AND the larger
+    # micro-batch probes plus a hill-climb refinement round.
+    max_candidates: int = 18
     confirmation_runs: int = 2
     samples_per_candidate: int = 2
     startup_timeout_s: float = 300.0
@@ -372,16 +375,40 @@ def baseline_candidate(
 
 
 def thread_candidates(
-    seed: BenchmarkCandidate, physical_cores: int, logical_cores: int
+    seed: BenchmarkCandidate,
+    physical_cores: int,
+    logical_cores: int,
+    *,
+    full_offload: bool = False,
 ) -> List[BenchmarkCandidate]:
-    """Return deterministic, unique thread alternatives around ``seed``."""
+    """Return deterministic, unique thread alternatives around ``seed``.
+
+    The classic probes (all physical cores, half of them, every logical
+    core) stay first. Two data-driven probes follow:
+
+    * decoupled generation/prompt threads (``threads`` = physical cores,
+      ``batch_threads`` = logical cores) because prompt processing scales
+      with SMT threads while decode usually prefers physical cores; and
+    * a deliberately small thread count when every layer already lives on
+      the GPU (``full_offload``): the CPU only feeds the backend there, and
+      oversubscribing it with spin-waiting workers measurably slows decode
+      on many desktop CPUs.
+    """
     physical = max(1, int(physical_cores or seed.threads))
     logical = max(physical, int(logical_cores or physical))
-    values = [physical, max(1, physical // 2), logical]
+    probes: List[Tuple[int, int]] = [
+        (physical, min(logical, physical)),
+        (max(1, physical // 2), max(1, physical // 2)),
+        (logical, logical),
+    ]
+    if logical > physical:
+        probes.append((physical, logical))
+    if full_offload and physical > 6:
+        low = max(2, min(physical, 6))
+        probes.append((low, low))
     out: List[BenchmarkCandidate] = []
     seen = {_candidate_key(seed)}
-    for threads in values:
-        batch_threads = min(logical, max(1, threads))
+    for threads, batch_threads in probes:
         item = BenchmarkCandidate(
             id=f"threads-{threads}-{batch_threads}",
             label=f"Threads {threads} / batch threads {batch_threads}",
@@ -397,30 +424,95 @@ def thread_candidates(
     return out
 
 
+_MIN_BATCH = 128
+_MAX_BATCH = 8192
+
+
+def _batch_pair(batch: int, ubatch: int) -> Tuple[int, int]:
+    """Clamp one batch/ubatch proposal to llama.cpp's useful power-of-two range."""
+    batch = max(_MIN_BATCH, min(_MAX_BATCH, int(batch)))
+    ubatch = max(_MIN_BATCH // 2, min(batch, int(ubatch)))
+    return batch, ubatch
+
+
 def batch_candidates(seed: BenchmarkCandidate) -> List[BenchmarkCandidate]:
-    """Return bounded power-of-two batch/ubatch alternatives."""
-    pairs = [
+    """Return bounded power-of-two batch/ubatch alternatives around ``seed``.
+
+    The classic anchors (512/256 ... 2048/1024) remain so every run still
+    covers the historically validated region. They are followed by a
+    geometric neighbourhood of the *seed* itself: half, equal, and double
+    steps of both axes plus a larger 4096/8192 prompt-batch probe. On 24-32
+    GB GPUs the larger micro-batches are frequently the real prompt
+    processing optimum, and the old fixed list could never reach them.
+    """
+    anchors = [
         (512, 256),
         (1024, 512),
         (1024, 1024),
         (2048, 512),
         (2048, 1024),
     ]
+    neighbourhood = [
+        _batch_pair(seed.batch // 2, seed.ubatch // 2),
+        _batch_pair(seed.batch, seed.ubatch // 2),
+        _batch_pair(seed.batch, seed.ubatch * 2),
+        _batch_pair(seed.batch * 2, seed.ubatch),
+        _batch_pair(seed.batch * 2, seed.ubatch * 2),
+        _batch_pair(2048, 2048),
+        _batch_pair(4096, 1024),
+        _batch_pair(4096, 2048),
+    ]
     out: List[BenchmarkCandidate] = []
     seen = {_candidate_key(seed)}
-    for batch, ubatch in pairs:
-        item = BenchmarkCandidate(
-            id=f"batch-{batch}-{ubatch}-t{seed.threads}",
-            label=f"Batch {batch} / ubatch {ubatch}",
-            threads=seed.threads,
-            batch_threads=seed.batch_threads,
-            batch=batch,
-            ubatch=min(ubatch, batch),
-            draft_n_max=seed.draft_n_max,
-        )
+    for batch, ubatch in [*anchors, *neighbourhood]:
+        item = _batch_candidate(seed, batch, ubatch)
         if _candidate_key(item) not in seen:
             seen.add(_candidate_key(item))
             out.append(item)
+    return out
+
+
+def _batch_candidate(
+    seed: BenchmarkCandidate, batch: int, ubatch: int
+) -> BenchmarkCandidate:
+    batch, ubatch = _batch_pair(batch, ubatch)
+    return BenchmarkCandidate(
+        id=f"batch-{batch}-{ubatch}-t{seed.threads}",
+        label=f"Batch {batch} / ubatch {ubatch}",
+        threads=seed.threads,
+        batch_threads=seed.batch_threads,
+        batch=batch,
+        ubatch=ubatch,
+        draft_n_max=seed.draft_n_max,
+    )
+
+
+def refine_batch_candidates(
+    best: BenchmarkCandidate, tried: Sequence[BenchmarkCandidate]
+) -> List[BenchmarkCandidate]:
+    """Return the next untried hill-climb steps beyond the current best pair.
+
+    The staged search measures a bounded batch/ubatch family. When the best
+    pair sits on the edge of that family, the true optimum may lie one step
+    further out. Each refinement proposes the immediate neighbours in the
+    direction that was not yet measured (double/halve ubatch, double batch),
+    so the sweep keeps climbing until a step regresses instead of stopping
+    at a fixed list boundary.
+    """
+    seen = {(item.batch, item.ubatch) for item in tried}
+    seen.add((best.batch, best.ubatch))
+    proposals = [
+        _batch_pair(best.batch, best.ubatch * 2),
+        _batch_pair(best.batch * 2, best.ubatch * 2),
+        _batch_pair(best.batch * 2, best.ubatch),
+        _batch_pair(best.batch, best.ubatch // 2),
+    ]
+    out: List[BenchmarkCandidate] = []
+    for batch, ubatch in proposals:
+        if (batch, ubatch) in seen:
+            continue
+        seen.add((batch, ubatch))
+        out.append(_batch_candidate(best, batch, ubatch))
     return out
 
 
@@ -1224,7 +1316,10 @@ class BenchmarkRunner:
             # Stage 1: find the best CPU thread count while every other axis
             # stays identical. Individual failures remain visible evidence.
             for candidate in thread_candidates(
-                baseline_spec, self.physical_cores, self.logical_cores
+                baseline_spec,
+                self.physical_cores,
+                self.logical_cores,
+                full_offload=bool(getattr(self.base_config, "full_offload", False)),
             ):
                 if len(results) >= self.limits.max_candidates:
                     break
@@ -1240,26 +1335,41 @@ class BenchmarkRunner:
                 seen.add(_candidate_key(candidate))
 
             # Stage 2: batch/ubatch can interact strongly with CPU thread count.
-            # Standard's 14-candidate budget fits bounded batch families for the
+            # Standard's 18-candidate budget fits bounded batch families for the
             # top two distinct thread finalists; testing only the single Stage-1
             # winner could miss the global combination while leaving budget idle.
+            # Finalists are distinct generation-thread counts (the best
+            # batch-thread variant of each), so the decoupled 8/16 probe never
+            # crowds out a genuinely different CPU configuration.
             thread_finalists: List[BenchmarkCandidate] = []
-            seen_threads: set[Tuple[int, int]] = set()
+            seen_threads: set[int] = set()
             for item in self._rank(list(results), baseline):
-                thread_key = (item.candidate.threads, item.candidate.batch_threads)
-                if thread_key in seen_threads:
+                if item.candidate.threads in seen_threads:
                     continue
-                seen_threads.add(thread_key)
+                seen_threads.add(item.candidate.threads)
                 thread_finalists.append(item.candidate)
                 if len(thread_finalists) >= 2:
                     break
 
-            for thread_seed in thread_finalists:
+            # Split the remaining budget: the leading finalist explores the
+            # classic family plus the larger micro-batch probes, the runner-up
+            # still receives the validated classic family, and any surplus
+            # funds the refinement stage below.
+            remaining = max(0, self.limits.max_candidates - len(results))
+            quotas: List[int] = []
+            if thread_finalists:
+                first_quota = (remaining + 1) // 2
+                quotas.append(first_quota)
+                if len(thread_finalists) > 1:
+                    quotas.append(min(5, remaining - first_quota))
+            for thread_seed, quota in zip(thread_finalists, quotas):
+                launched = 0
                 for candidate in batch_candidates(thread_seed):
-                    if len(results) >= self.limits.max_candidates:
+                    if len(results) >= self.limits.max_candidates or launched >= quota:
                         break
                     if _candidate_key(candidate) in seen:
                         continue
+                    launched += 1
                     self._check_cancelled()
                     try:
                         measured = self._run_candidate(candidate)
@@ -1271,6 +1381,52 @@ class BenchmarkRunner:
                     by_id[candidate.id] = measured
                     seen.add(_candidate_key(candidate))
                 if len(results) >= self.limits.max_candidates:
+                    break
+
+            # Stage 2b: hill-climb beyond the measured batch family. While the
+            # candidate budget lasts, keep stepping the current best pair
+            # outward (larger micro-batches first) and stop as soon as one
+            # refinement fails to beat the incumbent by the noise threshold.
+            # This is what lets the sweep discover a 4096/2048 prompt optimum
+            # on large-VRAM GPUs instead of stopping at the list boundary.
+            refine_rounds = 0
+            while len(results) < self.limits.max_candidates and refine_rounds < 4:
+                incumbent = self._rank(list(results), baseline)[0]
+                proposals = refine_batch_candidates(
+                    incumbent.candidate, [item.candidate for item in results]
+                )
+                proposals = [
+                    item for item in proposals if _candidate_key(item) not in seen
+                ]
+                if not proposals:
+                    break
+                refine_rounds += 1
+                improved = False
+                for candidate in proposals:
+                    if len(results) >= self.limits.max_candidates:
+                        break
+                    self._check_cancelled()
+                    try:
+                        measured = self._run_candidate(candidate)
+                    except BenchmarkCancelled:
+                        raise
+                    except BenchmarkFailure as exc:
+                        measured = CandidateResult(candidate=candidate, error=str(exc))
+                    results.append(measured)
+                    by_id[candidate.id] = measured
+                    seen.add(_candidate_key(candidate))
+                    if measured.valid and self._score(measured, baseline) > (
+                        self._score(incumbent, baseline)
+                        * (1.0 + float(self.limits.min_improvement))
+                    ):
+                        self._emit(
+                            "Batch refinement improved the incumbent: "
+                            f"{candidate.label} ({measured.overall_tps:.2f} tok/s "
+                            f"vs {incumbent.overall_tps:.2f} tok/s)"
+                        )
+                        improved = True
+                        break
+                if not improved:
                     break
 
         # Stage 3 (optional): retain the best runtime axes and increase draft

@@ -86,25 +86,24 @@ sampling:
     temperature: 0.3
 
 notes: >
-  DiffusionGemma ist ein Diffusions-Textmodell (kein autoregressives GGUF
-  für den normalen llama-server). Es läuft über llama-diffusion-gemma-server
-  (PR #24427) — einen EIGENEN OpenAI-kompatiblen HTTP-Server mit /health,
-  /v1/chat/completions, /props und Port-Binding. Wähle deinen Diffusion-
-  Build im Fork-Dropdown der GUI (z.B. "d_bXXXX_vulkan_llama.cpp" oder
-  "d_bXXXX_hip_llama.cpp"); der AutoTuner findet
-  llama-diffusion-gemma-server automatisch darin, kein Pfad muss hartcodiert
-  werden. Der Server ist persistent abfragbar (Chat-UI, RooCode, OpenAI-
-  Clients) — Port/Zustand wie bei jedem anderen Server. Mainline b9700
-  ertechnet die Architektur "diffusion-gemma" nicht; der AutoTuner erkennt
-  sie trotzdem (is_diffusion) und wählt automatisch den gemma-server-Runner.
-  Mainline-Diffusionsmodelle (Dream/LLaDA/RND1) haben KEINEN eigenen Server
-  und laufen stattdessen single-shot über llama-diffusion-cli. Scheduling:
-  ENTWEDER --diffusion-eps ODER --diffusion-block-length, nicht beides
-  (DiffusionGemma nutzt Block-Scheduling). Fork-spezifische Flags müssen
-  über diffusion.fork_args zugeschaltet werden, falls dein Build sie kennt.
-  WICHTIG VRAM: DiffusionGemma hat einen extrem großen F16-KV-Cache
-  (k/v_length=512, 5x normal). Auto ist daher auf 4096 gedeckelt
-  (KV ~0,47 GiB); 8192 kann mit Allocator-Overhead eine zusammenhängende
-  1-GiB-Vulkan-Allokation erreichen und trotz freiem Gesamt-VRAM crashen.
-  Die Rechnung reserviert außerdem 1,5 GiB Diffusions-Runtime-Overhead.
-  Pinnen auf die 32-GB-R9700 geschieht automatisch (env_overrides).
+  DiffusionGemma is a diffusion text model (not an autoregressive GGUF for the
+  normal llama-server). It runs through llama-diffusion-gemma-server (PR
+  #24427), a SEPARATE OpenAI-compatible HTTP server with /health,
+  /v1/chat/completions, /props, and port binding. Select your diffusion build
+  in the GUI's fork dropdown (for example "d_bXXXX_vulkan_llama.cpp" or
+  "d_bXXXX_hip_llama.cpp"); AutoTuner finds llama-diffusion-gemma-server
+  inside it automatically, no path needs to be hard-coded. The server stays
+  queryable (chat UI, RooCode, OpenAI clients); port and state behave like any
+  other server. Mainline b9700 does not recognise the "diffusion-gemma"
+  architecture; AutoTuner still detects it (is_diffusion) and automatically
+  selects the gemma-server runner. Mainline diffusion models
+  (Dream/LLaDA/RND1) have NO server of their own and instead run single-shot
+  through llama-diffusion-cli. Scheduling: EITHER --diffusion-eps OR
+  --diffusion-block-length, not both (DiffusionGemma uses block scheduling).
+  Fork-specific flags must be enabled through diffusion.fork_args if your
+  build knows them. IMPORTANT for VRAM: DiffusionGemma has an extremely large
+  F16 KV cache (k/v_length=512, 5x normal). Auto is therefore capped at 4096
+  (KV ~0.47 GiB); 8192 can, with allocator overhead, reach a contiguous 1 GiB
+  Vulkan allocation and crash despite free total VRAM. The calculation also
+  reserves 1.5 GiB of diffusion runtime overhead. Pinning to the 32 GB R9700
+  happens automatically (env_overrides).

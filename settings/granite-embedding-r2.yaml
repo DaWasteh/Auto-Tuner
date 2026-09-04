@@ -56,15 +56,14 @@ sampling:
 # Speculation ohnehin nur bei Draft/MTP-Fund, was es hier nicht gibt.
 
 notes: >
-  IBM Granite Embedding Multilingual R2 (April 2026) — ModernBERT-basierte
-  Dense-Embedding-Modelle, arch "modern-bert". Zwei Größen: 97m (384-dim)
-  und 311m (768-dim, Matryoshka 768->512/384/256/128). 200+ Sprachen
-  (erweitert für 52 + Code), 32768 Token Kontext, CLS-Pooling, Apache 2.0.
-  KEIN Chat/Completion — als Embedding-Endpoint betreiben (--embeddings,
-  --pooling cls sind in extra_args gesetzt). Use-Cases: semantische Suche,
-  RAG-Retrieval. Reranker separat (eigenes Modell).
-  HINWEIS: Falls AutoTuner-GUI-Logik (Sampling-Dropdowns, Draft/n-gram-
-  Checkboxen, KV-Quant) für dieses Profil sichtbar bleibt, einfach
-  ignorieren — im --embeddings-Modus haben sie keine Wirkung. Sollte ein
-  künftiger AutoTuner-Build einen expliziten "embedding"-Task-Schalter
-  bekommen, kann dieses Profil entsprechend vereinfacht werden.
+  IBM Granite Embedding Multilingual R2 (April 2026): ModernBERT-based dense
+  embedding models, architecture "modern-bert". Two sizes: 97m (384-dim) and
+  311m (768-dim, Matryoshka 768->512/384/256/128). 200+ languages (extended
+  for 52 + code), 32768-token context, CLS pooling, Apache 2.0. NO
+  chat/completion: run it as an embedding endpoint (--embeddings and --pooling
+  cls are set in extra_args). Use cases: semantic search, RAG retrieval. The
+  reranker is a separate model. NOTE: if AutoTuner GUI logic (sampling
+  dropdowns, draft/n-gram checkboxes, KV quant) remains visible for this
+  profile, simply ignore it; in --embeddings mode it has no effect. Should a
+  future AutoTuner build gain an explicit "embedding" task switch, this
+  profile can be simplified accordingly.

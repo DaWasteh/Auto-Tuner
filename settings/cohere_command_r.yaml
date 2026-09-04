@@ -28,8 +28,7 @@ sampling:
     repeat_penalty: 1.0
 
 notes: >
-  Spezialisiert auf RAG und Tool-Calling. Niedrige Temperature schon im
-  Chat-Modus, weil Command R/R+ aus Quellen zitieren soll - "Chat" ist
-  hier eher dokument-gestützte Konversation, nicht freies Schreiben.
-  Coding-Profil ist quasi greedy (0.1) für deterministische Tool-Calls
-  und strukturierte Ausgaben.
+  Specialised in RAG and tool calling. Low temperature already in chat mode
+  because Command R/R+ is meant to cite from sources: "chat" here is
+  document-grounded conversation rather than free writing. The coding profile
+  is almost greedy (0.1) for deterministic tool calls and structured output.

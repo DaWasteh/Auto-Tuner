@@ -52,11 +52,10 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  Baidu ERNIE 4.5 — MoE-Familie, Apache-2.0, Architektur "ernie4_5-moe".
-  Varianten: 300B-A47B (Datacenter/Cluster) und 21B-A3B (lokal, auch als
-  Thinking-Edition), nativer Kontext bis 131072. Sampling konservativ-mittig
-  (temp 0.8 / top_p 0.8 chat, 0.6 coding), da Baidu keine prominente
-  einheitliche llama.cpp-Empfehlung veröffentlicht — bei Bedarf an die
-  generation_config der konkreten Variante anpassen. --jinja für das
-  Chat-Template / Thinking-Trennung. 21B-A3B (3B aktiv) läuft mit
-  --n-cpu-moe gut auf einer 32-GB-Karte.
+  Baidu ERNIE 4.5: MoE family, Apache-2.0, architecture "ernie4_5-moe".
+  Variants: 300B-A47B (datacenter/cluster) and 21B-A3B (local, also as a
+  Thinking edition), native context up to 131072. Sampling is conservative
+  (temp 0.8 / top_p 0.8 chat, 0.6 coding) because Baidu publishes no prominent
+  unified llama.cpp recommendation; adjust to the generation_config of the
+  specific variant if needed. --jinja for the chat template / thinking
+  separation. 21B-A3B (3B active) runs well with --n-cpu-moe on a 32 GB card.

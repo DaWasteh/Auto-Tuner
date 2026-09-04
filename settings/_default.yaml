@@ -21,6 +21,6 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  Fallback-Profil. Falls kein spezifisches Profil passt, wird dieses verwendet.
-  Chat-Defaults sind bewusst konservativ-mittig (temp 0.7), Coding deutlich
-  deterministischer (temp 0.2). Modell-spezifische YAMLs überschreiben das.
+  Fallback profile. It is used whenever no specific profile matches. Chat
+  defaults are deliberately conservative (temp 0.7); coding is clearly more
+  deterministic (temp 0.2). Model-specific YAML files override this.

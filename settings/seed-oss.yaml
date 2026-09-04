@@ -57,12 +57,12 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  ByteDance Seed-OSS-36B-Instruct — dichtes 36B-Reasoning/Agentic-Modell,
-  Apache-2.0, nativer 512k-Kontext, Architektur "seed_oss". Besonderheit:
-  steuerbares Thinking-Budget (CoT-Länge frei wählbar, 512 Tokens bis
-  unbegrenzt) — bei harten Tasks (AIME, LiveCodeBench) steigt der Score mit
-  größerem Budget. Sampling = ByteDance-Empfehlung temp=1.1 (!) /
-  top_p=0.95 im Chat — die hohe Temperatur ist Absicht des Herstellers;
-  Coding-Profil etwas konservativer (temp 1.0 / top_p 0.8, vgl. Taubench
-  1.0/0.7). --jinja für das Thinking-Template. Dense → kein MoE-Offload,
-  passt quantisiert gut auf eine 32-GB-Karte.
+  ByteDance Seed-OSS-36B-Instruct: dense 36B reasoning/agentic model,
+  Apache-2.0, native 512k context, architecture "seed_oss". Special feature: a
+  controllable thinking budget (CoT length freely selectable, 512 tokens to
+  unlimited); on hard tasks (AIME, LiveCodeBench) the score rises with a
+  larger budget. Sampling follows the ByteDance recommendation temp=1.1 (!) /
+  top_p=0.95 in chat; the high temperature is the vendor's intention; the
+  coding profile is somewhat more conservative (temp 1.0 / top_p 0.8, compare
+  Taubench 1.0/0.7). --jinja for the thinking template. Dense, so no MoE
+  offload; quantised it fits well on a 32 GB card.

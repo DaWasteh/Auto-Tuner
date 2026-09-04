@@ -31,8 +31,8 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  Ternary-Bonsai (8B/4B/1.7B) - Gewichte in {-1, 0, +1} (1.58 bits/weight).
-  Zwischen 1-bit Bonsai und full-precision: ~9x kleiner, 5x schneller,
-  besser auf Benchmarks als 1-bit Bonsai (avg +5 Punkte).
-  Q2_0 ist die eingesetzte Speicher-Form (2-bit aligned für Metal/CUDA).
-  Braucht den PrismML 2b_llama.cpp-Fork (Ternary-Kerne, 2-bit Q2_0).
+  Ternary-Bonsai (8B/4B/1.7B): weights in {-1, 0, +1} (1.58 bits per weight).
+  Between 1-bit Bonsai and full precision: about 9x smaller, 5x faster, and
+  better on benchmarks than 1-bit Bonsai (avg +5 points). Q2_0 is the storage
+  format used (2-bit aligned for Metal/CUDA). Requires the PrismML
+  2b_llama.cpp fork (ternary kernels, 2-bit Q2_0).

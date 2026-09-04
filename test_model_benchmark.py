@@ -18,6 +18,7 @@ from model_benchmark import (
     BenchmarkSuiteRunner,
     CandidateResult,
     batch_candidates,
+    refine_batch_candidates,
     baseline_candidate,
     draft_candidates,
     parse_timing_payload,
@@ -70,13 +71,42 @@ def test_candidate_generation_is_deterministic_and_valid() -> None:
     first = thread_candidates(base, 8, 16)
     second = thread_candidates(base, 8, 16)
     assert first == second
-    assert [item.threads for item in first] == [8, 4, 16]
+    # Classic probes first, then the decoupled generation/prompt-thread probe.
+    assert [(item.threads, item.batch_threads) for item in first] == [
+        (8, 8),
+        (4, 4),
+        (16, 16),
+        (8, 16),
+    ]
     assert all(item.draft_n_max == 2 for item in first)
+    # Fully offloaded models additionally probe a deliberately small thread
+    # count; the seed itself (6/6 here) is never duplicated, so use a 12/12 seed.
+    seed12 = __import__("dataclasses").replace(base, threads=12, batch_threads=12)
+    offloaded = thread_candidates(seed12, 16, 32, full_offload=True)
+    assert (6, 6) in {(item.threads, item.batch_threads) for item in offloaded}
+    assert (6, 6) not in {
+        (item.threads, item.batch_threads)
+        for item in thread_candidates(seed12, 16, 32)
+    }
 
     batches = batch_candidates(first[0])
     assert batches
     assert len({(item.batch, item.ubatch) for item in batches}) == len(batches)
     assert all(item.ubatch <= item.batch for item in batches)
+    # The classic validated family stays first; larger micro-batch probes
+    # that 24-32 GB GPUs frequently prefer follow it.
+    pairs = [(item.batch, item.ubatch) for item in batches]
+    # The seed pair (512/256) is never repeated; the remaining anchors lead.
+    assert pairs[:4] == [(1024, 512), (1024, 1024), (2048, 512), (2048, 1024)]
+    assert (2048, 2048) in pairs and (4096, 2048) in pairs
+    assert all(128 <= item.batch <= 8192 for item in batches)
+
+    refined = refine_batch_candidates(batches[-1], batches)
+    assert refined
+    assert all(
+        (item.batch, item.ubatch) not in set(pairs) for item in refined
+    )
+    assert all(item.threads == batches[-1].threads for item in refined)
 
     drafts = draft_candidates(batches[0], maximum=4)
     assert [item.draft_n_max for item in drafts] == [1, 3, 4]
@@ -1702,3 +1732,36 @@ def test_path_specific_tuning_save_is_atomic_and_legacy_compatible(
 
     app_settings.clear_expert_override("same", model_a)
     assert app_settings.get_expert_override("same", model_a) is None
+
+
+def test_batch_refinement_hill_climbs_beyond_the_measured_family(monkeypatch) -> None:
+    """A larger budget lets the sweep keep climbing past the fixed batch list."""
+    limits = BenchmarkLimits(
+        max_candidates=24,
+        confirmation_runs=0,
+        samples_per_candidate=2,
+        total_timeout_s=60,
+    )
+    runner = _runner(limits)
+    calls: list[BenchmarkCandidate] = []
+
+    def fake_benchmark(candidate: BenchmarkCandidate) -> CandidateResult:
+        calls.append(candidate)
+        # Prompt throughput keeps improving with the micro-batch up to 4096;
+        # every thread count behaves the same so the batch axis decides.
+        prompt = 100.0 + min(candidate.ubatch, 4096) / 32.0
+        generation = 100.0
+        return _measured(candidate, prompt, generation)
+
+    monkeypatch.setattr(runner, "_benchmark_candidate", fake_benchmark)
+    monkeypatch.setattr(
+        "model_benchmark.probe_binary_build_number", lambda _binary: 10786
+    )
+    result = runner.run()
+
+    assert len(calls) <= limits.max_candidates
+    assert result.winner.candidate.ubatch >= 2048
+    # The refinement stage proposed at least one pair outside the static
+    # family (ubatch 4096 is only reachable through hill-climbing).
+    assert any(item.ubatch >= 4096 for item in calls)
+    assert result.score(result.winner) > 1.03

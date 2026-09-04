@@ -45,4 +45,7 @@ notes: >
   Think-Max workflows should reserve at least a 384k context window. These
   are datacenter-scale models; local workstation use needs very aggressive
   quantization plus large system RAM and CPU expert offload. Keep preserved
-  reasoning for long agent/tool sessions.
+  reasoning for long agent/tool sessions. llama.cpp b10786 adds the
+  DeepSeek-V4-Flash-Vision-Exp projector (deepseek4v mmproj) and the
+  image-token routing bias; vision needs that build plus a matching mmproj
+  file, and image spans attend bidirectionally inside the sliding window.

@@ -144,3 +144,74 @@ def test_live_widget_retranslation_always_uses_original_source(tmp_path) -> None
     manager.apply_to(root)
     assert button.text() == "Fermer"
     root.close()
+
+
+def test_profile_notes_follow_the_interface_language(tmp_path) -> None:
+    from settings_loader import load_profiles
+
+    manager = LanguageManager(BUILTIN_LANGUAGES, tmp_path / "languages")
+    assert not manager.errors
+    profiles = load_profiles(ROOT / "settings")
+    files = {profile.source_file for profile in profiles}
+    english = manager.packs[DEFAULT_LANGUAGE_ID]
+    # Every bundled pack explains every shipped profile.
+    for pack in manager.available():
+        assert set(pack.profile_notes) == files, pack.qualified_id
+    # The YAML text is the English canonical version.
+    for profile in profiles:
+        assert " ".join(profile.notes.split()) == english.profile_notes[profile.source_file]
+    gemma = next(profile for profile in profiles if profile.source_file == "gemma-4.yaml")
+
+    manager.select(DEFAULT_LANGUAGE_ID)
+    assert manager.profile_notes(gemma).startswith("Gemma is sensitive")
+    manager.select("builtin:de-DE")
+    assert manager.profile_notes(gemma).startswith("Gemma ist empfindlich")
+    assert manager.profile_notes("gemma-4.yaml").startswith("Gemma ist empfindlich")
+    manager.select("builtin:ja-JP")
+    assert manager.profile_notes(gemma).startswith("Gemma は")
+    # Unknown profiles fall back to the supplied YAML text.
+    assert manager.profile_notes("does-not-exist.yaml", "yaml fallback") == "yaml fallback"
+    assert manager.profile_notes(None, "plain") == "plain"
+
+    template = json.loads(manager.ensure_custom_template().read_text(encoding="utf-8"))
+    assert template["profile_notes"]["gemma-4.yaml"].startswith("Gemma is sensitive")
+
+
+def test_profile_notes_are_validated_in_custom_packs(tmp_path) -> None:
+    user_dir = tmp_path / "languages"
+    manager = LanguageManager(BUILTIN_LANGUAGES, user_dir)
+    custom = tmp_path / "notes.json"
+    custom.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "id": "notes",
+                "name": "Notes",
+                "locale": "xx-XX",
+                "strings": {},
+                "profile_notes": {"gemma-4.yaml": "Custom Gemma explanation"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported = manager.import_pack(custom)
+    manager.select(imported.qualified_id)
+    assert manager.profile_notes("gemma-4.yaml") == "Custom Gemma explanation"
+    assert manager.profile_notes("qwen3_8.yaml").startswith("Qwen3.8-27B")
+
+    for bad in ({"../evil.yaml": "x"}, {"gemma-4.yaml": ""}, ["gemma-4.yaml"]):
+        custom.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "id": "bad-notes",
+                    "name": "Bad",
+                    "locale": "xx-XX",
+                    "strings": {},
+                    "profile_notes": bad,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(LanguagePackError):
+            manager.import_pack(custom, replace=True)

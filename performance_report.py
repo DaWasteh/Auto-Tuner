@@ -171,8 +171,50 @@ def _svg_text(x: float, y: float, value: object, *, css: str = "") -> str:
     return f'<text x="{x:.1f}" y="{y:.1f}"{class_attr}>{escape(str(value))}</text>'
 
 
+_MAX_CHART_CANDIDATES = 12
+
+
+def _settings_caption(candidate: dict, *, public: bool = False) -> str:
+    """Return a compact one-line runtime-settings caption for chart columns."""
+    settings = _candidate_settings(candidate)
+    if not settings:
+        return ""
+
+    def value(key: str) -> str:
+        return _public_text(settings.get(key, "—"), public=public, default="—")
+
+    # Spaces around the slashes keep redacted values from reading like a
+    # POSIX path in public exports (for example "]/8").
+    parts = [
+        f"threads {value('threads')} / {value('batch_threads')}",
+        f"batch {value('batch')} / {value('ubatch')}",
+    ]
+    draft = _integer(settings.get("draft_n_max"))
+    if draft:
+        parts.append(f"draft {draft}")
+    return " · ".join(parts)
+
+
+def _winner_settings_text(candidate: Optional[dict]) -> str:
+    """Return the applied winner settings in a human-readable form."""
+    settings = _candidate_settings(candidate) if isinstance(candidate, dict) else {}
+    if not settings:
+        return "—"
+    text = (
+        f"threads {settings.get('threads', '—')} / batch threads "
+        f"{settings.get('batch_threads', '—')} · batch {settings.get('batch', '—')} / "
+        f"ubatch {settings.get('ubatch', '—')}"
+    )
+    draft = _integer(settings.get("draft_n_max"))
+    if draft:
+        text += f" · draft n-max {draft}"
+    return text
+
+
 def _throughput_chart(record: dict, chart_id: str, *, public: bool = False) -> str:
-    rows = [row for row in _candidate_rows(record) if not row.get("error")][:24]
+    rows = [row for row in _candidate_rows(record) if not row.get("error")][
+        :_MAX_CHART_CANDIDATES
+    ]
     if not rows:
         return '<p class="muted">No valid candidate timings to graph.</p>'
     metrics = (
@@ -208,11 +250,13 @@ def _throughput_chart(record: dict, chart_id: str, *, public: bool = False) -> s
                 f'<span class="bar-caption">{escape(label)}</span>'
                 "</div>"
             )
+        caption = _settings_caption(row, public=public)
         groups.append(
-            '<div class="candidate-column">'
+            f'<div class="candidate-column{" is-winner" if winner else ""}">'
             f'<div class="candidate-bars">{"".join(bars)}</div>'
-            f'<div class="column-label"><b>{"★ " if winner else ""}{escape(identifier)}</b></div>'
-            "</div>"
+            f'<div class="column-label"><b>{"★ " if winner else ""}{escape(identifier)}</b>'
+            + (f"<br><span>{escape(caption)}</span>" if caption else "")
+            + "</div></div>"
         )
     title_id = f"throughput-title-{chart_id}"
     desc_id = f"throughput-desc-{chart_id}"
@@ -237,7 +281,7 @@ def _acceptance_chart(record: dict, chart_id: str, *, public: bool = False) -> s
         )
     winner_id = _text(record.get("winner_id"))
     columns: List[str] = []
-    for candidate, drafted, accepted, ratio in rows[:24]:
+    for candidate, drafted, accepted, ratio in rows[:_MAX_CHART_CANDIDATES]:
         label = _display_text(
             record,
             _text(candidate.get("label"), _text(candidate.get("id"), "candidate")),
@@ -450,6 +494,7 @@ def _summary_table(records: Sequence[dict], *, public: bool = False) -> str:
             ),
             public=public,
         )
+        settings_text = _public_text(_winner_settings_text(winner), public=public)
         rows.append(
             "<tr>"
             f'<td><a href="#run-{index}">{escape(model)}</a></td>'
@@ -458,6 +503,7 @@ def _summary_table(records: Sequence[dict], *, public: bool = False) -> str:
             f"<td>{escape(drafter)}</td>"
             f"<td>{_integer(record.get('desired_context')):,}</td>"
             f"<td>{escape(winner_label)}</td>"
+            f'<td class="settings-cell">{escape(settings_text)}</td>'
             f"<td>{_format_tps(winner.get('prompt_tps') if winner else None)}</td>"
             f"<td>{_format_tps(winner.get('generation_tps') if winner else None)}</td>"
             f"<td>{_format_tps(winner.get('overall_tps') if winner else None)}</td>"
@@ -465,14 +511,81 @@ def _summary_table(records: Sequence[dict], *, public: bool = False) -> str:
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="10">No saved benchmark runs.</td></tr>')
+        rows.append('<tr><td colspan="11">No saved benchmark runs.</td></tr>')
     return (
         '<div class="table-wrap" role="region" aria-label="Benchmark winner overview" tabindex="0"><table>'
         '<caption class="sr-only">Winning result for every saved benchmark run</caption><thead><tr>'
         '<th scope="col">Model</th><th scope="col">Mode</th>'
-        '<th scope="col">Backend / build</th><th scope="col">Drafter</th><th scope="col">Context</th><th scope="col">Winner</th><th scope="col">PP tok/s</th>'
+        '<th scope="col">Backend / build</th><th scope="col">Drafter</th><th scope="col">Context</th><th scope="col">Winner</th>'
+        '<th scope="col">Applied settings</th><th scope="col">PP tok/s</th>'
         '<th scope="col">Decode tok/s</th><th scope="col">End-to-end tok/s</th><th scope="col">Draft acceptance</th>'
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+
+def _best_settings_section(records: Sequence[dict], *, public: bool = False) -> str:
+    """Render the one-glance answer: the fastest lane and its settings per model."""
+    rows = _representative_winners(records)
+    if not rows:
+        return ""
+    lanes_by_model: Dict[str, int] = {}
+    for record in records:
+        lanes_by_model[_model_name(record).casefold()] = (
+            lanes_by_model.get(_model_name(record).casefold(), 0) + 1
+        )
+    cards: List[str] = []
+    for record, winner in rows:
+        model = _model_display(record, public=public)
+        target = _public_text(
+            record.get("performance_target"), public=public, default="unknown"
+        )
+        backend = _backend_display(record, public=public)
+        drafter = (
+            _display_text(record, record.get("drafter_label"), public=public)
+            or "No drafter"
+        )
+        settings = _candidate_settings(winner)
+        drafted, accepted, ratio = _acceptance(winner)
+        lane_count = lanes_by_model.get(_model_name(record).casefold(), 1)
+        draft_depth = _integer(settings.get("draft_n_max"))
+        chips = "".join(
+            f"<span>{escape(chip)}</span>"
+            for chip in (target, backend, drafter)
+            if chip
+        )
+        setting_cells = (
+            f'<div><span>Threads</span><b>{escape(_public_text(settings.get("threads", "—"), public=public))}'
+            f' / {escape(_public_text(settings.get("batch_threads", "—"), public=public))}</b></div>'
+            f'<div><span>Batch / ubatch</span><b>{escape(_public_text(settings.get("batch", "—"), public=public))}'
+            f' / {escape(_public_text(settings.get("ubatch", "—"), public=public))}</b></div>'
+            f'<div><span>Draft n-max</span><b>{draft_depth if draft_depth else "off"}</b></div>'
+            f'<div><span>Context</span><b>{_integer(record.get("desired_context")):,}</b></div>'
+        )
+        metrics = (
+            f'<div class="best-metric pp"><span>PP</span><b>{_format_tps(winner.get("prompt_tps"))}</b></div>'
+            f'<div class="best-metric decode"><span>Decode</span><b>{_format_tps(winner.get("generation_tps"))}</b></div>'
+            f'<div class="best-metric overall"><span>End-to-end</span><b>{_format_tps(winner.get("overall_tps"))}</b></div>'
+            + (
+                f'<div class="best-metric accept"><span>Accepted</span><b>{ratio * 100:.0f}%</b></div>'
+                if drafted
+                else ""
+            )
+        )
+        cards.append(
+            '<article class="best-card">'
+            f"<header><h4>{escape(model)}</h4>"
+            f'<p class="best-lane">{chips}<span class="lane-count">{lane_count} lane(s) measured</span></p></header>'
+            f'<div class="best-metrics">{metrics}</div>'
+            f'<div class="best-settings">{setting_cells}</div>'
+            "</article>"
+        )
+    return (
+        '<section class="best-section" id="best-settings" aria-labelledby="best-settings-title">'
+        '<div class="subsection-heading"><div><span class="section-kicker">Apply these</span>'
+        '<h3 id="best-settings-title">Recommended settings per model</h3></div>'
+        "<p>The fastest measured lane for each model and the exact runtime settings that won it. "
+        "Everything else in this report is the evidence behind these numbers.</p></div>"
+        '<div class="best-grid">' + "".join(cards) + "</div></section>"
     )
 
 
@@ -909,12 +1022,12 @@ def build_performance_report_html(
             + (
                 _winner_overview(raw_records, test_type, public=public)
                 + _winner_acceptance_overview(raw_records, test_type, public=public)
-                + '<div class="candidate-diagrams"><div class="subsection-heading">'
-                '<div><span class="section-kicker">Every successful lane</span>'
-                "<h4>Candidate comparison diagrams</h4></div>"
-                "<p>Throughput and drafted-token acceptance stay together for each run.</p></div>"
+                + '<details class="candidate-diagrams">'
+                '<summary><span class="section-kicker">Every successful lane</span>'
+                f"<span class=\"summary-title\">Candidate comparison diagrams · {len(typed)} run(s)</span>"
+                '<span class="summary-hint">Throughput and drafted-token acceptance for every measured candidate, ranked fastest first.</span></summary>'
                 + _run_chart_groups(typed, test_type, public=public)
-                + "</div>"
+                + "</details>"
                 if typed
                 else '<p class="empty-state">No saved runs for this workload.</p>'
             )
@@ -941,11 +1054,15 @@ def build_performance_report_html(
 :root{--panel-glass:#111a26e8;--cyan:#5bd6ff;--blue:#4b8dff;--green:#55d990;--amber:#ffd166;--purple:#b794f6;--radius:18px}
 body{background:radial-gradient(circle at 12% -8%,#214f7566 0,transparent 30rem),radial-gradient(circle at 92% 12%,#4d2f7560 0,transparent 28rem),linear-gradient(180deg,#0a1018,#090d14 55%,#0b1119);background-attachment:fixed}
 main{max-width:1720px;padding:32px clamp(18px,3vw,48px) 64px}section{scroll-margin-top:92px}h1,h2,h3,h4,h5,h6{line-height:1.14;text-wrap:balance}h2{font-size:clamp(1.6rem,3vw,2.4rem)}h3{font-size:clamp(1.35rem,2.2vw,1.85rem)}h4{font-size:1.15rem}h5{font-size:1.05rem}h6{font-size:1rem}a:focus-visible,summary:focus-visible,[tabindex="0"]:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}.skip-link{position:fixed;z-index:100;left:16px;top:12px;transform:translateY(-160%);padding:9px 14px;border-radius:8px;background:#fff;color:#07101a;font-weight:800}.skip-link:focus{transform:none}.hero{position:relative;overflow:hidden;padding:clamp(24px,4vw,50px);border-color:#507095;background:linear-gradient(135deg,#172a40f2,#111a28f4 58%,#251c3cf0);isolation:isolate}.hero:after{content:"";position:absolute;z-index:-1;right:-8rem;top:-10rem;width:31rem;height:31rem;border-radius:50%;background:conic-gradient(from 40deg,#5bd6ff33,#b794f644,#55d99022,#5bd6ff33);filter:blur(8px)}.hero-top{display:flex;justify-content:space-between;align-items:center;gap:16px}.report-badge{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border:1px solid #5bd6ff55;border-radius:999px;background:#07121dbb;color:#bceeff;font-size:.8rem;font-weight:750}.report-badge:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}.hero h1{max-width:900px;letter-spacing:-.035em}.hero-copy{max-width:850px;color:#c0ccdb;font-size:1rem}.kpis{grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px}.kpi{position:relative;overflow:hidden;padding:16px;background:linear-gradient(150deg,#0b141fcc,#111c2acc);border-color:#40566f}.kpi:after{content:"";position:absolute;inset:auto 0 0;height:3px;background:linear-gradient(90deg,var(--cyan),var(--purple))}.kpi b{font-variant-numeric:tabular-nums}.report-nav{position:sticky;z-index:20;top:10px;width:max-content;max-width:100%;margin:18px auto 28px;padding:7px;overflow-x:auto;flex-wrap:nowrap;border:1px solid #3d5068;border-radius:999px;background:#0a111be8;box-shadow:0 12px 32px #0008;backdrop-filter:blur(16px);scrollbar-width:none}.report-nav::-webkit-scrollbar{display:none}.report-nav a{flex:0 0 auto;border-color:transparent;background:transparent;color:#c6d3e2;font-weight:650}.report-nav a:hover{border-color:#4f6883;background:#182536;color:#fff}.section-heading,.subsection-heading,.workload-heading,.model-group-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:18px}.section-heading{margin:48px 0 18px}.section-heading h2,.workload-heading h3,.subsection-heading h4,.model-group-heading h5{margin:3px 0 0}.section-heading>p,.subsection-heading>p{max-width:620px;margin:0;color:var(--muted);text-align:right}.section-kicker{color:var(--cyan);font-size:.75rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase}.hardware-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,430px),1fr));gap:16px}.hardware-card{padding:20px;border:1px solid #3a506a;border-radius:var(--radius);background:linear-gradient(150deg,#152233,#101923);box-shadow:0 14px 34px #0004}.hardware-card-head{display:flex;align-items:center;gap:14px}.hardware-index{display:grid;place-items:center;width:48px;height:48px;border:1px solid #5bd6ff66;border-radius:14px;background:#07131f;color:var(--cyan);font-weight:850}.hardware-card h3{margin:0;font-size:1.15rem}.hardware-card p{margin:3px 0 0;color:var(--muted)}.hardware-cpu{display:flex;flex-direction:column;gap:3px;margin:18px 0;padding:14px;border-radius:12px;background:#0a121d}.hardware-cpu>span,.hardware-stat span{color:var(--muted);font-size:.72rem;font-weight:750;letter-spacing:.09em;text-transform:uppercase}.hardware-cpu small{color:var(--muted)}.hardware-stats{display:flex;flex-wrap:wrap;gap:8px}.hardware-stat{min-width:105px;flex:1;padding:10px 12px;border:1px solid #31445b;border-radius:10px;background:#192535}.hardware-stat b{display:block;margin-top:2px;font-size:1.12rem}.gpu-list{display:grid;gap:8px;margin:16px 0 0;padding:0;list-style:none}.gpu-list li{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;background:#0a121d}.gpu-list li div{display:flex;flex-direction:column}.gpu-list li span:last-child{color:var(--muted);font-size:.82rem}.device-dot{width:10px;height:10px;flex:0 0 auto;border-radius:50%;background:var(--purple);box-shadow:0 0 14px #b794f699}.cpu-dot{background:var(--cyan)}.visual-dashboard{margin-top:48px}.dashboard-head{margin-bottom:18px}.leader-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin:18px 0 28px}.leader-card{display:flex;align-items:center;gap:14px;min-width:0;padding:15px;border:1px solid #354a62;border-radius:14px;background:linear-gradient(145deg,#142132,#101923)}.metric-token{display:grid;place-items:center;width:54px;height:54px;flex:0 0 auto;border-radius:16px;background:#142d42;color:#aee8ff;font-size:.76rem;font-weight:900;letter-spacing:.04em}.metric-token.decode{background:#2d2348;color:#ddccff}.metric-token.overall{background:#17372a;color:#a9efc2}.metric-token.context{background:#3a2c16;color:#ffe3a0}.metric-token.acceptance{background:#3e3118;color:#ffe7a6}.leader-card>div{display:flex;min-width:0;flex-direction:column}.leader-label{color:var(--muted);font-size:.78rem;font-weight:750;text-transform:uppercase}.leader-card strong{font-size:1.45rem;font-variant-numeric:tabular-nums}.leader-card strong small{font-size:.72rem;color:var(--muted)}.leader-card div>span:last-child{overflow:hidden;color:#c5d0dc;font-size:.82rem;text-overflow:ellipsis}.visual-workload{margin:22px 0 34px;padding:clamp(16px,2.5vw,28px);border:1px solid #354c65;border-radius:22px;background:linear-gradient(160deg,#111c29e8,#0d151fe8);box-shadow:0 18px 46px #0004}.workload-heading{align-items:center;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line)}.detail-jump{flex:0 0 auto;padding:8px 12px;border:1px solid #46617e;border-radius:999px;text-decoration:none}.overview-note{margin-top:14px;background:#101b28}.metric-panel{border-color:#354a62;background:linear-gradient(145deg,#152231,#111a25)}.metric-panel h4{position:sticky;left:12px;width:max-content;max-width:calc(100vw - 80px);margin:0 0 8px;padding:3px 9px;border-radius:7px;background:#152231;z-index:1}.metric-panel h4 small,.acceptance-overview-panel h4 small{color:var(--muted);font-weight:500}.acceptance-overview-panel{margin:18px 0;padding:16px;border:1px solid #4f452c;border-radius:14px;background:linear-gradient(145deg,#211d15,#171711)}.acceptance-overview-panel h4{margin:0}.acceptance-overview-panel p{margin:5px 0 12px}.acceptance-overview-scroll{overflow-x:auto;padding:6px 2px;scrollbar-gutter:stable}.candidate-diagrams{margin-top:24px;padding-top:18px;border-top:1px solid var(--line)}.model-chart-group{margin-top:22px}.model-group-heading{align-items:center;margin-bottom:9px}.model-group-heading span{color:var(--muted)}.run-chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,650px),1fr));gap:14px}.run-chart-card{min-width:0;padding:15px;border:1px solid #344a62;border-radius:15px;background:#0d1621;content-visibility:auto;contain-intrinsic-size:auto 640px}.run-chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.run-chart-head h6{margin:0}.run-chart-head p{margin:4px 0 0;color:var(--muted);font-size:.82rem}.chips{display:flex;max-width:55%;flex-wrap:wrap;justify-content:flex-end;gap:5px}.chips span,.status-pill{padding:4px 8px;border:1px solid #40566e;border-radius:999px;background:#172333;color:#c7d5e4;font-size:.72rem}.chart-pair{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,.8fr);gap:10px}.chart-pair>div{min-width:0}.chart-label{margin:0 0 6px;color:#dbe6f1;font-size:.78rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase}.chart{height:calc(100% - 25px)}.empty-state{padding:24px;border:1px dashed #425873;border-radius:14px;color:var(--muted);text-align:center}.results-section{margin-top:56px}.method-callout{margin:16px 0 22px}.table-wrap{border-color:#3b5068;border-radius:14px}.table-wrap table{font-variant-numeric:tabular-nums}.detail-workload{margin-top:34px}.detail-workload>.workload-heading{position:sticky;z-index:4;top:75px;padding:12px 14px;border:1px solid #354a61;border-radius:12px;background:#0d1620ed;backdrop-filter:blur(12px)}details.run{content-visibility:auto;contain-intrinsic-size:auto 420px;border-color:#344a60;border-radius:14px;background:#111a25}details.run>summary{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 17px}.summary-copy{min-width:0;overflow-wrap:anywhere}.measured-pill{border-color:#39765a;background:#133326;color:#a7eac1}.failed-pill{border-color:#81454d;background:#3a1b20;color:#ffc0c5}.run-body{padding:8px 17px 22px}.facts div{border:1px solid #304257;background:#172331}.callout{background:#111b28}.privacy-note{display:inline-flex;margin-top:10px;padding:6px 10px;border:1px solid #37705b;border-radius:999px;background:#102b21;color:#a6e9c1;font-size:.78rem}.report-footer{margin-top:52px;padding:22px 0;border-top:1px solid var(--line);color:var(--muted);text-align:center}.report-footer a{font-weight:700}.sr-only{clip-path:inset(50%)}
+.metric-legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin:-8px 0 24px;color:var(--muted);font-size:.82rem}.metric-legend span{display:inline-flex;align-items:center;gap:7px}.swatch{display:inline-block;width:14px;height:14px;border-radius:4px}
+.best-section{margin:8px 0 34px;padding:clamp(16px,2.5vw,26px);border:1px solid #3d5a78;border-radius:22px;background:linear-gradient(160deg,#12213a,#0f1826 70%);box-shadow:0 18px 46px #0005}.best-section>.subsection-heading{margin-bottom:16px}.best-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:14px}.best-card{display:flex;flex-direction:column;gap:12px;min-width:0;padding:16px;border:1px solid #3a5169;border-radius:16px;background:linear-gradient(150deg,#16243a,#111a28)}.best-card header h4{margin:0;font-size:1.05rem;overflow-wrap:anywhere}.best-lane{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 0}.best-lane span{padding:3px 8px;border:1px solid #40566e;border-radius:999px;background:#172333;color:#c7d5e4;font-size:.72rem}.best-lane .lane-count{border-style:dashed;color:var(--muted)}.best-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(78px,1fr));gap:8px}.best-metric{padding:9px 10px;border-radius:10px;background:#0b1420;border-left:3px solid var(--line)}.best-metric span{display:block;color:var(--muted);font-size:.68rem;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.best-metric b{display:block;margin-top:2px;font-size:1.15rem;font-variant-numeric:tabular-nums}.best-metric.pp{border-left-color:#66bbff}.best-metric.decode{border-left-color:#b794f6}.best-metric.overall{border-left-color:#58d68d}.best-metric.accept{border-left-color:#ffd166}.best-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px;padding-top:10px;border-top:1px dashed #33445a}.best-settings div{display:flex;flex-direction:column}.best-settings span{color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em}.best-settings b{font-variant-numeric:tabular-nums}
+details.candidate-diagrams{margin-top:24px;padding-top:12px;border-top:1px solid var(--line)}details.candidate-diagrams>summary{display:flex;flex-direction:column;gap:3px;cursor:pointer;padding:12px 14px;border:1px solid #3b5068;border-radius:12px;background:#0d1621;list-style:none}details.candidate-diagrams>summary::-webkit-details-marker{display:none}details.candidate-diagrams>summary::after{content:"Show diagrams ▸";align-self:flex-start;margin-top:4px;color:var(--accent);font-weight:700;font-size:.82rem}details.candidate-diagrams[open]>summary::after{content:"Hide diagrams ▾"}details.candidate-diagrams>summary:hover{border-color:#5a7597}.summary-title{font-size:1.05rem;font-weight:750}.summary-hint{color:var(--muted);font-size:.82rem}
+.bar-stage{background:repeating-linear-gradient(to top,#ffffff10 0,#ffffff10 1px,transparent 1px,transparent 25%),linear-gradient(#ffffff09,#ffffff03)}.candidate-column{width:168px}.candidate-column.is-winner .column-label b{color:#a9efc2}.column-label span{display:block;font-size:.72rem}.settings-cell{white-space:nowrap;font-size:.82rem;color:#c7d5e4}.report-nav a[href="#best-settings"]{color:#a9efc2}
 @media(max-width:1000px){.chart-pair{grid-template-columns:1fr}.section-heading,.subsection-heading{align-items:flex-start;flex-direction:column}.section-heading>p,.subsection-heading>p{text-align:left}.detail-workload>.workload-heading{top:72px}}
 @media(max-width:700px){main{padding:14px 12px 42px}.hero{padding:22px 18px}.hero-top,.workload-heading,.run-chart-head{align-items:flex-start;flex-direction:column}.report-nav{top:6px;margin:12px 0 22px;border-radius:14px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.kpi{padding:12px}.chips{max-width:100%;justify-content:flex-start}.visual-workload{padding:14px;border-radius:16px}.run-chart-grid{grid-template-columns:1fr}.detail-jump{align-self:flex-start}.detail-workload>.workload-heading{position:static}.status-pill{align-self:flex-start}details.run>summary{align-items:flex-start;flex-direction:column}.hardware-grid{grid-template-columns:1fr}}
-@media(max-width:420px){.kpis{grid-template-columns:1fr}.leader-grid{grid-template-columns:1fr}.model-column{width:116px}.candidate-column{width:182px}}
+@media(max-width:420px){.kpis{grid-template-columns:1fr}.leader-grid{grid-template-columns:1fr}.model-column{width:116px}.candidate-column{width:160px}.best-settings{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.vertical-bar{transition:none}}
-@media print{.skip-link,.report-nav,.detail-jump{display:none}.visual-workload,.hardware-card,.leader-card,.run-chart-card{break-inside:avoid;box-shadow:none}.detail-workload>.workload-heading{position:static}.run-chart-card{content-visibility:visible}.report-footer{color:#333}}
+@media print{.skip-link,.report-nav,.detail-jump{display:none}details.candidate-diagrams>summary::after{display:none}.best-section,.best-card{break-inside:avoid;box-shadow:none}.visual-workload,.hardware-card,.leader-card,.run-chart-card{break-inside:avoid;box-shadow:none}.detail-workload>.workload-heading{position:static}.run-chart-card{content-visibility:visible}.report-footer{color:#333}}
 """
     generated_text = generated.astimezone(timezone.utc).isoformat(timespec="seconds")
     model_count = len({_model_name(record).casefold() for record in records})
@@ -1008,6 +1125,7 @@ main{max-width:1720px;padding:32px clamp(18px,3vw,48px) 64px}section{scroll-marg
         "</div></header>"
         '<nav class="report-nav" aria-label="Report sections">'
         '<a href="#hardware">Hardware</a><a href="#visual-dashboard">Highlights</a>'
+        '<a href="#best-settings">Best settings</a>'
         '<a href="#charts-fast">Quick charts</a><a href="#charts-quick">Standard charts</a>'
         '<a href="#winner-overview">Winner table</a><a href="#run-details">Run details</a></nav>'
         + _hardware_overview(records, public=public)
@@ -1016,6 +1134,12 @@ main{max-width:1720px;padding:32px clamp(18px,3vw,48px) 64px}section{scroll-marg
         '<h2 id="visual-dashboard-title">Visual performance overview</h2></div>'
         "<p>Fastest per-model lanes first, followed by every successful candidate comparison. Complete text and tables stay below.</p></div>"
         + _leader_cards(records, public=public)
+        + '<p class="metric-legend" aria-label="Metric legend">'
+        '<span><i class="swatch bar-pp"></i>PP = prompt processing tok/s</span>'
+        '<span><i class="swatch bar-decode"></i>Decode = generated tok/s</span>'
+        '<span><i class="swatch bar-overall"></i>End-to-end = whole request tok/s</span>'
+        '<span><i class="swatch bar-accept"></i>Accepted = drafted tokens kept</span></p>'
+        + _best_settings_section(records, public=public)
         + "".join(visual_sections)
         + "</section>"
         '<section class="results-section" id="run-details" aria-labelledby="run-details-title">'

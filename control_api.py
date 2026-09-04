@@ -13,17 +13,35 @@ import hmac
 import http.client
 import ipaddress
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import SplitResult, urlsplit
 
 from autotuner_version import VERSION
 
 _CONTROL_BODY_LIMIT = 1024 * 1024
+_MIN_SWITCH_TIMEOUT_S = 1.0
+_MAX_SWITCH_TIMEOUT_S = 24 * 60 * 60.0
+DISCOVERY_SCHEMA = 1
+DISCOVERY_FILE_NAME = "control_api.json"
+#: Canonical execution-backend identifiers advertised by ``/api/v1/runtimes``.
+RUNTIME_BACKENDS = (
+    "vulkan",
+    "hip",
+    "cuda",
+    "sycl",
+    "metal",
+    "opencl",
+    "cpu",
+    "unknown",
+)
 _PROXY_BODY_LIMIT = 128 * 1024 * 1024
 _COPY_BUFFER = 64 * 1024
 _UPSTREAM_TIMEOUT_S = 900.0
@@ -61,6 +79,14 @@ class ApiModel:
     input_types: Tuple[str, ...] = ("text",)
     runnable: bool = True
     unavailable_reason: str = ""
+    # Optional descriptive fields for control clients (benchmark campaigns,
+    # model switchers). Unknown values are advertised as ``null``.
+    size_bytes: int = 0
+    quant: str = ""
+    params_b: float = 0.0
+    family: str = ""
+    architecture: str = ""
+    default_runtime_id: str = ""
 
     def openai_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +107,44 @@ class ApiModel:
             "path": self.path,
             "runnable": bool(self.runnable),
             "unavailable_reason": self.unavailable_reason,
+            "size_bytes": int(self.size_bytes) if self.size_bytes > 0 else None,
+            "quant": self.quant or None,
+            "params_b": float(self.params_b) if self.params_b > 0 else None,
+            "family": self.family or None,
+            "architecture": self.architecture or None,
+            "default_runtime_id": self.default_runtime_id or None,
+        }
+
+
+@dataclass(frozen=True)
+class ApiRuntime:
+    """One discovered llama-server build selectable through ``/api/v1/switch``."""
+
+    id: str
+    label: str
+    server_binary: str
+    backend: str = "unknown"
+    build: Optional[int] = None
+    build_info: str = ""
+    is_default: bool = False
+    available: bool = True
+    unavailable_reason: str = ""
+
+    def runtime_dict(self) -> Dict[str, Any]:
+        backend = str(self.backend or "unknown").strip().lower()
+        if backend not in RUNTIME_BACKENDS:
+            backend = "unknown"
+        return {
+            "id": self.id,
+            "label": self.label,
+            "server_binary": self.server_binary,
+            "backend": backend,
+            "build": f"b{int(self.build)}" if self.build else None,
+            "build_number": int(self.build) if self.build else None,
+            "build_info": self.build_info or None,
+            "is_default": bool(self.is_default),
+            "available": bool(self.available),
+            "unavailable_reason": self.unavailable_reason,
         }
 
 
@@ -91,6 +155,7 @@ class ControlRequest:
     action: str
     model_id: str = ""
     timeout_s: float = 300.0
+    runtime_id: str = ""
     created_at: float = field(default_factory=time.monotonic, init=False)
     _event: threading.Event = field(default_factory=threading.Event, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -145,9 +210,15 @@ class ControlRequest:
         return dict(self._result or {})
 
 
-SwitchCallback = Callable[[str, float], Dict[str, Any]]
+#: ``switch_callback(model_id, timeout_s, options)``. ``options`` carries
+#: ``runtime_id`` (empty keeps the GUI's selected build) and ``timeout_s``.
+#: The result must contain ``backend_url`` and may contain ``alias``,
+#: ``backend_api_key``, and a JSON-serialisable ``detail`` snapshot that is
+#: merged into ``/api/v1/status`` while the model stays active.
+SwitchCallback = Callable[[str, float, Dict[str, Any]], Dict[str, Any]]
 StopCallback = Callable[[float], Dict[str, Any]]
 LogCallback = Callable[[str], None]
+RuntimeProbe = Callable[[ApiRuntime], ApiRuntime]
 
 
 @dataclass
@@ -190,6 +261,7 @@ class ControlApiServer:
         stop_callback: Optional[StopCallback] = None,
         log_callback: Optional[LogCallback] = None,
         switch_timeout_s: float = 300.0,
+        runtime_probe: Optional[RuntimeProbe] = None,
     ) -> None:
         self.host = _validated_loopback_host(host)
         self.port = int(port)
@@ -201,15 +273,20 @@ class ControlApiServer:
         self._switch_callback = switch_callback
         self._stop_callback = stop_callback
         self._log_callback = log_callback
+        self._runtime_probe = runtime_probe
         self.switch_timeout_s = max(1.0, float(switch_timeout_s))
         self._catalogue_lock = threading.RLock()
         self._models: Dict[str, ApiModel] = {}
+        self._runtimes: Dict[str, ApiRuntime] = {}
+        self._default_runtime_id = ""
         self._state_lock = threading.RLock()
         self._active_model_id = ""
         self._loading_model_id = ""
+        self._active_runtime_id = ""
         self._backend_url = ""
         self._backend_alias = ""
         self._backend_api_key: Optional[str] = None
+        self._active_detail: Dict[str, Any] = {}
         self._active_since = 0.0
         self._switch_lock = threading.Lock()
         self._inflight_requests = 0
@@ -270,6 +347,48 @@ class ControlApiServer:
         with self._catalogue_lock:
             self._models = catalogue
 
+    def update_runtimes(
+        self, runtimes: Iterable[ApiRuntime], default_runtime_id: str = ""
+    ) -> None:
+        catalogue: Dict[str, ApiRuntime] = {}
+        for runtime in runtimes:
+            if not isinstance(runtime, ApiRuntime):
+                raise TypeError("runtime entries must be ApiRuntime instances")
+            if not runtime.id or runtime.id in catalogue:
+                raise ValueError(f"duplicate or empty runtime ID: {runtime.id!r}")
+            catalogue[runtime.id] = runtime
+        default_id = str(default_runtime_id or "")
+        if default_id not in catalogue:
+            default_id = next(
+                (item.id for item in catalogue.values() if item.is_default), ""
+            )
+        with self._catalogue_lock:
+            self._runtimes = catalogue
+            self._default_runtime_id = default_id
+
+    def runtimes(self, *, probe: bool = False) -> List[ApiRuntime]:
+        with self._catalogue_lock:
+            values = list(self._runtimes.values())
+        if probe and self._runtime_probe is not None:
+            probed: List[ApiRuntime] = []
+            for runtime in values:
+                try:
+                    probed.append(self._runtime_probe(runtime))
+                except Exception as exc:  # pragma: no cover - defensive
+                    self._log(f"runtime probe failed for {runtime.id}: {exc}")
+                    probed.append(runtime)
+            values = probed
+        return values
+
+    def runtime(self, runtime_id: str) -> Optional[ApiRuntime]:
+        with self._catalogue_lock:
+            return self._runtimes.get(runtime_id)
+
+    @property
+    def default_runtime_id(self) -> str:
+        with self._catalogue_lock:
+            return self._default_runtime_id
+
     def models(self, *, include_unrunnable: bool = False) -> List[ApiModel]:
         with self._catalogue_lock:
             values = list(self._models.values())
@@ -283,20 +402,48 @@ class ControlApiServer:
 
     def status(self) -> Dict[str, Any]:
         with self._state_lock:
-            return {
-                "status": (
-                    "loading"
-                    if self._loading_model_id
-                    else "ready"
-                    if self._active_model_id and self._backend_url
-                    else "idle"
-                ),
+            ready = bool(
+                self._active_model_id
+                and self._backend_url
+                and not self._loading_model_id
+            )
+            state = "loading" if self._loading_model_id else "ready" if ready else "idle"
+            detail = dict(self._active_detail) if ready else {}
+            payload: Dict[str, Any] = {
+                "status": state,
                 "active_model": self._active_model_id or None,
                 "loading_model": self._loading_model_id or None,
                 "active_since": self._active_since or None,
                 "inflight_requests": self._inflight_requests,
                 "endpoint": self.base_url,
+                "ready": ready,
+                "backend_url": (self._backend_url or None) if ready else None,
+                "alias": (self._backend_alias or None) if ready else None,
+                "backend_api_key": self._backend_api_key if ready else None,
+                "active_runtime": (self._active_runtime_id or None) if ready else None,
+                "default_runtime_id": self.default_runtime_id or None,
+                "pid": None,
+                "log_path": None,
+                "runtime": None,
+                "model": None,
+                "launch": None,
+                "devices": None,
+                "env": None,
+                "command_line": None,
             }
+            for key in (
+                "pid",
+                "log_path",
+                "runtime",
+                "model",
+                "launch",
+                "devices",
+                "env",
+                "command_line",
+            ):
+                if key in detail:
+                    payload[key] = detail[key]
+            return payload
 
     def clear_active(self, model_id: Optional[str] = None) -> None:
         with self._state_lock:
@@ -310,9 +457,11 @@ class ControlApiServer:
                     return
             self._active_model_id = ""
             self._loading_model_id = ""
+            self._active_runtime_id = ""
             self._backend_url = ""
             self._backend_alias = ""
             self._backend_api_key = None
+            self._active_detail = {}
             self._active_since = 0.0
 
     def _runnable_model(self, model_id: str) -> ApiModel:
@@ -331,19 +480,83 @@ class ControlApiServer:
             )
         return model
 
-    def ensure_model(self, model_id: str) -> Dict[str, Any]:
+    def _validated_runtime_id(self, runtime_id: Any) -> str:
+        if runtime_id is None:
+            return ""
+        if not isinstance(runtime_id, str):
+            raise ControlApiError(
+                "runtime_id must be a string.", status=400, code="invalid_request"
+            )
+        value = runtime_id.strip()
+        if not value:
+            return ""
+        with self._catalogue_lock:
+            known = self._runtimes.get(value)
+            catalogue_published = bool(self._runtimes)
+        if catalogue_published and known is None:
+            raise ControlApiError(
+                f"Unknown llama-server runtime ID: {value}. "
+                "Read GET /api/v1/runtimes for the selectable builds.",
+                status=409,
+                code="runtime_unavailable",
+            )
+        if known is not None and not known.available:
+            raise ControlApiError(
+                known.unavailable_reason or f"Runtime {value} is not available.",
+                status=409,
+                code="runtime_unavailable",
+            )
+        return value
+
+    @staticmethod
+    def _validated_timeout(timeout_s: Any, default: float) -> float:
+        if timeout_s is None:
+            return float(default)
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+            raise ControlApiError(
+                "timeout_s must be a number of seconds.",
+                status=400,
+                code="invalid_request",
+            )
+        value = float(timeout_s)
+        if value != value or value <= 0:  # NaN or non-positive
+            raise ControlApiError(
+                "timeout_s must be a positive number of seconds.",
+                status=400,
+                code="invalid_request",
+            )
+        return min(_MAX_SWITCH_TIMEOUT_S, max(_MIN_SWITCH_TIMEOUT_S, value))
+
+    def ensure_model(
+        self,
+        model_id: str,
+        *,
+        runtime_id: Any = None,
+        timeout_s: Any = None,
+    ) -> Dict[str, Any]:
         model = self._runnable_model(model_id)
+        runtime = self._validated_runtime_id(runtime_id)
+        timeout = self._validated_timeout(timeout_s, self.switch_timeout_s)
         with self._switch_lock:
-            return self._ensure_model_locked(model_id, model)
+            return self._ensure_model_locked(
+                model_id, model, runtime_id=runtime, timeout_s=timeout
+            )
 
     def _ensure_model_locked(
-        self, model_id: str, model: ApiModel
+        self,
+        model_id: str,
+        model: ApiModel,
+        *,
+        runtime_id: str = "",
+        timeout_s: Optional[float] = None,
     ) -> Dict[str, Any]:
+        timeout = float(timeout_s) if timeout_s is not None else self.switch_timeout_s
         with self._state_lock:
             if (
                 self._active_model_id == model_id
                 and self._backend_url
                 and not self._loading_model_id
+                and (not runtime_id or runtime_id == self._active_runtime_id)
             ):
                 return self.status()
             if self._inflight_requests:
@@ -354,14 +567,21 @@ class ControlApiServer:
                     code="model_busy",
                 )
             self._active_model_id = ""
+            self._active_runtime_id = ""
             self._backend_url = ""
             self._backend_alias = ""
             self._backend_api_key = None
+            self._active_detail = {}
             self._active_since = 0.0
             self._loading_model_id = model_id
-        self._log(f"switch requested: {model_id}")
+        self._log(
+            f"switch requested: {model_id}"
+            + (f" on runtime {runtime_id}" if runtime_id else "")
+        )
         try:
-            result = self._switch_callback(model_id, self.switch_timeout_s)
+            result = self._switch_callback(
+                model_id, timeout, {"runtime_id": runtime_id, "timeout_s": timeout}
+            )
             backend_url = _validated_backend_url(str(result.get("backend_url", "")))
             alias = str(result.get("alias", "") or model.name)
             backend_api_key = result.get("backend_api_key")
@@ -371,12 +591,23 @@ class ControlApiServer:
                     status=500,
                     code="invalid_backend",
                 )
+            detail = _json_safe(result.get("detail") or {})
+            if not isinstance(detail, dict):
+                detail = {}
+            runtime_info = detail.get("runtime")
+            active_runtime = ""
+            if isinstance(runtime_info, dict):
+                active_runtime = str(runtime_info.get("id") or "")
+            if not active_runtime:
+                active_runtime = runtime_id or self.default_runtime_id
             with self._state_lock:
                 self._active_model_id = model_id
                 self._loading_model_id = ""
+                self._active_runtime_id = active_runtime
                 self._backend_url = backend_url
                 self._backend_alias = alias
                 self._backend_api_key = backend_api_key
+                self._active_detail = detail
                 self._active_since = time.time()
             self._log(f"model ready: {model_id} -> {backend_url}")
             return self.status()
@@ -522,6 +753,19 @@ class _ControlRequestHandler(BaseHTTPRequestHandler):
             if route == "/api/v1/status" and self.command == "GET":
                 self._send_json(200, self.api.status())
                 return
+            if route == "/api/v1/runtimes" and self.command == "GET":
+                self._send_json(
+                    200,
+                    {
+                        "runtimes": [
+                            runtime.runtime_dict()
+                            for runtime in self.api.runtimes(probe=True)
+                        ],
+                        "default_runtime_id": self.api.default_runtime_id or None,
+                        "active_runtime": self.api.status().get("active_runtime"),
+                    },
+                )
+                return
             if route == "/api/v1/switch" and self.command == "POST":
                 payload = self._read_json(_CONTROL_BODY_LIMIT)
                 model_id = payload.get("model_id", payload.get("model"))
@@ -531,7 +775,14 @@ class _ControlRequestHandler(BaseHTTPRequestHandler):
                         status=400,
                         code="invalid_request",
                     )
-                self._send_json(200, self.api.ensure_model(model_id))
+                self._send_json(
+                    200,
+                    self.api.ensure_model(
+                        model_id,
+                        runtime_id=payload.get("runtime_id", payload.get("runtime")),
+                        timeout_s=payload.get("timeout_s"),
+                    ),
+                )
                 return
             if route == "/api/v1/stop" and self.command == "POST":
                 # Consume/validate an optional empty object so accidental large
@@ -810,3 +1061,95 @@ def _validated_backend_url(value: str) -> str:
         )
     host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     return f"http://{host}:{port}{parsed.path.rstrip('/')}"
+
+
+def _json_safe(value: Any, _depth: int = 0) -> Any:
+    """Coerce a GUI-provided snapshot into plain JSON-serialisable values."""
+    if _depth > 8:
+        return None
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return None if value != value else value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item, _depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item, _depth + 1) for item in value]
+    return str(value)
+
+
+def discovery_payload(
+    *,
+    enabled: bool,
+    port: int,
+    token: str = "",
+    version: str = VERSION,
+    pid: Optional[int] = None,
+    started_at: str = "",
+    host: str = "127.0.0.1",
+) -> Dict[str, Any]:
+    """Build the small client-discovery document written next to the settings.
+
+    External clients (Pi, the Supercalc benchmark) read this file instead of
+    parsing the potentially very large ``autotuner_settings.json``. The token
+    is only present while the gateway is enabled.
+    """
+    port_value = int(port)
+    payload: Dict[str, Any] = {
+        "schema": DISCOVERY_SCHEMA,
+        "enabled": bool(enabled),
+        "base_url": f"http://{host}:{port_value}",
+        "port": port_value,
+        "version": str(version),
+        "pid": int(pid) if pid else None,
+        "started_at": str(started_at or ""),
+    }
+    if enabled and token:
+        payload["token"] = str(token)
+    return payload
+
+
+def write_discovery_file(path: Path, payload: Dict[str, Any]) -> bool:
+    """Atomically write *payload* to *path* with owner-only permissions."""
+    target = Path(path)
+    tmp: Optional[Path] = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            # Windows has no POSIX mode bits; the per-user profile directory
+            # already restricts access to the owner.
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp, target)
+        tmp = None
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def read_discovery_file(path: Path) -> Dict[str, Any]:
+    """Return the discovery document, or an empty dict when absent/invalid."""
+    try:
+        target = Path(path)
+        if target.stat().st_size > 64 * 1024:
+            return {}
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}

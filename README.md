@@ -57,7 +57,9 @@ Performance Test Result:
   pins remain authoritative. The original v1 cap of 16k context is gone.
 - **Per-family YAML profiles** in `settings/` — override sampling,
   max context, chat template, and llama-server flags per model family.
-  Easy for contributors to extend without touching Python.
+  Easy for contributors to extend without touching Python. Each profile's
+  `notes` explanation is shown in the configuration preview and follows the
+  interface language through the language packs' `profile_notes`.
 - **Companion-file auto-pairing** — sibling files don't pollute the
   model menu, they're attached to their main model:
   - `mmproj` projectors → vision (longest-prefix wins). The `mmproj`
@@ -156,9 +158,16 @@ Performance Test Result:
   snapshot under `benchmark-site/`; pushes to `main` deploy that snapshot to the
   [public GitHub Pages dashboard](https://dawasteh.github.io/Auto-Tuner/). See the
   [publishing guide](docs/benchmark-pages.md). Legacy fixed-25% results are
-  classified as Custom; the old legacy tile is gone. Standard search now checks
-  batch families for its top two thread finalists, MTP depth stops only after
-  two meaningful regressions, and a
+  classified as Custom; the old legacy tile is gone. The report opens with a
+  **Recommended settings per model** section (fastest lane plus the exact
+  winning threads/batch/ubatch/draft values), keeps the per-run candidate
+  diagrams collapsed until you open them, and repeats the applied settings in
+  the winner table. Standard search (18-candidate budget since v5.3.9) probes
+  decoupled generation/prompt threads and a small thread count for fully
+  offloaded models, checks batch families for its top two thread finalists,
+  adds 2048/2048 and 4096-token micro-batch probes for large-VRAM GPUs,
+  hill-climbs beyond the measured batch family while budget remains, MTP depth
+  stops only after two meaningful regressions, and a
   candidate must clear 3% in every paired prompt variant before promotion. The
   fastest performance mode is remembered only when context, token mix, test tier,
   and drafter are directly comparable. Exact contexts above the static estimate are
@@ -1066,15 +1075,16 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10760)
+## Server features (compatible through llama.cpp b10786)
 
 Build/version probing, complete profile-command matrices, and backend smoke
-checks are validated through exact stock **b10760** (`0f3a71be1`) on the local
-Windows Vulkan and HIP builds. The b10743→b10760 help diff adds or removes no
-long option, so existing command generation remains current. AutoTuner still
-quarantines the upstream NextN regression in b10741-b10748 and points affected
-users to b10749+ rather than
-letting llama-server abort during model or draft-context loading. The following
+checks are validated through exact stock **b10786** (`de8656bd9`) on the local
+Windows Vulkan and HIP builds. The b10760→b10786 help diff adds or removes no
+long option, so existing command generation remains current; the one semantic
+change (preserved reasoning is now the llama.cpp default for templates that
+support it) is documented in the table below. AutoTuner still quarantines the
+upstream NextN regression in b10741-b10748 and points affected users to b10749+
+rather than letting llama-server abort during model or draft-context loading. The following
 `llama-server` features are supported (verified against `llama-server --help` /
 `tools/server/README.md`; the detailed historical source audit remains below):
 
@@ -1090,7 +1100,7 @@ letting llama-server abort during model or draft-context loading. The following
 | `--cache-ram` / `-cram` | ✅ Host-memory prompt caching (PR #16391), auto-on with a 2048 MiB bounded default, adjustable in GUI/CLI and included in RAM planning. Vision caching is enabled for b10045+ and forced to `0` for older/unprobeable builds. |
 | `--reasoning on/off/auto` | ✅ Via dropdown |
 | `--reasoning-budget N` | ✅ Via spin-box. **Renamed from `--think-budget` at b9625** (the old spelling is gone, not an alias); AutoTuner emits the new name and still reads the legacy one back from older persisted settings |
-| `--reasoning-preserve` | ✅ Optional Expert checkbox; omitted means template default |
+| `--reasoning-preserve` | ✅ Optional Expert checkbox; omitted leaves the llama.cpp default (template default before b10786, **enabled by default since b10786** for templates that support it). Add `--no-reasoning-preserve` to the Extra CLI flags to force it off. |
 | `--chat-template-kwargs ...` | ✅ The dropdown produces this automatically |
 | `--jinja` | ✅ Ticked visibly |
 | `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
@@ -1112,6 +1122,45 @@ letting llama-server abort during model or draft-context loading. The following
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.3.9 — llama.cpp b10786, campaign-ready control API, localized profile notes
+
+- **Exact b10786 compatibility:** stock Vulkan and HIP binaries at commit
+  `de8656bd9` expose the same 331 long options as b10760. New profiles cover
+  NVIDIA Nemotron 3 Super 120B-A12B and Nemotron Labs 3 Puzzle 75B-A9B; Puzzle
+  is gated to b10786 because that build first reads the per-layer expert
+  arrays (PR #25444). DeepSeek-V4 notes describe the new b10786 vision
+  projector, the scanner's hybrid list now uses the exact upstream
+  `deepseek4`/`falcon-h1`/`granitehybrid` names, and the Expert tooltip plus
+  this README explain llama.cpp's new preserved-reasoning default.
+- **External control API for benchmark campaigns:** `GET /api/v1/runtimes`
+  lists every llama-server build in the toolbar with backend and probed build
+  identity; `POST /api/v1/switch` accepts `runtime_id` and `timeout_s`, so a
+  client can run several models across Vulkan/HIP/CUDA builds in sequence;
+  `/api/v1/status` returns the direct llama-server URL, alias, PID, runtime,
+  model, launch settings, devices, and a redacted command line;
+  `/api/v1/models` adds size, quant, parameter count, family, and architecture.
+  AutoTuner writes a small `~/.autotuner/control_api.json` discovery file
+  (token only while enabled) so Pi and the Supercalc benchmark never parse the
+  large settings file. The Pi extension reads it first and falls back to a
+  bounded regex scan. See [`docs/control-api.md`](docs/control-api.md).
+- **Profile explanations follow the interface language:** every profile's
+  `notes` is now English in YAML, language packs carry an optional
+  `profile_notes` map, and all eight bundled packs (English, German, Dutch,
+  Swedish, Japanese, French, Greek, Polish) translate all 76 profiles;
+  switching the language re-renders the configuration preview. Missing
+  entries in custom packs fall back to English. See
+  [`docs/languages.md`](docs/languages.md).
+- **Closer-to-optimum performance search:** decoupled thread probes, a
+  low-thread probe for fully offloaded models, larger micro-batch candidates,
+  and a hill-climb refinement stage with an 18-candidate Standard budget.
+- **Clearer benchmark report:** a *Recommended settings per model* section,
+  metric legend, applied-settings column, ranked candidate charts with
+  settings captions, and collapsed per-run diagrams.
+- **Validation:** source suite, exact b10786 help matrix, and the rebuilt
+  Windows artifact are recorded in
+  [`docs/v5.3.9-validation.md`](docs/v5.3.9-validation.md); the upstream
+  review is in [`docs/llama-b10786-audit.md`](docs/llama-b10786-audit.md).
 
 ### v5.3.8 — llama.cpp b10760, current model profiles, cleaner HIP builds
 

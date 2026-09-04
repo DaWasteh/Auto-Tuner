@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import os
+import stat as stat_module
 import shutil
 import subprocess
 import tempfile
@@ -16,7 +18,16 @@ from urllib.parse import urlsplit
 import pytest
 
 import app_settings
-from control_api import ApiModel, ControlApiError, ControlApiServer, ControlRequest
+from control_api import (
+    ApiModel,
+    ApiRuntime,
+    ControlApiError,
+    ControlApiServer,
+    ControlRequest,
+    discovery_payload,
+    read_discovery_file,
+    write_discovery_file,
+)
 
 
 TOKEN = "test-token-with-at-least-sixteen-characters"
@@ -120,7 +131,7 @@ def test_control_api_auth_catalogue_switch_status_and_stop() -> None:
     switches: list[str] = []
     stops: list[bool] = []
 
-    def switch(model_id: str, _timeout: float) -> Dict[str, Any]:
+    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
         switches.append(model_id)
         return {
             "backend_url": "http://127.0.0.1:65530",
@@ -208,7 +219,7 @@ def test_control_api_auth_catalogue_switch_status_and_stop() -> None:
 def test_openai_proxy_switches_model_and_rewrites_only_backend_identity(upstream) -> None:
     upstream_url, requests = upstream
 
-    def switch(model_id: str, _timeout: float) -> Dict[str, Any]:
+    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
         assert model_id == "qwen-7b"
         return {
             "backend_url": upstream_url,
@@ -245,7 +256,7 @@ def test_sse_proxy_flushes_first_event_without_buffering(upstream) -> None:
     api = ControlApiServer(
         port=0,
         token=TOKEN,
-        switch_callback=lambda _model, _timeout: {
+        switch_callback=lambda _model, _timeout, _options: {
             "backend_url": upstream_url,
             "alias": "stream-alias",
         },
@@ -284,7 +295,7 @@ def test_proxy_lease_blocks_conflicting_switch_without_truncating_stream(
     upstream_url, _requests = upstream
     switched: list[str] = []
 
-    def switch(model_id: str, _timeout: float) -> Dict[str, Any]:
+    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
         switched.append(model_id)
         return {"backend_url": upstream_url, "alias": f"alias-{model_id}"}
 
@@ -390,7 +401,7 @@ def test_switches_are_serialized_across_concurrent_http_clients() -> None:
     max_callbacks = 0
     order: list[str] = []
 
-    def switch(model_id: str, _timeout: float) -> Dict[str, Any]:
+    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal active_callbacks, max_callbacks
         with state_lock:
             active_callbacks += 1
@@ -446,13 +457,13 @@ def test_control_request_timeout_failure_and_loopback_guards() -> None:
             host="0.0.0.0",
             port=1233,
             token=TOKEN,
-            switch_callback=lambda _model, _timeout: {},
+            switch_callback=lambda _model, _timeout, _options: {},
         )
     with pytest.raises(ValueError, match="16"):
         ControlApiServer(
             port=1233,
             token="short",
-            switch_callback=lambda _model, _timeout: {},
+            switch_callback=lambda _model, _timeout, _options: {},
         )
 
 
@@ -464,7 +475,7 @@ def test_pi_extension_runtime_discovery_and_control_port_precedence(tmp_path) ->
     api = ControlApiServer(
         port=0,
         token=TOKEN,
-        switch_callback=lambda _model, _timeout: {
+        switch_callback=lambda _model, _timeout, _options: {
             "backend_url": "http://127.0.0.1:65530",
             "alias": "test",
         },
@@ -508,6 +519,44 @@ def test_pi_extension_runtime_discovery_and_control_port_precedence(tmp_path) ->
         assert "autotuner" in result.stdout
         assert "pi-runtime-model" in result.stdout
         assert "Assertion failed" not in result.stderr
+
+        # AutoTuner >= 5.3.9 sidecar: no environment override and a settings
+        # file that is far too large to parse must still resolve the gateway.
+        (tmp_path / "autotuner_settings.json").write_text(
+            json.dumps({"control_api_port": 65529, "control_api_token": "stale-token-value-0000"})
+            + " " * (3 * 1024 * 1024),
+            encoding="utf-8",
+        )
+        write_discovery_file(
+            tmp_path / "control_api.json",
+            discovery_payload(enabled=True, port=api.port, token=TOKEN, pid=1),
+        )
+        sidecar_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("AUTOTUNER_")
+        }
+        sidecar_environment["AUTOTUNER_DATA_DIR"] = str(tmp_path)
+        result = subprocess.run(
+            [
+                pi_command,
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "-e",
+                str(extension),
+                "--list-models",
+                "autotuner",
+            ],
+            env=sidecar_environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "pi-runtime-model" in result.stdout
     finally:
         api.stop()
 
@@ -555,3 +604,200 @@ def test_pi_extension_typechecks_when_local_pi_types_are_available() -> None:
             check=False,
         )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_runtimes_endpoint_switch_options_and_extended_status() -> None:
+    calls: list[tuple[str, float, Dict[str, Any]]] = []
+
+    def switch(model_id: str, timeout: float, options: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append((model_id, timeout, dict(options)))
+        return {
+            "backend_url": "http://127.0.0.1:65531",
+            "alias": "qwen",
+            "detail": {
+                "pid": 42,
+                "runtime": {"id": options.get("runtime_id") or "vulkan-b10786"},
+                "launch": {"ctx_size": 4096, "port": 65531},
+                "command_line": ["llama-server", "--api-key", "<redacted>"],
+            },
+        }
+
+    probed: list[str] = []
+
+    def probe(runtime: ApiRuntime) -> ApiRuntime:
+        probed.append(runtime.id)
+        return dataclasses.replace(runtime, build=10786, build_info="b10786-de8656bd9")
+
+    api = ControlApiServer(
+        port=0, token=TOKEN, switch_callback=switch, runtime_probe=probe
+    )
+    api.update_models(
+        [
+            ApiModel(
+                id="qwen-7b",
+                name="Qwen 7B",
+                path="C:/models/qwen.gguf",
+                context_window=32768,
+                size_bytes=4_000_000_000,
+                quant="Q4_K_M",
+                params_b=7.0,
+                family="Qwen3 (Alibaba)",
+                architecture="qwen3",
+                default_runtime_id="vulkan-b10786",
+            )
+        ]
+    )
+    api.update_runtimes(
+        [
+            ApiRuntime(
+                id="vulkan-b10786",
+                label="b10786_vulkan_llama.cpp",
+                server_binary="C:/builds/vulkan/llama-server.exe",
+                backend="vulkan",
+                is_default=True,
+            ),
+            ApiRuntime(
+                id="hip-broken",
+                label="broken_hip_llama.cpp",
+                server_binary="",
+                backend="hip",
+                available=False,
+                unavailable_reason="No runnable llama-server found in this build.",
+            ),
+        ],
+        "vulkan-b10786",
+    )
+    api.start()
+    try:
+        status, body, _headers = _request(api.base_url, "GET", "/api/v1/runtimes")
+        assert status == 200
+        assert body["default_runtime_id"] == "vulkan-b10786"
+        assert body["active_runtime"] is None
+        assert [item["id"] for item in body["runtimes"]] == ["vulkan-b10786", "hip-broken"]
+        first, second = body["runtimes"]
+        assert first["build"] == "b10786" and first["build_number"] == 10786
+        assert first["build_info"] == "b10786-de8656bd9"
+        assert first["backend"] == "vulkan" and first["is_default"] is True
+        assert second["available"] is False and second["backend"] == "hip"
+        assert "No runnable" in second["unavailable_reason"]
+        assert probed == ["vulkan-b10786", "hip-broken"]
+
+        status, body, _headers = _request(api.base_url, "GET", "/api/v1/models")
+        item = body["models"][0]
+        assert item["size_bytes"] == 4_000_000_000
+        assert item["quant"] == "Q4_K_M" and item["params_b"] == 7.0
+        assert item["family"] == "Qwen3 (Alibaba)" and item["architecture"] == "qwen3"
+        assert item["default_runtime_id"] == "vulkan-b10786"
+        assert body["default_runtime_id"] == "vulkan-b10786"
+
+        status, body, _headers = _request(api.base_url, "GET", "/api/v1/status")
+        assert body["status"] == "idle" and body["ready"] is False
+        assert body["backend_url"] is None and body["runtime"] is None
+
+        for runtime_id in ("cuda-nope", "hip-broken"):
+            status, body, _headers = _request(
+                api.base_url,
+                "POST",
+                "/api/v1/switch",
+                payload={"model_id": "qwen-7b", "runtime_id": runtime_id},
+            )
+            assert status == 409 and body["error"]["code"] == "runtime_unavailable"
+        status, body, _headers = _request(
+            api.base_url,
+            "POST",
+            "/api/v1/switch",
+            payload={"model_id": "qwen-7b", "timeout_s": "soon"},
+        )
+        assert status == 400 and body["error"]["code"] == "invalid_request"
+        assert calls == []
+
+        status, body, _headers = _request(
+            api.base_url,
+            "POST",
+            "/api/v1/switch",
+            payload={"model_id": "qwen-7b", "runtime_id": "vulkan-b10786", "timeout_s": 12.5},
+        )
+        assert status == 200 and body["status"] == "ready" and body["ready"] is True
+        assert body["backend_url"] == "http://127.0.0.1:65531"
+        assert body["alias"] == "qwen" and body["backend_api_key"] is None
+        assert body["active_runtime"] == "vulkan-b10786"
+        assert body["runtime"]["id"] == "vulkan-b10786"
+        assert body["launch"] == {"ctx_size": 4096, "port": 65531}
+        assert body["pid"] == 42
+        assert body["command_line"] == ["llama-server", "--api-key", "<redacted>"]
+        assert calls == [
+            ("qwen-7b", 12.5, {"runtime_id": "vulkan-b10786", "timeout_s": 12.5})
+        ]
+
+        # Re-selecting the same model on the same (or unspecified) runtime is
+        # idempotent; a different runtime forces a real transition.
+        for payload in (
+            {"model_id": "qwen-7b"},
+            {"model_id": "qwen-7b", "runtime_id": "vulkan-b10786"},
+        ):
+            status, body, _headers = _request(
+                api.base_url, "POST", "/api/v1/switch", payload=payload
+            )
+            assert status == 200 and body["status"] == "ready"
+        assert len(calls) == 1
+        api.update_runtimes(
+            [
+                ApiRuntime(
+                    id="vulkan-b10786",
+                    label="b10786_vulkan_llama.cpp",
+                    server_binary="C:/builds/vulkan/llama-server.exe",
+                    backend="vulkan",
+                    is_default=True,
+                ),
+                ApiRuntime(
+                    id="hip-b10786",
+                    label="b10786_hip_llama.cpp",
+                    server_binary="C:/builds/hip/llama-server.exe",
+                    backend="hip",
+                ),
+            ],
+            "vulkan-b10786",
+        )
+        status, body, _headers = _request(
+            api.base_url,
+            "POST",
+            "/api/v1/switch",
+            payload={"model_id": "qwen-7b", "runtime_id": "hip-b10786"},
+        )
+        assert status == 200 and body["active_runtime"] == "hip-b10786"
+        assert len(calls) == 2 and calls[-1][2]["runtime_id"] == "hip-b10786"
+        status, body, _headers = _request(api.base_url, "GET", "/api/v1/runtimes")
+        assert body["active_runtime"] == "hip-b10786"
+    finally:
+        api.stop()
+
+
+def test_discovery_file_is_atomic_private_and_tokenless_when_disabled(tmp_path) -> None:
+    path = tmp_path / "nested" / "control_api.json"
+    payload = discovery_payload(
+        enabled=True,
+        port=1233,
+        token=TOKEN,
+        version="5.3.9",
+        pid=7,
+        started_at="2026-09-03T18:00:00Z",
+    )
+    assert payload["schema"] == 1
+    assert payload["base_url"] == "http://127.0.0.1:1233"
+    assert payload["token"] == TOKEN and payload["pid"] == 7
+    assert write_discovery_file(path, payload) is True
+    loaded = read_discovery_file(path)
+    assert loaded == payload
+    if os.name != "nt":
+        assert stat_module.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(path.parent.glob("*.tmp"))
+
+    disabled = discovery_payload(enabled=False, port=1233, token=TOKEN)
+    assert disabled["enabled"] is False and "token" not in disabled
+    assert write_discovery_file(path, disabled) is True
+    assert read_discovery_file(path)["enabled"] is False
+    assert "token" not in read_discovery_file(path)
+
+    path.write_text("not json", encoding="utf-8")
+    assert read_discovery_file(path) == {}
+    assert read_discovery_file(tmp_path / "missing.json") == {}

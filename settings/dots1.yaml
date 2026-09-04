@@ -37,9 +37,9 @@ sampling:
     repeat_penalty: 1.05
 
 notes: >
-  rednote-hilab dots.llm1 — MoE, 142B total / 14B aktiv (Instruct +
-  Base), Architektur "dots1", nativer 32k-Kontext, Leistung auf
-  Qwen2.5-72B-Niveau. rednote nennt in der Card keine explizite
-  Sampler-Empfehlung, daher konservativ-mittige Defaults (temp 0.7 chat /
-  0.3 coding) — bei Bedarf an die generation_config anpassen. Mit nur 14B
-  aktiven Parametern + --n-cpu-moe auf einer 32-GB-Karte gut lauffähig.
+  rednote-hilab dots.llm1: MoE, 142B total / 14B active (Instruct + Base),
+  architecture "dots1", native 32k context, performance at Qwen2.5-72B level.
+  rednote's card gives no explicit sampler recommendation, so conservative
+  middle-of-the-road defaults are used (temp 0.7 chat / 0.3 coding); adjust to
+  the generation_config if needed. With only 14B active parameters plus
+  --n-cpu-moe it runs well on a 32 GB card.

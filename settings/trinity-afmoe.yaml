@@ -63,17 +63,17 @@ extra_args:
   - --jinja
 
 notes: >
-  Arcee AI Trinity (AFMoE / "afmoe", AfmoeForCausalLM) — Attention-First MoE,
-  in llama.cpp seit b7061. Nano = 6B total / ~1B active, Mini = 26B / ~3B,
-  je 128 Experten (8 aktiv, 1 shared), 128k nativer Kontext. KEIN Mamba-Hybrid:
-  voller KV-Cache pro Layer (Tuner-Hybrid-Logik greift hier korrekt NICHT zu).
-  Dieses Profil deckt auch Dolphin-X1-Trinity-Nano (dphn) ab — den
-  RL-dezensierten Re-Train von Trinity-Nano: gleiche Architektur, gleiches
-  ChatML-Template, nur das Alignment unterscheidet sich. Bei Dolphin steuert
-  der System-Prompt Ton und Ausrichtung (z.B. "You are Dolphin, a helpful,
-  unbiased, and uncensored AI assistant.") — ohne gesetzten System-Prompt
-  verhält sich das Modell in einem unspezifischen Default. Sampling = Arcees
-  offizielle Empfehlung (temp 0.15 / top_k 50 / top_p 0.75 / min_p 0.06),
-  bewusst deterministisch für stabile Tool-/Struktur-Ausgaben. Trinity-Mini
-  kann via vLLM mit deepseek_r1-Reasoning-Parser + hermes-Tool-Parser laufen;
-  unter llama.cpp übernimmt `--jinja` die Template-/Channel-Trennung.
+  Arcee AI Trinity (AFMoE / "afmoe", AfmoeForCausalLM): attention-first MoE,
+  in llama.cpp since b7061. Nano = 6B total / ~1B active, Mini = 26B / ~3B,
+  each with 128 experts (8 active, 1 shared), 128k native context. NOT a Mamba
+  hybrid: full KV cache per layer (the tuner's hybrid logic correctly does NOT
+  apply here). This profile also covers Dolphin-X1-Trinity-Nano (dphn), the
+  RL-uncensored retrain of Trinity-Nano: same architecture, same ChatML
+  template, only the alignment differs. With Dolphin the system prompt
+  controls tone and alignment (for example "You are Dolphin, a helpful,
+  unbiased, and uncensored AI assistant."); without a system prompt the model
+  behaves in an unspecific default. Sampling follows Arcee's official
+  recommendation (temp 0.15 / top_k 50 / top_p 0.75 / min_p 0.06),
+  deliberately deterministic for stable tool/structured output. Trinity-Mini
+  can run via vLLM with the deepseek_r1 reasoning parser + hermes tool parser;
+  under llama.cpp `--jinja` handles the template/channel separation.

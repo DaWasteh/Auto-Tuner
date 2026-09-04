@@ -57,12 +57,12 @@ draft_p_min: 0.75
 ngram_method: ngram-mod
 
 notes: >
-  OpenBMB MiniCPM5-1B — dichtes 1B-On-Device-Modell (Standard-llama-Arch,
-  kein Hybrid, kein mmproj), Apache-2.0, 1B-Klasse-SOTA bei Tool-Use/Code/
-  Reasoning, nativer 128k-Kontext. Architektur "llama" — daher KEIN
-  arch_fallback (würde sonst alle Llama-Modelle fangen), Match nur über
-  Dateiname. Hybrid-Reasoning aus einem Checkpoint: Think/No-Think über
-  das Chat-Template (enable_thinking). Sampling = OpenBMB-Empfehlung:
-  chat = No-Think (temp 0.7), coding = Think (temp 0.9), top_p 0.95 in
-  beiden. --jinja ist Pflicht (Chat-Template + XML-Tool-Call-Parsing).
-  Für Tool-Calling ist SGLang/llama.cpp mit korrektem Parser empfohlen.
+  OpenBMB MiniCPM5-1B: dense 1B on-device model (standard llama architecture,
+  no hybrid, no mmproj), Apache-2.0, 1B-class SOTA for tool
+  use/code/reasoning, native 128k context. Architecture "llama", therefore NO
+  arch_fallback (it would otherwise catch all Llama models); matching only by
+  filename. Hybrid reasoning from one checkpoint: think/no-think through the
+  chat template (enable_thinking). Sampling follows the OpenBMB
+  recommendation: chat = no-think (temp 0.7), coding = think (temp 0.9), top_p
+  0.95 in both. --jinja is mandatory (chat template + XML tool-call parsing).
+  For tool calling, SGLang/llama.cpp with the correct parser is recommended.

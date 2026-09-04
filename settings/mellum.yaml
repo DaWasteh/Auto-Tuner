@@ -76,16 +76,14 @@ ngram_k4v_size_m: 24
 ngram_k4v_min_hits: 1
 
 notes: >
-  JetBrains Mellum2-12B-A2.5B — sparse MoE (64 Experten, 8 aktiv), 12B total
-  / 2.5B aktiv, 128k Kontext via layer-selektives YaRN, Apache 2.0. Kein
-  Multimodal. Inference-Kosten/Speed verhalten sich wie ein dichtes 2.5B,
-  trotz 12B Gesamtgröße.
-  Drei Varianten: Base (Completion), Instruct (direkt), Thinking
-  (<think>-CoT). Für die Thinking-Variante `--jinja` als Extra-Arg setzen,
-  damit <think>-Blöcke sauber ins reasoning_content-Feld getrennt werden:
-    -- --jinja
-  ngram_method steht hier ABSICHTLICH auf ngram-map-k4v (nicht dem globalen
-  Default ngram-mod): das ist MTP-kompatibel und übersteht beide Fälle —
-  egal ob llama.cpp den von JetBrains beschriebenen MTP-Head erkennt/ausführt
-  oder nicht. Bei Crashes mit Speculation: in der GUI Draft/n-gram abschalten
-  und tok/s vergleichen (MoE-A2.5B profitiert nicht garantiert von Speculation).
+  JetBrains Mellum2-12B-A2.5B: sparse MoE (64 experts, 8 active), 12B total /
+  2.5B active, 128k context via layer-selective YaRN, Apache 2.0. No
+  multimodality. Inference cost/speed behaves like a dense 2.5B despite the
+  12B total size. Three variants: Base (completion), Instruct (direct),
+  Thinking (<think> CoT). For the Thinking variant set `--jinja` as an extra
+  arg so that <think> blocks are cleanly separated into the reasoning_content
+  field: -- --jinja. ngram_method is DELIBERATELY set to ngram-map-k4v here
+  (not the global default ngram-mod): it is MTP-compatible and survives both
+  cases, whether or not llama.cpp recognises/executes the MTP head JetBrains
+  describes. On crashes with speculation: disable draft/n-gram in the GUI and
+  compare tok/s (a MoE A2.5B does not benefit from speculation for certain).
