@@ -2106,6 +2106,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
         draft_allowed, draft_message, _draft_build = check_draft_model_build(
             effective_draft,
             tuning_binary,
+            target=model,
         )
         if draft_message:
             level = "Warning" if draft_allowed else "Error"

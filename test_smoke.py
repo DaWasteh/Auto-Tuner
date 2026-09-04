@@ -26,6 +26,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Make the project root importable when tests are run from the repo root
 ROOT = Path(__file__).resolve().parent
+
+
+@pytest.fixture(autouse=True)
+def _non_blocking_long_message_dialog(monkeypatch):
+    """Keep the scrollable report dialog from opening a modal event loop.
+
+    Performance-suite tests drive the completion path end to end; the
+    production dialog must not block the offscreen test process.
+    """
+    qt_launcher = sys.modules.get("qt_launcher")
+    if qt_launcher is None:
+        try:
+            import qt_launcher  # noqa: F811
+        except Exception:
+            return
+    monkeypatch.setattr(qt_launcher._LongMessageDialog, "exec", lambda self: 1)
 sys.path.insert(0, str(ROOT))
 
 from hardware import GPUInfo, SystemInfo, detect_system, format_system  # noqa: E402
@@ -345,12 +361,16 @@ def test_b10786_nemotron_profiles_and_exact_hybrid_names() -> None:
     assert not metadata_is_hybrid_architecture({"general.architecture": "llama"})
 
 
-def test_b10786_server_help_advertises_every_profile_flag() -> None:
+def test_latest_server_help_advertises_every_profile_flag() -> None:
     """Every long option emitted directly by a shipped profile exists in the
-    exact b10786 llama-server help captured during the audit."""
-    help_file = ROOT / ".pi" / "b10786-llama-server-help.txt"
-    if not help_file.is_file():
-        pytest.skip("exact b10786 help capture is not present")
+    newest exact llama-server help captured during an audit (b10797)."""
+    captures = sorted(
+        (ROOT / ".pi").glob("b*-llama-server-help.txt"),
+        key=lambda item: int(re.sub(r"\D", "", item.name.split("-", 1)[0]) or 0),
+    )
+    if not captures:
+        pytest.skip("no exact llama-server help capture is present")
+    help_file = captures[-1]
     advertised = set(
         re.findall(r"(?<![\w-])(--[a-z0-9][a-z0-9-]*)", help_file.read_text(encoding="utf-8", errors="replace"))
     )
@@ -366,6 +386,126 @@ def test_b10786_server_help_advertises_every_profile_flag() -> None:
     # b10786 keeps both spellings of the reasoning-preserve switch and the
     # server now defaults it to enabled for templates that support it.
     assert {"--reasoning-preserve", "--no-reasoning-preserve"} <= advertised
+
+
+def test_mtp_sidecar_root_tensor_preflight(tmp_path) -> None:
+    """A same-architecture MTP sidecar must carry the target's root tensors.
+
+    Mirrors the b10786 Qwen3.8 Flash Next failure: llama-server loads a ``-md``
+    head with the full qwen4exp loader and aborts with ``check_tensor_dims``
+    when ``output_hc_norm``/``output_norm``/``token_embd`` are missing.
+    """
+    from tuner import (
+        _entry_root_tensors,
+        check_draft_model_build,
+        mtp_sidecar_missing_root_tensors,
+    )
+
+    def entry(name, metadata, size=1024**3):
+        path = tmp_path / name
+        path.write_bytes(b"GGUF")
+        return ModelEntry(
+            path=path, name=path.stem, group="x", size_bytes=size, metadata=metadata
+        )
+
+    target = entry(
+        "Qwen3.8-Flash-Next-UD-Q2_K_XL.gguf",
+        {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "__tensor_scan_complete__": True,
+            "__root_tensors__": [
+                "token_embd.weight",
+                "output_norm.weight",
+                "output_hc_norm.weight",
+                "output.weight",
+                "rope_freqs.weight",
+            ],
+        },
+        size=100 * 1024**3,
+    )
+    incomplete = entry(
+        "mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 49,
+            "qwen4exp.nextn_predict_layers": 1,
+            "__tensor_scan_complete__": True,
+            "__root_tensors__": ["token_embd.weight", "output.weight"],
+        },
+    )
+    shared = entry(
+        "mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf",
+        {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 49,
+            "qwen4exp.nextn_predict_layers": 1,
+            "__tensor_scan_complete__": True,
+            "__root_tensors__": [],
+        },
+    )
+    complete = entry(
+        "mtp-Qwen3.8-Flash-Next-complete-Q4_K_M.gguf",
+        {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 49,
+            "qwen4exp.nextn_predict_layers": 1,
+            "__tensor_scan_complete__": True,
+            # output.weight and rope_freqs.weight are optional for the loader.
+            "__root_tensors__": [
+                "token_embd.weight",
+                "output_norm.weight",
+                "output_hc_norm.weight",
+            ],
+        },
+    )
+    assert mtp_sidecar_missing_root_tensors(target, incomplete) == [
+        "output_hc_norm.weight",
+        "output_norm.weight",
+    ]
+    assert mtp_sidecar_missing_root_tensors(target, shared) == [
+        "output_hc_norm.weight",
+        "output_norm.weight",
+        "token_embd.weight",
+    ]
+    assert mtp_sidecar_missing_root_tensors(target, complete) == []
+
+    allowed, message, detected = check_draft_model_build(
+        incomplete, "server", target=target
+    )
+    assert not allowed and detected is None
+    assert "output_hc_norm.weight" in message and "qwen4exp" in message
+    assert "n-gram" in message
+    # Without a target (legacy callers) the preflight cannot judge and stays
+    # permissive; a complete sidecar passes with a target as well.
+    assert check_draft_model_build(incomplete, "server")[0]
+    assert check_draft_model_build(complete, "server", target=target)[0]
+
+    # Different-architecture drafters (DFlash, EAGLE, assistant heads) and
+    # non-MTP siblings are never judged by this rule.
+    dflash = entry(
+        "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+        {
+            "general.architecture": "dflash",
+            "__tensor_scan_complete__": True,
+            "__root_tensors__": ["fc.weight"],
+        },
+    )
+    assert mtp_sidecar_missing_root_tensors(target, dflash) == []
+    plain = entry(
+        "Qwen3.8-0.6B-Q8_0.gguf",
+        {
+            "general.architecture": "qwen4exp",
+            "__tensor_scan_complete__": True,
+            "__root_tensors__": ["token_embd.weight"],
+        },
+    )
+    assert mtp_sidecar_missing_root_tensors(target, plain) == []
+
+    # Unknown headers (no scan) never veto.
+    unknown_target = entry("opaque.gguf", {"general.architecture": "qwen4exp"})
+    assert _entry_root_tensors(unknown_target) is None
+    assert mtp_sidecar_missing_root_tensors(unknown_target, incomplete) == []
 
 
 def test_ministral_does_not_collide_with_mistral_medium() -> None:
@@ -1858,6 +1998,12 @@ def test_performance_suite_selects_and_reports_fastest_mode(
         qt_launcher.QMessageBox,
         "information",
         lambda *args, **_kwargs: messages.append(str(args[-1])),
+    )
+    # The completion report now uses the scrollable dialog helper.
+    monkeypatch.setattr(
+        qt_launcher.MainWindow,
+        "_show_long_message",
+        lambda self, title, message, icon=None: messages.append(str(message)),
     )
 
     model = _fake_model(tmp_path, "Qwen3.8-27B-Q4_K_M", 4.0)

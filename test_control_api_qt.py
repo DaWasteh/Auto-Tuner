@@ -453,3 +453,26 @@ def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch
     assert payload["schema"] == 1 and payload["port"] == app_settings.get_control_api_port()
     window._servers.clear()
     window.close()
+
+
+def test_long_message_dialog_scrolls_and_keeps_ok_reachable(tmp_path, monkeypatch) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qt_launcher = pytest.importorskip("qt_launcher")
+    qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
+    app = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
+    assert app is qt_widgets.QApplication.instance()
+    message = "\n".join(f"line {index}: PP 123.4, decode 56.7 tok/s" for index in range(400))
+    dialog = qt_launcher._LongMessageDialog("Performance test complete", message)
+    dialog.show()
+    app.processEvents()
+    screen = dialog.screen() or app.primaryScreen()
+    available = screen.availableGeometry()
+    assert dialog.height() <= int(available.height() * 0.75) + 1
+    assert dialog.width() <= int(available.width() * 0.9) + 1
+    assert dialog.text.toPlainText() == message
+    assert dialog.text.isReadOnly()
+    ok = dialog._buttons.button(qt_widgets.QDialogButtonBox.StandardButton.Ok)
+    assert ok is not None and ok.isVisible()
+    ok.click()
+    assert dialog.result() == qt_widgets.QDialog.DialogCode.Accepted
+    dialog.close()

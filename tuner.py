@@ -706,8 +706,105 @@ def resolve_draft_n_max(
     return max(1, int(getattr(profile, "draft_max", 0) or 2))
 
 
+# Root tensors llama.cpp creates as optional (``TENSOR_NOT_REQUIRED`` or a
+# tied fallback), so a standalone MTP sidecar may legitimately omit them.
+_OPTIONAL_ROOT_TENSORS = frozenset({"output.weight", "rope_freqs.weight"})
+
+
+def _entry_root_tensors(entry: ModelEntry) -> Optional[Set[str]]:
+    """Return every root tensor name of *entry* across all of its shards.
+
+    ``None`` means the header could not be scanned, in which case callers must
+    not veto anything. Split GGUFs keep their root tensors in arbitrary
+    shards (Qwen3.8 Flash Next's first shard carries metadata only), so every
+    part header is combined; only the small header section is read.
+    """
+    metadata = entry.metadata or {}
+    names: Set[str] = set()
+    complete = bool(metadata.get("__tensor_scan_complete__"))
+    roots = metadata.get("__root_tensors__")
+    if isinstance(roots, (list, tuple)):
+        names.update(str(name) for name in roots)
+    elif not complete:
+        return None
+    parts = [Path(part) for part in (entry.part_paths or []) if part]
+    for part in parts:
+        try:
+            if part.resolve(strict=False) == Path(entry.path).resolve(strict=False):
+                continue
+        except (OSError, RuntimeError):
+            if part == entry.path:
+                continue
+        try:
+            from scanner import read_gguf_metadata
+
+            part_md = read_gguf_metadata(part)
+        except Exception:
+            return None
+        part_roots = part_md.get("__root_tensors__")
+        if not isinstance(part_roots, (list, tuple)) or not part_md.get(
+            "__tensor_scan_complete__"
+        ):
+            return None
+        names.update(str(name) for name in part_roots)
+        complete = True
+    return names if complete else None
+
+
+def _is_mtp_style_sidecar(draft_model: ModelEntry) -> bool:
+    """True for a separate NextN/MTP head file, however it was converted.
+
+    Assistant-architecture heads report ``drafter_spec_type == "mtp"``.
+    Community sidecars that keep the target's architecture (Qwen3.8 Flash
+    Next ``mtp-*.gguf``) are paired as plain ``-md`` siblings by filename, so
+    detect them through their own ``<arch>.nextn_predict_layers`` metadata.
+    """
+    if draft_model.drafter_spec_type == "mtp":
+        return True
+    metadata = draft_model.metadata or {}
+    arch = str(draft_model.architecture or "").strip()
+    try:
+        nextn = int(metadata.get(f"{arch}.nextn_predict_layers", 0) or 0)
+    except (TypeError, ValueError):
+        nextn = 0
+    return nextn > 0
+
+
+def mtp_sidecar_missing_root_tensors(
+    target: Optional[ModelEntry], draft_model: Optional[ModelEntry]
+) -> List[str]:
+    """Return target root tensors a same-architecture MTP sidecar lacks.
+
+    Mainline llama.cpp loads ``-md`` MTP heads with the target's architecture
+    loader (there is no separate "head only" loader), so an all-NextN sidecar
+    must still carry ``token_embd``, ``output_norm`` and every other required
+    root tensor of the family, e.g. Qwen3.8 Flash Next's ``output_hc_norm``.
+    Community "shared"/"embedding-free" sidecars omit them and abort at
+    ``check_tensor_dims`` after the full target has already been loaded.
+    An empty list means "no evidence of incompatibility".
+    """
+    if target is None or draft_model is None:
+        return []
+    if not _is_mtp_style_sidecar(draft_model):
+        return []
+    draft_arch = str(draft_model.architecture or "").strip().lower()
+    target_arch = str(target.architecture or "").strip().lower()
+    if not draft_arch or draft_arch != target_arch:
+        return []
+    draft_roots = _entry_root_tensors(draft_model)
+    target_roots = _entry_root_tensors(target)
+    if draft_roots is None or target_roots is None or not target_roots:
+        return []
+    required = {
+        name for name in target_roots if name not in _OPTIONAL_ROOT_TENSORS
+    }
+    return sorted(required - draft_roots)
+
+
 def check_draft_model_build(
-    draft_model: Optional[ModelEntry], binary: str
+    draft_model: Optional[ModelEntry],
+    binary: str,
+    target: Optional[ModelEntry] = None,
 ) -> Tuple[bool, str, Optional[int]]:
     """Preflight draft formats whose support is not visible in ``--help``.
 
@@ -717,9 +814,26 @@ def check_draft_model_build(
     advertise the right CLI while instantiating the older 58-tensor graph.
     Reject either known-incompatible runtime before it can crash; retain the
     existing warning-only behavior for wrappers whose version cannot be read.
+
+    When *target* is given, a same-architecture MTP sidecar is additionally
+    checked for the root tensors the architecture loader requires.
     """
     if draft_model is None:
         return True, "", None
+
+    missing = mtp_sidecar_missing_root_tensors(target, draft_model)
+    if missing:
+        shown = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
+        return (
+            False,
+            f"The MTP sidecar {draft_model.path.name} cannot load on mainline "
+            f"llama.cpp: it lacks {shown}. llama-server loads a standalone MTP "
+            f"head with the full {draft_model.architecture} loader, so the "
+            "sidecar must carry the same root tensors as the target model "
+            "(only output.weight may be omitted). Re-convert the head with a "
+            "current converter or use n-gram speculation instead.",
+            None,
+        )
 
     if draft_model.drafter_spec_type == "mtp":
         detected = probe_binary_build_number(binary)

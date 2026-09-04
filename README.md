@@ -1075,14 +1075,15 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10786)
+## Server features (compatible through llama.cpp b10797)
 
 Build/version probing, complete profile-command matrices, and backend smoke
-checks are validated through exact stock **b10786** (`de8656bd9`) on the local
-Windows Vulkan and HIP builds. The b10760→b10786 help diff adds or removes no
-long option, so existing command generation remains current; the one semantic
-change (preserved reasoning is now the llama.cpp default for templates that
-support it) is documented in the table below. AutoTuner still quarantines the
+checks are validated through exact stock **b10797** (`832fd6f17`) on the local
+Windows Vulkan build (b10786 Vulkan/HIP were validated for v5.3.9). The
+b10760→b10797 help diffs add or remove no long option, so existing command
+generation remains current; the one semantic change since b10760 (preserved
+reasoning is the llama.cpp default for templates that support it) is
+documented in the table below. AutoTuner still quarantines the
 upstream NextN regression in b10741-b10748 and points affected users to b10749+
 rather than letting llama-server abort during model or draft-context loading. The following
 `llama-server` features are supported (verified against `llama-server --help` /
@@ -1122,6 +1123,32 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.0 — llama.cpp b10797, MTP sidecar preflight, readable performance summary
+
+- **Exact b10797 compatibility:** the stock Vulkan binary at commit
+  `832fd6f17` exposes the same 331 long options as b10786. The eleven
+  upstream commits add `n_expert_used_max()` (Puzzle-style per-layer expert
+  arrays), a GBNF fix for empty object schemas, SYCL/OpenCL/CUDA kernel work,
+  and a CMake rebuild fix; none changes a flag, an architecture, or a
+  loader contract AutoTuner depends on. The help-capture test now checks the
+  newest captured build automatically.
+- **MTP sidecar preflight:** llama-server loads a standalone `-md` MTP head
+  with the target's full architecture loader, so a sidecar must carry the
+  same root tensors as the model (`token_embd`, `output_norm`, Qwen3.8 Flash
+  Next's `output_hc_norm`, …). Community "shared"/embedding-free sidecars do
+  not, and every Flash Next Quick-suite lane that used them died at
+  `check_tensor_dims` after the 50 GB target had already loaded. AutoTuner now
+  reads the root tensors of the sidecar and of every target shard, refuses
+  such a drafter before launch with the missing tensor names, and the Quick
+  suite lists the lane under *Failed/skipped* instead of burning minutes per
+  mode. Working sidecars (Qwen3.6 MTP, Gemma 4 assistant, DFlash/DSpark)
+  are unaffected.
+- **Readable performance summary:** the completion and failure reports use a
+  scrollable dialog capped at three quarters of the screen height, so the OK
+  button is always visible even for long multi-model summaries.
+- **Validation and binary:** see [`docs/v5.4.0-validation.md`](docs/v5.4.0-validation.md)
+  and [`docs/llama-b10797-audit.md`](docs/llama-b10797-audit.md).
 
 ### v5.3.9 — llama.cpp b10786, campaign-ready control API, localized profile notes
 

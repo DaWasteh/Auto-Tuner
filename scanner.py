@@ -210,6 +210,12 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             max_block_index = -1
             scan_complete = False
             tensor_offsets: List[Tuple[str, int]] = []
+            # Root (non-``blk.N``) tensor names. llama.cpp loads a standalone
+            # MTP/NextN sidecar with the full architecture loader, which
+            # requires the same root tensors as the target model, so this list
+            # lets the launch preflight reject an incomplete sidecar before
+            # llama-server aborts with ``check_tensor_dims``.
+            root_tensors: List[str] = []
             try:
                 for _ in range(n_tensors):
                     tname_len = struct.unpack("<Q", f.read(8))[0]
@@ -223,6 +229,8 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
                     tensor_offset = struct.unpack("<Q", f.read(8))[0]
                     tensor_offsets.append((tname, tensor_offset))
                     tl = tname.lower()
+                    if not tname.startswith("blk.") and len(root_tensors) < 512:
+                        root_tensors.append(tname)
                     # DSpark uses the DFlash architecture plus an additional
                     # Markov/confidence head, so ``general.architecture`` alone
                     # cannot distinguish it. b10329 names those root tensors
@@ -280,6 +288,7 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             # last-shard MTP block from stale ``nextn_predict_layers`` metadata.
             md["__tensor_scan_complete__"] = scan_complete
             md["__max_block_index__"] = max_block_index
+            md["__root_tensors__"] = root_tensors
 
             if scan_complete and tensor_offsets:
                 try:
@@ -303,7 +312,8 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Metadata cache + bounded parallel reader
 
-_METADATA_CACHE_SCHEMA = 3
+# Schema 4 adds ``__root_tensors__`` for the MTP sidecar preflight.
+_METADATA_CACHE_SCHEMA = 4
 _METADATA_CACHE_MAX_ENTRIES = 2048
 _METADATA_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _METADATA_CACHE_LOCK = threading.RLock()

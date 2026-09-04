@@ -61,8 +61,8 @@ from PyQt6.QtGui import (
     QStandardItemModel,
 )
 from PyQt6.QtWidgets import (
-    QApplication,
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -81,17 +81,18 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QPushButton,
+    QPlainTextEdit,
     QProgressBar,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStatusBar,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
-    QStatusBar,
     QSystemTrayIcon,
     QTextEdit,
     QToolBar,
@@ -3923,6 +3924,63 @@ def _command_value(command: Sequence[object], *flags: str) -> Optional[str]:
 def _redacted_command_list(command: Sequence[object]) -> List[str]:
     """List form of :func:`_redacted_command` for JSON consumers."""
     return _redacted_command(command).split(" ") if command else []
+
+
+class _LongMessageDialog(QDialog):
+    """Scrollable replacement for oversized ``QMessageBox`` reports."""
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        icon: QMessageBox.Icon = QMessageBox.Icon.Information,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        icon_label = QLabel()
+        pixmap_icon = self.style().standardIcon(
+            {
+                QMessageBox.Icon.Warning: QStyle.StandardPixmap.SP_MessageBoxWarning,
+                QMessageBox.Icon.Critical: QStyle.StandardPixmap.SP_MessageBoxCritical,
+                QMessageBox.Icon.Question: QStyle.StandardPixmap.SP_MessageBoxQuestion,
+            }.get(icon, QStyle.StandardPixmap.SP_MessageBoxInformation)
+        )
+        icon_label.setPixmap(pixmap_icon.pixmap(32, 32))
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        header.addWidget(icon_label, 0)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlainText(message)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.text.setFrameShape(QFrame.Shape.NoFrame)
+        header.addWidget(self.text, 1)
+        layout.addLayout(header)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._buttons = buttons
+
+        # Size to the content but never beyond ~75% of the available screen.
+        metrics = self.text.fontMetrics()
+        lines = message.count("\n") + 1
+        longest = max((metrics.horizontalAdvance(line) for line in message.splitlines()), default=0)
+        wanted_width = min(max(520, longest + 96), 1100)
+        wanted_height = min(max(200, lines * metrics.lineSpacing() + 110), 100_000)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            wanted_width = min(wanted_width, int(available.width() * 0.9))
+            wanted_height = min(wanted_height, int(available.height() * 0.75))
+        self.resize(wanted_width, wanted_height)
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setDefault(True)
+            ok_button.setFocus()
 
 
 def _control_api_catalogue(
@@ -12111,6 +12169,7 @@ class MainWindow(QMainWindow):
                             check_draft_model_build(
                                 cast(Optional[ModelEntry], options["draft_model"]),
                                 runtime_binary,
+                                target=candidate,
                             )
                         )
                         if draft_message:
@@ -12994,7 +13053,9 @@ class MainWindow(QMainWindow):
                 "Performance test finished without a saved profile."
             )
             detail = "\n".join(failed_rows[:12]) or "Every profile failed."
-            QMessageBox.warning(self, "Performance test failed", detail)
+            self._show_long_message(
+                "Performance test failed", detail, QMessageBox.Icon.Warning
+            )
             return
 
         status = (
@@ -13104,7 +13165,24 @@ class MainWindow(QMainWindow):
                 )
                 lines.extend(failed_rows[:6])
             message = "\n".join(lines)
-        QMessageBox.information(self, "Performance test complete", message)
+        self._show_long_message("Performance test complete", message)
+
+    def _show_long_message(
+        self,
+        title: str,
+        message: str,
+        icon: QMessageBox.Icon = QMessageBox.Icon.Information,
+    ) -> QDialog:
+        """Show a multi-line report in a scrollable dialog that fits the screen.
+
+        ``QMessageBox`` grows with its text and, for a multi-model performance
+        summary, becomes taller than the display so the OK button ends up
+        off-screen. This dialog keeps the text selectable, scrolls when needed
+        and never exceeds roughly three quarters of the available screen.
+        """
+        dialog = _LongMessageDialog(title, message, icon, self)
+        dialog.exec()
+        return dialog
 
     def _on_performance_tuning_failed(self, message: str) -> None:
         self._finish_performance_tuning_ui()
@@ -14067,6 +14145,7 @@ class MainWindow(QMainWindow):
         draft_allowed, draft_message, _draft_build = check_draft_model_build(
             draft_for_launch,
             runtime_binary,
+            target=entry,
         )
         if draft_message:
             self._log(f"[Draft compatibility] {draft_message}")
