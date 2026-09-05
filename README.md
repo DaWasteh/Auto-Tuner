@@ -247,6 +247,14 @@ Performance Test Result:
   per-user login autostart on Windows, Linux, and macOS, plus optional **X →
   notification area/system tray** behavior. Both options are disabled by
   default; the tray menu and the dedicated **Quit** button always exit normally.
+- **One instance per user** — a second start of `AutoTuner.exe` (or
+  `qt_launcher.py`) does not open a rival window: it brings the running
+  AutoTuner to the front, also out of the notification area, and exits. The
+  lock is scoped to the user and the data folder, so a portable
+  `AUTOTUNER_DATA_DIR` still gets its own instance;
+  `AUTOTUNER_ALLOW_MULTIPLE_INSTANCES=1` switches the guard off for development.
+  Quit from the tray menu always ends the process, and a shutdown watchdog
+  ends a hung teardown after 15 s so no window-less AutoTuner lingers.
 - **Stable theme preview** — switching or previewing a theme preserves the
   current window and pane/splitter arrangement; responsive Appearance controls
   retain full theme/font names through sensible widths and tooltips.
@@ -747,6 +755,8 @@ The tuner prints the mlock decision before every launch:
 | `AUTOTUNER_MODELS` | `./models` | Where to scan for `*.gguf` files |
 | `LLAMA_SERVER` | `llama-server` | Path or name of the server binary |
 | `LLAMA_CPP_DIR` | (auto-detected) | Your llama.cpp checkout. If set, the auto-tuner will look for `build/bin/[Release/]llama-server[.exe]` inside it. |
+| `AUTOTUNER_DATA_DIR` | `~/.autotuner` | Portable override of the user-data folder (settings, logs, caches). Each data folder also has its own single-instance lock. |
+| `AUTOTUNER_ALLOW_MULTIPLE_INSTANCES` | unset | Set to `1` to allow several GUI instances for the same user and data folder (development only). |
 
 ### Server binary auto-discovery
 
@@ -1133,6 +1143,36 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.2 — one instance, no leftover process
+
+- **Why:** with *Hide on close* enabled, X parks AutoTuner in the notification
+  area. Windows 11 hides new tray icons in the overflow menu, so the running
+  AutoTuner looked like a leftover process, and the next double-click on
+  `AutoTuner.exe` started a second copy that fought over the control-API port
+  and the console log (`autotuner_console.log` could not rotate because the
+  first instance still held it).
+- **Single instance:** `single_instance.py` holds a per-user, per-data-folder
+  `QLocalServer` lock (named pipe on Windows, socket in `$TMPDIR` on Unix,
+  stale sockets are cleaned after nobody answers). A second launch sends an
+  *activate* request, the running window is restored from the tray or from a
+  minimised state and raised (the new process grants the foreground right
+  first), and the second process exits. Simultaneous launches resolve to one
+  primary; `AUTOTUNER_ALLOW_MULTIPLE_INSTANCES=1` disables the guard.
+- **Quit always ends the process:** *Quit* from the tray menu, the Quit
+  button, and Ctrl+C now call `QApplication.quit()` after a successful close.
+  A window that was already hidden in the tray is not "the last visible
+  window" for Qt's `quitOnLastWindowClosed`, so the event loop could keep
+  running. A daemon watchdog additionally ends the process 15 s after the
+  event loop finished if interpreter teardown hangs.
+- **Verification:** `test_single_instance.py` covers the lock in one process
+  and across processes, the activation signal, both X paths (plain close, and
+  hide-to-tray followed by a Quit that must end `app.exec()`), and window
+  restoration; two opt-in tests (`AUTOTUNER_GUI_PROCESS_TESTS=1`, Windows
+  desktop) start the real GUI process, close it with `WM_CLOSE`, and assert
+  the process exits, then hide a first instance and check that a second
+  launch restores it and exits. Evidence in
+  [`docs/v5.4.2-validation.md`](docs/v5.4.2-validation.md).
 
 ### v5.4.1 — translated hover help, Русский, free KV precision, prompt-cache reuse
 

@@ -176,6 +176,12 @@ from localization import (
     LanguageManager,
     LanguagePackError,
 )
+from single_instance import (
+    ALLOW_MULTIPLE_ENV,
+    SingleInstanceGuard,
+    instance_key,
+    multiple_instances_allowed,
+)
 from control_api import (
     ApiModel,
     ApiRuntime,
@@ -15129,7 +15135,31 @@ class MainWindow(QMainWindow):
         if not self.isVisible() and self._servers:
             self._restore_from_tray()
         self._force_quit = True
-        self.close()
+        if self.close():
+            # close() accepted: the window is gone for good. Do not rely on
+            # quitOnLastWindowClosed alone — a window that was already hidden
+            # in the notification area is not "the last visible window" from
+            # Qt's point of view, so without this the event loop kept running
+            # and the process stayed behind after Quit from the tray menu.
+            QApplication.quit()
+
+    def _activate_from_other_instance(self) -> None:
+        """Bring this window forward because another launch was redirected here."""
+        self._log(
+            "A second AutoTuner start was redirected to this running instance."
+        )
+        if self.isHidden():
+            self._restore_from_tray()
+            return
+        if self.isMinimized():
+            self.setWindowState(
+                (self.windowState() & ~Qt.WindowState.WindowMinimized)
+                | Qt.WindowState.WindowActive
+            )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        QApplication.alert(self)
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:  # noqa: N802
         # An updater may be replacing files or installing dependencies. QThread.quit()
@@ -15609,6 +15639,32 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("AutoTuner")
+
+    # One AutoTuner per user and data folder. A second double-click on the
+    # executable brings the running window back (also out of the notification
+    # area) instead of starting a rival process that fights over the control
+    # API port and the console log.
+    guard = SingleInstanceGuard(instance_key(app_settings.app_data_dir()))
+    if multiple_instances_allowed():
+        print(
+            f"[AutoTuner] {ALLOW_MULTIPLE_ENV} is set — single-instance guard disabled.",
+            flush=True,
+        )
+    elif not guard.try_acquire():
+        if guard.notify_running_instance():
+            print(
+                "[AutoTuner] AutoTuner is already running — its window was "
+                "brought to the front instead of starting a second instance.",
+                flush=True,
+            )
+        else:
+            print(
+                "[AutoTuner] AutoTuner is already running but did not answer; "
+                "not starting a second instance.",
+                flush=True,
+            )
+        return
+
     manager = _application_theme_manager(app, _bundled_resource("assets", "themes"))
     selected_theme = app_settings.get_theme_id()
     applied_theme = manager.apply(app, selected_theme, app_settings.get_font_size())
@@ -15649,6 +15705,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         window, _bundled_resource("assets", "AutoTuner.ico")
     )
     window._install_windows_system_menu()
+    guard.activate_requested.connect(window._activate_from_other_instance)
+    app.aboutToQuit.connect(guard.release)
 
     # ── Ctrl+C / SIGTERM: stop the servers BEFORE the GUI dies ──────────
     # llama-server children are spawned with start_new_session (Unix) /
@@ -15687,7 +15745,94 @@ def main(argv: Optional[List[str]] = None) -> None:
     _signal_wakeup_timer.timeout.connect(lambda: None)
     _signal_wakeup_timer.start(250)
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    guard.release()
+    _arm_exit_watchdog(exit_code)
+    lingering = _drain_background_work(window)
+    if lingering:
+        # Interpreter teardown with a live QThread aborts ("QThread: Destroyed
+        # while thread is still running") and a daemon thread that still
+        # writes to stdout trips "could not acquire lock ... at interpreter
+        # shutdown". Both end as a crash dialog or a wrong exit code instead
+        # of a clean close, so end the process directly instead.
+        print(
+            "[AutoTuner] Ending the process with background work still active: "
+            + ", ".join(lingering),
+            flush=True,
+        )
+        _flush_std_streams()
+        os._exit(exit_code)
+    sys.exit(exit_code)
+
+
+def _drain_background_work(window: MainWindow, timeout_s: float = 10.0) -> List[str]:
+    """Wait (bounded) for worker threads; return the names of any still alive.
+
+    Every worker QThread is parented to the main window, so ``findChildren``
+    sees the hardware probe, model scan, update, OCR, and benchmark threads
+    even when their attribute was already cleared. Plain daemon threads
+    (llama-server exit watchers, sysinfo refresh) cannot be joined safely
+    here; they are only reported.
+    """
+    deadline = time.monotonic() + timeout_s
+    lingering: List[str] = []
+    try:
+        threads = window.findChildren(QThread)
+    except RuntimeError:
+        threads = []
+    for thread in threads:
+        try:
+            if not thread.isRunning():
+                continue
+            thread.quit()
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not thread.wait(remaining_ms):
+                lingering.append(thread.objectName() or "QThread")
+        except RuntimeError:
+            continue
+    for py_thread in threading.enumerate():
+        if py_thread is threading.main_thread() or not py_thread.is_alive():
+            continue
+        if py_thread.name == "AutoTunerExitWatchdog":
+            continue
+        lingering.append(py_thread.name)
+    return lingering
+
+
+def _flush_std_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+
+
+def _arm_exit_watchdog(exit_code: int, timeout_s: float = 15.0) -> None:
+    """Guarantee that the process ends once the Qt event loop has finished.
+
+    Interpreter teardown after ``app.exec()`` normally takes milliseconds.
+    Should a worker (metadata scan, hardware probe, a llama-server wait) still
+    hold the interpreter at that point, the user would see a window-less
+    AutoTuner lingering in Task Manager. The watchdog is a daemon thread, so
+    it never delays a normal exit; it only ends a shutdown that hangs.
+    """
+
+    def _force_exit() -> None:
+        time.sleep(timeout_s)
+        try:
+            print(
+                f"[AutoTuner] Shutdown did not finish within {timeout_s:.0f}s "
+                "— ending the process.",
+                flush=True,
+            )
+        except Exception:
+            pass
+        os._exit(exit_code)
+
+    threading.Thread(
+        target=_force_exit, name="AutoTunerExitWatchdog", daemon=True
+    ).start()
 
 
 if __name__ == "__main__":

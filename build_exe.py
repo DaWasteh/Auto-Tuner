@@ -145,6 +145,7 @@ def main() -> int:
         "theme_dialog",
         "localization",
         "control_api",
+        "single_instance",
         "ocr_workflow",
         "model_benchmark",
         "performance_report",
