@@ -423,8 +423,18 @@ class _GuiProcess:
             return None
 
     def kill(self) -> None:
+        # A frozen onefile build is a bootloader plus a child process; killing
+        # only the Popen handle would leave the real (tray-hidden) AutoTuner
+        # behind. Take the whole tree down.
         if self.proc.poll() is None:
-            self.proc.kill()
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(self.proc.pid)],
+                capture_output=True,
+            )
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
         try:
             self._stderr.close()
         except OSError:
