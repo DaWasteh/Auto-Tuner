@@ -63,6 +63,8 @@ jobs:
 
       # Frozen PyQt6 on Linux needs the X/EGL/Qt platform stack present at
       # build time (PyInstaller records which xcb plugins to bundle).
+      # QtNetwork (single-instance guard) also needs libgssapi_krb5.so.2 so
+      # PyInstaller can bundle it for distributions that lack it.
       - name: Install Linux Qt runtime libraries
         if: runner.os == 'Linux'
         run: |
@@ -71,7 +73,8 @@ jobs:
             libegl1 libgl1 libglib2.0-0 libfontconfig1 libdbus-1-3 \
             libxkbcommon0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
-            libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+            libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 \
+            libgssapi-krb5-2
 
       - name: Install dependencies + PyInstaller
         run: |

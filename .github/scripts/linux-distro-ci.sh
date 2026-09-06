@@ -23,6 +23,9 @@ retry() {
   return 1
 }
 
+# PyQt6's QtNetwork module (used by single_instance.py) links against
+# libgssapi_krb5.so.2. Minimal Debian-family containers do not ship it, so the
+# Kerberos runtime is installed explicitly on every distribution.
 install_runtime_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
@@ -33,7 +36,7 @@ install_runtime_dependencies() {
       libxkbcommon0 libxkbcommon-x11-0 libxcb1 libxcb-cursor0 \
       libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
       libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 \
-      libxcb-xinerama0 libxcb-xkb1
+      libxcb-xinerama0 libxcb-xkb1 libgssapi-krb5-2
     if [[ "$mode" == "source" ]]; then
       retry apt-get install -y --no-install-recommends python3 python3-pip python3-venv
     fi
@@ -42,7 +45,7 @@ install_runtime_dependencies() {
       ca-certificates coreutils util-linux unzip procps-ng pciutils \
       mesa-libEGL mesa-libGL glib2 fontconfig dbus-libs \
       libxkbcommon libxkbcommon-x11 libxcb xcb-util-cursor xcb-util-wm \
-      xcb-util-image xcb-util-keysyms xcb-util-renderutil
+      xcb-util-image xcb-util-keysyms xcb-util-renderutil krb5-libs
     if [[ "$mode" == "source" ]]; then
       retry dnf -y install python3 python3-pip
     fi
@@ -52,7 +55,7 @@ install_runtime_dependencies() {
       ca-certificates coreutils util-linux unzip procps-ng pciutils \
       libglvnd glib2 fontconfig dbus libxkbcommon libxkbcommon-x11 \
       libxcb xcb-util-cursor xcb-util-wm xcb-util-image \
-      xcb-util-keysyms xcb-util-renderutil
+      xcb-util-keysyms xcb-util-renderutil krb5
     if [[ "$mode" == "source" ]]; then
       retry pacman -S --needed --noconfirm python python-pip
     fi
