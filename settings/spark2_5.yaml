@@ -1,0 +1,44 @@
+display_name: "Spark X2.5 (XHToken)"
+patterns:
+  - spark-x2.5
+  - spark-x2_5
+  - spark2.5
+  - spark2_5
+arch_fallback:
+  - spark2_5
+min_llama_build: 10828
+
+# Official XHToken/Spark-X2.5-1.7B config.json: 28 blocks, 3:1 SWA/full
+# attention, 512-token sliding window, head_dim=256, 1M native context.
+# Budgeting is still hardware-limited; this is not an allocation promise.
+max_context: 1048576
+recommended_kv_quant: q8_0
+
+# Official model card: temperature=1, top_p=.95, top_k=-1 (disabled).
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+ngram_method: ngram-map-k4v
+notes: >
+  Spark-X2.5-1.7B uses the spark2_5 architecture added in llama.cpp b10828
+  (PR #27868), fused QKV and head-wise sigmoid attention gates. Use the
+  embedded Spark2.5 template for reasoning/tool calls, not a Qwen template.
+  Native context is 1,048,576 tokens; available RAM/VRAM determines the
+  actual safe window. Q8 KV is preferred; no speculative MTP head is assumed.
+  Sources: https://huggingface.co/XHToken/Spark-X2.5-1.7B and
+  https://github.com/ggml-org/llama.cpp/pull/27868.

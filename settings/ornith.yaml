@@ -37,14 +37,10 @@ patterns:
 # automatisch gecappt (min(max_context, native_ctx)); hier der native Wert.
 max_context: 262144
 
-# KV-Quant. Wie bei qwen3_5-3_6.yaml: q5_0 ist für die A3B-MoE-Variante der
-# Sweet-Spot (mehr VRAM bleibt für Expert-Layer übrig). Für das 9B-Dense ist
-# der Unterschied auf der 32-GB-R9700 folgenlos — es passt mit vollem KV @
-# q5_0 ebenso wie @ q8_0 locker rein; wer für das Dense-Modell maximale
-# KV-Qualität will, kann q8_0 im Expert-Panel pinnen. Einheitlich q5_0 als
-# konservativer, MoE-tauglicher Default. (AMD/Vulkan: MoE-KV MUSS komplett
-# im VRAM liegen — der Tuner reserviert das ohnehin nie aus dem RAM.)
-recommended_kv_quant: q5_0
+# Q8 wie bei Qwen3.5/3.6: bevorzugte Long-Context-/Tool-Calling-Qualität.
+# Auto reserviert KV-Speicher vor der Expert-Platzierung; nur ein zu großes
+# Kontextziel darf auf Q4 zurückfallen. Manuelle Pins bleiben erhalten.
+recommended_kv_quant: q8_0
 
 # RoPE-Scaling (YaRN). Gleiche Basis wie Qwen3.5/3.6 — 262144 nativ reicht
 # für nahezu alle Coding-Sessions; YaRN nur bei Bedarf in der GUI aktivieren.

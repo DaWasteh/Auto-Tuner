@@ -50,11 +50,11 @@ Performance Test Result:
   `--list-devices` table. AutoTuner emits only that backend's selector
   (`HIP_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`) when known, so HIP and
   Vulkan's different physical-device order cannot silently select the wrong GPU.
-- **Free-memory aware, Q4-first KV** — Auto mode uses symmetric `q4_0`
-  K/V for normal llama.cpp models and spends saved RAM/VRAM on context instead
-  of silently upgrading the cache toward F16. Context still follows memory
-  that is actually free *right now*, not a hard-coded cap; manual Expert K/V
-  pins remain authoritative. The original v1 cap of 16k context is gone.
+- **Free-memory aware, Q8-first KV** — Auto prefers symmetric `q8_0` for
+  long-context and tool-calling quality, without spending spare memory on
+  F16/BF16. Q4 is only a fallback when Q8 cannot hold the target context;
+  incompatible runners/head dimensions use F16. Placement and context follow
+  currently free RAM/VRAM, and manual Expert K/V pins remain authoritative.
 - **Per-family YAML profiles** in `settings/` — override sampling,
   max context, chat template, and llama-server flags per model family.
   Easy for contributors to extend without touching Python. Each profile's
@@ -316,10 +316,8 @@ PDF rendering requires PyMuPDF and image normalization requires Pillow (both are
 installed by `requirements.txt`). Word/Office/OpenDocument input additionally
 requires a local LibreOffice installation; without it AutoTuner gives a clear
 error and leaves the source untouched. Unlimited-OCR uses its verified
-`document parsing.` prompt, the global Q4 Auto KV default, deterministic
-sampling, explicit Flash Attention off, and requires llama.cpp b10287+ (a
-current build such as b10362
-is recommended). **There is no CMake/build flag for `max_tiles=32`.** The value
+`document parsing.` prompt, compatible F16 KV with Flash Attention off,
+deterministic sampling, and requires llama.cpp b10287+ (b10839 is audited). **There is no CMake/build flag for `max_tiles=32`.** The value
 comes from the projector GGUF metadata. For the full 32-tile Unlimited-OCR
 path, the mmproj must contain `clip.vision.preproc_max_tiles=32`; AutoTuner
 warns when an older projector would silently fall back to 9 tiles. Reconvert
@@ -787,20 +785,23 @@ When you start the tuner, you can choose between:
 
 #### KV precision and TurboQuant options
 
-Auto mode plans every placement against symmetric `q4_0` K/V as the
-capacity-first baseline across normal llama.cpp model families: context is
-never traded for precision, and a peer GPU is used only when Q4 plus the
-requested/native context does not fit the primary card. Since v5.4.1 Auto then
-takes a *free* precision upgrade: when symmetric `f16` or `q8_0` still reaches
-exactly the context that Q4 delivers within the same VRAM plan, the denser cache
-is chosen. Measured on b10797 Vulkan (R9700), Q4_0 K/V costs 4–9 % decode speed
-on a fully offloaded 27B hybrid and up to 24 % prompt speed at 16k depth on a
-full-attention 24B model versus F16, while Q8_0 is within 1–3 % of F16, so the
-upgrade is pure speed and recall quality on otherwise idle VRAM. Mixed K/V
-pairs are still avoided because their FlashAttention fallbacks vary by
-backend/build. Expert mode can still pin any supported K/V types explicitly.
-Dedicated non-llama-server runners that do not expose quantized KV (currently
-DiffusionGemma) continue to report their real F16 runtime contract.
+Since v5.4.3 Auto reserves for symmetric **Q8_0** K/V: the intended balance
+of long-context/tool-calling quality and memory, not a step toward F16/BF16.
+Spare memory never triggers an unquantised upgrade. If Q8 cannot hold the
+requested/native context in the usable **per-slot** budget, Auto falls back
+to symmetric Q4 and explains why. Lowering the context or explicitly pinning
+Q8 avoids that quality trade-off. A peer GPU may be used to preserve Q8 at the
+target context; peers with no usable memory remain excluded.
+
+Explicit K/V pins remain authoritative and their actual precision is included
+in placement. Automatic pairs stay symmetric for default CUDA/MLA compatibility.
+Flash Attention off (including Grok) and known head dimensions incompatible
+with quantisation use F16 as a compatibility exception. Changing Flash Attention
+now recomputes KV and memory rather than applying an unsafe late flag overlay.
+DiffusionGemma retains its forced-F16 runner contract; mainline diffusion-cli
+now receives the planned `-ctk`, `-ctv`, and `-fa` values. Existing manual profiles
+are not rewritten. Older measured Q4/F16 winners remain historical evidence but
+must be benchmarked again before automatic reuse with the new search policy.
 
 The Expert K/V dropdowns expose the mainline types `f16`, `bf16`, `q8_0`,
 `q5_0`, `q5_1`, `q4_0`, `q4_1`, and `iq4_nl`, plus fork-only `turbo2`,
@@ -849,7 +850,7 @@ patterns:
   - my-model-base
 
 max_context: 131072
-recommended_kv_quant: q4_0
+recommended_kv_quant: q8_0
 
 sampling:
   temperature: 0.7
@@ -867,7 +868,7 @@ notes: >
 ```
 
 `recommended_kv_quant` is retained for profile compatibility/documentation;
-from v5.3.2 normal Auto mode deliberately standardizes on Q4_0. Manual Expert
+from v5.4.3 normal Auto mode deliberately prefers Q8_0. Manual Expert
 K/V selections are the supported way to override that global default.
 
 Profiles with empty `patterns:` become the fallback when nothing else
@@ -897,7 +898,9 @@ matches. See `settings/_default.yaml`.
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
 | `glm-5_2.yaml` | GLM-5.2 + GLM-5.3 (non-Flash), 1M + IndexShare/MTP | `glm-dsa` |
 | `glm-5_3_flash.yaml` | GLM-5.3-Flash, 320B-A18B multimodal KDA/DSA hybrid | `glm5next` / `glm5-next` |
-| `hy4-preview.yaml` | Tencent Hy4 Preview, 770B-A49B, 1M (community patch required) | `hyv4` / `hy_v4` |
+| `hy4-preview.yaml` | Tencent Hy4 Preview, older community GGUF (patch required) | `hyv4` |
+| `hy4-mainline.yaml` | Tencent HY4 Preview, official mainline GGUF, b10813+ | `hy_v4` |
+| `spark2_5.yaml` | Spark X2.5 1.7B, 1M native context, b10828+ | `spark2_5` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
@@ -925,9 +928,9 @@ Notes on the new profiles:
   development caveats and the IQ3+ recommendation are recorded in the profile.
 - **Hy4 Preview** uses Tencent's official temp 0.9/top-p 1.0 sampling and
   1M native-context metadata, while AutoTuner still caps the actual context to
-  each selected quant/backend/system. Stock upstream llama.cpp does not yet
-  expose `hyv4`; the currently published 435-GiB Q4_K_M and 214-GiB STQ1_0
-  GGUFs require the community architecture patch documented by their author.
+  each selected quant/backend/system. Stock b10813+ supports the official
+  `hy_v4` GGUF format; older `hyv4` GGUFs still need their community patch.
+  Architecture metadata disambiguates these formats even with identical filenames.
   That conversion drops the native MTP layer, so the profile does not claim
   embedded speculative decoding.
 - **Qwen3.8** keeps a separate profile from Qwen3.5/3.6 because its official
@@ -981,14 +984,14 @@ Notes on the new profiles:
    CPU cores.
 2. **Place the model**: full GPU offload if it fits, else partial
    offload using the GGUF's exact `n_layers`, else CPU only.
-3. **Compute the KV budget**: free VRAM (after the model) plus free
-   RAM (minus a safety reserve).
-4. **Pick KV quant + context**: reserve for symmetric Q4_0, allocate the
-   resulting memory headroom to the largest safe context, then upgrade to
-   symmetric F16 or Q8_0 only when that exact context still fits (idle VRAM
-   becomes speed and recall quality, never less context). Explicit Expert
-   pins can choose another K/V type. Round automatic context down to a bounded
-   alignment.
+3. **Compute the KV budget**: use the actual KV placement pool after weights,
+   runtime buffers and safety reserves. GPU-only KV cannot borrow host RAM;
+   partial offload is bounded by both pools, unified memory is counted once.
+4. **Pick KV quant + context**: reserve for Q8 (or the explicit/compatible
+   pair), account for every parallel slot, and fall back to Q4 only if Q8
+   cannot hold the target. Never auto-upgrade to F16/BF16 for quality alone.
+   Explicit Expert pins can choose another K/V type. Round automatic context
+   down to a bounded alignment.
 5. **Threads / batch**: scale with placement (full GPU offload needs
    fewer CPU threads than CPU-only inference; long context wants
    smaller batches to keep prompt-prefill memory bounded).
@@ -1095,15 +1098,16 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10797)
+## Server features (compatible through llama.cpp b10839)
 
-Build/version probing, complete profile-command matrices, and backend smoke
-checks are validated through exact stock **b10797** (`832fd6f17`) on the local
-Windows Vulkan build (b10786 Vulkan/HIP were validated for v5.3.9). The
-b10760→b10797 help diffs add or remove no long option, so existing command
-generation remains current; the one semantic change since b10760 (preserved
-reasoning is the llama.cpp default for templates that support it) is
-documented in the table below. AutoTuner still quarantines the
+The exact **b10839** (`0cae43063`) source/help audit is recorded in
+[`docs/llama-b10839-audit.md`](docs/llama-b10839-audit.md). Since b10797,
+`--log-jsonl` / `--no-log-jsonl` are the only new server long options; both
+are supported through Extra CLI flags and pruned for older binaries. Text
+logging remains the default. A tracked flag manifest now validates every
+shipped profile in CI, not only on machines with local help captures.
+Simple/map-k n-gram value flags also prune their values correctly on old forks.
+AutoTuner still quarantines the
 upstream NextN regression in b10741-b10748 and points affected users to b10749+
 rather than letting llama-server abort during model or draft-context loading. The following
 `llama-server` features are supported (verified against `llama-server --help` /
@@ -1142,7 +1146,19 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--numa` | ✅ Already present |
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
-| Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; global Q4 Auto KV (`-fa off`), manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+| Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.3 — Q8 KV by default, llama.cpp b10839
+
+- Q8-first placement and cache selection, Q4 only for capacity, no automatic
+  F16/BF16 quality upgrade. Correct per-slot and one-sided-pin budgets.
+- Compatible F16 fallback for non-FA/head-dimension restrictions; Flash
+  Attention changes cascade through memory planning. Diffusion CLI enacts KV.
+- Spark X2.5 profile and separate mainline HY4 support; profile notes in all
+  nine languages. Exact b10839 flags checked by portable regression tests.
+- Old measured winners require a fresh search. Pages retains all historical
+  data and explicitly distinguishes it from the new Q8 policy.
+- Validation: [`docs/v5.4.3-validation.md`](docs/v5.4.3-validation.md).
 
 ### v5.4.2 — one instance, no leftover process
 

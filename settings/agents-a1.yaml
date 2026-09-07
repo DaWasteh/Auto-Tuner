@@ -22,9 +22,8 @@ patterns:
 # Following und Tool-Calling. Reasoning über <think>-Blöcke (Qwen3-Parser).
 # Native 262144 (256k) Kontext — wird via GGUF-Metadata gecappt.
 max_context: 262144
-# q5_0: wie bei Qwen3.5-A3B-MoE der Sweet-Spot — mehr VRAM bleibt für
-# Expert-Layer übrig (siehe Begründung in qwen3_5-3_6.yaml).
-recommended_kv_quant: q5_0
+# Q8 für Long-Context-/Tool-Calling-Qualität; Q4 nur bei knappem KV-Budget.
+recommended_kv_quant: q8_0
 
 # RoPE-Scaling (YaRN): gleiche Qwen3.5-Basis, gleiche Erweiterbarkeit.
 rope_scale:

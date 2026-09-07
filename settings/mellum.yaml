@@ -18,11 +18,9 @@ patterns:
 # Global-Attention-Layern (SWA-Layer bleiben kurz). Wird automatisch über
 # GGUF native_context begrenzt, daher hier den nativen 128k-Wert.
 max_context: 131072
-# MoE-A2.5B → q5_0 wie bei den Qwen3.5/3.6-MoE-Varianten: spart ggü. q8_0
-# ~37% KV-VRAM, sodass auf 16-GB-Karten mehr Expert-Layer im VRAM bleiben.
-# Für reine Sessions auf der 32-GB-R9700, wo eh alles passt, kann im
-# Expert-Panel q8_0 gepinnt werden.
-recommended_kv_quant: q5_0
+# Q8 ist das Qualitätsziel; nur bei zu knappem KV-Budget fällt Auto auf Q4
+# zurück. Die Speicherreservierung berücksichtigt Q8 vor der Platzierung.
+recommended_kv_quant: q8_0
 
 # RoPE-Scaling: aus. Das Modell IST bereits das YaRN-erweiterte 128k-Target;
 # weiter zu skalieren wird von JetBrains nicht unterstützt. Arch "mellum"

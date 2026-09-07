@@ -30,7 +30,7 @@ class ModelProfile:
     arch_fallback: List[str] = field(default_factory=list)
     max_context: int = 8192
     sampling: Dict[str, Any] = field(default_factory=dict)
-    recommended_kv_quant: str = "q4_0"
+    recommended_kv_quant: str = "q8_0"
     # Optional profile override for Flash Attention. None keeps AutoTuner's
     # normal default; OCR/reference-sensitive models can require it off.
     flash_attn: Optional[bool] = None
@@ -242,7 +242,7 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                 ],
                 max_context=int(data.get("max_context", 8192)),
                 sampling=sampling,
-                recommended_kv_quant=str(data.get("recommended_kv_quant", "q4_0")),
+                recommended_kv_quant=str(data.get("recommended_kv_quant", "q8_0")),
                 flash_attn=flash_attn,
                 min_llama_build=min_llama_build,
                 required_runtime_markers=[
@@ -328,6 +328,17 @@ def match_profile(
                 # Don't break — a later pattern in the same file might be longer
 
     if best is not None:
+        # A fork-specific filename can also name a newly supported upstream
+        # conversion (HY4: hyv4 versus hy_v4). When metadata explicitly names
+        # another claimed architecture, do not require the wrong fork marker.
+        if (
+            best.required_runtime_markers
+            and arch_lower
+            and arch_lower not in best.arch_fallback
+        ):
+            for p in profiles:
+                if arch_lower in p.arch_fallback:
+                    return p
         return best
 
     # No filename pattern matched — try the architecture fallback.

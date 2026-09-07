@@ -4,12 +4,10 @@ patterns:
   - hy4_preview
   - hy4preview
 
-# AngelSlim's community converter/runtime patch writes this architecture as
-# "hyv4". The official Transformers model_type is "hy_v4"; retain both as
-# fallbacks so future upstream converters do not miss the profile.
+# AngelSlim's patched GGUF architecture is incompatible with mainline hy_v4.
+# Official hy_v4 GGUFs use hy4-mainline.yaml instead (metadata-authoritative).
 arch_fallback:
   - hyv4
-  - hy_v4
 
 # Official Tencent model card/config: 1,048,576 native tokens. AutoTuner still
 # computes the actually affordable context from the selected quant, RAM/VRAM,
@@ -55,8 +53,8 @@ notes: >
   iHC residual streams, and native 1M context. Official sampling is temp=0.9,
   top_p=1.0, top_k disabled; reasoning defaults to high and can be changed by
   the embedded chat template's reasoning_effort parameter. IMPORTANT: stock
-  upstream llama.cpp does not yet contain the "hyv4" architecture at the time
-  of this profile. AngelSlim/Hy4-preview-GGUF documents a community patch based
+  upstream llama.cpp b10839 supports the separate "hy_v4" format, not these
+  "hyv4" GGUFs. AngelSlim/Hy4-preview-GGUF documents a community patch based
   on llama.cpp commit 0cea36222; both published GGUFs require that architecture
   patch. Their Q4_K_M is about 435 GiB and STQ1_0 about 214 GiB at full
   residency, so practical use needs datacenter-class aggregate VRAM or very

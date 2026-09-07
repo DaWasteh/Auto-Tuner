@@ -28,8 +28,8 @@ patterns:
 # Profil ist trotzdem korrekt, falls ein kleiner-quantisierter Build oder
 # zukünftig eine kompaktere Variante hinzukommt.
 max_context: 262144
-# MoE mit sehr vielen Experten → q5_0 spart KV-VRAM für mehr Expert-Layer.
-recommended_kv_quant: q5_0
+# Q8 ist das Qualitätsziel, Q4 nur der Speicher-Fallback für große Kontexte.
+recommended_kv_quant: q8_0
 
 # RoPE-Scaling: aus (256k nativ). Arch "step35" nicht in
 # _ROPE_SCALE_SUPPORTED_ARCHS — korrekt.

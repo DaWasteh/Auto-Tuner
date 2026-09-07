@@ -12,7 +12,7 @@ arch_fallback:
 # Keep the automatic profile at the trained window; GGUF native metadata is
 # still authoritative and may clamp this lower.
 max_context: 1048576
-recommended_kv_quant: q5_0
+recommended_kv_quant: q8_0
 min_llama_build: 10437
 performance_target: throughput
 

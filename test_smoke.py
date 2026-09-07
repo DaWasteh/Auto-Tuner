@@ -17,8 +17,6 @@ import sys
 import types
 from pathlib import Path
 
-import re
-
 import pytest
 
 # Widget-level GUI checks run without requiring a real display server.
@@ -42,6 +40,8 @@ def _non_blocking_long_message_dialog(monkeypatch):
         except Exception:
             return
     monkeypatch.setattr(qt_launcher._LongMessageDialog, "exec", lambda self: 1)
+
+
 sys.path.insert(0, str(ROOT))
 
 from hardware import GPUInfo, SystemInfo, detect_system, format_system  # noqa: E402
@@ -182,7 +182,7 @@ def test_qwen38_flash_next_profile_uses_qwen4exp_metadata_contract() -> None:
     assert profile.rope_scale_max_ctx == 262144
     assert profile.sampling["chat"] == profile.sampling["coding"]
     assert profile.ngram_method == "ngram-map-k4v"
-    assert profile.recommended_kv_quant == "q4_0"
+    assert profile.recommended_kv_quant == "q8_0"
     assert profile.performance_target == "safe"
     assert profile.min_llama_build == 10737
     assert match_profile("opaque-preview.gguf", profiles, "qwen4exp") is profile
@@ -355,25 +355,25 @@ def test_b10786_nemotron_profiles_and_exact_hybrid_names() -> None:
     # even when a GGUF omits *.ssm.* keys.
     from scanner import _HYBRID_ARCHS, metadata_is_hybrid_architecture
 
-    for arch in ("falcon-h1", "granitehybrid", "deepseek4", "nemotron_h_moe", "qwen4exp"):
+    for arch in (
+        "falcon-h1",
+        "granitehybrid",
+        "deepseek4",
+        "nemotron_h_moe",
+        "qwen4exp",
+    ):
         assert arch in _HYBRID_ARCHS
         assert metadata_is_hybrid_architecture({"general.architecture": arch})
     assert not metadata_is_hybrid_architecture({"general.architecture": "llama"})
 
 
 def test_latest_server_help_advertises_every_profile_flag() -> None:
-    """Every long option emitted directly by a shipped profile exists in the
-    newest exact llama-server help captured during an audit (b10797)."""
-    captures = sorted(
-        (ROOT / ".pi").glob("b*-llama-server-help.txt"),
-        key=lambda item: int(re.sub(r"\D", "", item.name.split("-", 1)[0]) or 0),
-    )
-    if not captures:
-        pytest.skip("no exact llama-server help capture is present")
-    help_file = captures[-1]
-    advertised = set(
-        re.findall(r"(?<![\w-])(--[a-z0-9][a-z0-9-]*)", help_file.read_text(encoding="utf-8", errors="replace"))
-    )
+    """The pinned b10839 flag manifest is tracked: this runs in CI too."""
+    import json
+
+    manifest = json.loads((ROOT / "docs/llama-b10839-server-flags.json").read_text())
+    assert manifest["tag"] == "b10839"
+    advertised = set(manifest["flags"])
     assert len(advertised) >= 300
     emitted: set[str] = set()
     for profile in load_profiles(SETTINGS_DIR):
@@ -1147,9 +1147,7 @@ def test_lazy_mode_b10700_compatibility_adaptation() -> None:
     import tuner
 
     current = ["llama-server", "--lazy-mode", "auto", "-m", "model.gguf"]
-    legacy, notes = tuner._adapt_lazy_mode_for_binary(
-        current, {"--tensor-read-lazy"}
-    )
+    legacy, notes = tuner._adapt_lazy_mode_for_binary(current, {"--tensor-read-lazy"})
     assert legacy[1:3] == ["--tensor-read-lazy", "auto"]
     assert "b10700 option rename" in notes[0]
 
@@ -1236,9 +1234,7 @@ def test_b10743_rejects_array_backed_nextn_target_but_allows_scalar_qwen(
 
     scalar_model = copy.deepcopy(model)
     scalar_model.metadata["glm-dsa.attention.head_count_kv"] = 4
-    allowed, message, detected = tuner.check_model_build(
-        scalar_model, "b10743-server"
-    )
+    allowed, message, detected = tuner.check_model_build(scalar_model, "b10743-server")
     assert allowed
     assert message == ""
     assert detected == 10743
@@ -1386,7 +1382,10 @@ def test_prompt_cache_reuse_follows_cache_ram(tmp_path) -> None:
     cmd = build_command(model, cfg, profile, enable_prompt_cache=True)
     idx = cmd.index("--cache-ram")
     assert cmd[idx + 1] == "2048"
-    assert cmd[idx + 2 : idx + 4] == ["--cache-reuse", str(PROMPT_CACHE_REUSE_MIN_CHUNK)]
+    assert cmd[idx + 2 : idx + 4] == [
+        "--cache-reuse",
+        str(PROMPT_CACHE_REUSE_MIN_CHUNK),
+    ]
     assert PROMPT_CACHE_REUSE_MIN_CHUNK == 256
 
     # Disabled cache → no reuse flag either.
@@ -1401,7 +1400,11 @@ def test_prompt_cache_reuse_follows_cache_ram(tmp_path) -> None:
 
     # An Expert/profile override wins and never duplicates the flag.
     custom = build_command(
-        model, cfg, profile, enable_prompt_cache=True, extra_args=["--cache-reuse", "512"]
+        model,
+        cfg,
+        profile,
+        enable_prompt_cache=True,
+        extra_args=["--cache-reuse", "512"],
     )
     assert custom.count("--cache-reuse") == 1
     assert custom[custom.index("--cache-reuse") + 1] == "256"
@@ -1701,9 +1704,7 @@ def test_launch_button_recovers_after_selection_and_benchmark_cleanup(
     window.close()
 
 
-def test_hardware_bar_wraps_without_widening_main_window(
-    tmp_path, monkeypatch
-) -> None:
+def test_hardware_bar_wraps_without_widening_main_window(tmp_path, monkeypatch) -> None:
     """Long hardware text stays width-neutral and wraps below its measured fit."""
     global _QT_TEST_APP
 
@@ -3086,9 +3087,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     assert window._language_combo.findData("builtin:el-GR") >= 0
     assert window._language_combo.findData("builtin:pl-PL") >= 0
     assert window._language_combo.findData("builtin:ru-RU") >= 0
-    assert window._language_combo.findData(
-        qt_launcher.CUSTOM_LANGUAGE_ACTION
-    ) >= 0
+    assert window._language_combo.findData(qt_launcher.CUSTOM_LANGUAGE_ACTION) >= 0
 
     window._btn_more.click()
     _QT_TEST_APP.processEvents()
@@ -3108,9 +3107,12 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     _QT_TEST_APP.processEvents()
     assert window._btn_settings.text() == "⚙ Einstellungen"
     assert window._btn_models_folder.text() == "📂 Modellordner"
-    assert window._language_combo.itemText(
-        window._language_combo.findData(qt_launcher.CUSTOM_LANGUAGE_ACTION)
-    ) == "Eigenes Sprachpaket…"
+    assert (
+        window._language_combo.itemText(
+            window._language_combo.findData(qt_launcher.CUSTOM_LANGUAGE_ACTION)
+        )
+        == "Eigenes Sprachpaket…"
+    )
     assert qt_launcher.app_settings.get_language_id() == "builtin:de-DE"
     window._language_combo.setCurrentIndex(
         window._language_combo.findData("builtin:en-GB")
@@ -4160,20 +4162,15 @@ def _fake_dual_gpu_system(
     )
 
 
-def test_multi_gpu_pins_to_largest_when_model_and_q4_kv_fit(tmp_path) -> None:
-    """Keep the peer GPU free when requested context and Q4 KV fit.
-
-    The single-GPU decision is made against the Q4_0 capacity baseline. The
-    free precision upgrade may then pick F16 for the 32k request because it
-    still fits the pinned card; it must never re-open the peer GPU.
-    """
+def test_multi_gpu_pins_to_largest_when_model_and_q8_kv_fit(tmp_path) -> None:
+    """Keep the peer free when Q8 fits; never upgrade Auto to F16."""
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_model(tmp_path, "Qwen3.5-9B-Q8_0", size_gb=9.0)
     profile = match_profile(model.name, profiles)
     cfg = compute_config(model, _fake_dual_gpu_system(), profile, user_ctx=32768)
 
     assert cfg.ctx == 32768
-    assert cfg.cache_k == cfg.cache_v == "f16"
+    assert cfg.cache_k == cfg.cache_v == "q8_0"
     assert cfg.tensor_split is not None, "Expected tensor_split to be set"
     assert cfg.main_gpu == 0, f"Expected main_gpu=0 (largest), got {cfg.main_gpu}"
 
@@ -4219,15 +4216,10 @@ def _fake_qwen38_27b_model(tmp_path, name: str, size_gb: float):
         ("Qwen3.8-27B-UD-Q8_K_XL", 29.30),
     ],
 )
-def test_qwen38_dual_gpu_preserves_full_context_with_q4_default(
+def test_qwen38_dual_gpu_preserves_full_context_with_q8_default(
     tmp_path, name, size_gb
 ) -> None:
-    """Every weight quant keeps native context; precision is a free bonus.
-
-    Placement and the single-card decision are still planned against the
-    Q4_0 baseline. When idle VRAM lets Q8_0/F16 hold the same 262k window,
-    Auto takes it without spreading a variant that used to stay pinned.
-    """
+    """Every weight quant gets Q8 at native context, using a peer if needed."""
     profiles = load_profiles(SETTINGS_DIR)
     model = _fake_qwen38_27b_model(tmp_path, name, size_gb)
     profile = match_profile(model.name, profiles, model.architecture)
@@ -4248,15 +4240,15 @@ def test_qwen38_dual_gpu_preserves_full_context_with_q4_default(
     )
 
     assert cfg.ctx == 262144
-    assert cfg.cache_k == cfg.cache_v
-    assert cfg.cache_k in {"f16", "q8_0", "q4_0"}
-    if size_gb < 20:
-        # Q3/Q4/Q5 fit the R9700 alone with the Q4 baseline; the precision
-        # upgrade must not pull the RX 9070 XT in.
+    assert cfg.cache_k == cfg.cache_v == "q8_0"
+    if size_gb < 18:
+        # Q3/Q4 fit the R9700 alone even with Q8 KV.
         assert cfg.tensor_split is None
+    else:
+        # Q5/Q6/Q8 use the peer to preserve Q8 at the full native context.
+        assert cfg.tensor_split is not None
 
-    # Small variants may now stay on the R9700 because Auto no longer spreads
-    # solely to upgrade KV precision. Larger variants still use both cards.
+    # Every per-device weight + KV footprint must still respect its cap.
     from tuner import _gpu_usable_cap_gb
 
     footprint = (
@@ -4443,8 +4435,8 @@ def test_qwen4exp_plans_130k_with_lazy_ple_active_residency(
     assert cfg.estimated_model_vram_gb + cfg.estimated_model_ram_gb == pytest.approx(
         model.placement_size_gb
     )
-    assert (cfg.cache_k, cfg.cache_v) == ("q4_0", "q4_0")
-    assert cfg.estimated_kv_gb == pytest.approx(1.319, rel=0.03)
+    assert (cfg.cache_k, cfg.cache_v) == ("q8_0", "q8_0")
+    assert cfg.estimated_kv_gb == pytest.approx(2.250, rel=0.03)
     assert cfg.runtime_vram_overhead_gb == pytest.approx(0.558, rel=0.05)
     assert cfg.runtime_ram_overhead_gb == pytest.approx(7.17, rel=0.05)
     assert "file-backed" in (cfg.warning or "")
@@ -4758,9 +4750,11 @@ def test_second_server_avoids_full_primary(tmp_path) -> None:
     }
     cfg = compute_config(model, sys_info, profile, gpu_priorities=prio)
 
-    # The model fits on the 9070 XT alone → exclusive pin to its Vulkan
-    # index (small_vk_idx=0), and the (full) R9700 must be hidden.
-    assert cfg.full_offload is True
+    # Reserve Q8 KV, allowing a few CPU layers rather than occupying the
+    # already full peer. The 9070 XT remains the only visible GPU.
+    assert cfg.cache_k == cfg.cache_v == "q8_0"
+    assert cfg.ngl > 0
+    assert cfg.estimated_model_vram_gb + cfg.kv_vram_gb < 13
     assert cfg.env_overrides.get("GGML_VK_VISIBLE_DEVICES") == "0", (
         "second server must pin to the only card with free VRAM (9070 XT, "
         f"Vulkan 0); got {cfg.env_overrides.get('GGML_VK_VISIBLE_DEVICES')!r}"
@@ -6170,7 +6164,6 @@ def test_granite42_template_detects_reasoning_and_tool_calling() -> None:
         assert metadata_supports_tool_use({}, stripped_name)
 
 
-
 def test_thinking_detection_excludes_qwen3_2507_instruct() -> None:
     """Qwen3-2507-Instruct is the explicitly non-thinking branch — even
     if it inherits a generic template that mentions <think>, the filename
@@ -6576,9 +6569,8 @@ def test_alternate_kv_head_key_is_used_by_sizing() -> None:
     assert not any(w.id == "KV-HEAD-COUNT-MISSING" for w in audit_model_metadata(model))
 
 
-def test_auto_kv_upgrades_precision_only_when_context_is_free() -> None:
-    """Q4_0 stays the capacity baseline; denser caches are taken only when they
-    reach exactly the same context (measured: Q4_0 costs 4–24 % speed)."""
+def test_auto_kv_prefers_q8_and_falls_back_only_for_capacity() -> None:
+    """Q8 is the ceiling even with ample memory; Q4 is the capacity fallback."""
     from tuner import _pick_kv_quant
 
     def pick(budget_gb: float, target_ctx: int = 262144):
@@ -6593,8 +6585,8 @@ def test_auto_kv_upgrades_precision_only_when_context_is_free() -> None:
             base_v_per_token_mb=0.03125,
         )
 
-    # 20 GB holds 262k tokens at F16 (16.0 GB): full precision is free.
-    assert pick(20.0) == ("f16", "f16")
+    # Even 20 GB (enough for F16) must retain the Q8 standard.
+    assert pick(20.0) == ("q8_0", "q8_0")
     # 10 GB holds 262k only at Q8_0 (~8.5 GB); F16 would cost context.
     assert pick(10.0) == ("q8_0", "q8_0")
     # 5 GB reaches 262k only with Q4_0 (~4.5 GB).
@@ -6602,12 +6594,18 @@ def test_auto_kv_upgrades_precision_only_when_context_is_free() -> None:
     # Budget-limited case: Q4_0 delivers ~35k here, and no denser pair can
     # match that, so context wins over precision.
     assert pick(0.6) == ("q4_0", "q4_0")
-    # A small explicit request that every pair satisfies takes F16.
-    assert pick(0.6, target_ctx=4096) == ("f16", "f16")
+    # A small explicit request that every pair satisfies still takes Q8.
+    assert pick(0.6, target_ctx=4096) == ("q8_0", "q8_0")
     # TurboQuant forks map the chosen pair to their tiers.
     turbo = _pick_kv_quant(
-        "q5_0", 262144, 0.0625, 20.0, 262144, turbo=True,
-        base_k_per_token_mb=0.03125, base_v_per_token_mb=0.03125,
+        "q5_0",
+        262144,
+        0.0625,
+        20.0,
+        262144,
+        turbo=True,
+        base_k_per_token_mb=0.03125,
+        base_v_per_token_mb=0.03125,
     )
     assert turbo == ("turbo4", "turbo4")
 
@@ -8375,9 +8373,11 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         "presence_penalty": 0.0,
     }
     assert "--jinja" in hy4.extra_args
-    assert "stock upstream llama.cpp does not yet" in hy4.notes
+    assert 'separate "hy_v4" format' in hy4.notes
     assert "cannot use embedded speculative decoding" in hy4.notes
-    assert match_profile("opaque-hy4.gguf", profiles, "hy_v4") is hy4
+    stock_hy4 = match_profile("opaque-hy4.gguf", profiles, "hy_v4")
+    assert stock_hy4.source_file == "hy4-mainline.yaml"
+    assert stock_hy4.required_runtime_markers == []
 
     glm52 = match_profile("GLM-5.2-UD-Q4_K_XL.gguf", profiles, "glm-dsa")
     assert glm52.source_file == "glm-5_2.yaml"
@@ -8417,20 +8417,22 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         == "deepseek-r1-v3.yaml"
     )
 
-    granite42 = match_profile(
-        "granite-4.2-30b-Q6_K.gguf", profiles, "granite"
-    )
+    granite42 = match_profile("granite-4.2-30b-Q6_K.gguf", profiles, "granite")
     assert granite42.source_file == "granite-4_2.yaml"
     assert granite42.max_context == 131072
     assert granite42.arch_fallback == []
-    assert granite42.sampling["chat"] == granite42.sampling["coding"] == {
-        "temperature": 1.0,
-        "top_k": 0,
-        "top_p": 0.95,
-        "min_p": 0.0,
-        "repeat_penalty": 1.0,
-        "presence_penalty": 0.0,
-    }
+    assert (
+        granite42.sampling["chat"]
+        == granite42.sampling["coding"]
+        == {
+            "temperature": 1.0,
+            "top_k": 0,
+            "top_p": 0.95,
+            "min_p": 0.0,
+            "repeat_penalty": 1.0,
+            "presence_penalty": 0.0,
+        }
+    )
     assert "--jinja" in granite42.extra_args
     assert granite42.ngram_method == "ngram-mod"
     # The shared `granite` architecture must not steal older checkpoints.
@@ -8456,7 +8458,7 @@ def test_v511_new_model_profiles_and_architecture_fallbacks() -> None:
         ("opaque-c2.gguf", "bailingmoe3", "ling-3.yaml"),
         ("opaque-d.gguf", "glm-dsa", "glm-5_2.yaml"),
         ("opaque-d2.gguf", "hyv4", "hy4-preview.yaml"),
-        ("opaque-d3.gguf", "hy_v4", "hy4-preview.yaml"),
+        ("opaque-d3.gguf", "hy_v4", "hy4-mainline.yaml"),
         ("opaque-d4.gguf", "glm5next", "glm-5_3_flash.yaml"),
         ("opaque-d5.gguf", "glm5-next", "glm-5_3_flash.yaml"),
         ("opaque-e.gguf", "deepseek4", "deepseek-v4.yaml"),

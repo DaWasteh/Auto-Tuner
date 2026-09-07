@@ -20,7 +20,7 @@ min_llama_build: 10737
 # block. Do not inherit the separate Qwen3.8 27B/2.4T profile's optional 1M
 # YaRN claim until the Flash-Next model/runtime publishes that contract.
 max_context: 262144
-recommended_kv_quant: q4_0
+recommended_kv_quant: q8_0
 
 rope_scale:
   enabled: false

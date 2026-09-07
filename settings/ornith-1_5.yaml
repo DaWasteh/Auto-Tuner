@@ -6,7 +6,7 @@ patterns:
 
 # No arch_fallback: Ornith shares qwen35/qwen35moe with generic Qwen3.5/3.6.
 max_context: 262144
-recommended_kv_quant: q5_0
+recommended_kv_quant: q8_0
 performance_target: throughput
 
 rope_scale:

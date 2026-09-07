@@ -8,7 +8,7 @@ arch_fallback:
   - minimax-m3
 
 max_context: 1048576
-recommended_kv_quant: q5_0
+recommended_kv_quant: q8_0
 flash_attn: true
 min_llama_build: 10142
 performance_target: throughput

@@ -47,17 +47,13 @@ MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[
 ].moe_placement_ctx_target
 MOE_KV_RESERVE_FRAC = 0.06
 
-# Capacity-first stock llama.cpp KV default. Q4_0/Q4_0 is supported by the
-# current Vulkan and HIP FlashAttention paths and avoids mixed-quant backend
-# fallbacks. Expert/manual pins remain authoritative, and runner-specific
-# exceptions (currently DiffusionGemma) still report the cache they really use.
-DEFAULT_KV_CACHE_TYPE = "q4_0"
-# Denser symmetric K/V pairs Auto may take instead of the Q4_0 baseline when
-# they reach the very same context (see ``_pick_kv_quant``). Highest first.
-KV_PRECISION_UPGRADE_PAIRS: Tuple[Tuple[str, str], ...] = (
-    ("f16", "f16"),
-    ("q8_0", "q8_0"),
-)
+# Q8_0 is the quality/memory default for long context and tool calling.
+# Plan placement for Q8, never upgrade Auto to F16/BF16 just to fill memory.
+# Q4 is a capacity fallback only; symmetric pairs also work with default CUDA
+# FA builds (Q5/mixed pairs can require GGML_CUDA_FA_ALL_QUANTS).
+# Manual pins and runner-specific compatibility exceptions remain authoritative.
+DEFAULT_KV_CACHE_TYPE = "q8_0"
+KV_CAPACITY_FALLBACK_TYPE = "q4_0"
 
 # Default host-RAM prompt-cache size in MiB (``--cache-ram``). A bounded,
 # computed default replaces the previous unlimited/uncomputed value so the
@@ -233,6 +229,12 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--spec-draft-ngl",
     "--spec-draft-p-min",
     "--spec-draft-p-split",
+    "--spec-ngram-simple-min-hits",
+    "--spec-ngram-simple-size-m",
+    "--spec-ngram-simple-size-n",
+    "--spec-ngram-map-k-min-hits",
+    "--spec-ngram-map-k-size-m",
+    "--spec-ngram-map-k-size-n",
     "--spec-ngram-map-k4v-min-hits",
     "--spec-ngram-map-k4v-size-m",
     "--spec-ngram-map-k4v-size-n",
@@ -339,7 +341,18 @@ def _filter_command_for_supported_flags(
         if _is_flag_token(tok):
             flag = _flag_name(tok)
             takes_value = "=" not in tok and flag in _ARG_FLAGS_WITH_VALUES
-            if flag not in supported:
+            # KV precision/FA are a memory contract, not optional features.
+            # Keep unsupported cache controls so the runtime rejects the
+            # launch rather than silently allocating its larger default KV.
+            required_cache_flag = flag in {
+                "-ctk",
+                "--cache-type-k",
+                "-ctv",
+                "--cache-type-v",
+                "-fa",
+                "--flash-attn",
+            }
+            if flag not in supported and not required_cache_flag:
                 chunk = [tok]
                 i += 1
                 # Consume the flag's value as well: for known value-flags
@@ -813,9 +826,7 @@ def mtp_sidecar_missing_root_tensors(
     target_roots = _entry_root_tensors(target)
     if draft_roots is None or target_roots is None or not target_roots:
         return []
-    required = {
-        name for name in target_roots if name not in _OPTIONAL_ROOT_TENSORS
-    }
+    required = {name for name in target_roots if name not in _OPTIONAL_ROOT_TENSORS}
     return sorted(required - draft_roots)
 
 
@@ -1977,6 +1988,9 @@ class TunedConfig:
     # is shown so the user can see why context is throttled.
     kv_vram_gb: float = 0.0
     kv_ram_gb: float = 0.0
+    # Share of the current attention-KV bytes belonging to K. Retain this
+    # through manual snapshots so unequal K/V precision changes stay exact.
+    kv_key_fraction: float = 0.5
     # Fixed F32 recurrent state for Mamba/RWKV/linear-attention layers.
     # This is separate from context-growing attention KV.
     recurrent_state_vram_gb: float = 0.0
@@ -2180,6 +2194,7 @@ def _decide_moe_offload(
     batch_vram_reserve_gb: float = 0.0,
     n_parallel: int = 1,
     rope_scaling: bool = False,
+    kv_quant_scale: Optional[float] = None,
 ) -> Tuple[int, Optional[int], float, float, bool]:
     """Decide how to split an MoE model between GPU and CPU.
 
@@ -2204,14 +2219,18 @@ def _decide_moe_offload(
     shared_overhead_gb = model_size_gb * 0.08
     per_layer_expert_gb = max(0.001, (model_size_gb - shared_overhead_gb) / n_layers)
 
-    # ---- KV reservation in VRAM (global Q4_0 default) -------------------
+    # ---- KV reservation in VRAM (Q8 or explicit/compatible pair) --------
     # Cap at moe_placement_ctx_target so we don't pessimise layer placement
     # for huge profile_max values (Qwen3.6 → 262k, but most users run 32k).
     kv_reservation_ctx = max(2048, min(target_ctx, moe_placement_ctx_target))
     kv_reserve_gb = (
         kv_reservation_ctx
         * base_kv_per_token_mb
-        * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
+        * (
+            kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
+            if kv_quant_scale is None
+            else kv_quant_scale
+        )
         * max(1, n_parallel)
     ) / 1024.0
 
@@ -2510,6 +2529,36 @@ def _turbo_quant_for(label: str) -> str:
     return _TURBO_QUANT_MAP.get(label.lower(), label)
 
 
+def _auto_kv_requires_f16(model: ModelEntry, flash_attn: bool) -> str:
+    """Known upstream restrictions, not a quality preference or profile hint.
+
+    b10839 requires FA for quantised V and 32-element-aligned head dimensions
+    for Q8/Q4. Inspect scalar, broadcast and per-layer GGUF dimensions; leave
+    unknown dimensions to the runtime instead of inventing incompatibility.
+    Keep the automatic pair symmetric for MLA/default CUDA compatibility.
+    """
+    if not flash_attn:
+        return "Flash Attention is disabled; quantised V cache is unsupported"
+    md = model.metadata or {}
+    arch = model.architecture
+    for side in ("key", "value"):
+        for suffix in (f"attention.{side}_length", f"attention.{side}_length_swa"):
+            value = _metadata_arch_value(md, arch, (suffix,))
+            values = value if isinstance(value, list) else [value]
+            if value is None and suffix.endswith("_length"):
+                heads = _metadata_arch_int(md, arch, "attention.head_count")
+                embd = _metadata_arch_int(md, arch, "embedding_length")
+                values = [embd // heads] if heads > 0 and embd > 0 else []
+            for dim in values:
+                try:
+                    n = int(dim)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0 and n % 32:
+                    return f"{suffix}={n} is not aligned to Q8/Q4's 32-element blocks"
+    return ""
+
+
 def _pick_kv_quant(
     profile_recommended: str,
     target_ctx: int,
@@ -2521,31 +2570,21 @@ def _pick_kv_quant(
     asymmetric: bool = True,  # Vulkan b9106+ supports asymmetric FA
     base_k_per_token_mb: Optional[float] = None,
     base_v_per_token_mb: Optional[float] = None,
+    force_cache_k: Optional[str] = None,
+    force_cache_v: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """Return the capacity-first automatic K/V cache pair.
+    """Prefer symmetric Q8_0; use Q4_0 only when Q8 cannot hold the target.
 
-    Symmetric Q4_0 (``DEFAULT_KV_CACHE_TYPE``) remains the capacity baseline:
-    it is what every placement step reserves for and it never sacrifices
-    context to precision. Since v5.4.1 Auto additionally takes a *free*
-    precision upgrade: when F16 or Q8_0 still reaches exactly the context that
-    Q4_0 would deliver (the requested/native limit, or the budget-limited
-    value), the denser cache is chosen. That never changes placement, never
-    pulls in a second GPU, and never shrinks the context; it only spends VRAM
-    that would otherwise stay idle.
+    Placement reserves for Q8_0. Even unlimited headroom never upgrades Auto
+    to F16/BF16: Q8 is the intended quality/memory trade-off, not an intermediate
+    step toward unquantised KV. A memory-limited request may fall back to Q4;
+    when neither pair fits, Q4 delivers the largest safe context.
 
-    Why it matters: measured on b10797 Vulkan (R9700), a symmetric Q4_0 cache
-    costs 4–9 % decode speed on a fully offloaded 27B hybrid and up to 24 %
-    prompt-processing speed at 16k depth on a full-attention 24B model versus
-    F16, while Q8_0 is within 1–3 % of F16. The quantised cache also lowers
-    long-context recall quality. Symmetric F16/Q8_0 pairs are supported by
-    every FlashAttention backend, so no mixed K/V fallback differences arise.
-
-    The historical ``profile_recommended`` and ``asymmetric`` parameters remain
-    in the public signature for compatibility, but do not raise precision on
-    their own. Manual Expert pins remain untouched by :func:`compute_config`.
-    With ``turbo=True`` the chosen pair maps to the fork-only TurboQuant tiers.
-    Runner-specific paths that cannot apply cache quantisation bypass this
-    helper and report their real F16 cache.
+    ``kv_budget_gb`` is the usable PER-SLOT budget after compute headroom.
+    Historical profile recommendations/asymmetry remain signature-compatible
+    but do not override the global policy. Manual Expert pins are handled by
+    :func:`compute_config`. Explicit Turbo-KV opt-in maps to fork-only tiers;
+    runners that cannot apply quantisation bypass this helper.
     """
     # Beschränke target_ctx auf Modell-Maximum wenn nötig.
     if model_max_ctx > 0 and target_ctx > model_max_ctx:
@@ -2554,7 +2593,10 @@ def _pick_kv_quant(
     # Read the legacy arguments so static analyzers and third-party wrappers
     # can keep calling the old signature without implying they affect Auto.
     _ = profile_recommended, asymmetric
-    pairs: List[Tuple[str, str]] = [(DEFAULT_KV_CACHE_TYPE, DEFAULT_KV_CACHE_TYPE)]
+    pairs = tuple(
+        (force_cache_k or quant, force_cache_v or quant)
+        for quant in (DEFAULT_KV_CACHE_TYPE, KV_CAPACITY_FALLBACK_TYPE)
+    )
 
     budget_mb = kv_budget_gb * 1024 * 0.98
 
@@ -2582,7 +2624,8 @@ def _pick_kv_quant(
     for k, v in pairs:
         per_tok = _per_token_for_pair(k, v)
         if per_tok <= 0:
-            continue
+            chosen_k, chosen_v = k, v
+            break
         max_fit = int(budget_mb / per_tok)
         if max_fit >= target_ctx:
             chosen_k, chosen_v = k, v
@@ -2590,20 +2633,6 @@ def _pick_kv_quant(
     else:
         # Nothing in the table fit — fall back to the most aggressive entry.
         chosen_k, chosen_v = pairs[-1]
-
-    # Free precision upgrade: the context the Q4_0 baseline delivers is the
-    # contract; any denser symmetric pair that still reaches it wins.
-    baseline_per_tok = _per_token_for_pair(chosen_k, chosen_v)
-    if baseline_per_tok > 0 and target_ctx > 0:
-        baseline_ctx = min(int(budget_mb / baseline_per_tok), target_ctx)
-        if baseline_ctx > 0:
-            for k, v in KV_PRECISION_UPGRADE_PAIRS:
-                per_tok = _per_token_for_pair(k, v)
-                if per_tok <= 0:
-                    continue
-                if int(budget_mb / per_tok) >= baseline_ctx:
-                    chosen_k, chosen_v = k, v
-                    break
 
     if turbo:
         chosen_k = _turbo_quant_for(chosen_k)
@@ -2748,6 +2777,7 @@ def compute_config(
     turbo_kv: bool = False,  # Map quants → TurboQuant equivalents
     force_cache_k: Optional[str] = None,  # Pin K-quant; ctx adjusts
     force_cache_v: Optional[str] = None,  # Pin V-quant; ctx adjusts
+    force_flash_attn: Optional[bool] = None,  # KV compatibility must cascade
     force_ngl: Optional[int] = None,  # Pin layer offload count
     force_n_cpu_moe: Optional[int] = None,  # Pin MoE CPU-layer count
     force_n_parallel: Optional[int] = None,  # Pin --parallel slot count
@@ -3051,6 +3081,32 @@ def compute_config(
     )
     runtime_ram_overhead_gb = 0.0
 
+    flash_attn = (
+        bool(profile.flash_attn)
+        if getattr(profile, "flash_attn", None) is not None
+        else True
+    )
+    if force_flash_attn is not None:
+        flash_attn = bool(force_flash_attn)
+    # Upstream forcibly disables FA for Grok regardless of CLI preference.
+    if model_arch == "grok":
+        flash_attn = False
+    kv_compatibility_reason = _auto_kv_requires_f16(model, flash_attn)
+    auto_quant = "f16" if kv_compatibility_reason else DEFAULT_KV_CACHE_TYPE
+    placement_k = force_cache_k or auto_quant
+    placement_v = force_cache_v or auto_quant
+    if is_diffusion_gemma:
+        placement_k = placement_v = "f16"
+    elif turbo_kv and not kv_compatibility_reason:
+        placement_k, placement_v = (
+            _turbo_quant_for(placement_k),
+            _turbo_quant_for(placement_v),
+        )
+    placement_kv_per_tok = base_k_mb * kv_quant_factor(
+        placement_k
+    ) + base_v_mb * kv_quant_factor(placement_v)
+    placement_kv_scale = placement_kv_per_tok / base_kv_mb if base_kv_mb > 0 else 1.0
+
     # ---- (0.5) Calculate VRAM reserved for Vision + Draft models
     # These MUST be on GPU for optimal performance — UNLESS the user asked
     # to keep the mmproj in system RAM (--no-mmproj-offload). In that case
@@ -3246,6 +3302,7 @@ def compute_config(
             params_billion=params_b,
             target_ctx=target_ctx_for_placement,
             base_kv_per_token_mb=base_kv_mb,
+            kv_quant_scale=placement_kv_scale,
             ram_safety_gb=ram_safety_gb,
             moe_vram_safety_gb=moe_placement_safety_gb,
             moe_placement_ctx_target=perf_target.moe_placement_ctx_target,
@@ -3287,6 +3344,7 @@ def compute_config(
                 params_billion=params_b,
                 target_ctx=target_ctx_for_placement,
                 base_kv_per_token_mb=base_kv_mb,
+                kv_quant_scale=placement_kv_scale,
                 ram_safety_gb=ram_safety_gb,
                 moe_vram_safety_gb=moe_placement_safety_gb,
                 moe_placement_ctx_target=shrunk_target,
@@ -3323,7 +3381,7 @@ def compute_config(
     else:
         # Reserve VRAM for the KV cache before placing dense weight layers,
         # sized by the tier's dense_kv_reserve_ctx (0 for low_vram, whose KV
-        # goes to RAM instead). Use the same Q4_0 pair Auto will emit so layer
+        # goes to RAM instead). Reserve for the preferred Q8_0 pair so layer
         # placement and final context are planned against one cache contract.
         # Capped at the model's native context so we never
         # reserve for tokens the model can't address.
@@ -3338,7 +3396,7 @@ def compute_config(
             if native_ctx > 0:
                 reserve_ctx = min(reserve_ctx, native_ctx)
             desired_dense_kv_reserve_gb += (
-                reserve_ctx * base_kv_mb * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
+                reserve_ctx * placement_kv_per_tok * n_parallel
             ) / 1024.0
         model_weights_fit_vram = (
             placement_model_size_gb
@@ -3439,10 +3497,9 @@ def compute_config(
     )
 
     # Prefer one GPU when it can deliver the requested/model-maximum context
-    # with the global Q4_0 cache default. Before v5.3.2 this gate required F16,
-    # so Auto spread onto an otherwise idle peer solely to upgrade KV precision.
-    # Q4 is now the explicit capacity-first contract: preserve context first,
-    # then keep peer GPUs free whenever the Q4 cache and fixed footprint fit.
+    # with the global Q8_0 cache default. Use a peer when Q8 needs its memory,
+    # but never spread merely to obtain unquantised F16/BF16 KV.
+    # Keep peers free whenever Q8 and the fixed footprint fit the primary.
     # A hard force_gpu pin remains authoritative even when it sacrifices context.
     planned_single_gpu = forced_gpu is not None
     gpu_budget_free_vram = free_vram
@@ -3482,10 +3539,7 @@ def compute_config(
                 quality_rope_scaling,
             )
             default_kv_gb = (
-                quality_target_ctx
-                * base_kv_mb
-                * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
-                * n_parallel
+                quality_target_ctx * placement_kv_per_tok * n_parallel
             ) / 1024.0
             if default_kv_gb <= primary_usable_kv_budget * 0.98:
                 planned_single_gpu = True
@@ -3662,8 +3716,9 @@ def compute_config(
         and native_ctx > 0
         and native_ctx < profile_rope_max
     ):
-        # KV-Speicherbedarf pro Token (globales Q4_0-Auto-Default)
-        kv_per_tok_q4 = base_kv_mb * kv_quant_factor(DEFAULT_KV_CACHE_TYPE)
+        # The RoPE capacity ceiling must include the Q4 memory fallback;
+        # final selection still prefers Q8 if the resulting target fits.
+        kv_per_tok_min = base_kv_mb * kv_quant_factor(KV_CAPACITY_FALLBACK_TYPE)
 
         # ---- RoPE-Ziel-Context ----------------------------------------
         # Wie weit wir via YaRN ausdehnen wollen. Das alte Gate prüfte
@@ -3701,8 +3756,8 @@ def compute_config(
             # verkleinert, daher fällt der finale ctx (max_fit_ctx) etwas
             # kleiner aus — model_ctx_limit fängt das über min() ab.
             budget_ctx = (
-                int((kv_budget_per_slot_gb * 1024) / kv_per_tok_q4)
-                if kv_per_tok_q4 > 0
+                int((kv_budget_per_slot_gb * 1024) / kv_per_tok_min)
+                if kv_per_tok_min > 0
                 else 0
             )
 
@@ -3777,14 +3832,9 @@ def compute_config(
     # respect the user's pair as-is; when only one is pinned we still
     # let _pick_kv_quant decide the other within budget.
     #
-    # NVIDIA CUDA builds default GGML_CUDA_FA_ALL_QUANTS=OFF. At b9888 the
-    # CUDA FlashAttention selector correctly validates BOTH K and V cache
-    # types, but without FA_ALL_QUANTS it still requires K == V. Because the
-    # AutoTuner deliberately emits `-fa on`, automatic K/V asymmetry would be
-    # risky on NVIDIA CUDA systems (high- and low-VRAM alike): it can disable
-    # the FA kernel or abort depending on the model/backend. Keep auto KV
-    # symmetric on NVIDIA; AMD's common AutoTuner builds are Vulkan/ROCm and
-    # keep the asymmetric headroom win. Manual Expert pins are left untouched.
+    # Default CUDA FA builds require supported symmetric quant pairs.
+    # Auto therefore stays symmetric on all vendors; keep the legacy
+    # asymmetric argument for caller compatibility. Manual pins are untouched.
     primary_vendor = (
         primary_gpu.vendor if primary_gpu else system.primary_vendor
     ).lower()
@@ -3809,24 +3859,30 @@ def compute_config(
         else:
             kv_quant_strategy = "manual"
     else:
-        cache_k, cache_v = _pick_kv_quant(
-            profile.recommended_kv_quant,
-            target_ctx,
-            base_kv_mb,
-            kv_budget_gb,
-            model_ctx_limit,
-            turbo=turbo_kv,
-            asymmetric=auto_asymmetric_kv,
-            base_k_per_token_mb=base_k_mb,
-            base_v_per_token_mb=base_v_mb,
-        )
+        if kv_compatibility_reason:
+            cache_k, cache_v = "f16", "f16"
+            kv_quant_strategy = "compatibility-f16"
+        else:
+            cache_k, cache_v = _pick_kv_quant(
+                profile.recommended_kv_quant,
+                target_ctx,
+                base_kv_mb,
+                kv_budget_gb / n_parallel,
+                model_ctx_limit,
+                turbo=turbo_kv,
+                asymmetric=auto_asymmetric_kv,
+                base_k_per_token_mb=base_k_mb,
+                base_v_per_token_mb=base_v_mb,
+                force_cache_k=force_cache_k,
+                force_cache_v=force_cache_v,
+            )
         if force_cache_k is not None:
             cache_k = _turbo_quant_for(force_cache_k) if turbo_kv else force_cache_k
         if force_cache_v is not None:
             cache_v = _turbo_quant_for(force_cache_v) if turbo_kv else force_cache_v
         if cache_k != cache_v:
             kv_quant_strategy = "asymmetric"
-        if turbo_kv:
+        if turbo_kv and not kv_compatibility_reason:
             kv_quant_strategy = (
                 f"{kv_quant_strategy}+turbo"
                 if kv_quant_strategy != "symmetric"
@@ -3991,6 +4047,50 @@ def compute_config(
         runtime_vram_overhead_gb = base_runtime_vram_gb + qwen_gpu_actual_gb
         runtime_ram_overhead_gb = _QWEN4EXP_FIXED_HOST_RUNTIME_GB + qwen_host_actual_gb
 
+        # A host/QSA cap can make the eventual context much smaller than the
+        # target used to choose Q4. Reconsider Q8 at that exact context, without
+        # sacrificing tokens or bypassing either physical memory pool.
+        if (
+            not turbo_kv
+            and not kv_compatibility_reason
+            and force_cache_k is None
+            and force_cache_v is None
+            and cache_k == cache_v == KV_CAPACITY_FALLBACK_TYPE
+        ):
+            candidate = _pick_kv_quant(
+                profile.recommended_kv_quant,
+                ctx,
+                base_kv_mb,
+                kv_budget_gb / n_parallel,
+                model_ctx_limit,
+                base_k_per_token_mb=base_k_mb,
+                base_v_per_token_mb=base_v_mb,
+            )
+            candidate_per_tok = base_kv_mb * kv_quant_factor(candidate[0])
+            candidate_gb = ctx * candidate_per_tok * n_parallel / 1024.0
+            if unified_memory:
+                candidate_fits = (
+                    shared_fixed_gb
+                    + qwen_gpu_actual_gb
+                    + qwen_host_actual_gb
+                    + candidate_gb
+                    <= shared_cap_gb
+                )
+            else:
+                candidate_fits = (
+                    gpu_fixed_gb
+                    + qwen_gpu_actual_gb
+                    + (0.0 if no_kv_offload else candidate_gb)
+                    <= gpu_budget_free_vram
+                    and host_fixed_gb
+                    + qwen_host_actual_gb
+                    + (candidate_gb if no_kv_offload else 0.0)
+                    <= system.free_ram_gb
+                )
+            if candidate_fits:
+                cache_k, cache_v = candidate
+                actual_per_tok_mb = candidate_per_tok
+
     # Total KV across ALL n_parallel slots — llama-server allocates one
     # full KV buffer per slot, so the real VRAM/RAM footprint is
     # n_parallel × per-slot. Previously this was per-slot only, which
@@ -4010,6 +4110,21 @@ def compute_config(
             f"safe KV/compute-memory budget; clamped to {ctx:,} to avoid "
             "VRAM/RAM OOM."
         )
+    if kv_quant_strategy == "compatibility-f16":
+        detail = f"F16 KV compatibility fallback: {kv_compatibility_reason}."
+        warning = f"{warning} {detail}" if warning else detail
+    elif (
+        cache_k == cache_v == KV_CAPACITY_FALLBACK_TYPE
+        and force_cache_k is None
+        and force_cache_v is None
+        and not turbo_kv
+    ):
+        kv_quant_strategy = "capacity-q4"
+        detail = (
+            "Q8 KV cannot hold the target in the available memory; using Q4. "
+            "For long-context/tool-calling quality, reduce context or pin Q8."
+        )
+        warning = f"{warning} {detail}" if warning else detail
     if unified_memory:
         shared_total = (
             model_vram
@@ -4282,7 +4397,11 @@ def compute_config(
         # cache in RAM; every other full-offload/MoE path places it on GPUs.
         # A visibility pin hides every peer device, so approving this footprint
         # from aggregate VRAM would otherwise create a deterministic OOM.
-        gpu_kv_footprint_gb = 0.0 if no_kv_offload else estimated_kv_gb
+        gpu_kv_footprint_gb = 0.0 if no_kv_offload or ngl <= 0 else estimated_kv_gb
+        if not full_off and not is_moe_cfg and 0 < ngl < n_layers:
+            # Dense partial offload keeps CPU-layer KV in RAM, not on the
+            # primary. Counting it as VRAM can re-open an exhausted peer.
+            gpu_kv_footprint_gb *= ngl / n_layers
         fixed_primary_footprint_gb = (
             model_vram
             + vision_vram_gb
@@ -4296,9 +4415,8 @@ def compute_config(
         # Pin only when the selected cache PLUS the same long-context scratch
         # reserve used during sizing fits the primary. Testing the raw footprint
         # alone can repin a config that borrowed aggregate VRAM, discarding the
-        # reserve and recreating a single-card Vulkan OOM. Conversely, an Expert
-        # Q8 pin may legitimately fit one card even when Auto's preferred F16
-        # needed both; this exact post-selection test keeps that card free.
+        # reserve and recreating a single-card Vulkan OOM. An explicit Q4 pin
+        # may fit one card even when preferred Q8 needed both.
         primary_raw_kv_budget = max(
             0.0,
             primary_cap - effective_vram_safety - fixed_primary_footprint_gb,
@@ -4320,7 +4438,11 @@ def compute_config(
         # A user-supplied force_gpu ALWAYS pins exclusively: the user has
         # explicitly chosen the card this server boots on, so we hide every
         # other GPU and never spread — even if the model is overcommitted.
-        pin_to_primary = (forced_gpu is not None) or selected_cache_fits_primary
+        pin_to_primary = (
+            forced_gpu is not None
+            or not has_multiple_gpus  # placement already excluded exhausted peers
+            or selected_cache_fits_primary
+        )
 
         if pin_to_primary:
             if hip_known:
@@ -4706,11 +4828,7 @@ def compute_config(
         ubatch=ubatch,
         cache_k=cache_k,
         cache_v=cache_v,
-        flash_attn=(
-            bool(profile.flash_attn)
-            if getattr(profile, "flash_attn", None) is not None
-            else True
-        ),
+        flash_attn=flash_attn,
         sampling=sampling,
         mlock=mlock,
         no_mmap=no_mmap,
@@ -4739,6 +4857,11 @@ def compute_config(
         batch_vram_overhead_gb=moe_batch_vram_reserve_gb,
         kv_vram_gb=kv_vram_gb,
         kv_ram_gb=kv_ram_gb,
+        kv_key_fraction=(
+            base_k_mb * kv_quant_factor(cache_k) / actual_per_tok_mb
+            if actual_per_tok_mb > 0
+            else 0.5
+        ),
         recurrent_state_vram_gb=recurrent_state_vram_gb,
         recurrent_state_ram_gb=recurrent_state_ram_gb,
         kv_quant_strategy=kv_quant_strategy,
@@ -4845,6 +4968,7 @@ def build_diffusion_command(
 
     Flags emitted are mainline b9700 (examples/diffusion/README.md):
       -m / -p / -c / -ngl / -b / -ub  — standard load + batch knobs
+      -ctk / -ctv / -fa               — enacted KV types/FA (b10839 verified)
       --diffusion-steps N             — denoising steps (profile, def 256)
       --diffusion-algorithm 0..4      — token-selection algorithm
       --diffusion-eps F  XOR  --diffusion-block-length N  — schedule
@@ -4877,6 +5001,10 @@ def build_diffusion_command(
         str(config.ubatch),
     ]
 
+    # Mainline diffusion-cli copies cache_type_k/v and flash_attn_type into
+    # its context params: enact the cache that compute_config budgeted.
+    cmd += ["-ctk", config.cache_k, "-ctv", config.cache_v]
+    cmd += ["-fa", "on" if config.flash_attn else "off"]
     # Performance timings are enabled by default in current llama.cpp.
     # Assert --perf explicitly so fork defaults cannot hide prompt/eval timing
     # and tokens/s for single-shot diffusion runs.

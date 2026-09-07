@@ -11,12 +11,9 @@ patterns:
 # We cap at the native value; the tuner clamps to GGUF native anyway.
 max_context: 196608
 
-# KV-quant: q5_0 (asymmetric cv=q4_0 when the cascade needs room). With
-# key_length = value_length = 128 and 8 GQA KV-heads across 62 layers the
-# KV cache is moderate, but a 139B-A10B build still nearly fills the
-# combined 48 GB VRAM pool with weights, so keeping KV compact lets one
-# or two more expert layers stay resident on GPU.
-recommended_kv_quant: q5_0
+# Prefer symmetric Q8 for long-context/tool-calling quality. Large MoE
+# weights may leave too little KV memory; Q4 remains a capacity fallback.
+recommended_kv_quant: q8_0
 
 # Large MoE on a 48 GB combined VRAM pool: maximise GPU-resident expert
 # layers. "throughput" reserves only a 32k KV budget for placement so the

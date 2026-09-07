@@ -1,0 +1,37 @@
+display_name: "HY4 Preview (Tencent, mainline)"
+# Filename alone cannot distinguish AngelSlim's incompatible hyv4 GGUFs
+# from the official hy_v4 conversion. Resolve this profile from metadata.
+patterns: []
+arch_fallback:
+  - hy_v4
+min_llama_build: 10813
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+sampling:
+  chat:
+    temperature: 0.9
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.9
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+extra_args:
+  - --jinja
+ngram_method: ngram-mod
+notes: >
+  Mainline support for Tencent HY4 Preview with general.architecture=hy_v4
+  landed in PR #28127 (first available local release tag b10813). The older
+  AngelSlim hyv4 GGUF format remains a separate patched-runtime profile;
+  renaming its metadata does not convert its tensors. Official HY4 sampling
+  and native 1M context are shared, but memory remains hardware-limited.
+  The stock converter drops nextn/MTP layers; its GGUF does not contain
+  an embedded drafter on b10839.
+  Source: https://github.com/ggml-org/llama.cpp/pull/28127.

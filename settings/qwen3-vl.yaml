@@ -16,7 +16,7 @@ arch_fallback:
 # mmproj-Datei für den Vision-Encoder (Scanner erkennt sie; in der GUI als
 # mmproj zuordnen). Native Kontext bis 262144; via GGUF-Metadata gecappt.
 max_context: 262144
-recommended_kv_quant: q5_0
+recommended_kv_quant: q8_0
 
 # Throughput-Default wie bei den anderen Qwen-MoE-Profilen (greift für die
 # A3B/A22B-MoE-Varianten; Dense ignoriert den MoE-Offload ohnehin).

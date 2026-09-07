@@ -123,6 +123,7 @@ from tuner import (
     effective_load_mode,
     extract_params_billion,
     gemma_draft_needs_ik_fork,
+    kv_quant_factor,
     match_gpu_by_token,
     prepare_command_for_binary,
     probe_binary_build_info,
@@ -1099,7 +1100,9 @@ class _ApplicationSettingsDialog(QDialog):
         api_layout.addWidget(self.control_api_endpoint, 2, 2)
 
         api_key_label = QLabel("API key:")
-        initial_token = app_settings.get_control_api_token() or secrets.token_urlsafe(32)
+        initial_token = app_settings.get_control_api_token() or secrets.token_urlsafe(
+            32
+        )
         self.control_api_token = QLineEdit(initial_token)
         self.control_api_token.setReadOnly(True)
         self.control_api_token.setEchoMode(QLineEdit.EchoMode.Password)
@@ -3988,7 +3991,10 @@ class _LongMessageDialog(QDialog):
         # Size to the content but never beyond ~75% of the available screen.
         metrics = self.text.fontMetrics()
         lines = message.count("\n") + 1
-        longest = max((metrics.horizontalAdvance(line) for line in message.splitlines()), default=0)
+        longest = max(
+            (metrics.horizontalAdvance(line) for line in message.splitlines()),
+            default=0,
+        )
         wanted_width = min(max(520, longest + 96), 1100)
         wanted_height = min(max(200, lines * metrics.lineSpacing() + 110), 100_000)
         screen = self.screen() or QApplication.primaryScreen()
@@ -4022,9 +4028,7 @@ def _control_api_catalogue(
         if entry.is_standalone_drafter:
             reason = "Standalone draft models cannot serve requests by themselves."
         elif entry.is_diffusion and runner != "llama-diffusion-gemma-server":
-            reason = (
-                "This diffusion model uses a single-shot CLI rather than an HTTP server."
-            )
+            reason = "This diffusion model uses a single-shot CLI rather than an HTTP server."
         elif "--embeddings" in extra or "--embedding" in extra:
             reason = "This profile exposes embeddings rather than chat completions."
 
@@ -4172,6 +4176,15 @@ def _expert_load_mode_from_values(cfg: TunedConfig, vals: dict) -> str:
     return effective_load_mode(cfg) or "auto"
 
 
+def _expert_cascading_pins(snapshot: dict) -> dict:
+    """Include legacy FA choices in the memory/KV cascade, not a late overlay."""
+    pins = {k: v for k, v in (snapshot.get("pins") or {}).items() if v is not None}
+    values = snapshot.get("values") or {}
+    if "force_flash_attn" not in pins and "flash_attn" in values:
+        pins["force_flash_attn"] = bool(values["flash_attn"])
+    return pins
+
+
 def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
     """Overlay the NON-cascading values onto ``cfg`` (in place + returned).
 
@@ -4191,7 +4204,6 @@ def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
             cfg.batch = int(vals["batch"]) or cfg.batch
         if vals.get("ubatch"):
             cfg.ubatch = int(vals["ubatch"]) or cfg.ubatch
-        cfg.flash_attn = bool(vals.get("flash_attn", cfg.flash_attn))
         load_mode = _expert_load_mode_from_values(cfg, vals)
         cfg.load_mode = load_mode
         # Keep the legacy fields synchronized for external callers and the
@@ -4247,6 +4259,7 @@ def expert_cfg_from_values(base: TunedConfig, vals: dict) -> TunedConfig:
     cfg.ctx = int(vals.get("ctx", base.ctx))
     cfg.cache_k = str(vals.get("cache_k", base.cache_k))
     cfg.cache_v = str(vals.get("cache_v", base.cache_v))
+    cfg.flash_attn = bool(vals.get("flash_attn", base.flash_attn))
     cfg.ngl = int(vals.get("ngl", base.ngl))
     try:
         n_cpu = int(vals.get("n_cpu_moe", 0) or 0)
@@ -4262,12 +4275,20 @@ def expert_cfg_from_values(base: TunedConfig, vals: dict) -> TunedConfig:
         cfg.rope_scale_factor = float(base.rope_scale_factor or 1.0)
     # Non-cascading overlay (threads / batch / flags / sampling / reasoning)
     apply_expert_values(cfg, vals)
-    # Context-validation profiles can deliberately exceed the conservative
-    # planner ceiling. Keep their preview/preflight KV footprint proportional
-    # to the exact context and slot count instead of retaining the safe base's
-    # smaller estimate. Cache precision is normally pinned to the same pair.
-    kv_scale = (max(1, int(cfg.ctx or 1)) * max(1, int(cfg.n_parallel or 1))) / (
-        base_ctx * base_parallel
+    # Manual snapshots own their context/slots/quants. Scale K and V
+    # separately, including unequal MLA heads, rather than inheriting the
+    # Q8 estimate when a frozen snapshot actually requests F16/BF16.
+    key_share = max(0.0, min(1.0, base.kv_key_fraction))
+    key_scale = key_share * kv_quant_factor(cfg.cache_k) / kv_quant_factor(base.cache_k)
+    value_scale = (
+        (1.0 - key_share) * kv_quant_factor(cfg.cache_v) / kv_quant_factor(base.cache_v)
+    )
+    quant_scale = key_scale + value_scale
+    cfg.kv_key_fraction = key_scale / quant_scale if quant_scale > 0 else 0.5
+    kv_scale = (
+        quant_scale
+        * (max(1, int(cfg.ctx or 1)) * max(1, int(cfg.n_parallel or 1)))
+        / (base_ctx * base_parallel)
     )
     if abs(kv_scale - 1.0) > 1e-9:
         cfg.estimated_kv_gb = max(0.0, base.estimated_kv_gb * kv_scale)
@@ -4357,15 +4378,15 @@ class ExpertPanel(QWidget):
 
     # Mainline types are followed by fork-only TurboQuant formats. BF16 has
     # the same memory footprint as F16 and is available for exact Expert use;
-    # Auto prefers F16's higher mantissa precision unless a profile explicitly
-    # requests BF16. Selecting a Turbo type shows a special-fork warning.
+    # Auto prefers Q8_0, with Q4_0 only when the target exceeds its budget.
+    # Selecting a Turbo type shows a special-fork warning.
     _KV_QUANT_OPTIONS = [
+        "q8_0",
         "q4_0",
         "q4_1",
         "iq4_nl",
         "q5_0",
         "q5_1",
-        "q8_0",
         "f16",
         "bf16",
         "turbo4",
@@ -5135,6 +5156,7 @@ class ExpertPanel(QWidget):
             self._cb_reasoning,
         ):
             cb.currentTextChanged.connect(self._schedule_save)
+        self._chk_fa.toggled.connect(lambda _: self._on_edit("force_flash_attn"))
         for chk in (
             self._chk_fa,
             self._chk_jinja,
@@ -5433,6 +5455,8 @@ class ExpertPanel(QWidget):
                 self._user_pins["force_n_parallel"] = None
         elif kind == "force_rope_scale":
             self._user_pins["force_rope_scale"] = self._chk_rope.isChecked()
+        elif kind == "force_flash_attn":
+            self._user_pins["force_flash_attn"] = self._chk_fa.isChecked()
 
         self._recompute(force_overrides=dict(self._user_pins))
 
@@ -5625,9 +5649,7 @@ class ExpertPanel(QWidget):
         #    a recompute or a save.
         self._populating = True
         try:
-            self._user_pins = {
-                k: v for k, v in (snap.get("pins") or {}).items() if v is not None
-            }
+            self._user_pins = _expert_cascading_pins(snap)
             self._mode = mode
             self._btn_auto.setChecked(mode == "auto")
             self._btn_manual.setChecked(mode == "manual")
@@ -5687,7 +5709,9 @@ class _ResponsiveSystemBar(QWidget):
 
     _COMPACT_MIN_WIDTH = 640
 
-    def __init__(self, labels: Sequence[QLabel], parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self, labels: Sequence[QLabel], parent: Optional[QWidget] = None
+    ) -> None:
         super().__init__(parent)
         self._labels = list(labels)
         self._grid = QGridLayout(self)
@@ -5725,7 +5749,8 @@ class _ResponsiveSystemBar(QWidget):
         margins = self._grid.contentsMargins()
         spacing = max(0, self._grid.horizontalSpacing())
         text_width = sum(
-            label.fontMetrics().horizontalAdvance(label.text()) for label in self._labels
+            label.fontMetrics().horizontalAdvance(label.text())
+            for label in self._labels
         )
         return (
             margins.left()
@@ -7021,9 +7046,7 @@ class MainWindow(QMainWindow):
             try:
                 imported = self._language_manager.import_pack(source, replace=True)
             except (LanguagePackError, OSError) as exc:
-                QMessageBox.warning(
-                    self, tr("Could not load language pack"), str(exc)
-                )
+                QMessageBox.warning(self, tr("Could not load language pack"), str(exc))
                 self._restore_language_combo()
                 return
         except (LanguagePackError, OSError) as exc:
@@ -7193,7 +7216,9 @@ class MainWindow(QMainWindow):
                     is_default=index == current,
                     available=available,
                     unavailable_reason=(
-                        "" if available else "No runnable llama-server found in this build."
+                        ""
+                        if available
+                        else "No runnable llama-server found in this build."
                     ),
                 )
             )
@@ -7308,7 +7333,11 @@ class MainWindow(QMainWindow):
 
         path = self._control_model_paths.get(request.model_id)
         entry = next(
-            (model for model in self._all_entries if path is not None and model.path == path),
+            (
+                model
+                for model in self._all_entries
+                if path is not None and model.path == path
+            ),
             None,
         )
         if entry is None:
@@ -7402,9 +7431,7 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def _launch_control_entry(
-        self, request: ControlRequest, entry: ModelEntry
-    ) -> None:
+    def _launch_control_entry(self, request: ControlRequest, entry: ModelEntry) -> None:
         if request.done:
             return
         # Reuse exactly the same per-model target/profile/draft/mmproj and
@@ -7435,9 +7462,7 @@ class MainWindow(QMainWindow):
         record["control_requests"] = [request]
         # Expire slightly before the HTTP wait so Qt can stop an alive but
         # never-ready backend and deliver a structured timeout response.
-        record["control_deadline"] = max(
-            time.monotonic(), request.deadline - 0.5
-        )
+        record["control_deadline"] = max(time.monotonic(), request.deadline - 0.5)
         self._control_api_record = record
         if record.get("ready"):
             self._complete_control_record(record)
@@ -7595,8 +7620,7 @@ class MainWindow(QMainWindow):
             "parallel": None,
             "thinking": record.get("thinking"),
             "profile": model["profile"],
-            "performance_target": str(record.get("performance_target") or "")
-            or None,
+            "performance_target": str(record.get("performance_target") or "") or None,
             "mode": str(record.get("mode") or "") or None,
             "load_mode": None,
             "n_cpu_moe": None,
@@ -7678,7 +7702,9 @@ class MainWindow(QMainWindow):
         if isinstance(overrides, dict):
             for key, value in overrides.items():
                 upper = str(key).upper()
-                if any(secret in upper for secret in ("KEY", "TOKEN", "SECRET", "PASS")):
+                if any(
+                    secret in upper for secret in ("KEY", "TOKEN", "SECRET", "PASS")
+                ):
                     continue
                 env[str(key)] = str(value)
 
@@ -7717,7 +7743,9 @@ class MainWindow(QMainWindow):
         if record is self._control_api_record:
             self._control_api_record = None
             if self._control_api is not None:
-                self._control_api.clear_active(str(record.get("control_model_id") or ""))
+                self._control_api.clear_active(
+                    str(record.get("control_model_id") or "")
+                )
 
     def _open_application_settings(self) -> None:
         """Preview appearance and persist selection only on confirmation.
@@ -9385,7 +9413,9 @@ class MainWindow(QMainWindow):
                 "does not download release assets."
             )
             + "\n\n"
-            + _tr("autotuner_settings.json is backed up first and restored afterwards."),
+            + _tr(
+                "autotuner_settings.json is backed up first and restored afterwards."
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -10599,9 +10629,7 @@ class MainWindow(QMainWindow):
             # Auto mode: re-cascade from the saved pins (adapts to the
             # live VRAM / checkbox state), then overlay the saved
             # non-cascading widget values (threads / batch / flags / …).
-            pins = {
-                k: v for k, v in (override.get("pins") or {}).items() if v is not None
-            }
+            pins = _expert_cascading_pins(override)
             cascaded = (
                 self._build_auto_config(
                     entry, profile, pins, performance_target=target_name
@@ -11604,11 +11632,7 @@ class MainWindow(QMainWindow):
             if saved.get("mode") == "manual" and values:
                 effective = expert_cfg_from_values(auto, values)
             else:
-                saved_pins = {
-                    key: value
-                    for key, value in (saved.get("pins") or {}).items()
-                    if value is not None
-                }
+                saved_pins = _expert_cascading_pins(saved)
                 effective = self._benchmark_compute_config(
                     entry, profile, system, performance_target, options, saved_pins
                 )
@@ -11634,6 +11658,7 @@ class MainWindow(QMainWindow):
             "user_ctx": requested,
             "force_cache_k": effective.cache_k,
             "force_cache_v": effective.cache_v,
+            "force_flash_attn": effective.flash_attn,
             "force_n_parallel": 1,
             "force_draft_n_max": int(effective.draft_n_max or 0) or None,
             "force_rope_scale": bool(enable_yarn),
@@ -11658,7 +11683,6 @@ class MainWindow(QMainWindow):
             "batch_threads",
             "batch",
             "ubatch",
-            "flash_attn",
             "load_mode",
             "mlock",
             "no_mmap",
@@ -15145,9 +15169,7 @@ class MainWindow(QMainWindow):
 
     def _activate_from_other_instance(self) -> None:
         """Bring this window forward because another launch was redirected here."""
-        self._log(
-            "A second AutoTuner start was redirected to this running instance."
-        )
+        self._log("A second AutoTuner start was redirected to this running instance.")
         if self.isHidden():
             self._restore_from_tray()
             return

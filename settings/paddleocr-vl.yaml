@@ -8,7 +8,7 @@ arch_fallback:
   - paddleocr
 
 max_context: 131072
-recommended_kv_quant: f16
+recommended_kv_quant: q8_0
 performance_target: balanced
 draft_max: 0
 

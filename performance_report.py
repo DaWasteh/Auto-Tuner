@@ -554,12 +554,12 @@ def _best_settings_section(records: Sequence[dict], *, public: bool = False) -> 
             if chip
         )
         setting_cells = (
-            f'<div><span>Threads</span><b>{escape(_public_text(settings.get("threads", "—"), public=public))}'
-            f' / {escape(_public_text(settings.get("batch_threads", "—"), public=public))}</b></div>'
-            f'<div><span>Batch / ubatch</span><b>{escape(_public_text(settings.get("batch", "—"), public=public))}'
-            f' / {escape(_public_text(settings.get("ubatch", "—"), public=public))}</b></div>'
-            f'<div><span>Draft n-max</span><b>{draft_depth if draft_depth else "off"}</b></div>'
-            f'<div><span>Context</span><b>{_integer(record.get("desired_context")):,}</b></div>'
+            f"<div><span>Threads</span><b>{escape(_public_text(settings.get('threads', '—'), public=public))}"
+            f" / {escape(_public_text(settings.get('batch_threads', '—'), public=public))}</b></div>"
+            f"<div><span>Batch / ubatch</span><b>{escape(_public_text(settings.get('batch', '—'), public=public))}"
+            f" / {escape(_public_text(settings.get('ubatch', '—'), public=public))}</b></div>"
+            f"<div><span>Draft n-max</span><b>{draft_depth if draft_depth else 'off'}</b></div>"
+            f"<div><span>Context</span><b>{_integer(record.get('desired_context')):,}</b></div>"
         )
         metrics = (
             f'<div class="best-metric pp"><span>PP</span><b>{_format_tps(winner.get("prompt_tps"))}</b></div>'
@@ -1024,7 +1024,7 @@ def build_performance_report_html(
                 + _winner_acceptance_overview(raw_records, test_type, public=public)
                 + '<details class="candidate-diagrams">'
                 '<summary><span class="section-kicker">Every successful lane</span>'
-                f"<span class=\"summary-title\">Candidate comparison diagrams · {len(typed)} run(s)</span>"
+                f'<span class="summary-title">Candidate comparison diagrams · {len(typed)} run(s)</span>'
                 '<span class="summary-hint">Throughput and drafted-token acceptance for every measured candidate, ranked fastest first.</span></summary>'
                 + _run_chart_groups(typed, test_type, public=public)
                 + "</details>"
@@ -1113,6 +1113,9 @@ details.candidate-diagrams{margin-top:24px;padding-top:12px;border-top:1px solid
         '<div class="hero-top"><div class="eyebrow">Measured llama.cpp evidence</div>'
         f'<span class="report-badge">{report_badge}</span></div>'
         "<h1>AutoTuner benchmark dashboard</h1>"
+        '<p class="muted">Historical measurements retain their recorded runtime and KV settings. '
+        "AutoTuner v5.4.3 defaults to Q8 KV where feasible; older Q4/F16 results "
+        "are not measurements of that new policy.</p>"
         f'<p class="hero-copy">{hero_copy}</p>'
         f'<p class="muted">Generated {escape(generated_text)} · AutoTuner v{escape(VERSION)} · dependency-free HTML</p>'
         + privacy_note
