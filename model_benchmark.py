@@ -55,7 +55,7 @@ class BenchmarkFailure(RuntimeError):
 BENCHMARK_RECORD_SCHEMA = 4
 # v5.4.3: Q8-first placement/FA cascade; old Q4/F16 measured winners remain
 # historical evidence but must not silently override the new Auto policy.
-BENCHMARK_SEARCH_SCHEMA = 4
+BENCHMARK_SEARCH_SCHEMA = 5
 
 
 @dataclass(frozen=True)
@@ -1119,23 +1119,26 @@ class BenchmarkRunner:
         cfg = candidate.apply(self.base_config)
         port = _free_loopback_port()
         alias = f"autotuner-bench-{os.getpid()}-{port}"
-        cmd = build_command(
-            model=self.model,
-            config=cfg,
-            profile=self.profile,
-            draft_model=self.draft_model if self.enable_speculative else None,
-            server_binary=self.runtime_binary,
-            host="127.0.0.1",
-            port=port,
-            extra_args=["-a", alias],
-            use_thinking=self.use_thinking,
-            enable_speculative=self.enable_speculative,
-            enable_ngram=self.enable_ngram,
-            enable_prompt_cache=self.enable_prompt_cache,
-            prompt_cache_ram_mib=self.prompt_cache_ram_mib,
-            enable_metrics=False,
-            enable_slots_api=False,
-        )
+        try:
+            cmd = build_command(
+                model=self.model,
+                config=cfg,
+                profile=self.profile,
+                draft_model=self.draft_model if self.enable_speculative else None,
+                server_binary=self.runtime_binary,
+                host="127.0.0.1",
+                port=port,
+                extra_args=["-a", alias],
+                use_thinking=self.use_thinking,
+                enable_speculative=self.enable_speculative,
+                enable_ngram=self.enable_ngram,
+                enable_prompt_cache=self.enable_prompt_cache,
+                prompt_cache_ram_mib=self.prompt_cache_ram_mib,
+                enable_metrics=False,
+                enable_slots_api=False,
+            )
+        except ValueError as exc:
+            raise BenchmarkFailure(f"Incompatible memory-plan settings: {exc}") from exc
         allowed, message, _build = check_profile_build(self.profile, cmd[0])
         if not allowed:
             raise BenchmarkFailure(message or "selected llama.cpp build is too old")

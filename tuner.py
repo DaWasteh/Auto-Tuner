@@ -223,6 +223,9 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--rope-scale",
     "--rope-scaling",
     "--samplers",
+    "--spec-draft-device",
+    "--device-draft",
+    "-devd",
     "--spec-draft-model",
     "--spec-draft-n-max",
     "--spec-draft-n-min",
@@ -256,6 +259,10 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--top-p",
     "--ubatch-size",
     "-lzm",
+    "-ts",
+    "-mg",
+    "-ncmoe",
+    "-fit",
 }
 
 _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
@@ -267,10 +274,11 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-dev", "--device"},
     {"-fa", "--flash-attn"},
     {"-m", "--model"},
-    {"-md", "--model-draft"},
+    {"-md", "--model-draft", "--spec-draft-model"},
     {"-mmdev", "--mmproj-device"},
     {"-lm", "--load-mode"},
     {"-lzm", "--lazy-mode"},
+    {"-devd", "--device-draft", "--spec-draft-device"},
     {"-n", "--predict"},
     {"-ngl", "--gpu-layers", "--n-gpu-layers"},
     {"-np", "--parallel"},
@@ -281,6 +289,10 @@ _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
     {"-ub", "--ubatch-size"},
     {"-cram", "--cache-ram"},
     {"-rea", "--reasoning"},
+    {"-ts", "--tensor-split"},
+    {"-mg", "--main-gpu"},
+    {"-ncmoe", "--n-cpu-moe"},
+    {"-fit", "--fit"},
 )
 
 _FLAG_RE = re.compile(r"(?<![\w-])-{1,2}[A-Za-z][A-Za-z0-9_-]*")
@@ -342,17 +354,24 @@ def _filter_command_for_supported_flags(
             flag = _flag_name(tok)
             takes_value = "=" not in tok and flag in _ARG_FLAGS_WITH_VALUES
             # KV precision/FA are a memory contract, not optional features.
-            # Keep unsupported cache controls so the runtime rejects the
-            # launch rather than silently allocating its larger default KV.
-            required_cache_flag = flag in {
+            # Lazy row tables and draft-device placement are equally binding:
+            # preserve unsupported controls so the runtime rejects the launch
+            # rather than silently allocating an unbudgeted KV/table/device.
+            required_memory_flag = flag in {
                 "-ctk",
                 "--cache-type-k",
                 "-ctv",
                 "--cache-type-v",
                 "-fa",
                 "--flash-attn",
+                "--lazy-mode",
+                "-lzm",
+                "--tensor-read-lazy",
+                "--spec-draft-device",
+                "--device-draft",
+                "-devd",
             }
-            if flag not in supported and not required_cache_flag:
+            if flag not in supported and not required_memory_flag:
                 chunk = [tok]
                 i += 1
                 # Consume the flag's value as well: for known value-flags
@@ -881,6 +900,17 @@ def check_draft_model_build(
             )
 
     if not draft_model.is_dflash2_drafter:
+        if target is not None and target.architecture.lower() == "kimi-k3":
+            detected = probe_binary_build_number(binary)
+            if detected is not None and detected < 10853:
+                return (
+                    True,
+                    "Kimi-K3 model-based speculation uses full host checkpoints "
+                    "on this build. Bounded recurrent rollback requires llama.cpp "
+                    "b10853+; performance and transient host memory differ. "
+                    "Update the runtime or disable the external drafter.",
+                    detected,
+                )
         return True, "", None
 
     detected = probe_binary_build_number(binary)
@@ -1073,6 +1103,9 @@ def _adapt_spec_types_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     # Remove the external DSpark model and draft-only parameters. Preserve any
     # surviving n-gram method and its --spec-ngram-* tuning flags.
     draft_value_flags = {
+        "--spec-draft-device",
+        "--device-draft",
+        "-devd",
         "-md",
         "--model-draft",
         "--spec-draft-model",
@@ -1155,6 +1188,9 @@ def _adapt_nextn_regression_for_binary(cmd: List[str]) -> Tuple[List[str], List[
         return adapted, []
 
     draft_value_flags = {
+        "--spec-draft-device",
+        "--device-draft",
+        "-devd",
         "-md",
         "--model-draft",
         "--spec-draft-model",
@@ -1916,6 +1952,9 @@ class TunedConfig:
     # example ``Vulkan1``). b10541+ can pin MTMD independently from model
     # tensors; older binaries safely lose the flag during help-based pruning.
     mmproj_device: Optional[str] = None
+    # External draft weights are budgeted entirely on the primary device.
+    # Prevent llama.cpp from inheriting the target's multi-GPU device list.
+    draft_device: Optional[str] = None
 
     n_cpu_moe: Optional[int] = None
     is_moe: bool = False
@@ -3279,7 +3318,12 @@ def compute_config(
     # -ngl offload like a dense model, so we skip the expert-only
     # placement branch entirely. is_moe stays True for display / split
     # decisions are handled below via the disable_moe_placement flag.
-    disable_moe_placement = is_diffusion_gemma
+    # K2 Horizon's MoVA attention carries large routed VALUE weights that
+    # --n-cpu-moe (ffn_*_exps only) cannot move. The generic 8%-shared estimate
+    # would count them as movable FFN experts and understate required VRAM.
+    # Until tensor-level FFN placement is modelled, use whole-layer -ngl and
+    # its matching KV/split policy; retain is_moe for architecture/display.
+    disable_moe_placement = is_diffusion_gemma or model_arch == "k2-horizon"
     state_vram_reserve_for_placement = (
         0.0 if perf_target.kv_to_ram else recurrent_state_total_gb
     )
@@ -4294,8 +4338,22 @@ def compute_config(
     has_enough_vram = system.total_vram_gb > 8
 
     if force_mlock:
-        # Option B: User-Override — aktiviert mlock/no-mmap wenn System-Ressourcen reichen
-        mlock = (has_enough_vram or vram_resident_gb > 0) and (
+        # Forced locking also applies on CPU-only hosts, subject to their
+        # physical RAM budget and the platform privilege/memlock checks below.
+        cpu_lock_fits = (
+            not has_gpu
+            and model_ram > 0
+            and model_ram
+            + estimated_kv_gb
+            + mapped_model_resident_gb
+            + recurrent_state_total_gb
+            + runtime_ram_overhead_gb
+            + vision_ram_gb
+            + prompt_cache_ram_gb
+            + ram_safety_gb
+            < system.free_ram_gb
+        )
+        mlock = (has_enough_vram or vram_resident_gb > 0 or cpu_lock_fits) and (
             is_windows and is_admin or not is_windows
         )
     else:
@@ -4316,9 +4374,10 @@ def compute_config(
                 and ram_resident_gb < (system.free_ram_gb - 8)
                 and (not is_windows or is_admin)
             )
-    # Auto-lazy row tables require mmap. Never let automatic mlock/no-mmap
-    # turn a 26+ GiB PLE table into an eager resident read; an explicit
-    # --force-mlock remains the user's deliberate override.
+    # Keep automatic locking off for giant mappings. Current llama.cpp maps
+    # lazy tensors independently of ordinary --load-mode and skips locking
+    # them; none/dio/mlock do NOT themselves disable lazy PLE loading.
+    # Avoid platform/older-runtime locking surprises unless explicitly forced.
     if mlock and read_lazy_table_gb > 0 and not force_mlock:
         mlock = False
 
@@ -4378,6 +4437,7 @@ def compute_config(
     tensor_split: Optional[str] = None
     main_gpu: Optional[int] = None
     mmproj_device: Optional[str] = None
+    draft_device: Optional[str] = None
     env_overrides: Dict[str, str] = {}
 
     if has_gpu and len(system.gpus) > 1 and primary_gpu is not None:
@@ -4611,6 +4671,22 @@ def compute_config(
                     range(len(ordered)),
                     key=lambda i: int(ordered[i].hip_index),  # type: ignore[arg-type]
                 )
+                # DFlash/EAGLE-style contexts can reuse the target's output
+                # tensor. In layer split that tensor lives on the LAST device,
+                # not --main-gpu. Keep the primary last when an external draft
+                # is present, so its budget, weights AND shared head coincide.
+                # HIP/CUDA/Vulkan visibility selectors preserve list order.
+                ordered_backends = {
+                    str(g.runtime_backend or "").strip().lower() for g in ordered
+                }
+                if (
+                    draft_model is not None
+                    and len(ordered_backends) == 1
+                    and ordered_backends <= {"vulkan", "cuda", "hip", "rocm"}
+                ):
+                    primary_index = ordered.index(primary_gpu)
+                    idx_order.remove(primary_index)
+                    idx_order.append(primary_index)
                 visible_gpus = [ordered[i] for i in idx_order]
                 visible_indices = [
                     int(ordered[i].hip_index)  # type: ignore[arg-type]
@@ -4684,14 +4760,19 @@ def compute_config(
     # runtime placement identical whenever the exact binary supplied a
     # backend-qualified device map. Visibility selectors renumber devices, so
     # use the post-remap ``main_gpu`` ordinal rather than the original one.
-    if model.mmproj is not None and not no_mmproj_offload and primary_gpu is not None:
+    if primary_gpu is not None:
+        primary_device: Optional[str] = None
         backend = str(primary_gpu.runtime_backend or "").strip()
         if main_gpu is not None and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", backend):
-            mmproj_device = f"{backend}{main_gpu}"
+            primary_device = f"{backend}{main_gpu}"
         elif not env_overrides:
             runtime_device = str(primary_gpu.runtime_device or "").strip()
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\d+", runtime_device):
-                mmproj_device = runtime_device
+                primary_device = runtime_device
+        if model.mmproj is not None and not no_mmproj_offload:
+            mmproj_device = primary_device
+        if draft_model is not None:
+            draft_device = primary_device
 
     # ---- (4d) NUMA — immer aktivieren bei genügend Kernen für bessere Performance
     numa = None
@@ -4836,6 +4917,7 @@ def compute_config(
         tensor_split=tensor_split,
         main_gpu=main_gpu,
         mmproj_device=mmproj_device,
+        draft_device=draft_device,
         n_cpu_moe=n_cpu_moe,
         is_moe=is_moe,
         expert_count=expert_count,
@@ -5312,15 +5394,15 @@ def build_command(
     # "unknown argument"; in that case drop the two tokens below.
     cmd += ["--fit", "off"]
 
-    # b10653+ reads giant architecture-marked row tables on demand. Assert
-    # Auto explicitly for reproducibility; compatibility adaptation translates
-    # this b10700 spelling back to --tensor-read-lazy on older builds and prunes
-    # the complete pair when the feature is absent. qwen4exp's 26.8 GiB PLE
-    # table is the motivating case and must never be treated as GPU layer weights.
-    if model.read_lazy_size_bytes > 0 or model.architecture.lower() in {
-        "qwen4exp",
-        "gemma4",
-    }:
+    # b10653+ reads giant architecture-marked row tables on demand. The
+    # memory plan assumes Auto, so this is essential, not optionally prunable.
+    # Adapt the spelling on legacy builds; reject unsupported runtimes rather
+    # than accidentally making qwen4exp's 26.8-GiB PLE table eager. Small Gemma4
+    # models without an auto-lazy table need no such newer-runtime requirement.
+    lazy_auto = (
+        model.read_lazy_size_bytes > 0 or model.architecture.lower() == "qwen4exp"
+    )
+    if lazy_auto:
         cmd += ["--lazy-mode", "auto"]
 
     # ---- Performance timings + optional diagnostics endpoints ----------
@@ -5546,6 +5628,34 @@ def build_command(
         # the draftless path alongside -md.
         assert draft_model is not None  # guaranteed by use_external condition
         cmd += ["-md", str(draft_model.path)]
+        if (
+            config.tensor_split
+            and draft_model.drafter_spec_type in {"eagle3", "dflash", "dspark"}
+            and config.ngl > model.n_layers > 0
+        ):
+            output_device = max(
+                (
+                    i
+                    for i, part in enumerate(config.tensor_split.split(","))
+                    if float(part) > 0
+                ),
+                default=-1,
+            )
+            if config.main_gpu != output_device:
+                raise ValueError(
+                    "The external drafter shares the target output tensor, but "
+                    "the multi-GPU plan places it outside the budgeted draft GPU. "
+                    "Use a single GPU or a runtime with verified device reordering."
+                )
+        if config.draft_device:
+            cmd += ["--spec-draft-device", config.draft_device]
+        elif config.tensor_split:
+            raise ValueError(
+                "Cannot pin the external drafter to its budgeted GPU: the "
+                "multi-GPU plan has no exact backend device identity. "
+                "Re-detect hardware with the selected llama-server or disable "
+                "the external drafter."
+            )
         cmd += ["--spec-draft-ngl", "99"]
         cmd += ["--spec-draft-n-max", str(draft_val)]
         cmd += ["--spec-draft-p-min", str(draft_p_min)]
@@ -5689,6 +5799,17 @@ def build_command(
     # NAME so a duplicate ``--load-mode none`` in the free-form Extras
     # field is dropped entirely (flag + value) when the dropdown already
     # emitted ``--load-mode mlock`` — no stray value token leaks.
+    def _merge_key(flag: str) -> str:
+        # Aliases must not bypass generated memory/placement controls. Treat
+        # the removed legacy lazy spelling as equivalent only for merging,
+        # NOT as proof the selected binary accepts that spelling.
+        if flag in {"--tensor-read-lazy", "-lzm", "--lazy-mode"}:
+            return "--lazy-mode"
+        for group in _FLAG_ALIAS_GROUPS:
+            if flag in group:
+                return min(group)
+        return flag
+
     def _flag_keys(seq: List[str]) -> List[str]:
         keys: List[str] = []
         j = 0
@@ -5708,7 +5829,7 @@ def build_command(
                 j += 1
         return keys
 
-    seen: set = set(_flag_keys(cmd))
+    seen: set = {_merge_key(flag) for flag in _flag_keys(cmd)}
 
     def _append_unique(src: Optional[List[str]]) -> None:
         if not src:
@@ -5732,6 +5853,19 @@ def build_command(
                 key = tok
                 chunk = [tok]
                 j += 1
+            key = _merge_key(key)
+            if lazy_auto and key == "--lazy-mode":
+                value = (
+                    tok.split("=", 1)[1]
+                    if inline
+                    else (chunk[1] if len(chunk) > 1 else "")
+                )
+                if value.strip().lower() != "auto":
+                    raise ValueError(
+                        "This model's memory plan requires --lazy-mode auto for its "
+                        "giant row table. Remove the conflicting lazy-mode override; "
+                        "eager loading requires a full memory replan."
+                    )
             if key in seen:
                 continue
             seen.add(key)

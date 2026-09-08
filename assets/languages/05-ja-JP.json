@@ -433,7 +433,9 @@
     "Max context for low-VRAM / high-RAM systems (e.g. 8 GB VRAM, 64 GB RAM). KV cache moves to system RAM (--no-kv-offload), trading generation speed for far larger context — the only way to reach 90k+ on a 20 GB MoE that barely fits the GPU. Single parallel slot.": "VRAM が少なく RAM が多いシステム (例: 8 GB VRAM、64 GB RAM) 向けの最大コンテキスト。KV キャッシュをシステム RAM に移し (--no-kv-offload)、生成速度と引き換えにはるかに大きなコンテキストを得ます — GPU にぎりぎり収まる 20 GB の MoE で 90k 超を達成する唯一の方法です。並列スロットは 1 つ。"
   },
   "profile_notes": {
-    "spark2_5.yaml": "Spark-X2.5-1.7B は spark2_5 対応の llama.cpp b10828 以降が必要です。推論とツール呼び出しには組み込みの Spark テンプレートを使用します。ネイティブコンテキストは 1,048,576 トークンですが、実際の上限は RAM/VRAM に依存します。Q8 KV を優先し、MTP ドラフターは仮定しません。温度 1、top_p 0.95、top_k 無効。",
+    "minicpm5-2b.yaml": "MiniCPM5-2B（公式 GGUF では 2.6B）は42層、131,072トークンの密なテキストモデルです。標準 llama.cpp に対応。OpenBMB の Think 推奨値は温度1.0、top_p 0.95で、1Bの0.7/0.9とは異なります。推論の切替は埋め込みテンプレートの enable_thinking が制御します。Vision、MTP、未検証のRoPE拡張は想定しません。",
+    "k2-horizon.yaml": "IFM K2 Horizon は Kimi-K2 ではありません。mainline b10863 は k2-horizon 非対応で、MBZUAI-IFM の model/K2Horizon フォークが必要です。MoVA-36B-A4B は48層、FFN専門家100（8活性）、Value専門家64（4活性）、524,288トークンの文脈を持ちます。KVをValue専門家数で乗算しません。AutoはMoVA重みの過小見積りを避けるため層全体をオフロードします。埋め込みテンプレート、high reasoning、XMLツール、温度1、top_p 0.95を使用。フォーク推論とツールパーサーはローカル実機未検証で、Vision/MTPを保証しません。",
+    "spark2_5.yaml": "Spark-X2.5-1.7B/4B は spark2_5 対応の llama.cpp b10828 以降が必要です。推論とツール呼び出しには組み込みの Spark テンプレートを使用します。ネイティブコンテキストは 1,048,576 トークンですが、実際の上限は RAM/VRAM に依存します。Q8 KV を優先し、MTP ドラフターは仮定しません。温度 1、top_p 0.95、top_k 無効。",
     "hy4-mainline.yaml": "Tencent HY4 Preview のメインライン形式 hy_v4 は b10813 以降が必要です。旧 AngelSlim の hyv4 GGUF には専用のパッチ済みビルドが必要で、名前変更ではテンソルを変換できません。ネイティブ 1M コンテキストはメモリ容量で制限されます。コンバーターは MTP 層を除外するため組み込みドラフターはありません。Q8 KV、温度 0.9、top_p 1、top_k 無効。",
 
     "_default.yaml": "フォールバック用プロファイル。特定のプロファイルが一致しない場合に使用されます。チャットの既定値は意図的に控えめ（temp 0.7）で、コーディングは明確により決定的（temp 0.2）です。モデル固有の YAML がこれを上書きします。",

@@ -7658,13 +7658,13 @@ def test_cohere2moe_and_vibethinker_and_minicpm5_profiles_load() -> None:
 
     # MiniCPM5: pattern only, NO arch_fallback (arch is generic "llama").
     mc = match_profile("MiniCPM5-1B-F16.gguf", profiles, "llama")
-    assert mc.display_name == "MiniCPM5 (OpenBMB, on-device)"
+    assert mc.display_name == "MiniCPM5-1B (OpenBMB, on-device)"
     assert mc.arch_fallback == []
     assert "--jinja" in mc.extra_args
     # A plain llama model must NOT be swallowed by the MiniCPM5 profile.
     assert (
         match_profile("Llama-3.1-8B-Instruct-Q8_0.gguf", profiles, "llama").display_name
-        != "MiniCPM5 (OpenBMB, on-device)"
+        != "MiniCPM5-1B (OpenBMB, on-device)"
     )
 
 

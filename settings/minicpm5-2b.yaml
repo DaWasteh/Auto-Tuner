@@ -1,0 +1,42 @@
+display_name: "MiniCPM5-2B (OpenBMB)"
+patterns:
+  - minicpm5-2b
+  - minicpm5_2b
+  - minicpm5-2.6b
+  - minicpm5_2.6b
+  - minicpm-5-2b
+  - minicpm5 2b
+  - minicpm5 2.6b
+
+# The official 2B GGUF calls itself 2.6B. Both are the same checkpoint.
+# Standard llama architecture: never claim the global llama arch fallback.
+# 42 layers, 16 Q / 2 KV heads, head_dim 128; read dimensions from GGUF.
+max_context: 131072
+recommended_kv_quant: q8_0
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+extra_args:
+  - --jinja
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+notes: >
+  MiniCPM5-2B (also labelled 2.6B in the official GGUF) is a dense text-only
+  llama model with 42 layers and native 131,072-token context. It works with
+  mainline llama.cpp. OpenBMB recommends temperature 1.0 and top_p 0.95 for
+  Think mode; do not inherit the 1B profile's 0.7/0.9 temperatures. Thinking
+  remains controlled by the embedded template (enable_thinking). No vision,
+  MTP or unverified RoPE extension is assumed. Sources:
+  https://huggingface.co/openbmb/MiniCPM5-2B and
+  https://github.com/OpenBMB/MiniCPM/blob/main/docs/deployment/llama_cpp.md.

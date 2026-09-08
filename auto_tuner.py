@@ -914,8 +914,7 @@ def _candidate_search_roots() -> List[Path]:
             siblings = [
                 sibling
                 for sibling in parent.parent.iterdir()
-                if sibling.is_dir()
-                and re.search(r"llama", sibling.name, re.IGNORECASE)
+                if sibling.is_dir() and re.search(r"llama", sibling.name, re.IGNORECASE)
             ]
             siblings.sort(
                 key=lambda sibling: _fork_name_sort_key(
@@ -2275,26 +2274,28 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                 print("  set LLAMA_CPP_DIR to your llama.cpp checkout.")
 
             # ── Build command (server path) ──────────────────────────────
-            cmd = build_command(
-                model=model,
-                config=cfg,
-                profile=profile,
-                draft_model=effective_draft,
-                server_binary=server,
-                host=args.host,
-                port=args.port,
-                extra_args=extra,
-                use_thinking=use_thinking,
-                # --nodraft disables all draft-based speculative decoding,
-                # including embedded MTP (which has no external file and so
-                # isn't covered by effective_draft=None alone). n-gram is
-                # independent (--ngram).
-                enable_speculative=use_draft,
-                enable_ngram=use_ngram,
-                enable_prompt_cache=not getattr(args, "no_prompt_cache", False),
-                enable_metrics=not getattr(args, "no_metrics", False),
-                enable_slots_api=bool(getattr(args, "slots_api", False)),
-            )
+            try:
+                cmd = build_command(
+                    model=model,
+                    config=cfg,
+                    profile=profile,
+                    draft_model=effective_draft,
+                    server_binary=server,
+                    host=args.host,
+                    port=args.port,
+                    extra_args=extra,
+                    use_thinking=use_thinking,
+                    # --nodraft disables external drafts AND embedded MTP.
+                    # Draftless n-gram remains independent.
+                    enable_speculative=use_draft,
+                    enable_ngram=use_ngram,
+                    enable_prompt_cache=not getattr(args, "no_prompt_cache", False),
+                    enable_metrics=not getattr(args, "no_metrics", False),
+                    enable_slots_api=bool(getattr(args, "slots_api", False)),
+                )
+            except ValueError as exc:
+                print(f"[AutoTuner] Incompatible memory-plan settings: {exc}")
+                return 2
 
         # Enforce profile-specific runtime gates before llama.cpp begins a
         # potentially multi-minute model load. OCR performs the same check in

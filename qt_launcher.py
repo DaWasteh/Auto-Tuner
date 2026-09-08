@@ -14436,22 +14436,26 @@ class MainWindow(QMainWindow):
                     "[Compat] Locking load mode disabled: the selected GPU build "
                     "is older than b10151 or its version could not be probed safely."
                 )
-            cmd = build_command(
-                model=entry,
-                config=cfg,
-                profile=profile,
-                draft_model=self._current_draft if use_draft else None,
-                server_binary=server_binary,
-                host=host,
-                port=port,
-                extra_args=["-a", alias],
-                use_thinking=use_thinking,
-                # The draft dropdown governs BOTH external draft (-md) and embedded
-                # MTP. Its leading no-draft entry suppresses both paths.
-                enable_speculative=use_draft,
-                enable_ngram=use_ngram,
-                enable_prompt_cache=use_prompt_cache,
-            )
+            try:
+                cmd = build_command(
+                    model=entry,
+                    config=cfg,
+                    profile=profile,
+                    draft_model=self._current_draft if use_draft else None,
+                    server_binary=server_binary,
+                    host=host,
+                    port=port,
+                    extra_args=["-a", alias],
+                    use_thinking=use_thinking,
+                    # The dropdown governs external drafts AND embedded MTP.
+                    enable_speculative=use_draft,
+                    enable_ngram=use_ngram,
+                    enable_prompt_cache=use_prompt_cache,
+                )
+            except ValueError as exc:
+                self._log(f"[Memory plan] {exc}")
+                launch_warning("Incompatible settings", str(exc))
+                return None
 
         build_allowed, build_message, _detected_build = check_profile_build(
             profile, cmd[0]

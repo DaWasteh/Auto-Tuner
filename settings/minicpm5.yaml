@@ -1,8 +1,9 @@
-display_name: "MiniCPM5 (OpenBMB, on-device)"
+display_name: "MiniCPM5-1B (OpenBMB, on-device)"
 patterns:
   - minicpm5
   - minicpm-5
 
+# The more-specific minicpm5-2b.yaml overrides this family fallback for 2B/2.6B.
 # KEIN arch_fallback: MiniCPM5-1B nutzt die Standard-LlamaForCausalLM-
 # Architektur, general.architecture ist schlicht "llama". "llama" als
 # Fallback zu beanspruchen würde jedes Llama-Modell auf dieses Profil

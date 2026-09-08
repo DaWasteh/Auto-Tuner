@@ -900,7 +900,9 @@ matches. See `settings/_default.yaml`.
 | `glm-5_3_flash.yaml` | GLM-5.3-Flash, 320B-A18B multimodal KDA/DSA hybrid | `glm5next` / `glm5-next` |
 | `hy4-preview.yaml` | Tencent Hy4 Preview, older community GGUF (patch required) | `hyv4` |
 | `hy4-mainline.yaml` | Tencent HY4 Preview, official mainline GGUF, b10813+ | `hy_v4` |
-| `spark2_5.yaml` | Spark X2.5 1.7B, 1M native context, b10828+ | `spark2_5` |
+| `spark2_5.yaml` | Spark X2.5 1.7B / 4B, 1M native context, b10828+ | `spark2_5` |
+| `minicpm5.yaml` / `minicpm5-2b.yaml` | MiniCPM5 1B / 2B (GGUF: 2.6B), distinct official sampling, 128K context | filename only; generic `llama` |
+| `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
@@ -1098,15 +1100,16 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10839)
+## Server features (compatible through llama.cpp b10863)
 
-The exact **b10839** (`0cae43063`) source/help audit is recorded in
-[`docs/llama-b10839-audit.md`](docs/llama-b10839-audit.md). Since b10797,
-`--log-jsonl` / `--no-log-jsonl` are the only new server long options; both
-are supported through Extra CLI flags and pruned for older binaries. Text
-logging remains the default. A tracked flag manifest now validates every
-shipped profile in CI, not only on machines with local help captures.
-Simple/map-k n-gram value flags also prune their values correctly on old forks.
+The exact **b10863** (`88ada91c1`) source/help audit is recorded in
+[`docs/llama-b10863-audit.md`](docs/llama-b10863-audit.md). Since b10839,
+parser option names are unchanged, but default draft/projector device
+inheritance changed. External drafts now use explicit device binding, with
+shared output heads kept on the same GPU. Lazy-table flags remain an essential
+memory contract rather than being silently pruned. Profile/flag tests are
+portable to CI; the audit includes actual Vulkan/HIP model and draft tests.
+Text logging, Q8-first KV and conservative graph reserves remain unchanged.
 AutoTuner still quarantines the
 upstream NextN regression in b10741-b10748 and points affected users to b10749+
 rather than letting llama-server abort during model or draft-context loading. The following
@@ -1118,7 +1121,7 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `-fa [on\|off\|auto]` | ✅ Emits `-fa on` **or** `-fa off` explicitly; model profiles such as Unlimited-OCR can require the reference non-FA path |
 | `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ All in the dropdown |
 | `--fit off` | ✅ Always emitted so llama.cpp's own auto-fit pass (default `on`) doesn't silently re-adjust the computed values (AutoTuner is the authority) |
-| `--lazy-mode auto` / `-lzm` | ✅ Current b10700+ spelling, explicit for giant architecture-marked row tables (qwen4exp/Gemma 4). Compatibility preparation translates it to legacy `--tensor-read-lazy` when that is what the selected binary advertises, or prunes the complete pair when lazy reads are unavailable. Lazy bytes remain budgeted as host mappings, not GPU-splittable layer weights. |
+| `--lazy-mode auto` / `-lzm` | ✅ Current b10700+ spelling, explicit for giant architecture-marked row tables (qwen4exp/Gemma 4). Compatibility preparation translates it to legacy `--tensor-read-lazy` when that is what the selected binary advertises, and retains this essential memory contract if unsupported so the runtime rejects the command. Conflicting lazy overrides require replanning. Lazy bytes remain file-backed mappings, not GPU-splittable weights; active pages still use OS-managed RAM. |
 | `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s; users can append `--no-perf` |
 | `--metrics` | ✅ Prometheus endpoint `GET /metrics`, including b10282+ speculative draft/accept counters (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
@@ -1129,7 +1132,7 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--chat-template-kwargs ...` | ✅ The dropdown produces this automatically |
 | `--jinja` | ✅ Ticked visibly |
 | `-lm, --load-mode {none,mmap,mlock,mmap+mlock,dio}` | ✅ Complete Expert dropdown. b10151's non-mmap `mlock` and explicit `mmap+mlock` semantics are version-gated; legacy checkbox snapshots are migrated. |
-| `-md` external drafter | ✅ Without `--spec-type` — the presence of `-md` enables the draft path automatically in mainline (verified b9442) |
+| `-md` external drafter | ✅ Model/tensor-aware speculative path; `--spec-draft-device` pins the budgeted GPU. Multi-GPU HIP/CUDA/Vulkan ordering keeps shared target output heads on that GPU too. Unknown device identity fails safely. |
 | `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.). On broken b10741-b10748 runtimes, command preparation disables only MTP while preserving compatible ngram speculation; standalone MTP heads and array-backed NextN targets are rejected before launch. Full MTP resumes on b10749+. |
 | `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. Generic DSpark is emitted on b10164+; Nemotron3.5 uses its b10665 profile gate. DFlash2 reuses `draft-dflash` and accepts mainline b10658+ (reviewed PR #27342 builds remain a legacy fallback). |
 | `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
@@ -1147,6 +1150,23 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.4 — llama.cpp b10863, model profiles and lazy-memory safety
+
+- Verified Spark-X2.5 **4B** and MiniCPM5 **2B** generation/tool calls with Q8
+  KV on b10863 Vulkan and HIP. Separate 2B/2.6B MiniCPM sampling profile.
+- New **K2 Horizon** profile with an explicit IFM-fork gate and conservative
+  MoVA-aware whole-layer placement; not confused with Kimi-K2.
+- Qwen Flash Next's **51.2B-entry / 26.8-GiB PLE table is already NVMe-backed
+  lazy data**, confirmed by a real launch. Unsupported flags and conflicting
+  overrides cannot silently invalidate that memory plan. Active pages still
+  consume RAM; the residency budget is not an OS cache limit.
+- Fixed external-draft GPU placement and the HIP shared-output-head abort;
+  actual two-GPU DFlash2 inference passes on both AMD backends. Added Kimi-K3
+  pre-b10853 checkpoint notice, alias-safe merging and CPU forced-lock fix.
+- 80 model profiles, translated notes in all nine languages; prior benchmark
+  measurements remain intact, old automatic winners require a fresh search.
+- [Audit](docs/llama-b10863-audit.md) · [Validation](docs/v5.4.4-validation.md).
 
 ### v5.4.3 — Q8 KV by default, llama.cpp b10839
 
