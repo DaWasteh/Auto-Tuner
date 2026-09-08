@@ -145,7 +145,9 @@ def upgrade_file(path: Path, gguf_mod) -> bool:
     tmp = path.with_name(path.stem + ".fixed.gguf")
     writer = gguf.GGUFWriter(str(tmp), ARCH, use_temp_file=False)
     for field in reader.fields.values():
-        if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith("GGUF."):
+        if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith(
+            "GGUF."
+        ):
             continue
         val_type = field.types[0]
         sub_type = field.types[-1] if val_type == gguf.GGUFValueType.ARRAY else None
@@ -166,7 +168,11 @@ def upgrade_file(path: Path, gguf_mod) -> bool:
         name = TENSOR_RENAMES.get(tensor.name, tensor.name)
         renamed += name != tensor.name
         writer.add_tensor_info(
-            name, tensor.data.shape, tensor.data.dtype, tensor.data.nbytes, tensor.tensor_type
+            name,
+            tensor.data.shape,
+            tensor.data.dtype,
+            tensor.data.nbytes,
+            tensor.tensor_type,
         )
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -194,7 +200,9 @@ def upgrade_file(path: Path, gguf_mod) -> bool:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("targets", nargs="+", help="GGUF-Dateien oder Ordner")
-    ap.add_argument("--gguf-py", help="Pfad zum gguf-py-Ordner eines llama.cpp-Checkouts")
+    ap.add_argument(
+        "--gguf-py", help="Pfad zum gguf-py-Ordner eines llama.cpp-Checkouts"
+    )
     args = ap.parse_args(argv)
 
     gguf_py = _find_gguf_py(args.gguf_py)

@@ -407,7 +407,9 @@ class ControlApiServer:
                 and self._backend_url
                 and not self._loading_model_id
             )
-            state = "loading" if self._loading_model_id else "ready" if ready else "idle"
+            state = (
+                "loading" if self._loading_model_id else "ready" if ready else "idle"
+            )
             detail = dict(self._active_detail) if ready else {}
             payload: Dict[str, Any] = {
                 "status": state,
@@ -903,15 +905,11 @@ class _ControlRequestHandler(BaseHTTPRequestHandler):
             upstream_headers["Content-Length"] = str(len(body))
             upstream_headers["Connection"] = "close"
             if lease.backend_api_key:
-                upstream_headers["Authorization"] = (
-                    f"Bearer {lease.backend_api_key}"
-                )
+                upstream_headers["Authorization"] = f"Bearer {lease.backend_api_key}"
 
             upstream_path = self.path
             if target.path and target.path != "/":
-                upstream_path = (
-                    target.path.rstrip("/") + "/" + self.path.lstrip("/")
-                )
+                upstream_path = target.path.rstrip("/") + "/" + self.path.lstrip("/")
             response_started = False
             try:
                 connection.request(
@@ -1023,7 +1021,12 @@ def _validated_loopback_host(host: str) -> str:
 
 def _validated_backend_url(value: str) -> str:
     parsed: SplitResult = urlsplit(value)
-    if parsed.scheme != "http" or not parsed.hostname or parsed.query or parsed.fragment:
+    if (
+        parsed.scheme != "http"
+        or not parsed.hostname
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ControlApiError(
             "AutoTuner returned an invalid llama-server URL.",
             status=500,

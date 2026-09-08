@@ -10,6 +10,7 @@ key/value pairs so we can spot the alternate name.
 Usage:
     python diag_kv_v2.py D:/models/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf
 """
+
 from __future__ import annotations
 
 import sys
@@ -66,8 +67,7 @@ def main(argv) -> None:
             sv = sv[:77] + "…"
         print(f"    {k:<{longest}}  =  {sv}")
     print()
-    print(f"  Total: {len(matches)} matching keys, "
-          f"{len(md)} keys overall in the GGUF")
+    print(f"  Total: {len(matches)} matching keys, {len(md)} keys overall in the GGUF")
 
 
 if __name__ == "__main__":

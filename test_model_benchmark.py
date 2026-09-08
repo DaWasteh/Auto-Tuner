@@ -85,8 +85,7 @@ def test_candidate_generation_is_deterministic_and_valid() -> None:
     offloaded = thread_candidates(seed12, 16, 32, full_offload=True)
     assert (6, 6) in {(item.threads, item.batch_threads) for item in offloaded}
     assert (6, 6) not in {
-        (item.threads, item.batch_threads)
-        for item in thread_candidates(seed12, 16, 32)
+        (item.threads, item.batch_threads) for item in thread_candidates(seed12, 16, 32)
     }
 
     batches = batch_candidates(first[0])
@@ -103,9 +102,7 @@ def test_candidate_generation_is_deterministic_and_valid() -> None:
 
     refined = refine_batch_candidates(batches[-1], batches)
     assert refined
-    assert all(
-        (item.batch, item.ubatch) not in set(pairs) for item in refined
-    )
+    assert all((item.batch, item.ubatch) not in set(pairs) for item in refined)
     assert all(item.threads == batches[-1].threads for item in refined)
 
     drafts = draft_candidates(batches[0], maximum=4)

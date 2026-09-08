@@ -85,9 +85,7 @@ def test_qt_catalogue_uses_path_stable_ids_capabilities_and_routeability(
     assert by_path[drafter.path].runnable is False
     assert "draft" in by_path[drafter.path].unavailable_reason.casefold()
 
-    app_settings.set_mmproj_selection(
-        first.name, app_settings.MMPROJ_NONE_SENTINEL
-    )
+    app_settings.set_mmproj_selection(first.name, app_settings.MMPROJ_NONE_SENTINEL)
     disabled = qt_launcher._control_api_catalogue([first], profiles)[0]
     assert disabled.input_types == ("text",)
 
@@ -195,7 +193,9 @@ def test_qt_control_requests_wait_for_health_and_stop_only_managed_server(
     window.close()
 
 
-def test_qt_control_transition_waits_for_real_process_exit(tmp_path, monkeypatch) -> None:
+def test_qt_control_transition_waits_for_real_process_exit(
+    tmp_path, monkeypatch
+) -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qt_launcher = pytest.importorskip("qt_launcher")
     qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
@@ -298,7 +298,9 @@ def test_launch_command_credentials_are_redacted_but_recoverable_for_proxy(
     assert str(key_file) not in qt_launcher._redacted_command(from_file)
 
 
-def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch) -> None:
+def test_qt_runtime_catalogue_selection_and_discovery_file(
+    tmp_path, monkeypatch
+) -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qt_launcher = pytest.importorskip("qt_launcher")
     qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
@@ -388,7 +390,15 @@ def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch
             "ready": True,
             "model": model.name,
             "alias": "qwen",
-            "command": ["llama-server", "-m", str(model.path), "-c", "4096", "-ngl", "99"],
+            "command": [
+                "llama-server",
+                "-m",
+                str(model.path),
+                "-c",
+                "4096",
+                "-ngl",
+                "99",
+            ],
             "fork_label": window._fork_combo.currentText(),
             "runtime_binary": binaries[Path(window._fork_combo.currentData())],
         }
@@ -409,7 +419,9 @@ def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch
     assert excinfo.value.code == "runtime_unavailable" and excinfo.value.status == 409
     assert launched == []
 
-    request = ControlRequest("switch", model_id, timeout_s=1, runtime_id="b10786-hip-llama-cpp")
+    request = ControlRequest(
+        "switch", model_id, timeout_s=1, runtime_id="b10786-hip-llama-cpp"
+    )
     window._handle_control_request(request)
     result = request.wait()
     assert window._fork_combo.currentText() == "b10786_hip_llama.cpp"
@@ -425,7 +437,9 @@ def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch
 
     # The same model on the already-selected runtime is idempotent, while the
     # default (toolbar) runtime now resolves to the HIP build as well.
-    again = ControlRequest("switch", model_id, timeout_s=1, runtime_id="b10786-hip-llama-cpp")
+    again = ControlRequest(
+        "switch", model_id, timeout_s=1, runtime_id="b10786-hip-llama-cpp"
+    )
     window._handle_control_request(again)
     again.wait()
     assert len(launched) == 1
@@ -435,7 +449,9 @@ def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch
     assert len(launched) == 1
 
     # Switching back to the Vulkan build restarts the model there.
-    back = ControlRequest("switch", model_id, timeout_s=1, runtime_id="b10786-vulkan-llama-cpp")
+    back = ControlRequest(
+        "switch", model_id, timeout_s=1, runtime_id="b10786-vulkan-llama-cpp"
+    )
     window._handle_control_request(back)
     back.wait()
     assert len(launched) == 2
@@ -450,18 +466,25 @@ def test_qt_runtime_catalogue_selection_and_discovery_file(tmp_path, monkeypatch
 
     payload = json.loads(discovery.read_text(encoding="utf-8"))
     assert payload["enabled"] is False and "token" not in payload
-    assert payload["schema"] == 1 and payload["port"] == app_settings.get_control_api_port()
+    assert (
+        payload["schema"] == 1
+        and payload["port"] == app_settings.get_control_api_port()
+    )
     window._servers.clear()
     window.close()
 
 
-def test_long_message_dialog_scrolls_and_keeps_ok_reachable(tmp_path, monkeypatch) -> None:
+def test_long_message_dialog_scrolls_and_keeps_ok_reachable(
+    tmp_path, monkeypatch
+) -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qt_launcher = pytest.importorskip("qt_launcher")
     qt_widgets = pytest.importorskip("PyQt6.QtWidgets")
     app = qt_widgets.QApplication.instance() or qt_widgets.QApplication([])
     assert app is qt_widgets.QApplication.instance()
-    message = "\n".join(f"line {index}: PP 123.4, decode 56.7 tok/s" for index in range(400))
+    message = "\n".join(
+        f"line {index}: PP 123.4, decode 56.7 tok/s" for index in range(400)
+    )
     dialog = qt_launcher._LongMessageDialog("Performance test complete", message)
     dialog.show()
     app.processEvents()

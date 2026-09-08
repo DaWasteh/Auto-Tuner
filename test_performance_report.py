@@ -223,7 +223,9 @@ def test_html_offers_recommended_settings_and_collapsed_candidate_diagrams() -> 
     assert 'class="run-chart-card"' in html
     # The winner table repeats the applied settings for scanning.
     assert "Applied settings" in html
-    assert "threads 8 / batch threads 8 · batch 1024 / ubatch 512 · draft n-max 7" in html
+    assert (
+        "threads 8 / batch threads 8 · batch 1024 / ubatch 512 · draft n-max 7" in html
+    )
     # Metric legend and settings captions under chart columns.
     assert "PP = prompt processing tok/s" in html
     assert "threads 8 / 8 · batch 1024 / 512 · draft 7" in html

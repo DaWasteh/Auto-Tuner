@@ -1,4 +1,4 @@
-Auflistung der Ordnerpfade für Volume OneDrive
+Auflistung der Ordnerpfade fÃ¼r Volume OneDrive
 Volumeseriennummer : 00000085 36CA:A260
 I:.
 |   get_metadata.py

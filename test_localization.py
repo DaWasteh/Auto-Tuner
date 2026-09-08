@@ -90,7 +90,9 @@ def test_custom_pack_import_is_validated_namespaced_and_atomic(tmp_path) -> None
     assert manager.translate("⚙ Settings") == "⚙ Ship settings"
     assert manager.translate("Language:") == "Language:"
 
-    custom.write_text(custom.read_text(encoding="utf-8").replace("Ship", "Crew"), encoding="utf-8")
+    custom.write_text(
+        custom.read_text(encoding="utf-8").replace("Ship", "Crew"), encoding="utf-8"
+    )
     with pytest.raises(FileExistsError):
         manager.import_pack(custom)
     replaced = manager.import_pack(custom, replace=True)
@@ -166,8 +168,13 @@ def test_profile_notes_follow_the_interface_language(tmp_path) -> None:
         assert set(pack.profile_notes) == files, pack.qualified_id
     # The YAML text is the English canonical version.
     for profile in profiles:
-        assert " ".join(profile.notes.split()) == english.profile_notes[profile.source_file]
-    gemma = next(profile for profile in profiles if profile.source_file == "gemma-4.yaml")
+        assert (
+            " ".join(profile.notes.split())
+            == english.profile_notes[profile.source_file]
+        )
+    gemma = next(
+        profile for profile in profiles if profile.source_file == "gemma-4.yaml"
+    )
 
     manager.select(DEFAULT_LANGUAGE_ID)
     assert manager.profile_notes(gemma).startswith("Gemma is sensitive")
@@ -177,7 +184,9 @@ def test_profile_notes_follow_the_interface_language(tmp_path) -> None:
     manager.select("builtin:ja-JP")
     assert manager.profile_notes(gemma).startswith("Gemma は")
     # Unknown profiles fall back to the supplied YAML text.
-    assert manager.profile_notes("does-not-exist.yaml", "yaml fallback") == "yaml fallback"
+    assert (
+        manager.profile_notes("does-not-exist.yaml", "yaml fallback") == "yaml fallback"
+    )
     assert manager.profile_notes(None, "plain") == "plain"
 
     template = json.loads(manager.ensure_custom_template().read_text(encoding="utf-8"))
@@ -249,7 +258,11 @@ def _gui_help_strings() -> set[str]:
             )
             if name == "_setting_tooltip":
                 found.update(a.value for a in node.args if is_const(a))
-            elif name in ("_tr", "translate", "tr") and node.args and is_const(node.args[0]):
+            elif (
+                name in ("_tr", "translate", "tr")
+                and node.args
+                and is_const(node.args[0])
+            ):
                 found.add(node.args[0].value)
         elif (
             isinstance(node, ast.Assign)
@@ -278,7 +291,9 @@ def test_every_gui_help_string_is_translated_in_every_builtin_pack(tmp_path) -> 
     assert len(required) >= 250
     for pack in manager.available():
         missing = sorted(text for text in required if text not in pack.strings)
-        assert missing == [], f"{pack.qualified_id} lacks {len(missing)} strings: {missing[:5]}"
+        assert missing == [], (
+            f"{pack.qualified_id} lacks {len(missing)} strings: {missing[:5]}"
+        )
         if pack.qualified_id != DEFAULT_LANGUAGE_ID:
             untranslated = [
                 text
@@ -300,7 +315,9 @@ def test_two_level_tooltips_are_translated_as_plain_text(tmp_path) -> None:
 
     manager.select("builtin:de-DE")
     translated = manager.translate_tooltip(html)
-    assert translated.startswith("<html><body style='max-width:520px'><p><b>Kurz gesagt:</b> ")
+    assert translated.startswith(
+        "<html><body style='max-width:520px'><p><b>Kurz gesagt:</b> "
+    )
     assert "Technische Details:" in translated
     assert "Oberflächensprache" in translated
     assert "Built-in JSON" not in translated
@@ -314,7 +331,9 @@ def test_two_level_tooltips_are_translated_as_plain_text(tmp_path) -> None:
     out = manager.translate_tooltip(dynamic)
     assert "Aktiver Build: b10797_vulkan" in out
     assert "Aufgelöster Pfad: L:\\x" in out
-    suffixed = html + "<br><br>AUTOTUNER_CONTROL_API_KEY currently overrides this value."
+    suffixed = (
+        html + "<br><br>AUTOTUNER_CONTROL_API_KEY currently overrides this value."
+    )
     assert manager.translate_tooltip(suffixed).endswith(
         "<br><br>AUTOTUNER_CONTROL_API_KEY currently overrides this value."
     )
@@ -350,11 +369,15 @@ def test_widget_tooltips_follow_the_language_live(tmp_path) -> None:
     manager.apply_to(root)
     assert "Кратко:" in button.toolTip()
     assert "Переименовать выбранный пользовательский профиль" in button.toolTip()
-    assert plain.toolTip() == "Наведите курсор, чтобы узнать, как собирается эта метрика."
+    assert (
+        plain.toolTip() == "Наведите курсор, чтобы узнать, как собирается эта метрика."
+    )
 
     manager.select("builtin:fr-FR")
     manager.apply_to(root)
     assert "En bref :" in button.toolTip()
-    assert plain.toolTip() == "Survolez pour savoir comment cette métrique est collectée."
+    assert (
+        plain.toolTip() == "Survolez pour savoir comment cette métrique est collectée."
+    )
     root.close()
     assert app is qt_widgets.QApplication.instance()

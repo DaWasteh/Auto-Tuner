@@ -138,9 +138,7 @@ def _read_language_pack(path: Path, source: str) -> LanguagePack:
     if not isinstance(payload, dict):
         raise LanguagePackError("top-level value must be an object")
     if payload.get("schema_version") != LANGUAGE_PACK_SCHEMA:
-        raise LanguagePackError(
-            f"schema_version must be {LANGUAGE_PACK_SCHEMA}"
-        )
+        raise LanguagePackError(f"schema_version must be {LANGUAGE_PACK_SCHEMA}")
 
     pack_id = payload.get("id")
     if not isinstance(pack_id, str) or not _ID_RE.fullmatch(pack_id):
@@ -240,7 +238,9 @@ class LanguageManager(QObject):
         errors: List[str] = []
         for source, root in (("builtin", self.builtin_dir), ("user", self.user_dir)):
             try:
-                paths = sorted(root.glob("*.json"), key=lambda item: item.name.casefold())
+                paths = sorted(
+                    root.glob("*.json"), key=lambda item: item.name.casefold()
+                )
             except OSError as exc:
                 errors.append(f"{root}: {exc}")
                 continue
@@ -306,7 +306,9 @@ class LanguageManager(QObject):
             return direct
         if "\n" not in text:
             return self._translate_line(text, strings)
-        return "\n".join(self._translate_line(line, strings) for line in text.split("\n"))
+        return "\n".join(
+            self._translate_line(line, strings) for line in text.split("\n")
+        )
 
     @staticmethod
     def _translate_line(line: str, strings: Dict[str, str]) -> str:
@@ -349,9 +351,7 @@ class LanguageManager(QObject):
         if match is None:
             return self.translate_text(text)
         summary = self.translate_text(_tooltip_html_to_text(match.group("summary")))
-        technical = self.translate_text(
-            _tooltip_html_to_text(match.group("technical"))
-        )
+        technical = self.translate_text(_tooltip_html_to_text(match.group("technical")))
         rebuilt = setting_tooltip_html(
             summary,
             technical,

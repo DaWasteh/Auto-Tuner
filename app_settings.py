@@ -3791,9 +3791,7 @@ def get_control_api_port() -> int:
     """Return the validated loopback gateway port (default 1233)."""
     raw: Any = os.environ.get(_CONTROL_API_PORT_ENV)
     if raw is None:
-        raw = _read_settings_shared().get(
-            "control_api_port", _DEFAULT_CONTROL_API_PORT
-        )
+        raw = _read_settings_shared().get("control_api_port", _DEFAULT_CONTROL_API_PORT)
     try:
         value = int(raw)
     except (TypeError, ValueError):

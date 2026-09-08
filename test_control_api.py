@@ -131,7 +131,9 @@ def test_control_api_auth_catalogue_switch_status_and_stop() -> None:
     switches: list[str] = []
     stops: list[bool] = []
 
-    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
+    def switch(
+        model_id: str, _timeout: float, _options: Dict[str, Any]
+    ) -> Dict[str, Any]:
         switches.append(model_id)
         return {
             "backend_url": "http://127.0.0.1:65530",
@@ -154,9 +156,7 @@ def test_control_api_auth_catalogue_switch_status_and_stop() -> None:
         status, body, _headers = _request(api.base_url, "GET", "/health", token=None)
         assert status == 200 and body["service"] == "autotuner-control-api"
 
-        status, body, headers = _request(
-            api.base_url, "GET", "/v1/models", token=None
-        )
+        status, body, headers = _request(api.base_url, "GET", "/v1/models", token=None)
         assert status == 401
         assert body["error"]["code"] == "unauthorised"
         assert headers["www-authenticate"].startswith("Bearer")
@@ -174,9 +174,12 @@ def test_control_api_auth_catalogue_switch_status_and_stop() -> None:
             "qwen-7b",
             "diffusion-cli",
         }
-        assert next(
-            item for item in body["models"] if item["id"] == "diffusion-cli"
-        )["runnable"] is False
+        assert (
+            next(item for item in body["models"] if item["id"] == "diffusion-cli")[
+                "runnable"
+            ]
+            is False
+        )
 
         status, body, _headers = _request(
             api.base_url,
@@ -216,10 +219,14 @@ def test_control_api_auth_catalogue_switch_status_and_stop() -> None:
     assert not api.running
 
 
-def test_openai_proxy_switches_model_and_rewrites_only_backend_identity(upstream) -> None:
+def test_openai_proxy_switches_model_and_rewrites_only_backend_identity(
+    upstream,
+) -> None:
     upstream_url, requests = upstream
 
-    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
+    def switch(
+        model_id: str, _timeout: float, _options: Dict[str, Any]
+    ) -> Dict[str, Any]:
         assert model_id == "qwen-7b"
         return {
             "backend_url": upstream_url,
@@ -295,7 +302,9 @@ def test_proxy_lease_blocks_conflicting_switch_without_truncating_stream(
     upstream_url, _requests = upstream
     switched: list[str] = []
 
-    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
+    def switch(
+        model_id: str, _timeout: float, _options: Dict[str, Any]
+    ) -> Dict[str, Any]:
         switched.append(model_id)
         return {"backend_url": upstream_url, "alias": f"alias-{model_id}"}
 
@@ -382,7 +391,9 @@ def test_control_api_settings_roundtrip_and_environment_overrides(
     real_save = app_settings.save_settings
     monkeypatch.setattr(app_settings, "save_settings", lambda _settings: False)
     with pytest.raises(OSError, match="configuration"):
-        app_settings.set_control_api_config(False, 9876, "replacement-token-long-enough")
+        app_settings.set_control_api_config(
+            False, 9876, "replacement-token-long-enough"
+        )
     assert app_settings.load_settings() == previous
     monkeypatch.setattr(app_settings, "save_settings", real_save)
 
@@ -392,7 +403,9 @@ def test_control_api_settings_roundtrip_and_environment_overrides(
     assert app_settings.get_control_api_enabled() is False
     assert app_settings.get_control_api_port() == 9876
     assert app_settings.ensure_control_api_token() == "environment-token-long-enough"
-    assert app_settings.regenerate_control_api_token() == "environment-token-long-enough"
+    assert (
+        app_settings.regenerate_control_api_token() == "environment-token-long-enough"
+    )
 
 
 def test_switches_are_serialized_across_concurrent_http_clients() -> None:
@@ -401,7 +414,9 @@ def test_switches_are_serialized_across_concurrent_http_clients() -> None:
     max_callbacks = 0
     order: list[str] = []
 
-    def switch(model_id: str, _timeout: float, _options: Dict[str, Any]) -> Dict[str, Any]:
+    def switch(
+        model_id: str, _timeout: float, _options: Dict[str, Any]
+    ) -> Dict[str, Any]:
         nonlocal active_callbacks, max_callbacks
         with state_lock:
             active_callbacks += 1
@@ -523,7 +538,12 @@ def test_pi_extension_runtime_discovery_and_control_port_precedence(tmp_path) ->
         # AutoTuner >= 5.3.9 sidecar: no environment override and a settings
         # file that is far too large to parse must still resolve the gateway.
         (tmp_path / "autotuner_settings.json").write_text(
-            json.dumps({"control_api_port": 65529, "control_api_token": "stale-token-value-0000"})
+            json.dumps(
+                {
+                    "control_api_port": 65529,
+                    "control_api_token": "stale-token-value-0000",
+                }
+            )
             + " " * (3 * 1024 * 1024),
             encoding="utf-8",
         )
@@ -567,10 +587,7 @@ def test_pi_extension_typechecks_when_local_pi_types_are_available() -> None:
     if tsc is None or pi_command is None:
         pytest.skip("TypeScript or Pi is not installed")
     package = (
-        Path(pi_command).parent
-        / "node_modules"
-        / "@earendil-works"
-        / "pi-coding-agent"
+        Path(pi_command).parent / "node_modules" / "@earendil-works" / "pi-coding-agent"
     )
     declarations = package / "dist" / "index.d.ts"
     type_roots = package / "node_modules" / "@types"
@@ -587,9 +604,7 @@ def test_pi_extension_typechecks_when_local_pi_types_are_available() -> None:
                 "noEmit": True,
                 "skipLibCheck": True,
                 "baseUrl": directory,
-                "paths": {
-                    "@earendil-works/pi-coding-agent": [str(declarations)]
-                },
+                "paths": {"@earendil-works/pi-coding-agent": [str(declarations)]},
                 "typeRoots": [str(type_roots)],
             },
             "files": [str(ROOT / "integrations" / "pi" / "autotuner.ts")],
@@ -609,7 +624,9 @@ def test_pi_extension_typechecks_when_local_pi_types_are_available() -> None:
 def test_runtimes_endpoint_switch_options_and_extended_status() -> None:
     calls: list[tuple[str, float, Dict[str, Any]]] = []
 
-    def switch(model_id: str, timeout: float, options: Dict[str, Any]) -> Dict[str, Any]:
+    def switch(
+        model_id: str, timeout: float, options: Dict[str, Any]
+    ) -> Dict[str, Any]:
         calls.append((model_id, timeout, dict(options)))
         return {
             "backend_url": "http://127.0.0.1:65531",
@@ -673,7 +690,10 @@ def test_runtimes_endpoint_switch_options_and_extended_status() -> None:
         assert status == 200
         assert body["default_runtime_id"] == "vulkan-b10786"
         assert body["active_runtime"] is None
-        assert [item["id"] for item in body["runtimes"]] == ["vulkan-b10786", "hip-broken"]
+        assert [item["id"] for item in body["runtimes"]] == [
+            "vulkan-b10786",
+            "hip-broken",
+        ]
         first, second = body["runtimes"]
         assert first["build"] == "b10786" and first["build_number"] == 10786
         assert first["build_info"] == "b10786-de8656bd9"
@@ -715,7 +735,11 @@ def test_runtimes_endpoint_switch_options_and_extended_status() -> None:
             api.base_url,
             "POST",
             "/api/v1/switch",
-            payload={"model_id": "qwen-7b", "runtime_id": "vulkan-b10786", "timeout_s": 12.5},
+            payload={
+                "model_id": "qwen-7b",
+                "runtime_id": "vulkan-b10786",
+                "timeout_s": 12.5,
+            },
         )
         assert status == 200 and body["status"] == "ready" and body["ready"] is True
         assert body["backend_url"] == "http://127.0.0.1:65531"

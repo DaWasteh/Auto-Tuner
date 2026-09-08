@@ -256,4 +256,3 @@ def launch(cmd: List[str], env_overrides: Optional[dict] = None) -> int:
             except KeyboardInterrupt:
                 _force_kill(proc)
         _restore_signal_handlers(prev_handlers)
-        

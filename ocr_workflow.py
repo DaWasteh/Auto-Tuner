@@ -153,9 +153,7 @@ def ocr_model_family(model: object) -> Optional[str]:
     # Only the checkpoint name distinguishes their incompatible prompts.
     if "unlimited" in text and "ocr" in text:
         return "unlimited-ocr"
-    if ("deepseek" in text and "ocr" in text) or (
-        "deepseek" in arch and "ocr" in arch
-    ):
+    if ("deepseek" in text and "ocr" in text) or ("deepseek" in arch and "ocr" in arch):
         return "deepseek-ocr"
     if "paddleocr" in text or "paddleocr" in arch:
         return "paddleocr-vl"
@@ -312,9 +310,7 @@ def parse_page_range(spec: str, page_count: int) -> Tuple[int, ...]:
         if start < 1 or end < start:
             raise ValueError(f"invalid page range: {chunk!r}")
         if end > page_count:
-            raise ValueError(
-                f"page {end} exceeds document page count {page_count}"
-            )
+            raise ValueError(f"page {end} exceeds document page count {page_count}")
         selected.update(range(start - 1, end))
     if not selected:
         raise ValueError("page range selects no pages")
@@ -815,7 +811,9 @@ class OcrJobRunner:
             suffix = original.suffix.lower()
             media = original
             if suffix in OFFICE_EXTENSIONS:
-                source_convert_dir = converted_dir / f"{index:04d}-{_safe_stem(original)}"
+                source_convert_dir = (
+                    converted_dir / f"{index:04d}-{_safe_stem(original)}"
+                )
                 media = self._convert_office(original, source_convert_dir)
                 self._assert_source_unchanged(original)
                 suffix = ".pdf"
@@ -853,7 +851,9 @@ class OcrJobRunner:
                         f"limit is {MAX_IMAGE_PIXELS:,}. Lower the DPI."
                     )
                 pixmap = page.get_pixmap(
-                    matrix=pymupdf.Matrix(scale, scale), alpha=False, colorspace=pymupdf.csRGB
+                    matrix=pymupdf.Matrix(scale, scale),
+                    alpha=False,
+                    colorspace=pymupdf.csRGB,
                 )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 pixmap.save(target)
@@ -1012,9 +1012,7 @@ class OcrJobRunner:
             ) from exc
         if isinstance(content, list):
             content = "".join(
-                str(part.get("text", ""))
-                for part in content
-                if isinstance(part, dict)
+                str(part.get("text", "")) for part in content if isinstance(part, dict)
             )
         text = str(content or "").strip()
         if self.options.strip_grounding:
@@ -1204,7 +1202,9 @@ class OcrJobRunner:
                     current += 1
                     page_number = page_index + 1
                     image_path = rendered_dir / f"{stem}-page-{page_number:04d}.png"
-                    output_path = pages_dir / f"{stem}-page-{page_number:04d}{extension}"
+                    output_path = (
+                        pages_dir / f"{stem}-page-{page_number:04d}{extension}"
+                    )
                     started = time.monotonic()
                     try:
                         self._assert_source_unchanged(source.original)
@@ -1271,7 +1271,9 @@ class OcrJobRunner:
                 if options.output_format == "markdown":
                     combined_parts.append(f"# {source.original.name}\n")
                     for page_number, text in entries:
-                        combined_parts.append(f"\n## Page {page_number}\n\n{text.strip()}\n")
+                        combined_parts.append(
+                            f"\n## Page {page_number}\n\n{text.strip()}\n"
+                        )
                 else:
                     combined_parts.append(f"===== {source.original.name} =====\n")
                     for page_number, text in entries:
@@ -1279,7 +1281,11 @@ class OcrJobRunner:
                             f"\n----- Page {page_number} -----\n{text.strip()}\n"
                         )
             _atomic_write(combined_output, "\n".join(combined_parts).rstrip() + "\n")
-            status = "completed_with_errors" if any(r.error for r in page_results) else "completed"
+            status = (
+                "completed_with_errors"
+                if any(r.error for r in page_results)
+                else "completed"
+            )
         except OcrCancelled as exc:
             status = "cancelled"
             fatal_error = str(exc)

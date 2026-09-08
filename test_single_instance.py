@@ -96,7 +96,9 @@ def test_second_guard_is_refused_and_activation_reaches_the_primary(tmp_path) ->
         assert not secondary.try_acquire()
         assert not secondary.is_primary
         assert secondary.notify_running_instance()
-        assert _pump(app, lambda: bool(activations)), "primary never saw the activate request"
+        assert _pump(app, lambda: bool(activations)), (
+            "primary never saw the activate request"
+        )
         assert activations == [1]
 
         # Only the documented command activates; noise must be ignored.
@@ -162,7 +164,9 @@ def test_guard_is_honoured_across_processes(tmp_path) -> None:
         assert first == "listening", first
 
         secondary = SingleInstanceGuard(key)
-        assert not secondary.try_acquire(), "the lock must be visible from another process"
+        assert not secondary.try_acquire(), (
+            "the lock must be visible from another process"
+        )
         assert secondary.notify_running_instance()
         out, _ = child.communicate(timeout=30)
         assert "activated" in out, out
@@ -187,7 +191,9 @@ def test_guard_is_honoured_across_processes(tmp_path) -> None:
 def window(tmp_path, monkeypatch):
     qt_launcher = pytest.importorskip("qt_launcher")
     app = _app()
-    monkeypatch.setattr(app_settings, "_settings_file", lambda: tmp_path / "settings.json")
+    monkeypatch.setattr(
+        app_settings, "_settings_file", lambda: tmp_path / "settings.json"
+    )
     monkeypatch.setattr(app_settings, "app_data_dir", lambda: tmp_path)
     # Never let a modal box block the offscreen test process.
     qt_widgets = sys.modules["PyQt6.QtWidgets"]
@@ -197,7 +203,9 @@ def window(tmp_path, monkeypatch):
     monkeypatch.setattr(
         qt_widgets.QMessageBox, "information", staticmethod(lambda *a, **k: None)
     )
-    win = qt_launcher.MainWindow(tmp_path / "models", SETTINGS_DIR, start_background=False)
+    win = qt_launcher.MainWindow(
+        tmp_path / "models", SETTINGS_DIR, start_background=False
+    )
     yield qt_launcher, app, win
     try:
         win._force_quit = True

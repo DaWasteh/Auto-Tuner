@@ -2082,15 +2082,21 @@ as the inference API (there is **no** separate metrics port):
 
   ```python
   import urllib.request
+
+
   def llama_metrics(base_url: str) -> dict[str, float]:
       out = {}
       with urllib.request.urlopen(f"{base_url}/metrics", timeout=0.5) as r:
           for line in r.read().decode().splitlines():
               if line and not line.startswith("#"):
                   name, _, val = line.partition(" ")
-                  try: out[name] = float(val)
-                  except ValueError: pass
+                  try:
+                      out[name] = float(val)
+                  except ValueError:
+                      pass
       return out
+
+
   # llama_metrics("http://127.0.0.1:1234")["llamacpp:predicted_tokens_seconds"]
   ```
 
