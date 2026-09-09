@@ -196,6 +196,32 @@ def test_failed_clone_cleans_every_pre_promotion_staging_tree(tmp_path: Path) ->
     assert "staging cleanup OK" in result.stdout
 
 
+@pytest.mark.parametrize("modern", [False, True])
+def test_flash_attention_options_follow_checked_out_source(tmp_path, modern) -> None:
+    ggml = tmp_path / "ggml"
+    ggml.mkdir()
+    (ggml / "CMakeLists.txt").write_text(
+        'set (GGML_CUDA_FA_QUANTS "q8_0-q8_0" CACHE STRING "quants")'
+        if modern
+        else 'option(GGML_CUDA_FA_ALL_QUANTS "all" OFF)',
+        encoding="utf-8",
+    )
+    result = _run_pwsh(
+        """
+        . $env:AUTOTUNER_TEST_COMMON_RECIPE
+        Get-LlamaFlashAttentionArgs -Repo $env:AUTOTUNER_TEST_WORKSPACE
+        """,
+        env={"AUTOTUNER_TEST_WORKSPACE": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = result.stdout.splitlines()
+    assert args == (
+        ["-UGGML_CUDA_FA_ALL_QUANTS", "-DGGML_CUDA_FA_QUANTS=all"]
+        if modern
+        else ["-DGGML_CUDA_FA_ALL_QUANTS=ON"]
+    )
+
+
 def test_stable_recipe_accepts_prefixed_and_unprefixed_exact_tags() -> None:
     common = _common_recipe()
 

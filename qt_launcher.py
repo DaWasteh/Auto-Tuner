@@ -4791,7 +4791,7 @@ class ExpertPanel(QWidget):
         )
 
         self._cb_load_mode = QComboBox()
-        self._cb_load_mode.addItem("auto (mmap default)", "auto")
+        self._cb_load_mode.addItem("auto (runtime/device default)", "auto")
         self._cb_load_mode.addItem("none (normal reads)", "none")
         self._cb_load_mode.addItem("mmap", "mmap")
         self._cb_load_mode.addItem("mlock (without mmap, b10151+)", "mlock")

@@ -1050,10 +1050,9 @@ function Invoke-LlamaCMakeBuild {
             # deterministic decoded text on an actual two-GPU layer split.
             "-DGGML_CUDA_NO_PEER_COPY=ON",
             "-DGGML_CUDA_FA=ON",
-            "-DGGML_CUDA_FA_ALL_QUANTS=ON",
             "-DGGML_FMA=ON",
             "-DGGML_F16C=ON"
-        ) + $resourceFlags + $commonArgs + $ExtraCMakeArgs
+        ) + $resourceFlags + $commonArgs + @(Get-LlamaFlashAttentionArgs -Repo $Repo) + $ExtraCMakeArgs
         Invoke-NativeChecked "$Backend configure" {
             cmake -S $Repo -B $buildDir @cmakeArgs
         }
@@ -1069,6 +1068,21 @@ function Invoke-LlamaCMakeBuild {
     }
     if ($Backend -eq "HIP") {
         Copy-HipRuntimeDependencies -Repo $Repo -RocmPath $environment.RocmPath
+    }
+}
+
+function Get-LlamaFlashAttentionArgs {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    # b10876 replaces the boolean with a K/V combination list. Inspect the
+    # checked-out source, not tag numbers: stable and pinned forks may differ.
+    $options = Get-Content -LiteralPath (Join-Path $Repo "ggml/CMakeLists.txt") -Raw -ErrorAction Stop
+    if ($options -match '(?m)^\s*set\s*\(\s*GGML_CUDA_FA_QUANTS\b') {
+        # Clear a legacy ON cache entry too, or upstream still warns/overrides.
+        "-UGGML_CUDA_FA_ALL_QUANTS"
+        "-DGGML_CUDA_FA_QUANTS=all"
+    } else {
+        "-DGGML_CUDA_FA_ALL_QUANTS=ON"
     }
 }
 

@@ -4443,7 +4443,7 @@ def test_qwen4exp_plans_130k_with_lazy_ple_active_residency(
 
     cmd = build_command(model, cfg, profile)
     lazy_index = cmd.index("--lazy-mode")
-    assert cmd[lazy_index + 1] == "auto"
+    assert cmd[lazy_index + 1] == "on"
 
 
 def test_dense_split_reserves_primary_only_mmproj_vram(tmp_path) -> None:

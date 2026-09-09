@@ -53,9 +53,9 @@ class BenchmarkFailure(RuntimeError):
 # Increment when persisted evidence or the search/decision procedure changes
 # in a way that makes an older winner unsafe to reuse automatically.
 BENCHMARK_RECORD_SCHEMA = 4
-# v5.4.3: Q8-first placement/FA cascade; old Q4/F16 measured winners remain
-# historical evidence but must not silently override the new Auto policy.
-BENCHMARK_SEARCH_SCHEMA = 5
+# v5.4.5: explicit lazy loading replaces device-dependent AUTO; measured
+# winners remain historical evidence but must be rechecked under this policy.
+BENCHMARK_SEARCH_SCHEMA = 6
 
 
 @dataclass(frozen=True)

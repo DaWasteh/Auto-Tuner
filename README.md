@@ -708,7 +708,18 @@ The Expert panel exposes llama.cpp's complete model-loading strategy: `auto`
 **b10151**, `mlock` means lock normally-read model memory **without mmap**, while
 `mmap+mlock` explicitly combines mapping and locking. AutoTuner emits the
 non-deprecated `--load-mode MODE` form and migrates old per-model
-`mlock`/`no_mmap` checkbox snapshots automatically.
+`mlock`/`no_mmap` checkbox snapshots automatically. **b10875 removed**
+`--mmap`, `--no-mmap`, `--mlock`, `--direct-io`/`-dio` and
+`--no-direct-io`/`-ndio` from the parser—not just their warning text.
+Old free-form switches are migrated; an explicit dropdown choice remains
+binding. Request locking through the dropdown or `--force-mlock`, not Extras:
+free-form locking now fails visibly rather than bypassing RAM/OS safety checks.
+
+For giant lazy row tables AutoTuner explicitly uses **`--lazy-mode on`**:
+b10867's `auto` can disable lazy loading on devices without mmap support.
+`on` preserves the active-row memory plan, potentially at an iGPU performance
+cost; it is **not a hard resident-memory limit**. Older saved `auto` Extras
+are migrated to this explicit contract. Ordinary model-load mode is separate.
 
 The automatic tuner still enables locking only when available RAM/VRAM and OS
 permissions make it safe. Old or unprobeable GPU builds retain the conservative
@@ -721,7 +732,7 @@ locking choices.
 |---|---|---|
 | **GPU backend present** | Any detected GPU; automatic config has no resolved binary yet | Locking stays off conservatively; Expert mode permits it after verifying b10151+ |
 | **CPU-only model** | `total_ram > 32 GB` AND `free_ram > model_ram_on_cpu + 8 GB` | non-mmap `mlock` selected when OS permissions allow it; on b10107–b10150 binaries non-mmap locking is unavailable and silently drops to mmap |
-| **Insufficient memory** | Safety reserve not met | Disabled (fallback to default mmap) |
+| **Insufficient memory** | Safety reserve not met | Locking disabled; runtime/device automatic load policy |
 
 **Force memory locking:**
 
@@ -1100,16 +1111,17 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10863)
+## Server features (compatible through llama.cpp b10878)
 
-The exact **b10863** (`88ada91c1`) source/help audit is recorded in
-[`docs/llama-b10863-audit.md`](docs/llama-b10863-audit.md). Since b10839,
-parser option names are unchanged, but default draft/projector device
-inheritance changed. External drafts now use explicit device binding, with
-shared output heads kept on the same GPU. Lazy-table flags remain an essential
-memory contract rather than being silently pruned. Profile/flag tests are
-portable to CI; the audit includes actual Vulkan/HIP model and draft tests.
-Text logging, Q8-first KV and conservative graph reserves remain unchanged.
+The exact **b10878** (`4850c7727`) source/help audit is recorded in
+[`docs/llama-b10878-audit.md`](docs/llama-b10878-audit.md). The old mmap/mlock/
+Direct-I/O switches have been removed; AutoTuner uses `--load-mode` and migrates
+legacy Extras. Giant lazy tables explicitly use `--lazy-mode on`, because
+upstream `auto` is now device-dependent. Failed or partial help probes are not
+used to prune commands. The HIP build helper chooses `GGML_CUDA_FA_QUANTS=all`
+for new source trees and retains the older option for stable/pinned forks.
+External-draft placement, Q8-first KV, text logging and conservative graph
+reserves remain unchanged. See the audit for exact live-test boundaries.
 AutoTuner still quarantines the
 upstream NextN regression in b10741-b10748 and points affected users to b10749+
 rather than letting llama-server abort during model or draft-context loading. The following
@@ -1121,7 +1133,7 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `-fa [on\|off\|auto]` | ✅ Emits `-fa on` **or** `-fa off` explicitly; model profiles such as Unlimited-OCR can require the reference non-FA path |
 | `-ctk/-ctv f16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` | ✅ All in the dropdown |
 | `--fit off` | ✅ Always emitted so llama.cpp's own auto-fit pass (default `on`) doesn't silently re-adjust the computed values (AutoTuner is the authority) |
-| `--lazy-mode auto` / `-lzm` | ✅ Current b10700+ spelling, explicit for giant architecture-marked row tables (qwen4exp/Gemma 4). Compatibility preparation translates it to legacy `--tensor-read-lazy` when that is what the selected binary advertises, and retains this essential memory contract if unsupported so the runtime rejects the command. Conflicting lazy overrides require replanning. Lazy bytes remain file-backed mappings, not GPU-splittable weights; active pages still use OS-managed RAM. |
+| `--lazy-mode on` / `-lzm` | ✅ Explicit for giant architecture-marked row tables (qwen4exp/Gemma 4), independent of b10867's device-dependent `auto`. Compatibility preparation translates the name to legacy `--tensor-read-lazy` when advertised; unsupported memory controls are retained so the runtime rejects the command. Eager overrides require replanning. Active mapped pages still consume OS-managed RAM; this is not a residency cap. |
 | `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s; users can append `--no-perf` |
 | `--metrics` | ✅ Prometheus endpoint `GET /metrics`, including b10282+ speculative draft/accept counters (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
@@ -1150,6 +1162,20 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.5 — llama.cpp b10878, removed flags and explicit lazy loading
+
+- Migrates the removed mmap/mlock/Direct-I/O switches to `--load-mode`, keeps
+  legacy semantics on old runtimes and prevents Extra flags bypassing locking
+  safety checks. Corrected the Expert `auto` label: runtime/device policy.
+- Giant row-table memory plans now assert `--lazy-mode on`; upstream `auto`
+  may eagerly load the entire table on iGPUs. Saved `auto` Extras migrate.
+- Failed/partial `--help` cannot silently prune command options.
+- HIP build recipe selects the new `GGML_CUDA_FA_QUANTS=all` by source
+  capability; old stable/fork trees keep their supported boolean option.
+- Existing benchmark history stays intact; automatic winners need a fresh
+  search after the loading-policy change (search schema 6).
+- [Audit](docs/llama-b10878-audit.md) · [Validation](docs/v5.4.5-validation.md).
 
 ### v5.4.4 — llama.cpp b10863, model profiles and lazy-memory safety
 

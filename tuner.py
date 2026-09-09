@@ -104,7 +104,7 @@ _QWEN4EXP_GPU_COMPUTE_BYTES = 72
 _QWEN4EXP_HOST_COMPUTE_BYTES = 215
 _QWEN4EXP_FIXED_HOST_RUNTIME_GB = 5.5
 
-# ``--lazy-mode auto`` (``--tensor-read-lazy`` before b10700) maps the complete
+# ``--lazy-mode on`` (``--tensor-read-lazy`` before b10700) maps the complete
 # row table into the process address space, but untouched file-backed pages are
 # reclaimable and do not consume
 # committed/physical RAM merely because MapViewOfFile/mmap spans them. Budget
@@ -431,6 +431,9 @@ def _probe_supported_flags_cached(
             **kwargs,
         )
     except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+        return None
+    if cp.returncode != 0:
+        # Error/partial usage text is not an authoritative capability list.
         return None
     out = cp.stdout or ""
     flags = set(_FLAG_RE.findall(out))
@@ -960,6 +963,60 @@ def _memlock_limit_gb() -> Optional[float]:
     return soft / (1024**3)
 
 
+# Removed from mainline in b10875 (PR #28334). These are value-less
+# switches, not aliases: each selected a complete load mode, last one wins
+# in upstream argv. Normalize before capability pruning or extra-flag merging.
+_LEGACY_LOAD_MODES = {
+    "--mmap": "mmap",
+    "--no-mmap": "none",
+    "--mlock": "mlock",
+    "-dio": "dio",
+    "--direct-io": "dio",
+    "-ndio": "none",
+    "--no-direct-io": "none",
+}
+
+
+def _normalize_legacy_load_flags(args: List[str]) -> Tuple[List[str], List[str]]:
+    """Migrate load switches, preserving last-wins within one argv source.
+
+    Modeled dropdown values still win over extras in build_command's merge.
+    Option values (including strings that look like flags) remain untouched.
+    """
+    chunks: List[List[str]] = []
+    notes: List[str] = []
+    last_mode: Optional[int] = None
+    i = 0
+    while i < len(args):
+        token = args[i]
+        flag = _flag_name(token)
+        is_mode = flag in _LEGACY_LOAD_MODES or flag in {"--load-mode", "-lm"}
+        if flag in _LEGACY_LOAD_MODES:
+            if "=" in token:
+                raise ValueError(
+                    f"{flag} was a value-less switch; use --load-mode MODE instead."
+                )
+            mode = _LEGACY_LOAD_MODES[flag]
+            chunk = ["--load-mode", mode]
+            notes.append(f"{flag} -> --load-mode {mode} (removed in b10875)")
+        else:
+            chunk = [token]
+            if (
+                flag in _ARG_FLAGS_WITH_VALUES
+                and "=" not in token
+                and i + 1 < len(args)
+            ):
+                i += 1
+                chunk.append(args[i])
+        if is_mode:
+            if last_mode is not None:
+                chunks[last_mode] = []
+            last_mode = len(chunks)
+        chunks.append(chunk)
+        i += 1
+    return [token for chunk in chunks for token in chunk], notes
+
+
 def _adapt_load_mode_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     """Adapt b10151's split locking modes for older versioned binaries.
 
@@ -1229,16 +1286,31 @@ def prepare_command_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
     if not cmd:
         return [], []
     flags = _probe_supported_flags(cmd[0])
-    if not flags:
+    if not flags or not ({"-m", "--model"} & flags):
         return _adapt_nextn_regression_for_binary(cmd)
-    adapted, mode_changes = _adapt_load_mode_for_binary(cmd)
+    build = _probe_binary_build_number(cmd[0])
+    legacy_lock_semantics = (
+        build is not None and build < _MIN_DISTINCT_MLOCK_BUILD and "--mlock" in flags
+    )
+    if {"--load-mode", "-lm"} & flags and not legacy_lock_semantics:
+        normalized, legacy_changes = _normalize_legacy_load_flags(cmd[1:])
+    else:
+        # Do not replace a supported old switch with an unsupported new one
+        # and then prune it on pre-load-mode forks.
+        normalized, legacy_changes = list(cmd[1:]), []
+    adapted, mode_changes = _adapt_load_mode_for_binary([cmd[0], *normalized])
     adapted, lazy_changes = _adapt_lazy_mode_for_binary(adapted, flags)
     adapted, spec_changes = _adapt_spec_types_for_binary(adapted)
     adapted, nextn_changes = _adapt_nextn_regression_for_binary(adapted)
     filtered, removed = _filter_command_for_supported_flags(adapted, flags)
     return (
         filtered,
-        mode_changes + lazy_changes + spec_changes + nextn_changes + removed,
+        legacy_changes
+        + mode_changes
+        + lazy_changes
+        + spec_changes
+        + nextn_changes
+        + removed,
     )
 
 
@@ -1962,8 +2034,8 @@ class TunedConfig:
 
     estimated_model_vram_gb: float = 0.0
     estimated_model_ram_gb: float = 0.0
-    # Giant row-gather weights left mmap-backed by current --lazy-mode auto
-    # (legacy --tensor-read-lazy auto).
+    # Giant row-gather weights kept mmap-backed by explicit --lazy-mode on
+    # (legacy --tensor-read-lazy on).
     # ``mapped_model_ram_gb`` is the full file-backed virtual mapping;
     # ``mapped_model_resident_gb`` is the conservative active working-set
     # reservation used for physical-memory planning. They are not ordinary
@@ -5394,16 +5466,18 @@ def build_command(
     # "unknown argument"; in that case drop the two tokens below.
     cmd += ["--fit", "off"]
 
-    # b10653+ reads giant architecture-marked row tables on demand. The
-    # memory plan assumes Auto, so this is essential, not optionally prunable.
-    # Adapt the spelling on legacy builds; reject unsupported runtimes rather
-    # than accidentally making qwen4exp's 26.8-GiB PLE table eager. Small Gemma4
-    # models without an auto-lazy table need no such newer-runtime requirement.
-    lazy_auto = (
+    # b10867 lets AUTO eagerly load even giant tables when a selected device
+    # lacks mmap support (notably iGPUs). Our active-row RAM budget requires
+    # explicit ON, which also exists in legacy --tensor-read-lazy builds.
+    # This may trade iGPU throughput for on-demand residency; never let
+    # AUTO silently turn a 26.8-GiB PLE map into an unbudgeted eager allocation.
+    # ON also maps small marked tables: conservative overbudgeting is safe.
+    # Models without a large table acquire no new runtime requirement.
+    lazy_required = (
         model.read_lazy_size_bytes > 0 or model.architecture.lower() == "qwen4exp"
     )
-    if lazy_auto:
-        cmd += ["--lazy-mode", "auto"]
+    if lazy_required:
+        cmd += ["--lazy-mode", "on"]
 
     # ---- Performance timings + optional diagnostics endpoints ----------
     # b10743 defaults performance timings off. Assert --perf explicitly so
@@ -5834,6 +5908,7 @@ def build_command(
     def _append_unique(src: Optional[List[str]]) -> None:
         if not src:
             return
+        src, _legacy_notes = _normalize_legacy_load_flags(src)
         j = 0
         n = len(src)
         while j < n:
@@ -5854,15 +5929,31 @@ def build_command(
                 chunk = [tok]
                 j += 1
             key = _merge_key(key)
-            if lazy_auto and key == "--lazy-mode":
+            if key == _merge_key("--load-mode") and key not in seen:
                 value = (
                     tok.split("=", 1)[1]
                     if inline
                     else (chunk[1] if len(chunk) > 1 else "")
                 )
-                if value.strip().lower() != "auto":
+                if value.strip().lower() in {"mlock", "mmap+mlock"}:
+                    # Extras are not visible to the earlier RAM/OS/runtime
+                    # veto. Never let them resurrect a rejected locking path.
                     raise ValueError(
-                        "This model's memory plan requires --lazy-mode auto for its "
+                        "Memory locking in Extra CLI flags bypasses safety checks. "
+                        "Select mlock/mmap+mlock in the Expert load-mode dropdown "
+                        "or use --force-mlock instead."
+                    )
+            if lazy_required and key == "--lazy-mode":
+                value = (
+                    tok.split("=", 1)[1]
+                    if inline
+                    else (chunk[1] if len(chunk) > 1 else "")
+                )
+                # Migrate saved pre-b10867 AUTO extras to the explicit ON
+                # contract already generated above; never append AUTO again.
+                if value.strip().lower() not in {"auto", "on"}:
+                    raise ValueError(
+                        "This model's memory plan requires --lazy-mode on for its "
                         "giant row table. Remove the conflicting lazy-mode override; "
                         "eager loading requires a full memory replan."
                     )

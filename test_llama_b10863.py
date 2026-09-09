@@ -156,7 +156,7 @@ def test_lazy_ple_is_independent_of_ordinary_load_mode(tmp_path, mode):
     model, cfg, p = _lazy_model_config(tmp_path)
     cfg.load_mode = mode
     cmd = tuner.build_command(model, cfg, p)
-    assert cmd[cmd.index("--lazy-mode") + 1] == "auto"
+    assert cmd[cmd.index("--lazy-mode") + 1] == "on"
     if mode != "auto":
         assert cmd[cmd.index("--load-mode") + 1] == mode
 
@@ -174,7 +174,7 @@ def test_lazy_override_requires_explicit_replan(tmp_path, flag, inline, source):
         p.extra_args = extras
     else:
         kwargs["extra_args"] = extras
-    with pytest.raises(ValueError, match="memory plan requires --lazy-mode auto"):
+    with pytest.raises(ValueError, match="memory plan requires --lazy-mode on"):
         tuner.build_command(model, cfg, p, **kwargs)
 
 
