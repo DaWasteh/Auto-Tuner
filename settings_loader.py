@@ -41,6 +41,9 @@ class ModelProfile:
     # executable or its sibling shared library. This safely gates community
     # architectures that have no meaningful numeric mainline build minimum.
     required_runtime_markers: List[str] = field(default_factory=list)
+    # Recognize a model without claiming an unimplemented inference runtime.
+    # Cleared only after its loader, memory plan and template are validated.
+    runtime_block_reason: str = ""
     extra_args: List[str] = field(default_factory=list)
     notes: str = ""
     source_file: Optional[str] = None  # which YAML this came from
@@ -250,6 +253,9 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                     for marker in runtime_markers
                     if str(marker).strip()
                 ],
+                runtime_block_reason=str(
+                    data.get("runtime_block_reason", "") or ""
+                ).strip(),
                 extra_args=[str(x) for x in extra],
                 notes=str(data.get("notes", "") or ""),
                 source_file=yml.name,
@@ -327,7 +333,17 @@ def match_profile(
                 best_len = len(pat)
                 # Don't break — a later pattern in the same file might be longer
 
+    # Known-unsupported architecture metadata must not be hidden by a generic
+    # filename match. Conversely, a blocked filename must not fall back to an
+    # older architecture (early V4.1 converters incorrectly wrote deepseek4).
+    if arch_lower:
+        for p in profiles:
+            if p.runtime_block_reason and arch_lower in p.arch_fallback:
+                return p
+
     if best is not None:
+        if best.runtime_block_reason:
+            return best
         # A fork-specific filename can also name a newly supported upstream
         # conversion (HY4: hyv4 versus hy_v4). When metadata explicitly names
         # another claimed architecture, do not require the wrong fork marker.

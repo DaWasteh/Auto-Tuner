@@ -1,0 +1,55 @@
+display_name: "DeepSeek-V4.1-Flash (runtime not yet supported)"
+patterns:
+  - deepseek-v4.1
+  - deepseek_v4.1
+  - deepseekv4.1
+  - deepseek-v4_1
+  - deepseek_v4_1
+  - deepseekv4_1
+  - deepseek-v41
+  - deepseek_v41
+  - deepseekv41
+  - deepseek41
+
+# deepseek41 is proposed by conversion-only PR #28696, not a released loader.
+arch_fallback:
+  - deepseek41
+  - deepseek_v41
+  - deepseek_v41_text
+
+runtime_block_reason: >
+  DeepSeek-V4.1-Flash cannot run on llama.cpp b10901. PR #28696 only converts
+  weights; no V4.1 inference graph is implemented. The V4 loader and memory
+  plan are incompatible. Wait for validated runtime support and an AutoTuner
+  profile update; a converted GGUF or a newer build number alone is not enough.
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  Recognition-only profile, not runnable support. DeepSeek-V4.1-Flash is a new
+  multimodal 552B-backbone Causal Encoder-Decoder with CSA2, Engram tables and
+  DSpark, not the 284B V4-Flash. Native context is 1,048,576; official sampling
+  is temperature 1.0 and top_p 0.95 (1.0 also allowed). Reasoning effort is an
+  integer from 1 to 100. The publisher provides a Python prompt encoder, not
+  a Jinja template. llama.cpp b10901 has no V4.1 inference implementation;
+  PR #28696 is conversion-only. Do not reuse V4's KV estimate, MTP flags or
+  vision projector. The publisher's FP4-cache efficiency is not a supported
+  llama.cpp cache type. Q8 here is only the unvalidated placeholder default.
+  Sources: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash and
+  https://github.com/ggml-org/llama.cpp/pull/28696.

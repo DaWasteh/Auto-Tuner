@@ -635,13 +635,16 @@ def _runtime_has_required_markers(binary: str, markers: List[str]) -> bool:
 def check_profile_build(
     profile: ModelProfile, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
-    """Validate numeric and fork-capability requirements against ``binary``.
+    """Validate explicit runtime blocks, numeric and fork requirements.
 
     Returns ``(allowed, message, detected_build)``. Numeric-only profiles keep
     allowing unprobeable wrappers with a warning. Fork-only architecture
     markers fail closed because a stock runtime is known not to load them.
     This is shared by GUI, TUI, and OCR launch paths.
     """
+    blocked = getattr(profile, "runtime_block_reason", "")
+    if blocked:
+        return False, f"{profile.display_name}: {blocked}", None
     required = max(0, int(getattr(profile, "min_llama_build", 0) or 0))
     markers = [
         str(marker).strip().lower()
@@ -675,10 +678,34 @@ def check_profile_build(
     return True, build_warning, detected
 
 
+def _model_runtime_block_reason(model: ModelEntry) -> str:
+    """Catch V4.1 GGUFs even if renamed or converted under the old V4 arch."""
+    md = model.metadata or {}
+    arch = str(md.get("general.architecture") or "").lower()
+    is_v41_name = re.search(
+        r"deepseek[-_]?v?4[._]?1(?=[\s._-]|$)", model.name, re.IGNORECASE
+    )
+    if (
+        is_v41_name
+        or arch in {"deepseek41", "deepseek_v41", "deepseek_v41_text"}
+        or (
+            arch == "deepseek4"
+            and any(str(key).startswith("deepseek4.engram.") for key in md)
+        )
+    ):
+        return (
+            "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
+            "in AutoTuner (b10901 / conversion-only PR #28696). The V4 loader "
+            "and memory plan are not compatible; GGUF conversion alone is "
+            "not inference support."
+        )
+    return ""
+
+
 def check_model_build(
     model: ModelEntry, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
-    """Reject target GGUFs that b10741-b10748 cannot load safely.
+    """Reject unimplemented architectures and unsafe b10741-b10748 GGUFs.
 
     PR #28159 made ``n_layer()`` exclude NextN before the generic per-layer
     arrays were read. Standard GGUFs that store FF/head metadata as arrays of
@@ -687,6 +714,9 @@ def check_model_build(
     with MTP disabled by :func:`prepare_command_for_binary`; array-backed
     targets must use b10749+ (PRs #28173/#28183) or a pre-regression build.
     """
+    blocked = _model_runtime_block_reason(model)
+    if blocked:
+        return False, blocked, None
     if not model.has_embedded_mtp:
         return True, "", None
 
@@ -1689,8 +1719,10 @@ def kv_per_token_parts_mb_from_metadata(
 
     # qwen4exp's QSA path creates a second cache over the same full-attention
     # layers. b10666 shapes it as one key head of indexer.key_length and one
-    # value head of the model's normal value length. It uses the selected K/V
-    # cache quants, so keep the additions split for asymmetric quant planning.
+    # value head of the model's normal value length. b10889 (PR #28330) drops
+    # indexer V. This version-independent planner deliberately retains that
+    # reserve so old/unknown runtimes and exported settings remain safe.
+    # It uses the selected K/V quants; keep asymmetric planning split.
     if arch.lower() == "qwen4exp":
         from scanner import metadata_attention_layer_count
 
@@ -5427,6 +5459,31 @@ def build_command(
       ``ngram_method: ngram-map-k4v`` is the supported way to combine
       "MTP + ngram" on an MTP model.
     """
+    blocked = getattr(
+        profile, "runtime_block_reason", ""
+    ) or _model_runtime_block_reason(model)
+    if blocked:
+        raise ValueError(blocked)
+    if draft_model is not None and enable_speculative:
+        blocked = _model_runtime_block_reason(draft_model)
+        if blocked:
+            raise ValueError(blocked)
+        if (
+            model.mmproj is not None
+            and model.architecture.lower() == "qwen35"
+            and draft_model.is_dflash2_drafter
+            and probe_binary_build_number(server_binary) == 10901
+        ):
+            # Actual HIP and Vulkan image requests fail after PR #28587 skips
+            # pinned M-RoPE rows: the recurrent draft cache then rejects the
+            # position gap. Text-only DFlash2 and vision without it both work.
+            # Gate only the reproduced build/combination, not other drafters.
+            raise ValueError(
+                "llama.cpp b10901 cannot reliably combine Qwen3.5/3.8 vision "
+                "with DFlash2: image requests fail with inconsistent draft "
+                "cache positions (HTTP 500). Disable Draft to use images, "
+                "or disable Vision for text-only DFlash2."
+            )
     cmd: List[str] = [
         server_binary,
         "-m",

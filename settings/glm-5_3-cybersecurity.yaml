@@ -1,0 +1,54 @@
+display_name: "GLM-5.3 Cybersecurity (dealignai)"
+patterns:
+  - glm-5.3-cybersecurity
+  - glm5.3-cybersecurity
+  - glm-5_3-cybersecurity
+  - glm_5_3_cybersecurity
+  - glm-5.3_cybersecurity
+
+# Do not claim glm-dsa globally: ordinary GLM-5.2/5.3 keeps its own defaults.
+max_context: 1048576
+recommended_kv_quant: q8_0
+min_llama_build: 10174
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.01
+    repeat_penalty: 1.1
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.01
+    repeat_penalty: 1.1
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  # llama.cpp defaults preserve_reasoning=true, which rewrites clear_thinking.
+  - --no-reasoning-preserve
+
+# Runtime/MTP architecture is unchanged; template behavior comes from the GGUF.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  Profile for dealignai/GLM-5.3-CYBERSECURITY-FP8 and its GGUF conversions,
+  not an official Z.ai Cyber SKU or GLM-5.3-Flash. Its config.json matches
+  Z.ai GLM-5.3: glm-dsa architecture, 1,048,576 native context, same KV/MTP
+  contract. A separate profile preserves the publisher's repetition_penalty
+  1.1 instead of base GLM's 1.0. Temperature 1.0 and top_p 0.95 are unchanged;
+  top_k 40 / min_p 0.01 retain AutoTuner's local GLM defaults. The derivative's
+  embedded template defaults clear_thinking to true, unlike upstream false;
+  --no-reasoning-preserve honors that default rather than forcing base
+  reasoning retention. Keep the derivative's embedded template.
+  The model-card 131,072 limit is a vLLM deployment example, not the native
+  context ceiling. FP8 Safetensors cannot be loaded directly by llama.cpp:
+  select a compatible GGUF. No vLLM flags are added to llama.cpp.
+  Source: https://huggingface.co/dealignai/GLM-5.3-CYBERSECURITY-FP8.

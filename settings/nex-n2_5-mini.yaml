@@ -1,0 +1,51 @@
+display_name: "Nex-N2.5-mini (Nex-AGI)"
+patterns:
+  - nex-n2.5-mini
+  - nex_n2.5_mini
+  - nex-n2_5-mini
+  - nex_n2_5_mini
+  - nex-n2.5_mini
+
+# Filename-only: never replace the generic Qwen3.5/3.6 architecture fallback.
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+# Conversion must retain the NextN weights before integrated MTP is available.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  Nex-AGI Nex-N2.5-mini is a 35B multimodal Qwen3.5-MoE derivative
+  (Qwen3_5MoeForConditionalGeneration; GGUF qwen35moe), with 40 layers,
+  attention every fourth layer, 256 experts/top-8 and 262,144 native context.
+  Both chat and coding use the publisher's temperature 0.7 / top_p 0.95 /
+  top_k 40. Keep the Nex chat template embedded in the GGUF, not a generic
+  Qwen replacement. On llama.cpp pass reasoning_effort via
+  chat_template_kwargs: none disables thinking, medium is adaptive (default),
+  high always thinks. enable_thinking is not this template's switch.
+  --jinja handles its Qwen3-Coder-style tools; SGLang's --tool-call-parser
+  and --reasoning-parser flags must not be copied to llama.cpp. Vision needs
+  the matching mmproj. MTP is available only when the converted GGUF retains
+  the declared NextN layer; no YaRN extension is enabled by default.
+  Source: https://huggingface.co/nex-agi/Nex-N2.5-mini.

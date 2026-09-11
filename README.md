@@ -896,6 +896,7 @@ matches. See `settings/_default.yaml`.
 | `ornith-1_5.yaml` | Ornith 1.5 9B/35B-A3B agentic coding (filename-gated) | `qwen35` / `qwen35moe` |
 | `paddleocr-vl.yaml` | PaddleOCR-VL 0.9B deterministic element recognition | `paddleocr` |
 | `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
+| `nex-n2_5-mini.yaml` | Nex-AGI Nex-N2.5-mini, 256K, own sampling and Nex template | `qwen35moe` (filename-gated) |
 | `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
 | `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
@@ -908,6 +909,7 @@ matches. See `settings/_default.yaml`.
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
 | `glm-5_2.yaml` | GLM-5.2 + GLM-5.3 (non-Flash), 1M + IndexShare/MTP | `glm-dsa` |
+| `glm-5_3-cybersecurity.yaml` | dealignai GLM-5.3-CYBERSECURITY-FP8 GGUFs, distinct repetition/template defaults | `glm-dsa` (filename-gated) |
 | `glm-5_3_flash.yaml` | GLM-5.3-Flash, 320B-A18B multimodal KDA/DSA hybrid | `glm5next` / `glm5-next` |
 | `hy4-preview.yaml` | Tencent Hy4 Preview, older community GGUF (patch required) | `hyv4` |
 | `hy4-mainline.yaml` | Tencent HY4 Preview, official mainline GGUF, b10813+ | `hy_v4` |
@@ -916,12 +918,23 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b10901 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+) | `bailingmoe3` |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.4.6:** DeepSeek-V4.1-Flash has a new CED/CSA2/Engram architecture;
+  conversion-only PR #28696 is not inference support. Its profile blocks
+  unsafe V4 fallback, including early GGUFs mislabeled `deepseek4`.
+  **Nex-N2.5-mini** uses temp 0.7/top_p 0.95/top_k 40 and its embedded Nex
+  template (`chat_template_kwargs.reasoning_effort`: none/medium/high).
+  **dealignai GLM-5.3-CYBERSECURITY-FP8** shares base GLM's architecture but
+  needs repeat penalty 1.1 and `--no-reasoning-preserve` to honor its
+  `clear_thinking=true` default. Keep its own GGUF template. Ordinary V4,
+  Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1111,9 +1124,17 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (compatible through llama.cpp b10878)
+## Server features (audited through llama.cpp b10901)
 
-The exact **b10878** (`4850c7727`) source/help audit is recorded in
+The **b10901** (`28ff09582`) [audit](docs/llama-b10901-audit.md) includes
+actual HIP and Vulkan inference, tool calls, multi-GPU DFlash2 and lazy PLE
+loading. **Known failure:** Qwen3.5/3.8 (`qwen35`) + DFlash2 + vision on
+b10901 fails image requests with HTTP 500; AutoTuner blocks this combination.
+Disable Draft for images or Vision for text-only drafting. The qwen4exp
+indexer-V reserve remains deliberately conservative for older runtimes.
+No new CLI migration is required; existing loading safeguards remain valid.
+
+The previous **b10878** (`4850c7727`) source/help audit is recorded in
 [`docs/llama-b10878-audit.md`](docs/llama-b10878-audit.md). The old mmap/mlock/
 Direct-I/O switches have been removed; AutoTuner uses `--load-mode` and migrates
 legacy Extras. Giant lazy tables explicitly use `--lazy-mode on`, because
@@ -1162,6 +1183,18 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.6 — model profiles and llama.cpp b10901 validation
+
+- Separate recognition-only DeepSeek-V4.1-Flash profile with a hard runtime
+  gate: no false compatibility with V4 or conversion-only GGUFs.
+- New Nex-N2.5-mini and dealignai GLM-5.3-Cybersecurity profiles, including
+  model-specific sampling/template behavior and notes in all nine languages.
+- Reproduced and guarded b10901 Qwen3.5/3.8 vision + DFlash2 HTTP 500 on
+  both HIP and Vulkan; tested the image-without-draft and text-with-draft paths.
+- Existing CLI flags, Q8 KV, tools, multi-GPU placement and explicit lazy
+  loading pass the b10901 checks. No blanket claim for untested models/backends.
+- [Audit](docs/llama-b10901-audit.md) · [Validation](docs/v5.4.6-validation.md).
 
 ### v5.4.5 — llama.cpp b10878, removed flags and explicit lazy loading
 
