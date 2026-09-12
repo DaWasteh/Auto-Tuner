@@ -93,7 +93,7 @@ def test_v41_model_gate_catches_legacy_conversion_and_generic_profile(
 
 def test_explicit_profile_runtime_block_prevents_command_export(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    with pytest.raises(ValueError, match="b10901"):
+    with pytest.raises(ValueError, match="b10930"):
         tuner.build_command(_model(tmp_path), _config(), profile)
 
 

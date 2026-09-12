@@ -695,7 +695,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b10901 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b10930 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -992,6 +992,14 @@ def _memlock_limit_gb() -> Optional[float]:
         return None
     return soft / (1024**3)
 
+
+#: First mainline build whose speculative prefill skips pinned M-RoPE image
+#: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
+#: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
+#: HTTP 500. Reproduced on b10901, b10903 and b10930 (HIP and Vulkan); PR
+#: #28715 (b10906) changed the handed-over position but did not fix this.
+#: Lower the gate only after an actual image+DFlash2 request succeeds.
+QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
 
 # Removed from mainline in b10875 (PR #28334). These are value-less
 # switches, not aliases: each selected a complete load mode, last one wins
@@ -5468,21 +5476,25 @@ def build_command(
         blocked = _model_runtime_block_reason(draft_model)
         if blocked:
             raise ValueError(blocked)
-        if (
-            model.mmproj is not None
+        build = (
+            probe_binary_build_number(server_binary)
+            if model.mmproj is not None
             and model.architecture.lower() == "qwen35"
             and draft_model.is_dflash2_drafter
-            and probe_binary_build_number(server_binary) == 10901
-        ):
-            # Actual HIP and Vulkan image requests fail after PR #28587 skips
-            # pinned M-RoPE rows: the recurrent draft cache then rejects the
-            # position gap. Text-only DFlash2 and vision without it both work.
-            # Gate only the reproduced build/combination, not other drafters.
+            else None
+        )
+        if build is not None and build >= QWEN35_VISION_DFLASH2_BROKEN_SINCE:
+            # Actual HIP and Vulkan image requests fail since PR #28587 skips
+            # pinned M-RoPE rows: the recurrent draft memory then rejects the
+            # position gap (X = 3, Y = 18). Text-only DFlash2 and vision
+            # without it both work. Gate only this combination, not other
+            # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
-                "llama.cpp b10901 cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: image requests fail with inconsistent draft "
-                "cache positions (HTTP 500). Disable Draft to use images, "
-                "or disable Vision for text-only DFlash2."
+                f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
+                "with DFlash2: since b10896 (verified through b10930) image "
+                "requests fail with inconsistent draft cache positions "
+                "(HTTP 500). Disable Draft to use images, or disable Vision "
+                "for text-only DFlash2."
             )
     cmd: List[str] = [
         server_binary,

@@ -918,7 +918,7 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b10901 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b10930 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+) | `bailingmoe3` |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
@@ -935,6 +935,8 @@ Notes on the new profiles:
   needs repeat penalty 1.1 and `--no-reasoning-preserve` to honor its
   `clear_thinking=true` default. Keep its own GGUF template. Ordinary V4,
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
+  The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
+  block now names b10930; nothing else in that profile changed.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1093,6 +1095,11 @@ unused-variable warning. Compiler diagnostics remain enabled (no blanket
 warning suppression and no `/WX`/`-Werror` policy for upstream/template code).
 The installed SDK still lacks LLVM PR #201563, so the helper applies that exact
 HIP/MSVC `<cmath>` include-order fix to a workspace-local clang resource copy.
+Since b10911 (PR #28091) upstream enables precompiled headers and a unity build
+for the model sources by default; both recipes were re-run unchanged on b10930.
+MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
+benign: `src/models/llama.cpp` is folded into a unity source and only one
+`llama.obj` is produced.
 It also places matching ROCm 7 DLLs beside each executable and links the SDK's
 rocBLAS/hipBLASLt kernel directories, preventing Windows from loading a stale
 System32/ROCm 7.1 runtime. Windows HIP builds set
@@ -1124,15 +1131,22 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b10901)
+## Server features (audited through llama.cpp b10930)
 
-The **b10901** (`28ff09582`) [audit](docs/llama-b10901-audit.md) includes
-actual HIP and Vulkan inference, tool calls, multi-GPU DFlash2 and lazy PLE
-loading. **Known failure:** Qwen3.5/3.8 (`qwen35`) + DFlash2 + vision on
-b10901 fails image requests with HTTP 500; AutoTuner blocks this combination.
-Disable Draft for images or Vision for text-only drafting. The qwen4exp
-indexer-V reserve remains deliberately conservative for older runtimes.
-No new CLI migration is required; existing loading safeguards remain valid.
+The **b10930** (`56381e407`) [audit](docs/llama-b10930-audit.md) repeats the
+actual HIP and Vulkan inference, tool-call, multi-GPU DFlash2, vision and lazy
+PLE checks on freshly built local trees. The `llama-server --help` surface is
+byte-identical to b10901, so no CLI migration is required. **Still broken
+upstream:** Qwen3.5/3.8 (`qwen35`) + DFlash2 + vision fails image requests
+with HTTP 500 on b10930 exactly as on b10901 (PR #28587's skipped image rows
+leave a position gap in the recurrent DFlash2 draft memory; PR #28715 in
+b10906 did not change that). AutoTuner now gates this combination on **every
+build from b10896 on** instead of only b10901; disable Draft for images or
+Vision for text-only DFlash2. b10907 (PR #28630) also
+stops MTP draft contexts on `deepseek2`/`glm4moe`/`cohere2moe` from allocating
+KV for every trunk layer; AutoTuner's plan stays conservative there. The
+previous **b10901** (`28ff09582`) [audit](docs/llama-b10901-audit.md) added the
+qwen4exp indexer-V reserve note; that reserve is unchanged.
 
 The previous **b10878** (`4850c7727`) source/help audit is recorded in
 [`docs/llama-b10878-audit.md`](docs/llama-b10878-audit.md). The old mmap/mlock/
@@ -1183,6 +1197,19 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.4.7 — llama.cpp b10930 rebuild, vision + DFlash2 gate widened
+
+- Fresh local Vulkan and HIP **b10930** builds from the unchanged Windows
+  recipes; upstream's new precompiled-header/unity build works with both the
+  Visual Studio 2026 and ROCm 7.2 Ninja toolchains (MSB8027 is benign).
+- The Qwen3.5/3.8 vision + DFlash2 HTTP 500 **still reproduces on b10930**
+  (HIP and Vulkan) and on b10903; PR #28715 (b10906) did not resolve it. The
+  gate now starts at b10896 (PR #28587) and stays open-ended until an actual
+  image + DFlash2 request succeeds on a newer build.
+- b10930 `--help` is byte-identical to b10901; all 162 profile/mode commands
+  per backend parse. DeepSeek-V4.1 stays blocked (PR #28696 still open).
+- [Audit](docs/llama-b10930-audit.md) · [Validation](docs/v5.4.7-validation.md).
 
 ### v5.4.6 — model profiles and llama.cpp b10901 validation
 
