@@ -205,6 +205,12 @@ def test_server_process_decodes_utf8_output():
 # ocr_workflow: cancel aborts an in-flight socket without blocking
 
 
+@pytest.mark.xfail(
+    sys.platform == "darwin",
+    reason="macOS does not wake a recv blocked in another thread on shutdown/close; "
+    "cancel falls back to the request timeout there",
+    strict=False,
+)
 def test_abort_connection_wakes_a_blocked_reader():
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -390,7 +396,14 @@ def test_windows_detector_skips_dxgi_when_wmi_covers_every_card(monkeypatch):
 
 def test_terminal_process_stop_is_awaited_before_exit():
     qt_launcher = pytest.importorskip("qt_launcher")
-    child = [sys.executable, "-c", "import time; time.sleep(60)"]
+    # The child ignores SIGTERM (POSIX) and never sees CTRL_BREAK (Windows,
+    # separate console), so stop() has to run its 10 s kill escalation.
+    child = [
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)",
+    ]
     proc = qt_launcher._TerminalProcess(child)
     proc.start()
     assert proc.is_running()
