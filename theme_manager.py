@@ -459,6 +459,12 @@ QLabel[themeRole="sysbar"] {{ color: {c["sysbar_text"]}; padding: 0 12px; }}"""
                     created_target = True
                 except FileExistsError:
                     raise FileExistsError(target) from None
+                except OSError:
+                    # exFAT/FAT32, SMB shares and some FUSE mounts cannot
+                    # hard-link; exclusive create still refuses to overwrite.
+                    with open(target, "x", encoding="utf-8") as handle:
+                        handle.write(data)
+                    created_target = True
                 finally:
                     if tmp.exists():
                         tmp.unlink()

@@ -241,11 +241,20 @@ class ProxyLease:
 
 class _ControlHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR lets a second AutoTuner bind the same loopback
+    # port next to an active listener (connections then land on either
+    # instance); exclusive use makes start() fail loudly instead.
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, address: Tuple[str, int], api: "ControlApiServer") -> None:
         self.api = api
         super().__init__(address, _ControlRequestHandler)
+
+    def server_bind(self) -> None:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if os.name == "nt" and exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        super().server_bind()
 
 
 class ControlApiServer:
@@ -940,11 +949,10 @@ class _ControlRequestHandler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(block)
                     self.wfile.flush()
-            except (
-                socket.timeout,
-                ConnectionRefusedError,
-                http.client.HTTPException,
-            ) as exc:
+            except (OSError, http.client.HTTPException) as exc:
+                # OSError covers timeouts, refused, reset and aborted
+                # backend connections (a dying llama-server); without a
+                # started response the client gets a retryable 502.
                 if response_started:
                     self.close_connection = True
                     return

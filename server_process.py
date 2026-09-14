@@ -55,6 +55,12 @@ class ServerProcess:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                # llama-server writes UTF-8 (model names, tokenizer dumps).
+                # The locale codec (cp1252 on Windows) would raise on a
+                # continuation byte, silently end the reader thread and let
+                # the full pipe block the server.
+                encoding="utf-8",
+                errors="replace",
                 env=env,
             )
         else:
@@ -64,6 +70,8 @@ class ServerProcess:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=env,
             )
 
@@ -89,17 +97,19 @@ class ServerProcess:
         deadline = time.monotonic() + 10  # 10 s grace period
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                return
+                break
             time.sleep(0.1)
 
-        # Force kill if still alive
-        try:
-            if os.name == "nt":
-                self.proc.kill()
-            else:
-                os.kill(-self.proc.pid, 9)  # SIGKILL
-        except (ProcessLookupError, OSError):
-            pass
+        # Force kill if still alive. A graceful exit still falls through to
+        # the reader join and state reset below so start() can run again.
+        if self.proc.poll() is None:
+            try:
+                if os.name == "nt":
+                    self.proc.kill()
+                else:
+                    os.kill(-self.proc.pid, 9)  # SIGKILL
+            except (ProcessLookupError, OSError):
+                pass
 
         # Ensure the reader thread stops
         self._stop_event.set()

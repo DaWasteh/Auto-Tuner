@@ -7,7 +7,7 @@ read-only text widget.  A system-tray icon provides Stop/Quit actions.
 from __future__ import annotations
 
 from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QAction, QCloseEvent, QIcon
+from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -31,6 +31,10 @@ class LogViewerWindow(QMainWindow):
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        # A verbose server would otherwise grow the document without bound.
+        document = self.log_edit.document()
+        if document is not None:
+            document.setMaximumBlockCount(20000)
         self.setCentralWidget(self.log_edit)
 
         # ── System tray ─────────────────────────────────────────────────
@@ -60,12 +64,20 @@ class LogViewerWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _poll_logs(self) -> None:
-        """Append new log lines to the text widget and auto-scroll."""
-        for line in self.server_process.get_logs():
-            self.log_edit.append(line.rstrip("\n"))
+        """Append new log lines to the text widget and follow the tail."""
+        lines = self.server_process.get_logs()
+        if not lines:
+            return
         # verticalScrollBar() is typed as QScrollBar | None in PyQt6 stubs
         sb = self.log_edit.verticalScrollBar()
-        if sb is not None:
+        at_bottom = sb is None or sb.value() >= sb.maximum() - 4
+        cursor = self.log_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        # One plain-text insert per tick: ``append()`` would relayout per
+        # line and auto-detect lines such as ``<think>`` as HTML.
+        cursor.insertText("".join(line.rstrip("\n") + "\n" for line in lines))
+        # Only follow the tail while the user has not scrolled up to read.
+        if at_bottom and sb is not None:
             sb.setValue(sb.maximum())
 
     def _stop_server(self) -> None:

@@ -263,6 +263,41 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "-mg",
     "-ncmoe",
     "-fit",
+    # Repeatable placement/adapter flags. Without these entries a pruned or
+    # deduplicated flag left its value behind as a positional argument.
+    "-ot",
+    "--override-tensor",
+    "-otd",
+    "--override-tensor-draft",
+    "--spec-draft-override-tensor",
+    "--override-kv",
+    "--lora",
+    "--lora-scaled",
+    "--control-vector",
+    "--control-vector-scaled",
+    "--api-key",
+    "--api-key-file",
+    "-ncmoed",
+    "--n-cpu-moe-draft",
+    "--spec-draft-n-cpu-moe",
+    "--spec-draft-ncmoe",
+}
+
+# llama-server appends every occurrence of these flags instead of keeping the
+# last one, so Extras may legitimately repeat them with different values.
+# Merging dedupes them on (flag, value) rather than on the flag name alone.
+_REPEATABLE_VALUE_FLAGS: Set[str] = {
+    "-ot",
+    "--override-tensor",
+    "-otd",
+    "--override-tensor-draft",
+    "--spec-draft-override-tensor",
+    "--override-kv",
+    "--lora",
+    "--lora-scaled",
+    "--control-vector",
+    "--control-vector-scaled",
+    "--api-key",
 }
 
 _FLAG_ALIAS_GROUPS: Tuple[Set[str], ...] = (
@@ -695,7 +730,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b10930 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b10948 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -996,8 +1031,8 @@ def _memlock_limit_gb() -> Optional[float]:
 #: First mainline build whose speculative prefill skips pinned M-RoPE image
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
-#: HTTP 500. Reproduced on b10901, b10903 and b10930 (HIP and Vulkan); PR
-#: #28715 (b10906) changed the handed-over position but did not fix this.
+#: HTTP 500. Reproduced on b10901, b10903, b10930 and b10948 (HIP and Vulkan);
+#: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
 
@@ -4077,7 +4112,9 @@ def compute_config(
         ctx = user_ctx
         if model_ctx_limit > 0 and ctx > model_ctx_limit:
             ctx = model_ctx_limit
-        if max_fit_ctx > 0 and ctx > max_fit_ctx:
+        # A known per-token cost with an exhausted budget yields 0 here;
+        # that must clamp (to the 2048 floor below), not count as "unknown".
+        if actual_per_tok_mb > 0 and ctx > max_fit_ctx:
             pin_clamped_to_budget = ctx
             ctx = max_fit_ctx
     else:
@@ -4101,7 +4138,7 @@ def compute_config(
         effective_min = _PREF_MIN_CTX
         if model_ctx_limit > 0 and model_ctx_limit < effective_min:
             effective_min = (model_ctx_limit // 1024) * 1024  # model too small for 32k
-        if max_fit_ctx > 0 and max_fit_ctx < effective_min:
+        if actual_per_tok_mb > 0 and max_fit_ctx < effective_min:
             effective_min = max(2048, (max_fit_ctx // 1024) * 1024)  # budget too tight
         ctx = max(effective_min, (ctx // 1024) * 1024)
     else:
@@ -5491,7 +5528,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b10930) image "
+                "with DFlash2: since b10896 (verified through b10948) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."
@@ -5998,6 +6035,13 @@ def build_command(
                 chunk = [tok]
                 j += 1
             key = _merge_key(key)
+            if flag in _REPEATABLE_VALUE_FLAGS:
+                value = (
+                    tok.split("=", 1)[1]
+                    if inline
+                    else (chunk[1] if len(chunk) > 1 else "")
+                )
+                key = (key, value.strip())
             if key == _merge_key("--load-mode") and key not in seen:
                 value = (
                     tok.split("=", 1)[1]

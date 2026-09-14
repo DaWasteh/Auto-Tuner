@@ -171,6 +171,10 @@ class CandidateResult:
     error: str = ""
     log_tail: List[str] = field(default_factory=list)
     confirmations: int = 0
+    # A confirmation problem keeps the exploratory measurement valid; it only
+    # withholds the "confirmed" status. Writing it into ``error`` would
+    # invalidate the baseline and zero every score.
+    confirmation_error: str = ""
 
     @property
     def valid(self) -> bool:
@@ -337,6 +341,7 @@ class BenchmarkResult:
                     "samples": [asdict(sample) for sample in item.samples],
                     "confirmations": item.confirmations,
                     "error": item.error,
+                    "confirmation_error": item.confirmation_error,
                     "log_tail": item.log_tail[-20:],
                 }
                 for item in self.candidates
@@ -894,6 +899,13 @@ class BenchmarkRunner:
         with self._connection_lock:
             connection = self._active_connection
         if connection is not None:
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                try:
+                    # close() alone does not wake a blocked recv on Linux.
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             try:
                 connection.close()
             except OSError:
@@ -1533,7 +1545,7 @@ class BenchmarkRunner:
             except BenchmarkCancelled:
                 raise
             except BenchmarkFailure as exc:
-                finalist.error = f"confirmation failed: {exc}"
+                finalist.confirmation_error = f"confirmation failed: {exc}"
                 continue
             finalist.samples.extend(confirmation.samples)
             finalist.confirmations += 1
@@ -1541,7 +1553,7 @@ class BenchmarkRunner:
             if finalist.sample_spread() <= self._sample_spread_limit():
                 confirmed_ids.add(finalist.candidate.id)
             else:
-                finalist.error = "confirmation measurements were too noisy"
+                finalist.confirmation_error = "confirmation measurements were too noisy"
 
         final_ranked = self._rank(results, baseline)
         if not final_ranked:

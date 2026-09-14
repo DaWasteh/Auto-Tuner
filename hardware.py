@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 import psutil
 import os
 
@@ -1266,11 +1267,23 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
 
     # Echten belegten VRAM über WMI win32com auslesen (DedicatedUsage)
     vram_used_map: Dict[str, float] = _get_gpu_vram_used_via_wmi()
-    # DXGI/PowerShell-Fallback für AMD RX 9000 Series (return: used_mb)
-    dxgi_used_map: Dict[str, float] = _get_gpu_vram_via_dxgi_powershell()
-    # Echten freien VRAM über WMI win32com auslesen (AvailableVideoMemory)
-    # Wird nur als letzte Option verwendet, da bei AMD RX 9000 ungenau
-    vram_free_map: Dict[str, float] = _get_gpu_vram_free_via_wmi()
+    # DXGI/PowerShell-Fallback für AMD RX 9000 Series (return: used_mb) und
+    # freier VRAM über WMI (AvailableVideoMemory, bei AMD RX 9000 ungenau):
+    # beide nur bei Bedarf abfragen. detect_system() läuft alle 6 s im GUI,
+    # und der PowerShell-Start kostet 1-2 s, wenn WMI bereits alle Karten
+    # abdeckt.
+    _fallback_maps: Dict[str, Dict[str, float]] = {}
+
+    def dxgi_used_map() -> Dict[str, float]:
+        if "dxgi" not in _fallback_maps:
+            _fallback_maps["dxgi"] = _get_gpu_vram_via_dxgi_powershell()
+        return _fallback_maps["dxgi"]
+
+    def vram_free_map() -> Dict[str, float]:
+        if "free" not in _fallback_maps:
+            _fallback_maps["free"] = _get_gpu_vram_free_via_wmi()
+        return _fallback_maps["free"]
+
     # GPU-Auslastung (nur NVIDIA über nvidia-smi, schnell)
     # WMI-basierte Utilization-Erkennung kann langsam sein und wird übersprungen
     gpu_util_map: Dict[str, float] = _get_nvidia_gpu_utilization()
@@ -1292,13 +1305,13 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
             if name.lower() in vram_used_map:
                 used_mb = vram_used_map[name.lower()]
                 free_mb = max(0, total_mb - int(used_mb))
-            elif name.lower() in dxgi_used_map:
+            elif name.lower() in dxgi_used_map():
                 # DXGI/PowerShell-Fallback (AMD RX 9000 Series)
-                used_mb = dxgi_used_map[name.lower()]
+                used_mb = dxgi_used_map()[name.lower()]
                 free_mb = max(0, total_mb - int(used_mb))
-            elif name.lower() in vram_free_map:
+            elif name.lower() in vram_free_map():
                 # AvailableVideoMemory als letzte Option
-                free_mb = int(min(vram_free_map[name.lower()], total_mb))
+                free_mb = int(min(vram_free_map()[name.lower()], total_mb))
             else:
                 free_mb = 0
             # GPU-Auslastung holen
@@ -1368,11 +1381,11 @@ def _detect_windows_gpus(skip_names: Optional[set] = None) -> List[GPUInfo]:
         elif name.lower() in vram_used_map:
             used_mb = vram_used_map[name.lower()]
             free_mb = max(0, total_mb - int(used_mb))
-        elif name.lower() in dxgi_used_map:
-            used_mb = dxgi_used_map[name.lower()]
+        elif name.lower() in dxgi_used_map():
+            used_mb = dxgi_used_map()[name.lower()]
             free_mb = max(0, total_mb - int(used_mb))
-        elif name.lower() in vram_free_map:
-            free_mb = int(min(vram_free_map[name.lower()], total_mb))
+        elif name.lower() in vram_free_map():
+            free_mb = int(min(vram_free_map()[name.lower()], total_mb))
         else:
             free_mb = 0
         gpus.append(
@@ -2141,7 +2154,21 @@ def _assign_hip_indices(gpus: List[GPUInfo], llama_binary: Optional[str]) -> Non
             taken.add(idx)
 
 
+_DETECT_LOCK = threading.Lock()
+
+
 def detect_system(llama_binary: Optional[str] = None) -> SystemInfo:
+    """Detect everything in one call. Best-effort; never raises.
+
+    Serialized: the GUI probes from a background timer and again on Launch,
+    and two simultaneous WMI/COM sessions on Windows have crashed the
+    process. The second caller waits for the first probe instead.
+    """
+    with _DETECT_LOCK:
+        return _detect_system_locked(llama_binary)
+
+
+def _detect_system_locked(llama_binary: Optional[str] = None) -> SystemInfo:
     """Detect everything in one call. Best-effort; never raises.
 
     Every sub-detection step is wrapped in try/except so that a failure
@@ -2160,42 +2187,76 @@ def detect_system(llama_binary: Optional[str] = None) -> SystemInfo:
 
     # --- GPU detection (each vendor independently protected) ---
     raw: List[GPUInfo] = []
-    for detector in (_detect_nvidia, _detect_amd_rocm, _detect_apple):
+    # Detector of origin per entry (by object id). One detector never reports
+    # the same physical card twice, so the duplicate merge below only pairs
+    # entries from DIFFERENT detectors (e.g. rocm-smi + DRM sysfs).
+    origins: Dict[int, int] = {}
+    for origin, detector in enumerate(
+        (_detect_nvidia, _detect_amd_rocm, _detect_apple)
+    ):
         try:
-            raw.extend(detector())
+            found = list(detector())
         except Exception:
-            pass
+            continue
+        for g in found:
+            origins[id(g)] = origin
+        raw.extend(found)
 
     # OS-specific catch-all detectors fill in whatever the vendor-specific
     # ones missed (Windows: AMD without ROCm, Intel Arc; Linux: DRM/sysfs for
     # new AMD cards plus lspci names for devices without measurable VRAM).
     found_names = {g.name.lower() for g in raw}
-    for detector in (
-        _detect_windows_gpus,
-        _detect_linux_drm_gpus,
-        _detect_linux_other_gpus,
+    for origin, detector in enumerate(
+        (
+            _detect_windows_gpus,
+            _detect_linux_drm_gpus,
+            _detect_linux_other_gpus,
+        ),
+        start=3,
     ):
         try:
-            raw.extend(detector(skip_names=found_names))
-            found_names = {g.name.lower() for g in raw}
+            found = list(detector(skip_names=found_names))
         except Exception:
-            pass
+            continue
+        for g in found:
+            origins[id(g)] = origin
+        raw.extend(found)
+        found_names = {g.name.lower() for g in raw}
 
     # Merge duplicate detections (e.g. rocm-smi + DRM sysfs for the same Linux
     # card). Prefer entries that have measured VRAM/utilization and keep any
     # PCI id found by the catch-all detector.
     merged: List[GPUInfo] = []
+    merged_origins: List[int] = []
     for g in raw:
+        origin = origins.get(id(g), -1)
         match_idx: Optional[int] = None
+        # Only entries from another detector can describe the same card. Two
+        # cards from ONE detector (RTX 3060 + RTX 3060 Ti, RX 9070 + RX 9070
+        # XT) must never collapse into one entry via the substring match, and
+        # two different PCI device ids are never the same card.
+        candidates = [
+            i
+            for i, old in enumerate(merged)
+            if merged_origins[i] != origin
+            and not (
+                old.pci_device_id is not None
+                and g.pci_device_id is not None
+                and old.pci_device_id != g.pci_device_id
+            )
+        ]
         if g.pci_device_id is not None:
-            for i, old in enumerate(merged):
-                if old.pci_device_id == g.pci_device_id:
+            for i in candidates:
+                if merged[i].pci_device_id == g.pci_device_id:
                     match_idx = i
                     break
-        if match_idx is None and merged:
-            match_idx = _best_gpu_name_match(g.name, [old.name for old in merged])
+        if match_idx is None and candidates:
+            found = _best_gpu_name_match(g.name, [merged[i].name for i in candidates])
+            if found is not None:
+                match_idx = candidates[found]
         if match_idx is None:
             merged.append(g)
+            merged_origins.append(origin)
             continue
         old = merged[match_idx]
         if old.total_vram_mb <= 0 and g.total_vram_mb > 0:

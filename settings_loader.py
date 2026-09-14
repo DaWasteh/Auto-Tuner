@@ -155,6 +155,14 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         except (OSError, yaml.YAMLError) as e:
             print(f"[AutoTuner] Warning: failed to load {yml.name}: {e}")
             continue
+        if not isinstance(data, dict):
+            print(f"[AutoTuner] Warning: {yml.name} is not a mapping; skipped.")
+            continue
+        for list_key in ("patterns", "arch_fallback"):
+            # ``patterns: qwen`` would otherwise iterate character-wise and
+            # match nearly every model.
+            if isinstance(data.get(list_key), str):
+                data[list_key] = [data[list_key]]
 
         sampling = data.get("sampling") or {}
         if not isinstance(sampling, dict):
@@ -236,8 +244,8 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
         if not isinstance(diffusion_cfg, dict):
             diffusion_cfg = {}
 
-        profiles.append(
-            ModelProfile(
+        try:
+            profile = ModelProfile(
                 display_name=str(data.get("display_name", yml.stem)),
                 patterns=[str(p).lower() for p in (data.get("patterns") or [])],
                 arch_fallback=[
@@ -283,7 +291,12 @@ def load_profiles(settings_dir: Path) -> List[ModelProfile]:
                 runner=runner_raw,
                 diffusion=diffusion_cfg,
             )
-        )
+        except (TypeError, ValueError) as e:
+            # One hand-edited field (e.g. an empty ``max_context:``) must
+            # not take every other profile down with it.
+            print(f"[AutoTuner] Warning: failed to load {yml.name}: {e}")
+            continue
+        profiles.append(profile)
     return profiles
 
 

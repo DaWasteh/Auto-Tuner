@@ -474,6 +474,28 @@ def _process_group_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
+def _close_quietly(connection: http.client.HTTPConnection) -> None:
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
+def _abort_connection(connection: http.client.HTTPConnection) -> None:
+    """Close the OS socket under an in-flight request from another thread."""
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        return
+    try:
+        handle = sock.detach()
+    except OSError:
+        return
+    try:
+        socket.close(handle)
+    except OSError:
+        pass
+
+
 def _terminate_process(proc: subprocess.Popen) -> None:
     if os.name == "nt":
         # Always target the complete LibreOffice process tree. soffice.com is
@@ -652,19 +674,23 @@ class OcrJobRunner:
     def cancel(self) -> None:
         self.cancel_event.set()
         with self._state_lock:
-            response = self._active_response
             connection = self._active_connection
             process = self._active_process
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
         if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
+            # ``response.close()`` / ``connection.close()`` would take the
+            # buffer lock the worker holds while blocked in ``recv`` and
+            # make the caller (usually the GUI thread) wait for the whole
+            # page inference. Closing the OS socket handle wakes that
+            # ``recv`` immediately on Windows and POSIX; the worker's
+            # ``finally`` then closes the Python objects and maps the
+            # resulting OSError to ``OcrCancelled``.
+            _abort_connection(connection)
+            # The Python-level close still runs (for connections without a
+            # live socket, and to release the SocketIO), but never on the
+            # caller's thread.
+            threading.Thread(
+                target=_close_quietly, args=(connection,), daemon=True
+            ).start()
         if process is not None:
             # Cancellation can be initiated by the GUI thread. Never make that
             # thread wait for LibreOffice's shutdown/taskkill grace periods.
@@ -743,7 +769,10 @@ class OcrJobRunner:
                         raise OcrWorkflowError(
                             f"LibreOffice conversion timed out: {source.name}"
                         )
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, OcrCancelled):
+            # ``cancel()`` may have run between Popen and the registration
+            # above; terminating here is idempotent and keeps the headless
+            # soffice from outliving the cancelled job.
             _terminate_process(proc)
             raise
         finally:

@@ -257,8 +257,20 @@ class LanguageManager(QObject):
                 packs[qualified] = pack
 
         if DEFAULT_LANGUAGE_ID not in packs:
-            raise LanguagePackError(
-                f"required default pack {DEFAULT_LANGUAGE_ID!r} is missing or invalid"
+            # The English pack is an identity map, so an empty ``strings``
+            # dict degrades to untranslated source text instead of a dead
+            # GUI when the built-in file was edited or partially extracted.
+            errors.append(
+                f"required default pack {DEFAULT_LANGUAGE_ID!r} is missing or "
+                "invalid; falling back to built-in English source text"
+            )
+            packs[DEFAULT_LANGUAGE_ID] = LanguagePack(
+                id="en-GB",
+                name="English (UK)",
+                locale="en-GB",
+                strings={},
+                source="builtin",
+                path=self.builtin_dir / "01-en-GB.json",
             )
         self.packs = packs
         self.errors = errors

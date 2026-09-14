@@ -75,6 +75,12 @@ def _read_value(f, vtype: int, want_array_elements: bool = True) -> Any:
             scalar = _SCALAR_FMT.get(atype)
             if scalar is not None:
                 f.seek(scalar[1] * n, os.SEEK_CUR)
+            elif atype == _GT_STRING:
+                # Tokenizer vocab/merges: ~150k strings each. Seek past the
+                # bytes instead of reading and decoding every element.
+                for _ in range(n):
+                    ln = struct.unpack("<Q", f.read(8))[0]
+                    f.seek(ln, os.SEEK_CUR)
             else:
                 for _ in range(n):
                     _read_value(f, atype, want_array_elements=False)

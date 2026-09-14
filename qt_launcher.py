@@ -556,6 +556,36 @@ def _default_models_path() -> Path:
 # Terminal process — spawns llama-server detached from the GUI
 
 
+def _send_ctrl_break_to_new_console(pid: int) -> bool:
+    """Best-effort CTRL_BREAK to a child that owns its own console (Windows).
+
+    ``GenerateConsoleCtrlEvent`` only reaches process groups attached to the
+    caller's console, and the GUI spawns llama-server with
+    ``CREATE_NEW_CONSOLE``. A process without a console of its own (the
+    frozen ``--windowed`` build) can attach to the child's console for the
+    duration of the call. A process that owns a console (source run from a
+    terminal) must not free it, so it keeps relying on the kill escalation.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        if kernel32.GetConsoleWindow():
+            return False
+        if not kernel32.AttachConsole(int(pid)):
+            return False
+        try:
+            kernel32.SetConsoleCtrlHandler(None, True)
+            return bool(kernel32.GenerateConsoleCtrlEvent(1, int(pid)))  # CTRL_BREAK
+        finally:
+            kernel32.FreeConsole()
+            kernel32.SetConsoleCtrlHandler(None, False)
+    except Exception:
+        return False
+
+
 class _TerminalProcess:
     """Spawn llama-server in an independent process group.
 
@@ -581,6 +611,23 @@ class _TerminalProcess:
         self.log_path: Optional[Path] = None
         self._stopped_event = threading.Event()
         self._stopped_event.set()
+
+    # Stops whose signal/kill escalation is still running on a daemon thread.
+    # main() waits for them before ending the process, so a Quit can never
+    # leave llama-server behind with the model in VRAM.
+    _pending_stops: "set[_TerminalProcess]" = set()
+    _pending_lock = threading.Lock()
+
+    @classmethod
+    def wait_pending_stops(cls, timeout: float) -> List["_TerminalProcess"]:
+        """Wait (bounded) for every in-flight stop; return those still pending."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with cls._pending_lock:
+                pending = list(cls._pending_stops)
+            if not pending or time.monotonic() >= deadline:
+                return pending
+            time.sleep(0.1)
 
     def _open_posix_log(self):
         log_dir = app_settings.app_data_dir() / "logs"
@@ -689,6 +736,7 @@ class _TerminalProcess:
         try:
             if os.name == "nt":
                 self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                _send_ctrl_break_to_new_console(self.proc.pid)
             else:
                 os.kill(-self.proc.pid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
@@ -699,6 +747,8 @@ class _TerminalProcess:
         proc = self.proc
         assert proc is not None
         self.proc = None
+        with _TerminalProcess._pending_lock:
+            _TerminalProcess._pending_stops.add(self)
 
         def _wait() -> None:
             try:
@@ -718,6 +768,8 @@ class _TerminalProcess:
             finally:
                 if proc.poll() is not None:
                     self._stopped_event.set()
+                with _TerminalProcess._pending_lock:
+                    _TerminalProcess._pending_stops.discard(self)
 
         threading.Thread(target=_wait, daemon=True).start()
 
@@ -10267,7 +10319,11 @@ class MainWindow(QMainWindow):
                 kind = "  [EAGLE-3]"
             elif arch.endswith("-assistant") or arch.endswith("_assistant"):
                 kind = "  [MTP]"
-            label = f"{c.name}{kind}   ({c.stat().st_size / (1024**3):.1f} GB)"
+            try:
+                size_label = f"{c.stat().st_size / (1024**3):.1f} GB"
+            except OSError:
+                size_label = "size unavailable"
+            label = f"{c.name}{kind}   ({size_label})"
             if auto is not None and c == auto:
                 label += "  (auto)"
             if not compatible:
@@ -13511,7 +13567,14 @@ class MainWindow(QMainWindow):
             # Probe: can we bind? If not, something else holds it.
             probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
-                sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Windows SO_REUSEADDR binds next to an ACTIVE listener and
+                # would report a taken port as free; exclusive use fails
+                # with WSAEADDRINUSE as intended.
+                exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+                if os.name == "nt" and exclusive is not None:
+                    sk.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+                else:
+                    sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     sk.bind((probe_host, p))
                     return False
@@ -15773,6 +15836,16 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     exit_code = app.exec()
     guard.release()
+    # A stop issued from closeEvent escalates to kill after 10 s on a daemon
+    # thread. Ending the process before that fires would orphan llama-server
+    # (its CTRL_BREAK never reaches a separate Windows console).
+    still_stopping = _TerminalProcess.wait_pending_stops(13.0)
+    if still_stopping:
+        print(
+            f"[AutoTuner] {len(still_stopping)} server process(es) did not stop "
+            "within the shutdown grace period.",
+            flush=True,
+        )
     _arm_exit_watchdog(exit_code)
     lingering = _drain_background_work(window)
     if lingering:
