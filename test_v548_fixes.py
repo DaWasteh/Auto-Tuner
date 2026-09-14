@@ -257,6 +257,7 @@ def test_convert_office_cancel_terminates_soffice(monkeypatch, tmp_path):
         def communicate(self, timeout=None):
             raise subprocess.TimeoutExpired("soffice", timeout)
 
+    monkeypatch.setattr(ocr_workflow, "find_libreoffice", lambda: "soffice")
     monkeypatch.setattr(ocr_workflow.subprocess, "Popen", lambda *a, **k: FakeProc())
     monkeypatch.setattr(ocr_workflow.shutil, "rmtree", lambda *a, **k: None)
     runner = ocr_workflow.OcrJobRunner.__new__(ocr_workflow.OcrJobRunner)

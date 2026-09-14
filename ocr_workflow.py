@@ -486,6 +486,12 @@ def _abort_connection(connection: http.client.HTTPConnection) -> None:
     sock = getattr(connection, "sock", None)
     if sock is None:
         return
+    # Linux/macOS wake a blocked recv on shutdown(); Windows only does so
+    # when the OS handle is closed. Do both, in that order.
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
     try:
         handle = sock.detach()
     except OSError:
