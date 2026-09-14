@@ -394,23 +394,28 @@ def test_windows_detector_skips_dxgi_when_wmi_covers_every_card(monkeypatch):
 # qt_launcher / control_api: shutdown and listener hardening
 
 
-def test_terminal_process_stop_is_awaited_before_exit():
+def test_terminal_process_stop_is_awaited_before_exit(tmp_path):
     qt_launcher = pytest.importorskip("qt_launcher")
+    ready = tmp_path / "ready"
     # The child ignores SIGTERM (POSIX) and never sees CTRL_BREAK (Windows,
-    # separate console), so stop() has to run its 10 s kill escalation.
+    # separate console), so stop() has to run its 10 s kill escalation. The
+    # marker file guarantees the handler is installed before stop() runs.
     child = [
         sys.executable,
         "-c",
-        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(60)",
+        "import pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "pathlib.Path(sys.argv[1]).touch(); time.sleep(60)",
+        str(ready),
     ]
     proc = qt_launcher._TerminalProcess(child)
     proc.start()
-    assert proc.is_running()
+    deadline = time.monotonic() + 20
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists() and proc.is_running()
     proc.stop()
     assert proc in qt_launcher._TerminalProcess._pending_stops
-    # A child that ignores the signal is killed after the 10 s grace period;
-    # the wait must cover that escalation instead of ending the process first.
     pending = qt_launcher._TerminalProcess.wait_pending_stops(20.0)
     assert pending == []
     assert proc.has_stopped()
