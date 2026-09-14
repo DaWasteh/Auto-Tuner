@@ -1208,6 +1208,27 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
 
+### v5.4.9 — control-API state, benchmark time budget, off-thread server probes
+
+- **Control API:** a switch the GUI rejects before touching any server
+  (busy, hardware pending, unknown model or runtime, shutting down) no longer
+  clears the active model; `/api/v1/status` keeps reporting the serving model
+  and proxied requests without `model` keep routing to it. Rejections after
+  the old server was stopped still report idle. Live-verified: 409
+  `autotuner_busy` during an OCR job left Agents-A1 active and routable.
+- **Performance test:** reaching the total time limit now ends exploration
+  and decides with the candidates measured so far ("total time limit reached
+  after N of up to M candidates" in the decision) instead of discarding every
+  measurement; only a limit hit before the baseline finishes is still a
+  failure. `AUTOTUNER_BENCHMARK_DEADLINE_S` overrides the limit for
+  diagnostics. Live-verified with a 240 s limit on Qwen3.6-35B (4 of 18
+  candidates, result saved).
+- **GUI:** the `/health`, `/v1/models` and `/slots` probes moved from the
+  500 ms GUI timer onto a worker thread; the window stays fluid while a
+  model loads and during benchmark suites with many server starts.
+- No new llama.cpp build; b10948 remains the audited runtime.
+  [Validation](docs/v5.4.9-validation.md).
+
 ### v5.4.8 — llama.cpp b10948 rebuild, planner and lifecycle fixes
 
 - Fresh local Vulkan and HIP **b10948** builds from the unchanged Windows

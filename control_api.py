@@ -58,12 +58,26 @@ _HOP_BY_HOP_HEADERS = {
 
 
 class ControlApiError(RuntimeError):
-    """An expected HTTP/control-plane failure with a stable status code."""
+    """An expected HTTP/control-plane failure with a stable status code.
 
-    def __init__(self, message: str, *, status: int = 500, code: str = "api_error"):
+    ``backend_untouched`` marks a switch rejection that happened before the
+    GUI stopped or started any llama-server (busy, hardware pending, unknown
+    model/runtime). The API then restores the previously active model instead
+    of reporting "no active model" while that server keeps serving.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 500,
+        code: str = "api_error",
+        backend_untouched: bool = False,
+    ):
         super().__init__(message)
         self.status = int(status)
         self.code = code
+        self.backend_untouched = bool(backend_untouched)
 
 
 @dataclass(frozen=True)
@@ -183,11 +197,17 @@ class ControlRequest:
         *,
         status: int = 500,
         code: str = "switch_failed",
+        backend_untouched: bool = False,
     ) -> None:
         with self._lock:
             if self._event.is_set():
                 return
-            self._error = ControlApiError(message, status=status, code=code)
+            self._error = ControlApiError(
+                message,
+                status=status,
+                code=code,
+                backend_untouched=backend_untouched,
+            )
             self._event.set()
 
     def wait(self) -> Dict[str, Any]:
@@ -577,6 +597,17 @@ class ControlApiServer:
                     status=409,
                     code="model_busy",
                 )
+            # Snapshot the serving model: a rejection that never touched the
+            # backend restores it below.
+            previous = (
+                self._active_model_id,
+                self._active_runtime_id,
+                self._backend_url,
+                self._backend_alias,
+                self._backend_api_key,
+                self._active_detail,
+                self._active_since,
+            )
             self._active_model_id = ""
             self._active_runtime_id = ""
             self._backend_url = ""
@@ -622,9 +653,33 @@ class ControlApiServer:
                 self._active_since = time.time()
             self._log(f"model ready: {model_id} -> {backend_url}")
             return self.status()
-        except Exception:
+        except Exception as exc:
             with self._state_lock:
+                restore = (
+                    isinstance(exc, ControlApiError)
+                    and exc.backend_untouched
+                    and bool(previous[0])
+                    and not self._active_model_id
+                    # clear_active() during the attempt means the GUI stopped
+                    # the old server after all; keep the cleared state then.
+                    and self._loading_model_id == model_id
+                )
                 self._loading_model_id = ""
+                if restore:
+                    (
+                        self._active_model_id,
+                        self._active_runtime_id,
+                        self._backend_url,
+                        self._backend_alias,
+                        self._backend_api_key,
+                        self._active_detail,
+                        self._active_since,
+                    ) = previous
+            if isinstance(exc, ControlApiError) and exc.backend_untouched:
+                self._log(
+                    f"switch to {model_id} rejected before touching the backend "
+                    f"({exc.code}); the previous model stays active"
+                )
             raise
 
     def acquire_proxy_lease(self, model_id: str = "") -> ProxyLease:

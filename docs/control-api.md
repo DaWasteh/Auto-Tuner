@@ -175,6 +175,14 @@ Request body:
 | 409 | `model_busy` | The active model has in-flight proxied requests; retry later |
 | 409 | `no_active_model` | Proxy request without a `model` and no active model |
 | 409 | `autotuner_busy` | An exclusive benchmark or OCR workflow owns the GUI |
+
+Rejections that AutoTuner issues **before it touches any server** (`autotuner_busy`,
+`hardware_pending`, `model_not_found`, `runtime_unavailable`, `shutting_down`)
+leave the previously active model active: `/api/v1/status` keeps reporting it
+and proxied requests without `model` keep routing to it. Only a switch that
+already stopped the old server (`launch_failed`, `launch_exception`,
+`stop_timeout`, `switch_timeout`) leaves the API idle, because that server is
+gone. (Since v5.4.9.)
 | 409 | `launch_failed` | AutoTuner refused the launch (compatibility, VRAM, missing binary) |
 | 500 | `launch_exception`, `invalid_backend`, `internal_error` | Unexpected failure |
 | 502 | `backend_unavailable`, `backend_exited` | llama-server unreachable or exited while loading |

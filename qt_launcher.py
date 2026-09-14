@@ -13,7 +13,9 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import itertools
 import json
+import queue
 import dataclasses
 import os
 import platform
@@ -584,6 +586,85 @@ def _send_ctrl_break_to_new_console(pid: int) -> bool:
             kernel32.SetConsoleCtrlHandler(None, False)
     except Exception:
         return False
+
+
+class _ServerProbeWorker:
+    """Run the readiness and slot probes of server records off the GUI thread.
+
+    ``_poll_server`` used to call ``urlopen`` with 0.3-0.4 s timeouts every
+    500 ms on Qt's thread, which stalled the window for up to that long per
+    tick while a model was loading. Jobs are now queued here; results come
+    back through a Qt signal, so the GUI only applies state changes.
+    """
+
+    def __init__(self, on_result: Callable[[dict], None]) -> None:
+        self._on_result = on_result
+        self._queue: "queue.Queue[Optional[dict]]" = queue.Queue()
+        self._pending: set = set()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="AutoTunerServerProbe", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, job: dict) -> bool:
+        """Queue one probe unless the same (token, kind) is still in flight."""
+        key = (job.get("token"), job.get("kind"))
+        with self._lock:
+            if key in self._pending:
+                return False
+            self._pending.add(key)
+        self._queue.put(job)
+        return True
+
+    def stop(self, timeout: float = 1.5) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    @staticmethod
+    def _probe(job: dict) -> dict:
+        result = dict(job)
+        url = str(job.get("url") or "").rstrip("/")
+        if job.get("kind") == "slots":
+            try:
+                with urllib.request.urlopen(f"{url}/slots", timeout=0.4) as resp:
+                    result["payload"] = json.loads(
+                        resp.read().decode("utf-8", errors="replace") or "[]"
+                    )
+            except Exception as exc:
+                result["error"] = str(exc)
+            return result
+        try:
+            with urllib.request.urlopen(f"{url}/health", timeout=0.3) as resp:
+                result["ready"] = resp.status == 200
+        except Exception:
+            result["ready"] = False
+        if result["ready"] and job.get("verify_models"):
+            result["served_ids"] = server_model_ids(url, timeout_seconds=0.3)
+        return result
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            try:
+                result = self._probe(job)
+            except Exception as exc:  # never let the worker die silently
+                result = dict(job, error=str(exc), ready=False)
+            finally:
+                with self._lock:
+                    self._pending.discard((job.get("token"), job.get("kind")))
+            try:
+                self._on_result(result)
+            except Exception:
+                pass
+
+
+_PROBE_TOKENS = itertools.count(1)
 
 
 class _TerminalProcess:
@@ -5903,6 +5984,7 @@ class MainWindow(QMainWindow):
     _sysinfo_ready = pyqtSignal(object)  # SystemInfo
     _bg_log = pyqtSignal(str)  # log message from background thread
     _control_request_ready = pyqtSignal(object)  # ControlRequest from HTTP threads
+    _probe_result_ready = pyqtSignal(object)  # server probe result from the worker
     _control_log_ready = pyqtSignal(str)  # gateway log line from HTTP threads
 
     _FORK_TOOLTIP_SUMMARY = (
@@ -6091,6 +6173,8 @@ class MainWindow(QMainWindow):
         self._bg_log.connect(self._log)
         self._control_request_ready.connect(self._handle_control_request)
         self._control_log_ready.connect(self._log)
+        self._probe_result_ready.connect(self._on_probe_result)
+        self._probe_worker = _ServerProbeWorker(self._probe_result_ready.emit)
         if start_background:
             self._configure_control_api()
             QTimer.singleShot(0, self._startup_load)
@@ -7334,7 +7418,10 @@ class MainWindow(QMainWindow):
             return
         if self._control_closing:
             request.fail(
-                "AutoTuner is shutting down.", status=503, code="shutting_down"
+                "AutoTuner is shutting down.",
+                status=503,
+                code="shutting_down",
+                backend_untouched=True,
             )
             return
         if request.action == "stop":
@@ -7373,6 +7460,7 @@ class MainWindow(QMainWindow):
                 "AutoTuner is busy with an exclusive benchmark or OCR workflow.",
                 status=409,
                 code="autotuner_busy",
+                backend_untouched=True,
             )
             return
         if self._system is None:
@@ -7380,6 +7468,7 @@ class MainWindow(QMainWindow):
                 "Hardware detection is still running; retry in a moment.",
                 status=503,
                 code="hardware_pending",
+                backend_untouched=True,
             )
             return
 
@@ -7397,6 +7486,7 @@ class MainWindow(QMainWindow):
                 f"The model {request.model_id!r} is no longer available.",
                 status=404,
                 code="model_not_found",
+                backend_untouched=True,
             )
             return
 
@@ -7409,6 +7499,7 @@ class MainWindow(QMainWindow):
                     "available; read GET /api/v1/runtimes.",
                     status=409,
                     code="runtime_unavailable",
+                    backend_untouched=True,
                 )
                 return
             if not self._select_control_runtime(runtime_root):
@@ -7417,6 +7508,7 @@ class MainWindow(QMainWindow):
                     "be selected in the toolbar.",
                     status=409,
                     code="runtime_unavailable",
+                    backend_untouched=True,
                 )
                 return
         else:
@@ -15069,71 +15161,99 @@ class MainWindow(QMainWindow):
                 )
                 QTimer.singleShot(0, lambda r=record: self._stop_specific_server(r))
                 continue
-            try:
-                import urllib.request
-
-                with urllib.request.urlopen(
-                    f"{health_base_url}/health", timeout=0.3
-                ) as resp:
-                    ready = resp.status == 200
-            except Exception:
-                ready = False
-            if ready and record is self._ocr_server_record:
-                expected_alias = str(record.get("alias") or "")
-                served_ids = server_model_ids(str(health_base_url), timeout_seconds=0.3)
-                if served_ids is None:
-                    # /health can turn green a fraction before /v1/models is
-                    # queryable. Retry on the next poll instead of calling a
-                    # transient verification failure a hostile endpoint.
-                    continue
-                if not expected_alias or expected_alias not in served_ids:
-                    shown = ", ".join(served_ids) if served_ids else "none"
-                    self._fail_pending_ocr(
-                        record,
-                        "A different service answered on the OCR port "
-                        f"(expected {expected_alias!r}; served models: {shown}).",
-                    )
-                    QTimer.singleShot(0, lambda r=record: self._stop_specific_server(r))
-                    continue
-            if ready:
-                record["ready"] = True
-                proc = record.get("proc")
-                pid = proc.proc.pid if proc is not None and proc.proc else "?"
-                self._log(
-                    f"[AutoTuner] Server ready (/health → 200) — "
-                    f"port {record.get('port')}."
-                )
-                if record.get("slots_api_enabled"):
-                    self._log(
-                        f"[AutoTuner] /slots monitoring enabled — "
-                        f"{record.get('base_url')}/slots"
-                    )
-                self._refresh_server_combo()  # flip the …→✓ marker in the list
-                if record is self._servers[-1]:
-                    self._server_ready = True
-                    self._status.showMessage(
-                        f"Ready — PID {pid} — {base_url}  "
-                        f"({len(self._servers)} server(s) running)"
-                    )
-                self._complete_control_record(record)
-                self._start_pending_ocr(record)
+            # The HTTP probe runs on the worker; _on_probe_result applies it.
+            self._probe_worker.submit(
+                {
+                    "kind": "health",
+                    "token": self._probe_token(record),
+                    "url": str(health_base_url),
+                    "verify_models": record is self._ocr_server_record,
+                }
+            )
 
         # If enabled, poll /slots at a lower cadence than the 500 ms process
         # liveness check. This keeps the server switcher useful for continuous
         # batching without hammering the local HTTP API.
-        refreshed_slots = False
         for record in self._servers:
             if record.get("ready") and record.get("slots_api_enabled"):
-                refreshed_slots = self._poll_slots_endpoint(record) or refreshed_slots
-        if refreshed_slots:
-            self._refresh_server_combo()
+                self._poll_slots_endpoint(record)
+
+    @staticmethod
+    def _probe_token(record: dict) -> int:
+        """Stable per-record identity for probe results (never a reused id())."""
+        token = record.get("probe_token")
+        if not isinstance(token, int):
+            token = next(_PROBE_TOKENS)
+            record["probe_token"] = token
+        return token
+
+    def _record_for_probe(self, result: dict) -> Optional[dict]:
+        token = result.get("token")
+        for record in self._servers:
+            if record.get("probe_token") == token:
+                return record
+        return None
+
+    def _on_probe_result(self, result: object) -> None:
+        """Apply one worker probe result on the GUI thread."""
+        if not isinstance(result, dict):
+            return
+        record = self._record_for_probe(result)
+        if record is None:
+            return  # the server exited or was stopped meanwhile
+        if result.get("kind") == "slots":
+            if self._apply_slots_probe(record, result):
+                self._refresh_server_combo()
+            return
+        if record.get("ready"):
+            return
+        ready = bool(result.get("ready"))
+        base_url = record.get("base_url")
+        if ready and record is self._ocr_server_record:
+            expected_alias = str(record.get("alias") or "")
+            served_ids = result.get("served_ids")
+            if served_ids is None:
+                # /health can turn green a fraction before /v1/models is
+                # queryable. Retry on the next poll instead of calling a
+                # transient verification failure a hostile endpoint.
+                return
+            if not expected_alias or expected_alias not in served_ids:
+                shown = ", ".join(served_ids) if served_ids else "none"
+                self._fail_pending_ocr(
+                    record,
+                    "A different service answered on the OCR port "
+                    f"(expected {expected_alias!r}; served models: {shown}).",
+                )
+                QTimer.singleShot(0, lambda r=record: self._stop_specific_server(r))
+                return
+        if not ready:
+            return
+        record["ready"] = True
+        proc = record.get("proc")
+        pid = proc.proc.pid if proc is not None and proc.proc else "?"
+        self._log(
+            f"[AutoTuner] Server ready (/health → 200) — port {record.get('port')}."
+        )
+        if record.get("slots_api_enabled"):
+            self._log(
+                f"[AutoTuner] /slots monitoring enabled — "
+                f"{record.get('base_url')}/slots"
+            )
+        self._refresh_server_combo()  # flip the …→✓ marker in the list
+        if record is self._servers[-1]:
+            self._server_ready = True
+            self._status.showMessage(
+                f"Ready — PID {pid} — {base_url}  "
+                f"({len(self._servers)} server(s) running)"
+            )
+        self._complete_control_record(record)
+        self._start_pending_ocr(record)
 
     def _poll_slots_endpoint(self, record: dict) -> bool:
-        """Poll GET /slots for a server record and cache a compact summary.
+        """Queue a GET /slots probe for a ready server at a 2 s cadence.
 
-        Returns True when the displayed summary changed. The endpoint shape has
-        varied between llama.cpp builds, so this accepts either a raw list or a
-        dict containing a ``slots`` list and treats unknown slot fields as idle.
+        Returns True when a probe was queued. The result is applied by
+        ``_apply_slots_probe`` when the worker reports back.
         """
         now = time.monotonic()
         if now < float(record.get("slots_next_probe", 0.0) or 0.0):
@@ -15142,20 +15262,27 @@ class MainWindow(QMainWindow):
         base_url = record.get("client_base_url") or record.get("base_url")
         if not base_url:
             return False
+        return self._probe_worker.submit(
+            {"kind": "slots", "token": self._probe_token(record), "url": str(base_url)}
+        )
+
+    def _apply_slots_probe(self, record: dict, result: dict) -> bool:
+        """Cache a compact /slots summary; True when the displayed text changed.
+
+        The endpoint shape has varied between llama.cpp builds, so this accepts
+        either a raw list or a dict containing a ``slots`` list and treats
+        unknown slot fields as idle.
+        """
         old = str(record.get("slots_summary", "") or "")
-        try:
-            with urllib.request.urlopen(f"{base_url}/slots", timeout=0.4) as resp:
-                payload = json.loads(
-                    resp.read().decode("utf-8", errors="replace") or "[]"
-                )
-        except Exception as exc:
+        if "error" in result:
             if not record.get("slots_error_logged"):
                 self._log(
-                    f"[AutoTuner] /slots not reachable on port {record.get('port')}: {exc}"
+                    f"[AutoTuner] /slots not reachable on port {record.get('port')}: "
+                    f"{result['error']}"
                 )
                 record["slots_error_logged"] = True
             return False
-
+        payload = result.get("payload")
         slots = payload.get("slots") if isinstance(payload, dict) else payload
         if not isinstance(slots, list):
             return False
@@ -15420,6 +15547,7 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._poll_timer.stop()
+            self._probe_worker.stop()
         except Exception:
             pass
 
@@ -15892,7 +16020,7 @@ def _drain_background_work(window: MainWindow, timeout_s: float = 10.0) -> List[
     for py_thread in threading.enumerate():
         if py_thread is threading.main_thread() or not py_thread.is_alive():
             continue
-        if py_thread.name == "AutoTunerExitWatchdog":
+        if py_thread.name in ("AutoTunerExitWatchdog", "AutoTunerServerProbe"):
             continue
         lingering.append(py_thread.name)
     return lingering

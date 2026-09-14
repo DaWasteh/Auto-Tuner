@@ -46,6 +46,14 @@ class BenchmarkCancelled(RuntimeError):
     """Raised internally when the user cancels a benchmark sweep."""
 
 
+class BenchmarkBudgetExhausted(RuntimeError):
+    """The total sweep deadline passed; decide with the measurements so far.
+
+    Deliberately not a ``BenchmarkFailure`` so the stage loops' per-candidate
+    error handling cannot swallow it and record phantom candidate failures.
+    """
+
+
 class BenchmarkFailure(RuntimeError):
     """Raised when the baseline or benchmark infrastructure cannot run."""
 
@@ -267,6 +275,9 @@ class BenchmarkResult:
     runtime_binary: str
     runtime_build: Optional[int]
     reason: str
+    # True when the total time limit ended exploration early; the winner was
+    # chosen from the candidates measured until then.
+    budget_exhausted: bool = False
 
     def by_id(self, candidate_id: str) -> CandidateResult:
         for result in self.candidates:
@@ -915,7 +926,9 @@ class BenchmarkRunner:
         if self._cancel.is_set():
             raise BenchmarkCancelled("Performance tuning cancelled")
         if self._deadline > 0.0 and time.monotonic() >= self._deadline:
-            raise BenchmarkFailure("Performance tuning reached its total time limit")
+            raise BenchmarkBudgetExhausted(
+                "Performance tuning reached its total time limit"
+            )
 
     def _emit(self, message: str) -> None:
         self.progress(self._completed_runs, self._total_runs, message)
@@ -1240,7 +1253,7 @@ class BenchmarkRunner:
         self._emit(f"{phase}: {candidate.label}")
         try:
             result = self._benchmark_candidate(candidate)
-        except (BenchmarkCancelled, BenchmarkFailure):
+        except (BenchmarkCancelled, BenchmarkBudgetExhausted, BenchmarkFailure):
             raise
         except Exception as exc:
             raise BenchmarkFailure(str(exc)) from exc
@@ -1281,6 +1294,13 @@ class BenchmarkRunner:
     def run(self) -> BenchmarkResult:
         started = time.monotonic()
         total_timeout_s = float(self.limits.total_timeout_s)
+        # Diagnostic override for live checks of the budget path (seconds).
+        override = os.environ.get("AUTOTUNER_BENCHMARK_DEADLINE_S", "").strip()
+        if override:
+            try:
+                total_timeout_s = float(override)
+            except ValueError:
+                pass
         self._deadline = started + total_timeout_s if total_timeout_s > 0.0 else 0.0
         if self.base_config.ctx <= 0:
             raise BenchmarkFailure("desired context must be positive")
@@ -1305,11 +1325,84 @@ class BenchmarkRunner:
             baseline = self._run_candidate(baseline_spec)
         except BenchmarkCancelled:
             raise
+        except BenchmarkBudgetExhausted as exc:
+            raise BenchmarkFailure(
+                "Performance tuning reached its total time limit before the "
+                "baseline finished"
+            ) from exc
         except BenchmarkFailure as exc:
             raise BenchmarkFailure(f"baseline failed: {exc}") from exc
         results.append(baseline)
         by_id[baseline_spec.id] = baseline
 
+        confirmed_ids: set[str] = set()
+        budget_exhausted = False
+        try:
+            self._explore_and_confirm(
+                baseline_spec, baseline, results, by_id, seen, confirmed_ids
+            )
+        except BenchmarkBudgetExhausted:
+            budget_exhausted = True
+            self._emit(
+                "Total time limit reached; deciding with the "
+                f"{len(results)} measured candidate(s)"
+            )
+
+        final_ranked = self._rank(results, baseline)
+        if not final_ranked:
+            raise BenchmarkFailure("all benchmark candidates failed")
+        winner = final_ranked[0]
+        winner_score = self._score(winner, baseline)
+        conservative_score = winner.paired_ratio_bounds(baseline, "overall")[0]
+        reason = "measured winner"
+        if winner.candidate.id != baseline_spec.id and (
+            winner_score < 1.0 + self.limits.min_improvement
+            or conservative_score < 1.0 + self.limits.min_improvement
+            or (
+                confirmed_ids
+                and winner.candidate.id not in confirmed_ids
+                and baseline_spec.id in confirmed_ids
+            )
+        ):
+            winner = baseline
+            reason = (
+                "Auto baseline kept because no uncertainty-safe candidate "
+                f"improved every paired workload sample by "
+                f"{self.limits.min_improvement * 100:.0f}%"
+            )
+        elif winner.candidate.id == baseline_spec.id:
+            reason = "Auto baseline remained fastest within the noise threshold"
+        if budget_exhausted:
+            reason += (
+                f" (total time limit reached after {len(results)} of up to "
+                f"{self.limits.max_candidates} candidates; remaining candidates "
+                "and unconfirmed finalists were skipped)"
+            )
+
+        self._completed_runs = self._total_runs
+        self._emit("Performance tuning complete")
+        return BenchmarkResult(
+            desired_context=int(self.base_config.ctx),
+            baseline_id=baseline_spec.id,
+            winner_id=winner.candidate.id,
+            candidates=results,
+            elapsed_s=time.monotonic() - started,
+            runtime_binary=self.runtime_binary,
+            runtime_build=probe_binary_build_number(self.runtime_binary),
+            reason=reason,
+            budget_exhausted=budget_exhausted,
+        )
+
+    def _explore_and_confirm(
+        self,
+        baseline_spec: BenchmarkCandidate,
+        baseline: CandidateResult,
+        results: List[CandidateResult],
+        by_id: Dict[str, CandidateResult],
+        seen: set,
+        confirmed_ids: set,
+    ) -> None:
+        """Stages 1-3 plus confirmation; raises BenchmarkBudgetExhausted."""
         if self.candidate_plan:
             # Opt-in target validation of stable short-pass finalists. An empty
             # or low-confidence shortlist is never passed by the caller, so the
@@ -1533,7 +1626,6 @@ class BenchmarkRunner:
 
         ranked = self._rank(results, baseline)
         finalists = ranked[: min(2, self.limits.confirmation_runs, len(ranked))]
-        confirmed_ids: set[str] = set()
         # Reverse order avoids always giving the exploratory winner the same
         # thermal/order advantage during confirmation.
         for finalist in reversed(finalists):
@@ -1554,44 +1646,6 @@ class BenchmarkRunner:
                 confirmed_ids.add(finalist.candidate.id)
             else:
                 finalist.confirmation_error = "confirmation measurements were too noisy"
-
-        final_ranked = self._rank(results, baseline)
-        if not final_ranked:
-            raise BenchmarkFailure("all benchmark candidates failed")
-        winner = final_ranked[0]
-        winner_score = self._score(winner, baseline)
-        conservative_score = winner.paired_ratio_bounds(baseline, "overall")[0]
-        reason = "measured winner"
-        if winner.candidate.id != baseline_spec.id and (
-            winner_score < 1.0 + self.limits.min_improvement
-            or conservative_score < 1.0 + self.limits.min_improvement
-            or (
-                confirmed_ids
-                and winner.candidate.id not in confirmed_ids
-                and baseline_spec.id in confirmed_ids
-            )
-        ):
-            winner = baseline
-            reason = (
-                "Auto baseline kept because no uncertainty-safe candidate "
-                f"improved every paired workload sample by "
-                f"{self.limits.min_improvement * 100:.0f}%"
-            )
-        elif winner.candidate.id == baseline_spec.id:
-            reason = "Auto baseline remained fastest within the noise threshold"
-
-        self._completed_runs = self._total_runs
-        self._emit("Performance tuning complete")
-        return BenchmarkResult(
-            desired_context=int(self.base_config.ctx),
-            baseline_id=baseline_spec.id,
-            winner_id=winner.candidate.id,
-            candidates=results,
-            elapsed_s=time.monotonic() - started,
-            runtime_binary=self.runtime_binary,
-            runtime_build=probe_binary_build_number(self.runtime_binary),
-            reason=reason,
-        )
 
 
 @dataclass
