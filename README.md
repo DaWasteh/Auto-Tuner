@@ -897,6 +897,7 @@ matches. See `settings/_default.yaml`.
 | `paddleocr-vl.yaml` | PaddleOCR-VL 0.9B deterministic element recognition | `paddleocr` |
 | `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
 | `nex-n2_5-mini.yaml` | Nex-AGI Nex-N2.5-mini, 256K, own sampling and Nex template | `qwen35moe` (filename-gated) |
+| `maple.yaml` | DeepGrove Maple-Preview 20B-A1B ternary reasoning MoE (TQ1_0/TQ2_0), 131k, b10964+ | `maple` |
 | `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
 | `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
@@ -918,13 +919,24 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b10948 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b10977 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+) | `bailingmoe3` |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.5.0:** **DeepGrove Maple-Preview** (`maple`, PR #27000, first tagged
+  in b10964 = stable v0.4.1) is a 20B-A1B ternary reasoning MoE with 24
+  layers, 256 experts (8 active), a 3:1 sliding-window-512/global attention
+  pattern and 131,072 native context; the official GGUFs are TQ1_0/TQ2_0
+  with a Q4_K or F16 head. The profile requires b10964+, keeps `--jinja
+  --reasoning-preserve` for the thinking-by-default ChatML template and
+  uses the usual thinking-model sampling (temp 0.6 / top_p 0.95 / top_k
+  20) because DeepGrove ships no `generation_config`. Vulkan has TQ1_0/TQ2_0
+  kernels; CUDA/HIP have none, so llama.cpp keeps the ternary expert
+  tensors on the CPU there. [Audit](docs/llama-b10977-audit.md).
 
 - **v5.4.6:** DeepSeek-V4.1-Flash has a new CED/CSA2/Engram architecture;
   conversion-only PR #28696 is not inference support. Its profile blocks
@@ -936,8 +948,9 @@ Notes on the new profiles:
   `clear_thinking=true` default. Keep its own GGUF template. Ordinary V4,
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
-  block named b10930; the **v5.4.8** b10948 re-check found it still open and
-  the block now names b10948. Nothing else in that profile changed.
+  block named b10930; the **v5.4.8** b10948 and **v5.5.0** b10977 re-checks
+  found it still open and the block now names b10977. Nothing else in that
+  profile changed.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1096,10 +1109,12 @@ unused-variable warning. Compiler diagnostics remain enabled (no blanket
 warning suppression and no `/WX`/`-Werror` policy for upstream/template code).
 The installed SDK still lacks LLVM PR #201563, so the helper applies that exact
 HIP/MSVC `<cmath>` include-order fix to a workspace-local clang resource copy.
-Since b10911 (PR #28091) upstream enables precompiled headers and a unity build
-for the model sources by default; both recipes were re-run unchanged on b10930
-and again on b10948, where upstream's new `-Xclang -fno-pch-timestamp` (PR
-#28816) is active for the ROCm clang HIP tree and needed no recipe change.
+b10911 (PR #28091) had enabled precompiled headers and a unity build for the
+model sources; b10977 (PR #28892) removes every `target_precompile_headers`
+again after the PCH/`CACHE_LINE_SIZE` heap-corruption report (PR #28882),
+while the unity build of `src/models` stays. Both recipes were re-run
+unchanged on b10930, b10948 and b10977; the clang `-fno-pch-timestamp`
+option (PR #28816) is still emitted but now idle.
 MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
 benign: `src/models/llama.cpp` is folded into a unity source and only one
 `llama.obj` is produced.
@@ -1134,22 +1149,31 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b10948)
+## Server features (audited through llama.cpp b10977)
 
-The **b10948** (`5f436dddb`) [audit](docs/llama-b10948-audit.md) repeats the
+The **b10977** (`0ecb159c9`) [audit](docs/llama-b10977-audit.md) repeats the
 actual HIP and Vulkan inference, tool-call, multi-GPU DFlash2, vision and lazy
-PLE checks on freshly built local trees. The only `common/arg.cpp` change in
-b10930→b10948 rewords the `-j/--json-schema` help sentences (PR #28736); the
-option set is identical to b10930 (415 names / 328 long options), so no CLI
-migration is required. The server now treats an empty `{}` JSON schema as
-"any object" and can emit structured `LOG_JSON` records (including the
-`--fit` memory breakdown) under `--log-jsonl`; AutoTuner sends no JSON schema
-and keeps reading the plain text log, so neither changes the launcher.
+PLE checks on freshly built local trees and adds a Maple-Preview TQ2_0 run.
+b10948→b10977 (29 commits, which include the **v0.4.1 stable** release at
+b10964) touches neither `common/arg.cpp` nor the server option table: the
+`--help` text is byte-identical on both backends (415 names / 328 long
+options), so no CLI migration is required. Behaviour changes that matter to
+the launcher are the CPU work-buffer sizing fix (PR #28882, a heap corruption
+with unity/PCH builds), the Gemma 4 / Step 3.5 / MiMo2 sliding-window pattern
+loaders that now require the array key (PR #28868), the qwen4exp
+hyper-connection norm reshape (PR #28896) and the recurrent-state context
+reuse check that runs before the KV probe (PR #28749). Gemma 4 12B + MTP
+drafter, Qwen3.8 Flash-Next (qwen4exp) and Qwen3.8 + DFlash2 were run live
+on both backends for those; Step 3.5 and MiMo2 GGUFs are not on this
+workstation. The previous **b10948** (`5f436dddb`)
+[audit](docs/llama-b10948-audit.md) covered the `-j/--json-schema` help
+rewording (PR #28736), the empty-schema "any object" default and the
+`LOG_JSON` records under `--log-jsonl`.
 **Still broken upstream:** Qwen3.5/3.8 (`qwen35`) + DFlash2 + vision fails
-image requests with HTTP 500 on b10948 exactly as on b10901–b10930 (PR
+image requests with HTTP 500 on b10977 exactly as on b10901–b10948 (PR
 #28587's skipped image rows leave a position gap in the recurrent DFlash2
 draft memory; PR #28715 in b10906 did not change that, and nothing in
-b10930→b10948 touches that path). AutoTuner gates this combination on
+b10930→b10977 touches that path). AutoTuner gates this combination on
 **every build from b10896 on**; disable Draft for images or Vision for
 text-only DFlash2. The previous **b10930** (`56381e407`)
 [audit](docs/llama-b10930-audit.md) established that gate. b10907 (PR #28630) also
@@ -1207,6 +1231,23 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.0 — llama.cpp b10977 / v0.4.1 audit, Maple-Preview profile
+
+- Fresh local Vulkan and HIP **b10977** builds (and the **v0.4.1** stable
+  trees, which are b10964) from the unchanged Windows recipes. The b10948→b10977
+  range changes no server option: `--help` is byte-identical on both backends
+  and all 164 profile/mode commands per backend parse. Upstream removed the
+  precompiled headers again (PR #28892) after a CPU work-buffer heap
+  corruption (PR #28882); the recipes needed no change.
+- **New profile `maple.yaml`:** DeepGrove Maple-Preview 20B-A1B ternary
+  reasoning MoE (`maple`, PR #27000, b10964+), TQ1_0/TQ2_0 GGUFs, 131k
+  context, thinking-model sampling, `--jinja --reasoning-preserve`; all nine
+  language packs carry its note. Run live on the b10977 Vulkan tree.
+- Image + DFlash2 on Qwen3.5/3.8 was re-run and **still fails on b10977**
+  (HIP and Vulkan); the b10896+ gate stays and now names b10977. The
+  DeepSeek-V4.1 block names b10977 (PR #28696 is still open).
+- [Audit](docs/llama-b10977-audit.md) · [Validation](docs/v5.5.0-validation.md).
 
 ### v5.4.9 — control-API state, benchmark time budget, off-thread server probes
 

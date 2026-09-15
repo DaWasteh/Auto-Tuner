@@ -1,0 +1,62 @@
+display_name: "Maple-Preview 20B-A1B (DeepGrove, ternary MoE)"
+patterns:
+  - maple-preview
+  - maple_preview
+  - maplepreview
+  - deepgrove
+
+# llama.cpp b10964 (PR #27000) added the dedicated maple architecture. The
+# fallback only fires for GGUFs whose filename matches no pattern.
+arch_fallback:
+  - maple
+
+# PR #27000 merged on 2026-09-14; b10964 is the first tagged build (and also
+# the v0.4.1 stable release) that loads the maple architecture. Older builds
+# abort with "unknown model architecture".
+min_llama_build: 10964
+
+# config.json: max_position_embeddings 131072, sliding_window 512 on 18 of the
+# 24 layers (3:1 SWA:global pattern), partial RoPE 0.5, no rope scaling.
+max_context: 131072
+recommended_kv_quant: q8_0
+
+# DeepGrove ships no generation_config.json. The checkpoint is a
+# thinking-by-default reasoning model on a Qwen2 tokenizer/ChatML template, so
+# the defaults follow the common thinking-model recommendation (temp 0.6,
+# top_p 0.95, top_k 20, no min_p / repeat penalty) for both modes.
+sampling:
+  chat:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+# The embedded Jinja template opens every reply with <think>; keep the
+# reasoning in multi-turn history like the other thinking profiles.
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+notes: >
+  DeepGrove Maple-Preview is a 20B-A1B ternary-weight reasoning MoE: 24
+  layers, 256 experts with 8 active, 3:1 sliding-window (512) to global
+  attention, 131,072 native context, MIT license. The official GGUFs pack the
+  ternary weights as TQ1_0 or TQ2_0 with a Q4_K or F16 LM head (4.6 to 5.9
+  GiB). llama.cpp b10964 (PR #27000, also stable v0.4.1) added the maple
+  architecture; this profile requires that build. Vulkan has TQ1_0/TQ2_0
+  matmul kernels, so the whole model runs on the GPU there; CUDA/HIP have no
+  ternary kernels, so on HIP llama.cpp keeps the TQ expert tensors in host
+  memory and computes them on the CPU. DeepGrove publishes no
+  generation_config, so the sampling defaults are the usual thinking-model
+  values (temp 0.6, top_p 0.95, top_k 20). The preview is tuned for raw
+  reasoning and received little agentic post-training; thinking is on by
+  default via the embedded ChatML-style template.

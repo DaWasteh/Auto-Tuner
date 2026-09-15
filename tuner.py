@@ -730,7 +730,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b10948 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b10977 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -1031,7 +1031,7 @@ def _memlock_limit_gb() -> Optional[float]:
 #: First mainline build whose speculative prefill skips pinned M-RoPE image
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
-#: HTTP 500. Reproduced on b10901, b10903, b10930 and b10948 (HIP and Vulkan);
+#: HTTP 500. Reproduced on b10901, b10903, b10930, b10948 and b10977 (HIP and Vulkan);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
@@ -5528,7 +5528,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b10948) image "
+                "with DFlash2: since b10896 (verified through b10977) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."
