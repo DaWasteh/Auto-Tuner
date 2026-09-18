@@ -2,6 +2,8 @@ display_name: "Ternary-Bonsai 27B (PrismML, 1.71-bit)"
 patterns:
   # Länger als sowohl "ternary-bonsai" als auch "bonsai-27b" und gewinnt
   # deshalb zuverlässig vor den bestehenden Bonsai-8B-Familienprofilen.
+  # Ternary-Bonsai 2 (PTQ1_0/PQ2_0, "ternary-bonsai-2-27b") hat ein eigenes
+  # Profil: bonsai-2-27b.yaml.
   - ternary-bonsai-27b
 
 # Qwen3.6-27B-Hybrid-Backbone: 262,144 Tokens nativ.

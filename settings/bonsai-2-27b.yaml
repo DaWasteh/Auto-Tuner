@@ -1,0 +1,72 @@
+display_name: "Ternary-Bonsai 2 27B (PrismML, 1.72-bit)"
+patterns:
+  # Länger als "ternary-bonsai" (8B-Familie) und "ternary-bonsai-27b"
+  # (Bonsai 27B der ersten Generation): "Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+  # und "...-PQ2_0.gguf" landen damit zuverlässig hier.
+  - ternary-bonsai-2-27b
+  - bonsai-2-27b
+
+# Qwen3.8-27B-Hybrid-Backbone (~75 % lineare Attention, GGUF-Architektur
+# qwen35): 262,144 Tokens nativ.
+max_context: 262144
+
+# Der Tuner beginnt mit Q8 und fällt bei langen Kontexten automatisch auf
+# Q5/Q4 zurück; mit Q4-KV passt laut PrismML auch der volle 262k-Kontext
+# neben die 6–7 GB Modellgewichte auf eine einzelne GPU.
+recommended_kv_quant: q8_0
+
+# Beide veröffentlichten Packungen (PTQ1_0 = ggml-Typ 143, PQ2_0 = Typ 142)
+# und die Hadamard-Aktivierungstransformation (prism.hadamard.*) gibt es nur
+# im PrismML-Fork (Branch prism). Mainline llama.cpp (b11042) lehnt beide
+# Dateien als unbekannten Tensortyp ab. AutoTuner findet beide versionierten
+# Fork-Bäume, z.B. 2b_b10687_vulkan_llama.cpp und 2b_b10687_hip_llama.cpp.
+server_binary: "2b_llama/llama-server"
+
+# PTQ1_0 kam erst nach dem alten Pin (prism-b10660) in den Fork; der
+# Rezept-Pin prism-b10687-5d80cff ist der erste geprüfte Stand mit beiden
+# Packungen. Die Fork-Binärdateien melden ihre eigene Build-Nummer.
+min_llama_build: 10687
+
+# Kein required_runtime_markers-Eintrag: match_profile würde ein Marker-
+# Profil bei fremd beanspruchter Architektur (qwen35 gehört qwen3_5-3_6.yaml)
+# überspringen. Mainline-Binärdateien fängt stattdessen die metadaten-
+# gesteuerte Sperre in tuner.check_model_build (prism.hadamard.* im GGUF,
+# aber kein prism.hadamard-Loader in der gewählten llama-Bibliothek).
+
+# --jinja für natives OpenAI-Tool-Calling des Qwen3.8-Templates; das
+# Modell denkt standardmäßig (Reasoning-Effort xhigh, medium für kürzere
+# Antworten; low wird nicht unterstützt).
+extra_args:
+  - --jinja
+
+# Offizielle Bonsai-2-Werte (Thinking-Modus, identisch mit den
+# general.sampling.*-Defaults im GGUF und den Benchmark-Einstellungen).
+# Nicht-Thinking laut Modellkarte: temp 0.7, top_p 0.80, presence 1.5.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  PrismML Ternary-Bonsai 2 27B on a Qwen3.8-27B hybrid-attention base:
+  end-to-end ternary weights (1.72 bits per weight), thinking by default,
+  tool calling, optional vision projector (mmproj Q8_0 0.63 GB or BF16
+  0.93 GB), 262k native context. Two packings of the same weights:
+  PTQ1_0 (dense trits, 1.75 bpw, 5.95 GB) and PQ2_0 (2-bit slots, 2.13
+  bpw, 7.21 GB). Both are Prism-private ggml types (143 / 142) with a
+  Hadamard activation transform: they need the PrismML prism fork built by
+  the Ternary/Bonsai recipes (2b_ builds, prism-b10687 or newer); mainline
+  llama.cpp rejects them as unknown tensor types. On this fork the Vulkan
+  backend has PTQ1_0 kernels but no PQ2_0 path, HIP/CUDA run both. Official
+  thinking-mode sampling (temperature 1.0, top-p 0.95, top-k 20).

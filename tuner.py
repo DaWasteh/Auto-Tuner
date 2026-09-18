@@ -769,10 +769,41 @@ def _nemotron_latent_mtp_block_reason(
     )
 
 
+#: PrismML Ternary-Bonsai 2 GGUFs (PTQ1_0 = ggml type 143, PQ2_0 = type 142)
+#: fold a Hadamard transform into their weights and describe it with
+#: ``prism.hadamard.*`` metadata that only the PrismML ``prism`` fork loads
+#: (recipes ``ternary_bonsai_{vulkan,hip}_llama_build.ps1``, ``2b_`` trees).
+#: Mainline llama.cpp rejects the tensors as unknown types (upstream issue
+#: #29058), and a runtime that lacked the Hadamard fold would decode garbage
+#: even if it accepted the types, so the check keys on the loader string in
+#: the selected binary's llama library rather than on a build number.
+_PRISM_HADAMARD_MARKER = "prism.hadamard"
+
+
+def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
+    """Explain why a Hadamard-folded PrismML GGUF cannot load on ``binary``."""
+    metadata = model.metadata or {}
+    if not any(str(key).startswith(_PRISM_HADAMARD_MARKER + ".") for key in metadata):
+        return ""
+    if _runtime_has_required_markers(binary, [_PRISM_HADAMARD_MARKER]):
+        return ""
+    file_type = metadata.get("general.file_type")
+    packing = {141: "PQ2_0", 143: "PTQ1_0"}.get(file_type, "PTQ1_0/PQ2_0")
+    return (
+        f"{model.name} carries PrismML Hadamard-folded ternary weights "
+        f"({packing}, prism.hadamard.* metadata) that only the PrismML prism "
+        "fork of llama.cpp loads (Ternary/Bonsai recipes, 2b_ builds, "
+        "prism-b10687 or newer). The selected binary and its llama library "
+        "have no prism.hadamard loader: mainline llama.cpp rejects these "
+        "tensors as unknown ggml types 142/143 (upstream issue #29058)."
+    )
+
+
 def check_model_build(
     model: ModelEntry, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
-    """Reject unimplemented architectures, latent-MoE Nemotron MTP GGUFs on
+    """Reject unimplemented architectures, PrismML Hadamard-folded GGUFs on
+    runtimes without the prism loader, latent-MoE Nemotron MTP GGUFs on
     pre-b11025 builds and unsafe b10741-b10748 GGUFs.
 
     PR #28159 made ``n_layer()`` exclude NextN before the generic per-layer
@@ -785,6 +816,9 @@ def check_model_build(
     blocked = _model_runtime_block_reason(model)
     if blocked:
         return False, blocked, None
+    prism_block = _prism_hadamard_block_reason(model, binary)
+    if prism_block:
+        return False, prism_block, None
     if not model.has_embedded_mtp:
         return True, "", None
 

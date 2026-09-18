@@ -780,7 +780,7 @@ L:\LAB\
     ├── llama.cpp\      ← standard build
     ├── tq_llama.cpp\   ← Turbo-Quant build
     ├── ik_llama.cpp\   ← Gemma 4 external drafter (fork still needed)
-    └── 1b_llama.cpp\   ← BitNet fork (Ternary-Bonsai)
+    └── 2b_b10687_vulkan_llama.cpp\   ← PrismML prism fork (Ternary-Bonsai, Ternary-Bonsai 2)
 I:\
 └── models\             ← your models
 ```
@@ -837,7 +837,11 @@ The tuner intelligently selects the best binary based on your model and settings
 - **Gemma 4 (with external draft)** $\rightarrow$ uses `ik_llama.cpp` (external sibling drafter still requires the fork).
 - **Gemma 4 (without draft)** $\rightarrow$ uses standard `llama.cpp`.
 - **Integrated MTP (e.g. Qwen3.6-27B-MTP)** $\rightarrow$ uses standard `llama.cpp` (native since b9190+; PR #22673 in mainline since 16 May 2026; no fork needed).
-- **Ternary-Bonsai** $\rightarrow$ uses `1b_llama.cpp`.
+- **Ternary-Bonsai / Ternary-Bonsai 2** $\rightarrow$ uses the PrismML prism fork
+  (`2b_bNNNN_{vulkan,hip}_llama.cpp`). Bonsai 2's `PTQ1_0` / `PQ2_0` packings and
+  their Hadamard fold are fork-only; mainline llama.cpp (b11042) rejects them as
+  unknown ggml types 143 / 142, and AutoTuner refuses such GGUFs before launch on
+  a runtime whose llama library has no `prism.hadamard` loader.
 - **Turbo-Quant Mode** $\rightarrow$ uses `tq_llama.cpp`.
 
 Example — run Devstral, override context, and pass an extra flag
@@ -1110,7 +1114,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`llama_stable_vulkan_build.ps1`](building%20llama.cpp/llama_stable_vulkan_build.ps1) / [`llama_stable_hip_build.ps1`](building%20llama.cpp/llama_stable_hip_build.ps1) | Stable `X.Y.Z` siblings: `X.Y.Z_vulkan_llama.cpp` and `X.Y.Z_hip_llama.cpp`. |
 | [`llama_prerelease_vulkan_build.ps1`](building%20llama.cpp/llama_prerelease_vulkan_build.ps1) / [`llama_prerelease_hip_build.ps1`](building%20llama.cpp/llama_prerelease_hip_build.ps1) | Latest exact `bNNNN` siblings, or truthful `bNNNN_dev_COMMIT_{backend}_llama.cpp` folders with `-Tag master`. |
 | [`turboquant_vulkan_llama_build.ps1`](building%20llama.cpp/turboquant_vulkan_llama_build.ps1) / [`turboquant_hip_llama_build.ps1`](building%20llama.cpp/turboquant_hip_llama_build.ps1) | Pinned TurboQuant KV-cache fork (`tq_bNNNN_{backend}_llama.cpp`). |
-| [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork (`2b_bNNNN_{backend}_llama.cpp`). |
+| [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork, release tag `prism-b10687-5d80cff` (2026-09-17, first pin with the Bonsai 2 `PTQ1_0` + `PQ2_0` kernels); the folder carries the fork's own build number: `2b_b10687_{backend}_llama.cpp`. |
 | [`diffusion_vulkan_llama_build.ps1`](building%20llama.cpp/diffusion_vulkan_llama_build.ps1) / [`diffusion_hip_llama_build.ps1`](building%20llama.cpp/diffusion_hip_llama_build.ps1) | Pinned DiffusionGemma PR #24427 pair; HIP avoids Vulkan's ~1 GiB single-allocation limit. |
 | [`ocr_vulkan_llama_build.ps1`](building%20llama.cpp/ocr_vulkan_llama_build.ps1) / [`ocr_hip_llama_build.ps1`](building%20llama.cpp/ocr_hip_llama_build.ps1) | Reviewed legacy DeepSeek-OCR PR #17400 pair; both build server + MTMD CLI. |
 | [`diffusion_vulkan_llama_build_ubuntu.sh`](building%20llama.cpp/diffusion_vulkan_llama_build_ubuntu.sh) | Ubuntu DiffusionGemma Vulkan recipe with an explicit `_ubuntu_vulkan_` output. |
@@ -1172,9 +1176,26 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11030)
+## Server features (audited through llama.cpp b11042)
 
-The **b11030** (`bdcbaaf6e`) [audit](docs/llama-b11030-audit.md) repeats the
+The **b11042** (`ec9281505`) [audit](docs/llama-b11042-audit.md) checks the
+twelve commits after b11030 (no server, argument, speculative or loader
+change: `--help` is byte-identical to b10948–b11030, 415 names / 328 long
+options, all 168 profile/mode commands parse on both backends) and repeats
+the HIP and Vulkan runtime, tool-call, DFlash2, vision, lazy-PLE, Gemma 4
+MTP, Maple and Nemotron runs on the b11042 trees. Its new subject is the
+**PrismML Ternary-Bonsai 2 27B** pair (`Ternary-Bonsai-2-27B-PTQ1_0.gguf`,
+`-PQ2_0.gguf`, BF16 mmproj): the Ternary/Bonsai recipes now pin the fork
+release `prism-b10687-5d80cff` (`2b_b10687_{vulkan,hip}_llama.cpp`), the
+new `bonsai-2-27b.yaml` profile carries the official thinking sampling,
+`--jinja`, 262k context and the fork requirement, and a metadata-driven gate
+(`prism.hadamard.*` in the GGUF, no `prism.hadamard` loader in the selected
+llama library) refuses those files on mainline before launch. Live on this
+workstation: both packings run fully on the GPU on **HIP** (PQ2_0 is the
+fastest), **Vulkan** runs PTQ1_0 on the GPU but has no PQ2_0 kernels (the
+weights stay CPU-mapped), mainline b11042 rejects both files and the
+previous fork pin (prism-b10660) rejects PTQ1_0. The previous **b11030**
+(`bdcbaaf6e`) [audit](docs/llama-b11030-audit.md) repeated the
 actual HIP and Vulkan inference, tool-call, multi-GPU DFlash2, vision, lazy
 PLE, Gemma 4 MTP and Maple runs on the local trees built by the unchanged
 recipes and adds a Nemotron 3 Nano Omni (`nemotron_h_moe`) run. b10977→b11030
@@ -1267,6 +1288,39 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.2 — Ternary-Bonsai 2 (PrismML prism-b10687), llama.cpp b11042 audit
+
+- **Ternary/Bonsai recipes re-pinned** to the fork release
+  `prism-b10687-5d80cff` (2026-09-17): the first pin that carries the
+  Bonsai 2 `PTQ1_0` (dense trits, 1.75 bpw) kernels next to `PQ2_0`. Both
+  Windows trees were built with the unchanged recipes; the folder now uses
+  the fork's own build number (`2b_b10687_{vulkan,hip}_llama.cpp`) instead
+  of the mainline merge-base count that would have collided with the old
+  tree.
+- **New profile `bonsai-2-27b.yaml`** for `Ternary-Bonsai-2-27B-PTQ1_0` /
+  `-PQ2_0` (Qwen3.8-27B hybrid base, `qwen35`, 262k, thinking by default):
+  official thinking sampling (temp 1.0 / top-p 0.95 / top-k 20), `--jinja`,
+  mmproj support, `server_binary: 2b_llama` and `min_llama_build: 10687`
+  (the old prism-b10660 tree rejects PTQ1_0). The patterns are longer than
+  the first-generation `ternary-bonsai-27b`, so Bonsai 27B, the 8B ternary
+  family and Qwen3.6 keep their profiles; notes in all nine language packs.
+- **Mainline gate for Hadamard-folded GGUFs:** `check_model_build` refuses a
+  GGUF with `prism.hadamard.*` metadata on any runtime whose llama library
+  lacks the `prism.hadamard` loader string, with the exact upstream
+  behaviour in the message (b11042: "invalid ggml type 143. should be in
+  [0, 43)", issue #29058). Ordinary GGUFs never trigger the scan.
+- **Live on both backends (fork prism-b10687):** HIP runs PQ2_0 and PTQ1_0
+  entirely on the GPU (text, image and tool-capable `--jinja` template);
+  Vulkan runs PTQ1_0 on the GPU but keeps PQ2_0 CPU-mapped (the fork has
+  no PQ2_0 Vulkan kernels). Mainline b11042 Vulkan/HIP reject both files.
+- **llama.cpp b11042 audit:** 12 commits after b11030, no CLI change
+  (`--help` byte-identical, manifest `docs/llama-b11042-server-flags.json`);
+  the full live chain was repeated on the b11042 trees.
+- **Updater verified against GitHub:** the frozen-binary swap
+  (`_BinaryUpdateWorker`), the git fast-forward and the source-ZIP overlay
+  (`_UpdateWorker`) were run for real (see validation).
+- [Audit](docs/llama-b11042-audit.md) · [Validation](docs/v5.5.2-validation.md).
 
 ### v5.5.1 — llama.cpp b11030 audit, DFM Mimir profile, Nemotron latent-MTP gate
 
