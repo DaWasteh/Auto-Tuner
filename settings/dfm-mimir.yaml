@@ -1,0 +1,61 @@
+display_name: "DFM Mimir 1B (Danish Foundation Models, HRM-Text)"
+patterns:
+  - dfm-mimir
+  - dfm_mimir
+  - dfmmimir
+  - hrm-mimir
+  - hrm_mimir
+  - mimir-1b
+  - mimir_1b
+
+# llama.cpp b11003 (PR #27625) added the dedicated hrm_text architecture. The
+# fallback only fires for GGUFs whose filename matches no pattern.
+arch_fallback:
+  - hrm_text
+
+# PR #27625 merged on 2026-09-16; b11003 is the first tagged build that loads
+# hrm_text. Older builds abort with "unknown model architecture".
+min_llama_build: 11003
+
+# config.json: max_position_embeddings 4096, default RoPE (theta 10000), no
+# rope scaling published. The scanner caps this to the GGUF native context.
+max_context: 4096
+recommended_kv_quant: q8_0
+
+# DFM publishes no generation_config.json and no sampling recommendation, so
+# both modes keep AutoTuner's conservative generic defaults.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.05
+    repeat_penalty: 1.05
+  coding:
+    temperature: 0.2
+    top_k: 40
+    top_p: 0.9
+    min_p: 0.05
+    repeat_penalty: 1.05
+
+# The embedded chat template is Gemma-4-style (tool calls, optional
+# enable_thinking -> <|think|>); --jinja is required for it.
+extra_args:
+  - --jinja
+
+notes: >
+  DFM Mimir is a 1B Danish/English instruction-tuned model from Danish
+  Foundation Models on the HRM-Text (Hierarchical Reasoning Model)
+  architecture: two 16-layer transformer stacks (low and high) run in
+  alternating cycles (2 H-cycles x 3 L-cycles) over the same token stream, so
+  every token passes 128 block slots built from 32 physical layers; hidden
+  size 1,536, 12 attention heads without GQA, a 262,144-token vocabulary with
+  a Gemma-4-style chat template, 4,096 native context, Apache 2.0. llama.cpp
+  b11003 (PR #27625) added the hrm_text architecture; this profile requires
+  that build. The KV cache holds one entry per pass (128 slots): about 3 GiB
+  at 4,096 tokens in F16 and half of that with Q8 K/V, which AutoTuner sizes
+  from the GGUF block_count; decode costs roughly four times a dense model of
+  equal width. Upstream implements causal attention only, the prefix-LM mode
+  of the reference is not available. DFM publishes no generation_config, so
+  the sampling defaults are AutoTuner's generic values. The template needs
+  --jinja; thinking is opt-in through enable_thinking.

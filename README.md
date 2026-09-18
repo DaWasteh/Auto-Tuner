@@ -898,6 +898,7 @@ matches. See `settings/_default.yaml`.
 | `qwen3_8.yaml` | Qwen3.8-27B VLM + Qwen3.8-2.4T-A95B text MoE | `qwen35` / `qwen35moe` |
 | `nex-n2_5-mini.yaml` | Nex-AGI Nex-N2.5-mini, 256K, own sampling and Nex template | `qwen35moe` (filename-gated) |
 | `maple.yaml` | DeepGrove Maple-Preview 20B-A1B ternary reasoning MoE (TQ1_0/TQ2_0), 131k, b10964+ | `maple` |
+| `dfm-mimir.yaml` | DFM Mimir 1B Danish/English HRM-Text (two 16-layer stacks, 128 KV slots per token), 4k, b11003+ | `hrm_text` |
 | `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
 | `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
@@ -919,13 +920,32 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b10977 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11030 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+) | `bailingmoe3` |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.5.1:** **DFM Mimir 1B** (`hrm_text`, PR #27625, first tagged in
+  b11003) is Danish Foundation Models' Danish/English instruction-tuned
+  Hierarchical Reasoning Model: two 16-layer transformer stacks (low/high)
+  run in alternating cycles (2 H × 3 L) over the same tokens, so every token
+  passes 128 block slots built from 32 physical layers. llama.cpp keeps one
+  KV entry per pass (128 slots, about 3 GiB at the native 4,096 context in
+  F16), which AutoTuner sizes from the GGUF `block_count`; decode costs
+  roughly four times a dense model of equal width and upstream implements
+  causal attention only (no prefix-LM). The profile requires b11003+, caps
+  the context at 4,096, keeps `--jinja` for the Gemma-4-style template
+  (thinking opt-in through `enable_thinking`) and uses the generic sampling
+  defaults because DFM ships no `generation_config`. Community GGUFs:
+  `noctrex/DFM-Mimir` (BF16/F16/Q8_0). The same release adds a
+  **Nemotron latent-MoE MTP gate**: Nemotron 3 Super GGUFs that carry their
+  MTP block (`moe_latent_size` 1024) fail llama.cpp's tensor count before
+  b11025 (PR #29018: "wrong number of tensors; expected 781, got 779"), with
+  or without speculation, so AutoTuner refuses those builds before launch
+  instead of letting the loader abort. [Audit](docs/llama-b11030-audit.md).
 
 - **v5.5.0:** **DeepGrove Maple-Preview** (`maple`, PR #27000, first tagged
   in b10964 = stable v0.4.1) is a 20B-A1B ternary reasoning MoE with 24
@@ -948,9 +968,10 @@ Notes on the new profiles:
   `clear_thinking=true` default. Keep its own GGUF template. Ordinary V4,
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
-  block named b10930; the **v5.4.8** b10948 and **v5.5.0** b10977 re-checks
-  found it still open and the block now names b10977. Nothing else in that
-  profile changed.
+  block named b10930; the **v5.4.8** b10948, **v5.5.0** b10977 and
+  **v5.5.1** b11030 re-checks found it still open (draft, last updated
+  2026-09-13) and the block now names b11030. Nothing else in that profile
+  changed.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1113,8 +1134,10 @@ b10911 (PR #28091) had enabled precompiled headers and a unity build for the
 model sources; b10977 (PR #28892) removes every `target_precompile_headers`
 again after the PCH/`CACHE_LINE_SIZE` heap-corruption report (PR #28882),
 while the unity build of `src/models` stays. Both recipes were re-run
-unchanged on b10930, b10948 and b10977; the clang `-fno-pch-timestamp`
-option (PR #28816) is still emitted but now idle.
+unchanged on b10930, b10948, b10977 and b11030; the clang `-fno-pch-timestamp`
+option (PR #28816) is still emitted but now idle. b11030's split of
+`ggml-vulkan.cpp` into buffer/debug sources plus shared headers (PR #28732)
+is picked up by upstream's CMake lists and needed no recipe change either.
 MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
 benign: `src/models/llama.cpp` is folded into a unity source and only one
 `llama.obj` is produced.
@@ -1149,31 +1172,44 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b10977)
+## Server features (audited through llama.cpp b11030)
 
-The **b10977** (`0ecb159c9`) [audit](docs/llama-b10977-audit.md) repeats the
-actual HIP and Vulkan inference, tool-call, multi-GPU DFlash2, vision and lazy
-PLE checks on freshly built local trees and adds a Maple-Preview TQ2_0 run.
-b10948→b10977 (29 commits, which include the **v0.4.1 stable** release at
-b10964) touches neither `common/arg.cpp` nor the server option table: the
-`--help` text is byte-identical on both backends (415 names / 328 long
-options), so no CLI migration is required. Behaviour changes that matter to
-the launcher are the CPU work-buffer sizing fix (PR #28882, a heap corruption
-with unity/PCH builds), the Gemma 4 / Step 3.5 / MiMo2 sliding-window pattern
-loaders that now require the array key (PR #28868), the qwen4exp
-hyper-connection norm reshape (PR #28896) and the recurrent-state context
-reuse check that runs before the KV probe (PR #28749). Gemma 4 12B + MTP
-drafter, Qwen3.8 Flash-Next (qwen4exp) and Qwen3.8 + DFlash2 were run live
-on both backends for those; Step 3.5 and MiMo2 GGUFs are not on this
-workstation. The previous **b10948** (`5f436dddb`)
+The **b11030** (`bdcbaaf6e`) [audit](docs/llama-b11030-audit.md) repeats the
+actual HIP and Vulkan inference, tool-call, multi-GPU DFlash2, vision, lazy
+PLE, Gemma 4 MTP and Maple runs on the local trees built by the unchanged
+recipes and adds a Nemotron 3 Nano Omni (`nemotron_h_moe`) run. b10977→b11030
+(53 commits, 168 files) again touches neither `common/arg.cpp` nor the server
+option table: the `--help` text is byte-identical on both backends and to
+b10948/b10977 (415 names / 328 long options), so no CLI migration is
+required. What changed underneath: the new `hrm_text` architecture (PR
+#27625, DFM Mimir 1B, profile `dfm-mimir.yaml`), the Nemotron MTP graph with
+optional latent projections (PR #29018, Nemotron 3 Super's MTP block now
+loads, gated to b11025+ in AutoTuner) and the Nemotron-H `layer_norm_epsilon`
+fallback (PR #28989), Vulkan sparse flash attention for the qwen4exp /
+MiniMax-M3 indexer path (PR #28105), the qwen4exp hyper-connection ops (PRs
+#28901/#28988), the Vulkan `mul_mat_id` row-id hoisting raised from 256 to
+1024 experts (PR #28501, Qwen3.8 Flash-Next's 512 experts leave the slow
+path), CUDA/HIP graphs for MTP draft graphs (PR #28549), the `--fit`
+auto-context with unified KV now sized for every sequence (PR #28849; AutoTuner
+always passes `-c` and `--fit off`, so unaffected), the GGUF data-section
+alignment relative to an embedded start offset (PR #28993; plain files are
+unchanged and `scanner.py` reads them the same way) and the DeepSeek V3.2/V4
+chat parser's message delimiters for server context checkpoints (PR #29008).
+Qwen3.8 Flash-Next (qwen4exp, sparse FA + hc ops on Vulkan), Gemma 4 12B + MTP
+drafter, Qwen3.8 + DFlash2, Maple TQ2_0 and Nemotron 3 Nano Omni were run
+live on both backends for those. The previous **b10977** (`0ecb159c9`)
+[audit](docs/llama-b10977-audit.md) covered the CPU work-buffer sizing fix
+(PR #28882), the Gemma 4 / Step 3.5 / MiMo2 sliding-window array loaders
+(PR #28868), the qwen4exp norm reshape (PR #28896) and the recurrent-state
+context reuse check (PR #28749); **b10948** (`5f436dddb`)
 [audit](docs/llama-b10948-audit.md) covered the `-j/--json-schema` help
 rewording (PR #28736), the empty-schema "any object" default and the
 `LOG_JSON` records under `--log-jsonl`.
 **Still broken upstream:** Qwen3.5/3.8 (`qwen35`) + DFlash2 + vision fails
-image requests with HTTP 500 on b10977 exactly as on b10901–b10948 (PR
+image requests with HTTP 500 on b11030 exactly as on b10901–b10977 (PR
 #28587's skipped image rows leave a position gap in the recurrent DFlash2
 draft memory; PR #28715 in b10906 did not change that, and nothing in
-b10930→b10977 touches that path). AutoTuner gates this combination on
+b10930→b11030 touches that path). AutoTuner gates this combination on
 **every build from b10896 on**; disable Draft for images or Vision for
 text-only DFlash2. The previous **b10930** (`56381e407`)
 [audit](docs/llama-b10930-audit.md) established that gate. b10907 (PR #28630) also
@@ -1231,6 +1267,30 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.1 — llama.cpp b11030 audit, DFM Mimir profile, Nemotron latent-MTP gate
+
+- Local Vulkan and HIP **b11030** trees from the unchanged Windows recipes
+  (built the same day, then re-verified by all four recipes including the
+  `v0.4.1` stable pair). The b10977→b11030 range (53 commits) changes no
+  server option: `--help` is byte-identical on both backends and to b10977,
+  and all 166 profile/mode commands per backend parse. The Vulkan source
+  split (PR #28732) needed no recipe change.
+- **New profile `dfm-mimir.yaml`:** DFM Mimir 1B (`hrm_text`, PR #27625,
+  b11003+), Danish/English HRM-Text with two 16-layer stacks and 128 KV
+  slots per token, 4,096 context, `--jinja`, generic sampling; all nine
+  language packs carry its note. The KV estimate follows the GGUF
+  `block_count` (128), matching the 3 GiB at 4k in F16 that upstream
+  documents.
+- **Nemotron latent-MoE MTP gate:** `nemotron_h_moe` GGUFs with an MTP
+  block and `moe_latent_size` (Nemotron 3 Super) are refused before launch on
+  builds older than b11025 (PR #29018) with the exact upstream failure
+  ("wrong number of tensors") instead of an opaque loader abort; Lightning,
+  Nano and stripped GGUFs are untouched.
+- Image + DFlash2 on Qwen3.5/3.8 was re-run and **still fails on b11030**
+  (HIP and Vulkan); the b10896+ gate stays and now names b11030. The
+  DeepSeek-V4.1 block names b11030 (PR #28696 is still an open draft).
+- [Audit](docs/llama-b11030-audit.md) · [Validation](docs/v5.5.1-validation.md).
 
 ### v5.5.0 — llama.cpp b10977 / v0.4.1 audit, Maple-Preview profile
 

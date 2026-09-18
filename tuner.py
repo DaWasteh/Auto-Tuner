@@ -730,17 +730,50 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b10977 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11030 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
     return ""
 
 
+#: PR #29018 (first tagged in b11025) registers the optional
+#: ``ffn_latent_down`` / ``ffn_latent_up`` projections of the ``nemotron_h_moe``
+#: MTP block. Nemotron 3 Super GGUFs (latent MoE, ``moe_latent_size`` 1024)
+#: that carry their MTP block therefore fail the loader's tensor count on
+#: older builds ("wrong number of tensors; expected 781, got 779"), whether
+#: speculation is enabled or not: skipped MTP tensors are still counted.
+#: Lightning/Nano (PR #26725 MTP without the latent step) are unaffected.
+_NEMOTRON_LATENT_MTP_BUILD = 11025
+
+
+def _nemotron_latent_mtp_block_reason(
+    model: ModelEntry, detected: Optional[int]
+) -> str:
+    """Explain why a latent-MoE Nemotron MTP GGUF cannot load on ``detected``."""
+    if detected is None or detected >= _NEMOTRON_LATENT_MTP_BUILD:
+        return ""
+    metadata = model.metadata or {}
+    arch = str(metadata.get("general.architecture", "") or "").strip()
+    if arch.replace("-", "_").lower() != "nemotron_h_moe":
+        return ""
+    latent = _metadata_arch_int(metadata, arch, "moe_latent_size")
+    if latent <= 0:
+        return ""
+    return (
+        f"{model.name} cannot load on llama.cpp b{detected}: its nemotron_h_moe "
+        f"MTP block carries latent-MoE projections (moe_latent_size {latent}) "
+        f"that the loader registers only from b{_NEMOTRON_LATENT_MTP_BUILD} on "
+        "(PR #29018); older builds abort with 'wrong number of tensors' even "
+        f"with speculation disabled. Use b{_NEMOTRON_LATENT_MTP_BUILD}+."
+    )
+
+
 def check_model_build(
     model: ModelEntry, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
-    """Reject unimplemented architectures and unsafe b10741-b10748 GGUFs.
+    """Reject unimplemented architectures, latent-MoE Nemotron MTP GGUFs on
+    pre-b11025 builds and unsafe b10741-b10748 GGUFs.
 
     PR #28159 made ``n_layer()`` exclude NextN before the generic per-layer
     arrays were read. Standard GGUFs that store FF/head metadata as arrays of
@@ -756,6 +789,9 @@ def check_model_build(
         return True, "", None
 
     detected = probe_binary_build_number(binary)
+    latent_block = _nemotron_latent_mtp_block_reason(model, detected)
+    if latent_block:
+        return False, latent_block, detected
     if (
         detected is None
         or detected < _BROKEN_NEXTN_BUILD_START
@@ -1031,7 +1067,8 @@ def _memlock_limit_gb() -> Optional[float]:
 #: First mainline build whose speculative prefill skips pinned M-RoPE image
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
-#: HTTP 500. Reproduced on b10901, b10903, b10930, b10948 and b10977 (HIP and Vulkan);
+#: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977 and b11030 (HIP
+#: and Vulkan);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
@@ -5528,7 +5565,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b10977) image "
+                "with DFlash2: since b10896 (verified through b11030) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."

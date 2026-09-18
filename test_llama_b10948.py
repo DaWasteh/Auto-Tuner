@@ -109,7 +109,7 @@ def test_vision_with_dflash2_stays_gated_through_b10948(
         tuner, "_probe_supported_flags", lambda _: {"--spec-type", "--mmproj"}
     )
     if blocked:
-        with pytest.raises(ValueError, match=rf"b{build}.*since b10896.*b10977"):
+        with pytest.raises(ValueError, match=rf"b{build}.*since b10896.*b11030"):
             tuner.build_command(model, config, profile, draft_model=draft)
     else:
         cmd = tuner.build_command(model, config, profile, draft_model=draft)
@@ -130,13 +130,13 @@ def test_documented_alternatives_still_build_on_b10948(tmp_path, monkeypatch):
     assert "-md" in tuner.build_command(model, config, profile, draft_model=draft)
 
 
-def test_v41_block_names_b10977(tmp_path):
+def test_v41_block_names_b11030(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b10977" in profile.runtime_block_reason
+    assert "b11030" in profile.runtime_block_reason
     assert "b10930" not in profile.runtime_block_reason
-    with pytest.raises(ValueError, match="b10977"):
+    with pytest.raises(ValueError, match="b11030"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b10977 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11030 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))
