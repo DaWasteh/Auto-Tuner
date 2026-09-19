@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml-cuda/mmq-config-rdna4.cuh b/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+index 9293d9d55..bbec4229a 100644
+--- a/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+@@ -1,3 +1,5 @@
++#include "../../rocmfpx/rocmfpx_mmq_rdna3.cuh"
++
+ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_rdna4(ggml_type type, int J, bool fallback) {
+     CASE(GGML_TYPE_Q1_0, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q1_0, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+@@ -286,5 +288,9 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_NVFP4, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_NVFP4, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, MMQ_ITER_K, false, false);
+ 
+-    return ggml_cuda_mmq_config(GGML_TYPE_COUNT, 256, 2, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, 256, false, true);
++    // ROCmFPX: the downstream fallback that PR #20 wired into the RDNA3 selector
++    // (issue #17) also serves RDNA4 (gfx1200/gfx1201): the tile loaders are the
++    // same kernels and the 128-row tiles stay below the 64 KiB LDS limit. Without
++    // it every ROCmFP4/ROCmFPX prompt batch aborts with "J_best=0" in mmq.cuh.
++    return ggml_rocmfpx_mmq_get_config_rdna3(type, J, fallback);
+ }

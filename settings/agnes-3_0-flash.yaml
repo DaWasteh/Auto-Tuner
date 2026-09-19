@@ -1,0 +1,88 @@
+display_name: "Agnes-3.0-Flash Preview 33B (Agnes AI)"
+patterns:
+  - agnes-3.0-flash
+  - agnes-3_0-flash
+  - agnes-3-0-flash
+  - agnes3.0-flash
+  - agnes-3.0
+  - agnes_3.0
+  - agnes3.0
+  - agnes-ai
+  - agnes-flash
+
+# No arch_fallback: every community GGUF of Agnes is a folded (kingjones777,
+# 0xKitkat, ngquocvinh) or patched (jakeatx, quimmedes) ``qwen35`` conversion,
+# and that architecture belongs to the generic Qwen3.5/3.6 profile. Filename
+# matching keeps opaque qwen35 re-quants there, exactly like Ornith 1.5.
+# Mainline llama.cpp has no ``agnes`` architecture (checked 2026-09-19 against
+# master: no hit in llama-arch.cpp / convert_hf_to_gguf.py).
+
+# config.json: max_position_embeddings 262144. The production/API checkpoint
+# with a 1M window is a different, closed model; no rope scaling is documented
+# for the Preview weights.
+max_context: 262144
+recommended_kv_quant: q8_0
+# Only 18 of the 72 layers (3:1 delta-rule : global attention) hold a KV cache
+# that grows with context, so the KV budget is modest; the dense 33B weights
+# (16.8 GiB at ROCmFP4, ~19 GiB Q4_K_M, ~34 GiB Q8_0) are what fill VRAM.
+performance_target: throughput
+
+# generation_config.json: temperature 1.0, top_k 20, top_p 0.95 (also written
+# into the GGUFs as general.sampling.*). Coding follows the Qwen3.5 recipe
+# (temp 0.6) because Agnes publishes no coding-specific values; presence
+# penalty stays 0.0 so repeated tool-call JSON is never taxed.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+# The chat template needs Jinja: reasoning_effort (xhigh default, medium, low;
+# "high" raises "Unexpected reasoning effort"), enable_thinking and
+# preserve_thinking (default true) are chat_template_kwargs, and tool calls use
+# the <tool_call><function=...><parameter=...> XML form the template renders.
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# In-file MTP head (qwen35.nextn_predict_layers 1, blk.72.nextn.*, block_count
+# 73). The kingjones777 model card swept --spec-draft-n-max 1..6 on the ROCmFPX
+# build (ROCm0, 7.1k-token code prompts): 17.9 / 22.8 / 25.9 / 26.3 / 25.3 /
+# 24.6 tok/s, peak at 4, with --spec-draft-p-min 0.0 ("the default 0.75 gate
+# throttles drafting"). Expert-panel overrides remain authoritative.
+draft_max: 4
+draft_p_min: 0.0
+
+notes: >
+  Agnes-3.0-Flash Preview (Agnes AI, September 2026) is a 33B dense
+  hybrid-attention multimodal reasoning model: 72 layers (54 gated delta-rule
+  plus 18 global attention, 3:1), 262,144 native context, text, image and
+  video input, tool calling, Apache-2.0. Its extra parallel SwiGLU branch has
+  no mainline llama.cpp support, so community GGUFs either fold that branch
+  into a standard qwen35 MLP (kingjones777, 0xKitkat, ngquocvinh; these load
+  on any qwen35-capable mainline build) or keep it as ffn_*_par tensors
+  (jakeatx, quimmedes; these need their patched forks). The kingjones777
+  MTP-ROCmFP4 / ROCmFPX files additionally use ROCmFPX tensor types (ggml
+  types 100-111, file types 100-124) that only the ROCmFPX fork of llama.cpp
+  loads (upstream PR #24185 is still open); AutoTuner refuses them before
+  launch on any runtime whose llama library has no ROCmFP loader. Sampling
+  follows generation_config (temp 1.0, top_p 0.95, top_k 20); coding uses temp
+  0.6 like Qwen3.5. The in-file MTP head measured best at draft depth 4 with
+  p-min 0 on the model card. The template accepts reasoning_effort xhigh
+  (default), medium or low only, and preserve_thinking defaults to true.
+  Measured on 2026-09-19 with the AutoTuner recipes (ROCmFPX main aed0d5fd9,
+  fork build 11544, RDNA4 MMQ fallback patch): STRIX_LEAN decodes about 67
+  tok/s on HIP (R9700) and 29 tok/s on Vulkan with the MTP head, COHERENT
+  matches it on HIP but drops to 5 tok/s on Vulkan (dual-scale ROCmFP4
+  shaders), and image requests succeed with the MTP head loaded on both
+  backends, unlike the older fork build the model card measured.

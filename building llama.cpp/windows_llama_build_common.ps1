@@ -1266,9 +1266,19 @@ function Invoke-LlamaPinnedForkBuild {
         [bool]$BuildUi = $true,
         [string[]]$Targets = @(),
         [string[]]$ExtraCMakeArgs = @(),
+        # Unified diffs applied with `git apply` on top of the pinned commit
+        # (downstream-only fixes the fork has not merged yet). HEAD stays the
+        # pinned commit, so the commit verification is unchanged; an existing
+        # output tree that lacks a listed patch is patched and rebuilt.
+        [string[]]$PatchFiles = @(),
         [ValidateRange(1, 256)][int]$Parallel = 20
     )
 
+    foreach ($patch in $PatchFiles) {
+        if (-not (Test-Path $patch -PathType Leaf)) {
+            throw "$Name patch file not found: $patch"
+        }
+    }
     $backendToken = $Backend.ToLowerInvariant()
     $tmp = Join-Path $Workspace "_tmp_${FolderPrefix}${backendToken}_llama_$PID"
     if (Test-Path $tmp) {
@@ -1288,6 +1298,11 @@ function Invoke-LlamaPinnedForkBuild {
     $actualCommit = (& git -C $tmp rev-parse HEAD | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $ExpectedCommit) {
         throw "$Name checkout mismatch: expected $ExpectedCommit, found $actualCommit"
+    }
+    foreach ($patch in $PatchFiles) {
+        Invoke-NativeChecked "$Name patch $(Split-Path $patch -Leaf)" {
+            git -C $tmp apply --whitespace=nowarn $patch
+        }
     }
 
     $identity = $FixedIdentity
@@ -1314,13 +1329,27 @@ function Invoke-LlamaPinnedForkBuild {
         Write-Host "==> Existing output found; verify without replacing: $repo"
         Remove-Item $tmp -Recurse -Force
         $stagingHandled = $true
-        try {
-            Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedCommit $ExpectedCommit | Out-Null
-            Write-Host "Success (existing): $repo ($Name, $Backend, pinned $ExpectedCommit)"
-            return
-        } catch {
-            if ($_.Exception.Message -like "Source commit mismatch:*") { throw }
-            Write-Warning "Existing output is incomplete; resume its clean source/build tree: $($_.Exception.Message)"
+        $pending = @()
+        foreach ($patch in $PatchFiles) {
+            & git -C $repo apply --reverse --check --whitespace=nowarn $patch 2>$null
+            if ($LASTEXITCODE -ne 0) { $pending += $patch }
+        }
+        if ($pending.Count -gt 0) {
+            foreach ($patch in $pending) {
+                Invoke-NativeChecked "$Name patch $(Split-Path $patch -Leaf)" {
+                    git -C $repo apply --whitespace=nowarn $patch
+                }
+            }
+            Write-Host "==> Applied $($pending.Count) pending patch file(s); rebuilding the existing tree"
+        } else {
+            try {
+                Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedCommit $ExpectedCommit | Out-Null
+                Write-Host "Success (existing): $repo ($Name, $Backend, pinned $ExpectedCommit)"
+                return
+            } catch {
+                if ($_.Exception.Message -like "Source commit mismatch:*") { throw }
+                Write-Warning "Existing output is incomplete; resume its clean source/build tree: $($_.Exception.Message)"
+            }
         }
     } else {
         Rename-Item $tmp $dir

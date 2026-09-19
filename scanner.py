@@ -19,7 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +154,12 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
         models (GLM-4.6, DeepSeek-V3) and on conversions whose nextn block is
         numbered differently from ``block_count``.
 
+      ``__ggml_types__`` — sorted, bounded list of the distinct ggml tensor
+        type ids seen in the tensor-info section. Fork-private weight
+        formats live outside mainline's ``[0, GGML_TYPE_COUNT)`` range
+        (ROCmFPX 100..111, PrismML 141..143), so the launch preflight can
+        refuse them on a stock runtime without reopening the file.
+
     Synthetic keys start with ``__`` and can never collide with real GGUF
     keys (the GGUF spec forbids leading underscores in key names).
     """
@@ -222,6 +228,7 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             # lets the launch preflight reject an incomplete sidecar before
             # llama-server aborts with ``check_tensor_dims``.
             root_tensors: List[str] = []
+            ggml_types: Set[int] = set()
             try:
                 for _ in range(n_tensors):
                     tname_len = struct.unpack("<Q", f.read(8))[0]
@@ -231,7 +238,9 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
                     # retain each relative data offset so giant auto-lazy row
                     # tables can be sized from the next tensor boundary.
                     f.read(8 * n_dims)
-                    f.read(4)  # ggml type
+                    ggml_type = struct.unpack("<I", f.read(4))[0]
+                    if len(ggml_types) < 64:
+                        ggml_types.add(ggml_type)
                     tensor_offset = struct.unpack("<Q", f.read(8))[0]
                     tensor_offsets.append((tname, tensor_offset))
                     tl = tname.lower()
@@ -295,6 +304,7 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             md["__tensor_scan_complete__"] = scan_complete
             md["__max_block_index__"] = max_block_index
             md["__root_tensors__"] = root_tensors
+            md["__ggml_types__"] = sorted(ggml_types)
 
             if scan_complete and tensor_offsets:
                 try:

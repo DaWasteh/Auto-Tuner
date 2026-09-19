@@ -842,6 +842,22 @@ The tuner intelligently selects the best binary based on your model and settings
   their Hadamard fold are fork-only; mainline llama.cpp (b11042) rejects them as
   unknown ggml types 143 / 142, and AutoTuner refuses such GGUFs before launch on
   a runtime whose llama library has no `prism.hadamard` loader.
+- **Agnes-3.0-Flash Preview, kingjones777 `MTP-ROCmFP4` / `ROCmFPX` GGUFs** $\rightarrow$
+  need the ROCmFPX fork (`github.com/ROCmFPX/ROCmFPX`, legacy
+  `charlie12345/ROCmFPX`). Their weights use the fork's reserved ggml types
+  100–111 (`Q4_0_ROCMFP4` = 100, `Q8_0_ROCMFPX` = 103; file types 100–124, e.g.
+  106 = *ROCmFP4 Strix Lean*), which mainline llama.cpp (b11042) rejects as
+  `invalid ggml type 100. should be in [0, 43)`; the CPU-only upstream PR #24185
+  is still open. AutoTuner records the tensor types during the header scan
+  and refuses such a GGUF before launch on a runtime whose llama library has
+  no `ROCmFP` loader string. Agnes itself is a folded `qwen35` conversion: the
+  standard quants (0xKitkat, ngquocvinh) load on mainline, while the
+  `ffn_*_par` conversions (jakeatx, quimmedes) need their own forks. The pinned
+  recipes `rocmfpx_{vulkan,hip}_llama_build.ps1` produce
+  `fpx_b11544_{vulkan,hip}_llama.cpp`; measured 2026-09-19: STRIX_LEAN decodes
+  about 67 tok/s on HIP (R9700) and 29 tok/s on Vulkan with the in-file MTP
+  head, COHERENT matches on HIP but drops to 5 tok/s on Vulkan, and image
+  requests work with the MTP head loaded on both backends.
 - **Turbo-Quant Mode** $\rightarrow$ uses `tq_llama.cpp`.
 
 Example — run Devstral, override context, and pass an extra flag
@@ -903,6 +919,7 @@ matches. See `settings/_default.yaml`.
 | `nex-n2_5-mini.yaml` | Nex-AGI Nex-N2.5-mini, 256K, own sampling and Nex template | `qwen35moe` (filename-gated) |
 | `maple.yaml` | DeepGrove Maple-Preview 20B-A1B ternary reasoning MoE (TQ1_0/TQ2_0), 131k, b10964+ | `maple` |
 | `dfm-mimir.yaml` | DFM Mimir 1B Danish/English HRM-Text (two 16-layer stacks, 128 KV slots per token), 4k, b11003+ | `hrm_text` |
+| `agnes-3_0-flash.yaml` | Agnes-3.0-Flash Preview 33B hybrid multimodal reasoning (folded `qwen35` GGUFs load on mainline; kingjones777's MTP-ROCmFP4 / ROCmFPX files need the ROCmFPX fork), 256k, in-file MTP | `qwen35` (filename-gated) |
 | `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
 | `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
@@ -1115,6 +1132,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`llama_prerelease_vulkan_build.ps1`](building%20llama.cpp/llama_prerelease_vulkan_build.ps1) / [`llama_prerelease_hip_build.ps1`](building%20llama.cpp/llama_prerelease_hip_build.ps1) | Latest exact `bNNNN` siblings, or truthful `bNNNN_dev_COMMIT_{backend}_llama.cpp` folders with `-Tag master`. |
 | [`turboquant_vulkan_llama_build.ps1`](building%20llama.cpp/turboquant_vulkan_llama_build.ps1) / [`turboquant_hip_llama_build.ps1`](building%20llama.cpp/turboquant_hip_llama_build.ps1) | Pinned TurboQuant KV-cache fork (`tq_bNNNN_{backend}_llama.cpp`). |
 | [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork, release tag `prism-b10687-5d80cff` (2026-09-17, first pin with the Bonsai 2 `PTQ1_0` + `PQ2_0` kernels); the folder carries the fork's own build number: `2b_b10687_{backend}_llama.cpp`. |
+| [`rocmfpx_vulkan_llama_build.ps1`](building%20llama.cpp/rocmfpx_vulkan_llama_build.ps1) / [`rocmfpx_hip_llama_build.ps1`](building%20llama.cpp/rocmfpx_hip_llama_build.ps1) | Pinned ROCmFPX fork (`ROCmFPX/ROCmFPX`, main commit `aed0d5fd9`, 2026-09-06; mainline base b10766), the only runtime for ROCmFP4 / ROCmFPX weights (ggml types 100–111, e.g. kingjones777's Agnes-3.0-Flash `MTP-ROCmFP4` GGUFs); regular Vulkan dequant shaders plus RDNA3+ HIP MMQ kernels, gfx1201. Both recipes apply `patches/rocmfpx-rdna4-mmq-fallback.patch` (the fork wires its ROCmFPX MMQ fallback table only into the RDNA3 selector; on gfx1201 every ROCmFP4 prompt batch otherwise aborts with `J_best=0`). The folder carries the fork's own build number: `fpx_b11544_{backend}_llama.cpp`. |
 | [`diffusion_vulkan_llama_build.ps1`](building%20llama.cpp/diffusion_vulkan_llama_build.ps1) / [`diffusion_hip_llama_build.ps1`](building%20llama.cpp/diffusion_hip_llama_build.ps1) | Pinned DiffusionGemma PR #24427 pair; HIP avoids Vulkan's ~1 GiB single-allocation limit. |
 | [`ocr_vulkan_llama_build.ps1`](building%20llama.cpp/ocr_vulkan_llama_build.ps1) / [`ocr_hip_llama_build.ps1`](building%20llama.cpp/ocr_hip_llama_build.ps1) | Reviewed legacy DeepSeek-OCR PR #17400 pair; both build server + MTMD CLI. |
 | [`diffusion_vulkan_llama_build_ubuntu.sh`](building%20llama.cpp/diffusion_vulkan_llama_build_ubuntu.sh) | Ubuntu DiffusionGemma Vulkan recipe with an explicit `_ubuntu_vulkan_` output. |
@@ -1288,6 +1306,49 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.3 — Agnes-3.0-Flash Preview profile, ROCmFPX gate and fork recipes
+
+- **New profile `agnes-3_0-flash.yaml`:** Agnes-3.0-Flash Preview (Agnes AI,
+  33B dense hybrid: 54 gated delta-rule + 18 global-attention layers, 262,144
+  context, text/image/video, tool calling, Apache-2.0). Mainline llama.cpp has
+  no `agnes` architecture and no support for its parallel SwiGLU branch, so
+  every community GGUF is a `qwen35` conversion; the profile is
+  filename-gated (`agnes-3.0-flash`, `agnes-3_0-flash`, `agnes3.0`, …) so
+  plain Qwen3.5 re-quants stay with the generic Qwen profile. Sampling follows
+  `generation_config` (temp 1.0 / top_p 0.95 / top_k 20, coding temp 0.6),
+  `--jinja --reasoning-preserve` for the reasoning_effort / preserve_thinking
+  template controls, and the in-file MTP head uses the model card's measured
+  optimum (`--spec-draft-n-max 4`, `--spec-draft-p-min 0.0`). All nine
+  language packs carry the note.
+- **ROCmFPX gate:** the GGUF header scan now records the distinct ggml tensor
+  types (`__ggml_types__`). A GGUF whose tensors or `general.file_type` fall
+  into the ROCmFPX reserved range (types 100–111, file types 100–124 —
+  kingjones777's `MTP-ROCmFP4-STRIX_LEAN` = 106, `-COHERENT` = 102,
+  `Q8_0-ROCmFPX` = 111) is refused before launch unless the selected
+  llama-server or its llama library contains the fork's `ROCmFP` loader
+  string, with the exact mainline error (`invalid ggml type 100. should be in
+  [0, 43)`, upstream PR #24185 open) in the message. Verified absent from the
+  local b11042, v0.4.1, prism-b10687 and tq trees.
+- **Fix:** a profile `draft_p_min: 0.0` (Nemotron 3.5 DSpark, Agnes) was
+  silently turned back into 0.75 when the command was built; an explicit 0.0
+  is now emitted.
+- **New recipes `rocmfpx_vulkan_llama_build.ps1` / `rocmfpx_hip_llama_build.ps1`:**
+  the ROCmFPX fork pinned to its main commit `aed0d5fd9` (2026-09-06, fork
+  build 11544, mainline base b10766) as `fpx_b11544_{vulkan,hip}_llama.cpp`,
+  gfx1201 HIP. `Invoke-LlamaPinnedForkBuild` gained `-PatchFiles` (unified
+  diffs applied on the pinned commit; an existing tree missing a patch is
+  patched and rebuilt), used for `patches/rocmfpx-rdna4-mmq-fallback.patch`:
+  the fork's ROCmFPX MMQ fallback (PR #20) is wired only into the RDNA3
+  selector, so unpatched gfx1201 aborts with `J_best=0` on the first prompt
+  batch. Live on both backends with the kingjones777 imatrix files: mainline
+  b11042 refuses them (`invalid ggml type 101. should be in [0, 43)`), the
+  fork plans and serves STRIX_LEAN and COHERENT through the real planner
+  (`--jinja`, `--mmproj`, `draft-mtp` n-max 4 / p-min 0): HIP about 67 tok/s
+  decode for both tiers, Vulkan 29 tok/s (LEAN) / 5 tok/s (COHERENT, dual-scale
+  ROCmFP4 shaders), image requests succeed with the MTP head loaded.
+- llama.cpp itself is unchanged since the [b11042 audit](docs/llama-b11042-audit.md);
+  the mainline trees were not rebuilt. [Validation](docs/v5.5.3-validation.md).
 
 ### v5.5.2 — Ternary-Bonsai 2 (PrismML prism-b10687), llama.cpp b11042 audit
 

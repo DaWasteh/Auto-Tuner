@@ -799,11 +799,126 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
     )
 
 
+#: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
+#: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
+#: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
+#: appending to its own compact sequence. Mainline llama.cpp b11042 knows
+#: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
+#: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
+#: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
+#: "ROCmFPX" GGUFs (file_type 106 = ROCmFP4 Strix Lean, 102 = Coherent,
+#: 111 = ROCmFP8) are the shipped examples. A fork runtime names every such
+#: file type "ROCmFP4 ..." / "ROCmFP8 ..." in its llama library, so the check
+#: keys on that string exactly like the prism.hadamard gate.
+_ROCMFPX_TYPE_RANGE = range(100, 140)
+_ROCMFPX_TENSOR_TYPES = {
+    100: "Q4_0_ROCMFP4",
+    101: "Q4_0_ROCMFP4_FAST",
+    102: "Q6_0_ROCMFPX",
+    103: "Q8_0_ROCMFPX",
+    104: "Q3_0_ROCMFPX",
+    105: "TURBO3_0",
+    106: "TURBO4_0",
+    107: "Q2_0_ROCMFPX_LEGACY",
+    108: "Q4_0_ROCMI4",
+    109: "Q5_0_ROCMFPX",
+    110: "Q7_0_ROCMFPX",
+    111: "Q2_0_ROCMFPX",
+}
+_ROCMFPX_FILE_TYPES = {
+    100: "ROCmFP4",
+    101: "ROCmFP4 Lean",
+    102: "ROCmFP4 Coherent",
+    103: "ROCmFP4 Fast",
+    104: "ROCmFP4 Fast Coherent",
+    105: "ROCmFP4 Strix",
+    106: "ROCmFP4 Strix Lean",
+    110: "ROCmFP6",
+    111: "ROCmFP8",
+    112: "ROCmFP3",
+    113: "ROCmFP3 Agent",
+    114: "ROCmFP6 Agent",
+    115: "ROCmFP8 Agent",
+    116: "ROCmFP6 Lean",
+    117: "ROCmFP6 Agent Lean",
+    118: "ROCmI4",
+    119: "ROCmFP2",
+    120: "ROCmFP5",
+    121: "ROCmFP5 Agent",
+    122: "ROCmFP7",
+    123: "ROCmFP7 Agent",
+    124: "ROCmFP2 Agent",
+}
+_ROCMFPX_MARKER = "rocmfp"
+
+
+def _rocmfpx_fork_types(
+    metadata: Dict[str, Any],
+) -> Tuple[List[int], Optional[int]]:
+    """Return the ROCmFPX tensor type ids seen and the ROCmFPX file type.
+
+    The tensor list comes from the scanner's bounded ``__ggml_types__`` scan
+    (empty on a shard or an unreadable tensor section); ``general.file_type``
+    is the fallback that still identifies such a file from its header alone.
+    """
+    seen: Set[int] = set()
+    raw = metadata.get("__ggml_types__") or []
+    if isinstance(raw, (list, tuple)):
+        for value in raw:
+            try:
+                type_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if type_id in _ROCMFPX_TYPE_RANGE:
+                seen.add(type_id)
+    file_type: Optional[int]
+    try:
+        file_type = int(metadata.get("general.file_type"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        file_type = None
+    if file_type is not None and file_type not in _ROCMFPX_TYPE_RANGE:
+        file_type = None
+    return sorted(seen), file_type
+
+
+def _rocmfpx_block_reason(model: ModelEntry, binary: str) -> str:
+    """Explain why a ROCmFPX-quantized GGUF cannot load on ``binary``."""
+    metadata = model.metadata or {}
+    fork_types, file_type = _rocmfpx_fork_types(metadata)
+    if not fork_types and file_type is None:
+        return ""
+    if _runtime_has_required_markers(binary, [_ROCMFPX_MARKER]):
+        return ""
+    if fork_types:
+        packing = ", ".join(
+            f"{_ROCMFPX_TENSOR_TYPES.get(type_id, 'ROCmFPX')} (ggml type {type_id})"
+            for type_id in fork_types
+        )
+    else:
+        packing = f"file_type {file_type}"
+    tier = _ROCMFPX_FILE_TYPES.get(file_type) if file_type is not None else None
+    tier_text = f", tier '{tier}'" if tier else ""
+    # Mainline names whichever offending tensor it meets first (the real
+    # STRIX_LEAN file reports 101 from blk.0.attn_gate.weight before 100).
+    offending = "/".join(str(t) for t in fork_types) if fork_types else str(file_type)
+    return (
+        f"{model.name} is quantized with ROCmFPX tensor types ({packing}"
+        f"{tier_text}) that only the ROCmFPX fork of llama.cpp loads "
+        "(github.com/ROCmFPX/ROCmFPX, legacy charlie12345/ROCmFPX). The "
+        "selected binary and its llama library carry no ROCmFP loader: "
+        f"mainline llama.cpp rejects the file as 'invalid ggml type {offending}. "
+        "should be in [0, 43)' (upstream PR #24185 is still open). Select a "
+        "ROCmFPX llama-server build, or use a standard quantization of the "
+        "same model (Q4_K_M / Q8_0 and similar) on mainline."
+    )
+
+
 def check_model_build(
     model: ModelEntry, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
     """Reject unimplemented architectures, PrismML Hadamard-folded GGUFs on
-    runtimes without the prism loader, latent-MoE Nemotron MTP GGUFs on
+    runtimes without the prism loader, ROCmFPX-quantized GGUFs on runtimes
+    without the ROCmFP loader, latent-MoE Nemotron MTP GGUFs on
     pre-b11025 builds and unsafe b10741-b10748 GGUFs.
 
     PR #28159 made ``n_layer()`` exclude NextN before the generic per-layer
@@ -819,6 +934,9 @@ def check_model_build(
     prism_block = _prism_hadamard_block_reason(model, binary)
     if prism_block:
         return False, prism_block, None
+    rocmfpx_block = _rocmfpx_block_reason(model, binary)
+    if rocmfpx_block:
+        return False, rocmfpx_block, None
     if not model.has_embedded_mtp:
         return True, "", None
 
@@ -864,6 +982,24 @@ def check_model_build(
                 detected,
             )
     return True, "", detected
+
+
+def _profile_draft_p_min(profile: ModelProfile) -> float:
+    """Return the profile's ``draft_p_min`` with an explicit ``0.0`` honoured.
+
+    ``float(value or 0.75)`` used to turn a deliberate ``draft_p_min: 0.0``
+    (Nemotron 3.5 DSpark heads without a confidence head, the Agnes-3.0-Flash
+    in-file MTP head that its model card measured at p-min 0) back into the
+    0.75 confidence gate. Only a missing, unparsable or out-of-range value
+    falls back to 0.75 now.
+    """
+    try:
+        value = float(getattr(profile, "draft_p_min", 0.75))
+    except (TypeError, ValueError):
+        return 0.75
+    if not 0.0 <= value <= 1.0:
+        return 0.75
+    return value
 
 
 def resolve_draft_n_max(
@@ -5759,7 +5895,7 @@ def build_command(
     draft_p_min = (
         0.0
         if draft_model is not None and draft_model.is_dflash2_drafter
-        else float(getattr(profile, "draft_p_min", 0.75) or 0.75)
+        else _profile_draft_p_min(profile)
     )
     vision_loaded = model.mmproj is not None
     # Path A gating with vision: allow -md alongside --mmproj only when the

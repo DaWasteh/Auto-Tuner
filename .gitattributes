@@ -5,3 +5,7 @@ app_settings.py whitespace=cr-at-eol
 settings_loader.py whitespace=cr-at-eol
 diag_kv_v2.py whitespace=cr-at-eol
 modelstree.md whitespace=cr-at-eol
+
+# Unified diffs applied with `git apply` on LF source trees must not be
+# CRLF-converted on Windows checkouts.
+*.patch -text

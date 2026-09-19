@@ -46,7 +46,7 @@ Invoke-Recipe "llama_stable_vulkan_build.ps1" @("-Tag", $StableTag, "-Workspace"
 Invoke-Recipe "llama_stable_hip_build.ps1" @("-Tag", $StableTag, "-Workspace", $Workspace, "-RocmPath", $RocmPath, "-Parallel", "$HipParallel")
 
 # Pinned fork pairs. Each pair contains the same exact source commit.
-foreach ($stem in ("diffusion", "ocr", "ternary_bonsai", "turboquant")) {
+foreach ($stem in ("diffusion", "ocr", "ternary_bonsai", "rocmfpx", "turboquant")) {
     Invoke-Recipe "${stem}_vulkan_llama_build.ps1" @("-Workspace", $Workspace, "-Parallel", "$VulkanParallel")
     Invoke-Recipe "${stem}_hip_llama_build.ps1" @("-Workspace", $Workspace, "-RocmPath", $RocmPath, "-Parallel", "$HipParallel")
 }
