@@ -17,7 +17,7 @@ recommended_kv_quant: q8_0
 
 # Beide veröffentlichten Packungen (PTQ1_0 = ggml-Typ 143, PQ2_0 = Typ 142)
 # und die Hadamard-Aktivierungstransformation (prism.hadamard.*) gibt es nur
-# im PrismML-Fork (Branch prism). Mainline llama.cpp (b11042) lehnt beide
+# im PrismML-Fork (Branch prism). Mainline llama.cpp (b11063) lehnt beide
 # Dateien als unbekannten Tensortyp ab. AutoTuner findet beide versionierten
 # Fork-Bäume, z.B. 2b_b10687_vulkan_llama.cpp und 2b_b10687_hip_llama.cpp.
 server_binary: "2b_llama/llama-server"

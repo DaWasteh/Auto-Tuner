@@ -52,3 +52,9 @@ notes: >
   Compatible MTP weights
   can use up to three speculative tokens. Do not route these checkpoints
   through the older Ling 2.6 bailingmoe2.5/bailing_hybrid fork profile.
+  llama.cpp b11063 (PR #28682) adds a dedicated Ling 3.0 (Bailing V3) chat
+  parser that llama-server selects automatically with --jinja from the
+  template's <role> markers: a tool call emitted before </think> (the template
+  pre-opens the think block) now surfaces as tool_calls instead of being
+  swallowed into reasoning_content. Older builds load the model but can lose
+  such tool calls in thinking mode, so b11063+ is recommended for tool use.

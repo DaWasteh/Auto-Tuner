@@ -257,10 +257,10 @@ def test_ternary_bonsai_recipes_pin_prism_b10687_with_the_fork_build_number():
 # ------------------------------------------------------------- carry-over ----
 
 
-def test_v41_block_and_vision_gate_still_name_b11030():
+def test_v41_block_and_vision_gate_now_name_b11063():
     # b11030..b11042 does not touch the server, the speculative helpers or
     # the recurrent memory; the image + DFlash2 request and the V4.1 block
-    # were last re-run on b11030 and keep that wording.
+    # were re-run on b11063 (v5.5.4) and now carry that wording.
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11030" in profile.runtime_block_reason
+    assert "b11063" in profile.runtime_block_reason
     assert tuner.QWEN35_VISION_DFLASH2_BROKEN_SINCE == 10896

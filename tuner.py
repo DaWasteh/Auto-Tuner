@@ -730,7 +730,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11030 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11063 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -802,7 +802,7 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11042 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11063 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -1237,8 +1237,8 @@ def _memlock_limit_gb() -> Optional[float]:
 #: First mainline build whose speculative prefill skips pinned M-RoPE image
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
-#: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977 and b11030 (HIP
-#: and Vulkan);
+#: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977, b11030,
+#: b11042 and b11063 (HIP and Vulkan; upstream issue #27408);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
@@ -5735,7 +5735,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b11030) image "
+                "with DFlash2: since b10896 (verified through b11063) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."

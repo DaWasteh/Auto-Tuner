@@ -941,9 +941,9 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11030 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11063 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
-| `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+) | `bailingmoe3` |
+| `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
@@ -990,9 +990,9 @@ Notes on the new profiles:
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
   block named b10930; the **v5.4.8** b10948, **v5.5.0** b10977 and
-  **v5.5.1** b11030 re-checks found it still open (draft, last updated
-  2026-09-13) and the block now names b11030. Nothing else in that profile
-  changed.
+  **v5.5.1** b11030 and **v5.5.4** b11063 re-checks found it still open
+  (draft, last updated 2026-09-19) and the block now names b11063. Nothing
+  else in that profile changed.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1194,9 +1194,31 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11042)
+## Server features (audited through llama.cpp b11063)
 
-The **b11042** (`ec9281505`) [audit](docs/llama-b11042-audit.md) checks the
+The **b11063** (`3d82ef62d`) [audit](docs/llama-b11063-audit.md) checks the
+21 commits after b11042. No option was added or removed (415 names / 328
+long options, all 170 profile/mode commands parse on both backends); the
+only new `--help` byte is the timestamped `llama_server: initializing ...`
+line that PR #29125 prints before argument parsing, which the manifest
+strips before hashing (AutoTuner detects readiness through `/health`, not
+log parsing). The behavioural change for a bundled profile is the
+**dedicated Ling 3.0 (Bailing V3) chat parser** (PR #28682): the Ling 3.0
+template pre-opens `<think>`, so a tool call could arrive before `</think>`
+and was swallowed into `reasoning_content`; llama-server now selects the
+specialised parser from the template's `<role>` markers whenever `--jinja`
+is set, which `ling-3.yaml` has always passed. Live on both b11063 trees the
+local Ling-3.0-flash IQ3_M returns `tool_calls` with thinking on (auto and
+required tool choice), the profile note and all nine packs now recommend
+b11063+ for tool use, and `min_llama_build` stays at b10749. The standard
+HIP and Vulkan chain (runtime, tool call, DFlash2, vision, lazy PLE, Gemma 4
+MTP, Maple, Nemotron) was repeated on b11063; the vision + DFlash2 request
+still fails with HTTP 500 on both backends (upstream #27408), so that gate
+now says "verified through b11063", and the DeepSeek-V4.1 block names
+b11063 (PR #28696 still a draft). Mainline still ends at ggml type 43: the
+PrismML (Bonsai 2) and ROCmFPX (Agnes) files stay fork-only and were
+re-refused live on the b11063 trees. The previous **b11042** (`ec9281505`)
+[audit](docs/llama-b11042-audit.md) checks the
 twelve commits after b11030 (no server, argument, speculative or loader
 change: `--help` is byte-identical to b10948–b11030, 415 names / 328 long
 options, all 168 profile/mode commands parse on both backends) and repeats
@@ -1306,6 +1328,36 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.4 — llama.cpp b11063 audit, Ling 3.0 (Bailing V3) parser
+
+- **llama.cpp b11063 audit** (21 commits after b11042): option set
+  unchanged, the new timestamped startup log line from PR #29125 is
+  stripped from the `--help` capture before hashing, and the full HIP and
+  Vulkan live chain passes on the new trees (Nemotron 3 Nano Omni back to
+  25.7 / 71.9 tok/s without the foreign load of the b11042 run).
+- **Ling 3.0:** b11063's dedicated Bailing V3 chat parser (PR #28682) is
+  selected automatically from the template with `--jinja`, which
+  `ling-3.yaml` already passes together with `--reasoning-preserve`;
+  AutoTuner sets no `--reasoning-format` that would bypass it. Live with the
+  local Ling-3.0-flash IQ3_M on both backends: with thinking on, a tool
+  call now arrives as `tool_calls` (auto and required tool choice) and the
+  reasoning stays in `reasoning_content`. The profile note and the nine
+  language packs document the parser and recommend b11063+ for tool use;
+  `min_llama_build` stays b10749 (older builds load and run the model).
+  The local quant turned out to be trunk-only (`nextn_predict_layers = 1`
+  but no `nextn.*` head tensors): AutoTuner's split-shard scan already
+  reports no embedded MTP for it and plans without `draft-mtp`, which
+  matters because a forced MTP graph aborts llama-server on such files.
+- **Gates re-verified on b11063:** Qwen3.5/3.8 vision + DFlash2 still
+  fails with HTTP 500 on HIP and Vulkan (upstream #27408), so the gate's
+  message now names b11063; DeepSeek-V4.1-Flash stays blocked (PR #28696
+  still a draft, wording moved to b11063); Ternary-Bonsai 2 (Prism types
+  142/143, #29058) and Agnes-3.0-Flash MTP-ROCmFP4 (types 100/101,
+  PR #24185) are still refused by mainline b11063 and stay on their forks.
+  PrismML's newer `prism-b10709` tag only adds DFly/DSpark drafter code (no
+  Vulkan PQ2_0 kernels), so the Bonsai recipes keep the b10687 pin.
+- [Audit](docs/llama-b11063-audit.md) · [Validation](docs/v5.5.4-validation.md).
 
 ### v5.5.3 — Agnes-3.0-Flash Preview profile, ROCmFPX gate and fork recipes
 

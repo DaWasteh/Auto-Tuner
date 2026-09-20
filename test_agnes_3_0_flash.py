@@ -257,7 +257,7 @@ def test_rocmfpx_gguf_is_refused_without_the_rocmfp_loader(
     assert not ok and detected is None
     assert seen == [("llama-server", ("rocmfp",))]
     assert model.name in message and packing in message and tier in message
-    # Mainline b11042 (Vulkan and HIP) really answers "tensor
+    # Mainline b11042 and b11063 (Vulkan and HIP) really answer "tensor
     # 'blk.0.attn_gate.weight' has invalid ggml type 101. should be in [0, 43)"
     # for the STRIX_LEAN file (2026-09-19 live run); every fork type is named.
     fork = "/".join(str(t) for t in types if t >= 100)

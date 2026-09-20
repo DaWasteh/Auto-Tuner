@@ -239,20 +239,20 @@ def test_nemotron_without_latent_moe_or_without_mtp_block_is_not_gated(
 # ------------------------------------------------------------- deepseek ----
 
 
-def test_v41_block_names_b11030(tmp_path):
+def test_v41_block_names_b11063(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11030" in profile.runtime_block_reason
+    assert "b11063" in profile.runtime_block_reason
     assert "b10977" not in profile.runtime_block_reason
     assert "b10977" not in profile.notes
-    with pytest.raises(ValueError, match="b11030"):
+    with pytest.raises(ValueError, match="b11063"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b11030 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11063 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))
     for pack in sorted((ROOT / "assets/languages").glob("*.json")):
         notes = json.loads(pack.read_text(encoding="utf-8"))["profile_notes"]
-        assert "b11030" in notes["deepseek-v4_1.yaml"], pack.name
+        assert "b11063" in notes["deepseek-v4_1.yaml"], pack.name
         assert "b10977" not in notes["deepseek-v4_1.yaml"], pack.name
 
 
@@ -298,7 +298,7 @@ def test_vision_with_dflash2_stays_gated_through_b11030(
         tuner, "_probe_supported_flags", lambda _: {"--spec-type", "--mmproj"}
     )
     if blocked:
-        with pytest.raises(ValueError, match=rf"b{build}.*since b10896.*b11030"):
+        with pytest.raises(ValueError, match=rf"b{build}.*since b10896.*b11063"):
             tuner.build_command(model, config, profile, draft_model=draft)
     else:
         cmd = tuner.build_command(model, config, profile, draft_model=draft)
