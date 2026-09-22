@@ -1,0 +1,37 @@
+display_name: "Xing 4.0 29B-A4B (recognition only)"
+patterns:
+  - xing4.0
+  - xing4_0
+  - xing-4.0
+arch_fallback:
+  - xing4_0
+max_context: 262144
+recommended_kv_quant: q8_0
+runtime_block_reason: >
+  Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp b11105
+  and no validated AutoTuner runtime. A GGUF file alone does not establish
+  inference support. Do not substitute the DeepSeek or Qwen architecture.
+# Author recommendations, retained for a future validated runtime:
+# https://huggingface.co/XingChen-AGI/Xing4.0-29B-A4B
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.05
+  coding:
+    temperature: 0.8
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.05
+extra_args:
+  - --jinja
+notes: >
+  Xing 4.0 29B-A4B is recognized but launch is blocked: mainline llama.cpp
+  b11105 has no xing4_0 loader. The local IQ4_NL GGUF uses that architecture;
+  neither its existence nor a compatible quantization implies runtime
+  support. The author's 256k context and sampling (chat temp 1.0, coding
+  0.8, top_p 0.95, repeat 1.05) are recorded for a future validated runtime.
+  MLA/mHC/MTP support must be checked before this block is removed.

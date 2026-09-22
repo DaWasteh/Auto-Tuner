@@ -1,0 +1,19 @@
+display_name: "VoxCPM2 BaseLM (Voice Lab component)"
+patterns:
+  - voxcpm2
+  - voxcpm-2
+# Do not block generic minicpm4 language models by architecture.
+max_context: 32768
+recommended_kv_quant: q8_0
+runtime_block_reason: >
+  VoxCPM2-BaseLM is a component of the Voice Lab TTS pipeline, not a
+  standalone llama-server chat model. Use the dedicated voxcpm2-cli or
+  llama-tts-server runtime with the remaining VoxCPM2 assets.
+notes: >
+  VoxCPM2 BaseLM is recognized so it does not silently receive generic chat
+  settings. It belongs to Voice Lab's separate TTS pipeline and cannot
+  synthesize speech through AutoTuner's ordinary chat-server path. Use
+  building llama.cpp/voicelab_voxcpm2_vulkan_build.ps1 for the isolated
+  tc-mb/llama.cpp-omni build (voxcpm2-cli and llama-tts-server) and supply
+  the complete TTS assets there. No minicpm4 architecture-wide block is
+  applied to unrelated language models.

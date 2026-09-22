@@ -62,7 +62,8 @@ class ModelProfile:
     #   ngram-simple / ngram-cache — older draftless variants
     # Default stays "ngram-mod" so existing profiles behave exactly as before.
     # IMPORTANT: only "ngram-mod" conflicts with integrated MTP (draft-mtp,
-    # ngram-mod -> mid-gen crashes, llama.cpp #23154, still open at b9334). The
+    # ngram-mod -> mid-gen crashes, llama.cpp #23154, stale-closed without
+    # a verified fix as of the b11105 audit). The
     # ngram-map-* methods are allowed alongside draft-mtp by the tuner. So to
     # actually combine MTP + ngram on an MTP model, set this to ngram-map-k4v.
     ngram_method: str = "ngram-mod"

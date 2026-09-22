@@ -928,7 +928,11 @@ matches. See `settings/_default.yaml`.
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
 | `granite-4_2.yaml` | IBM Granite 4.2 3B/8B/30B dense reasoning + tools | `granite` (filename-gated) |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
-| `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash | `muse-glimmer` |
+| `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls | `muse-glimmer` |
+| `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+ | `mimo2` (filename-gated; no local weights tested) |
+| `fastcontext-1_0-4b.yaml` | Microsoft FastContext 1.0 4B SFT/RL repository explorer, 262k, GGUF sampling defaults | `qwen3` (filename-gated) |
+| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11105 loader** | `xing4_0` |
+| `voxcpm2.yaml` | VoxCPM2 BaseLM: **Voice Lab TTS component, ordinary chat launch blocked** | `minicpm4` (filename-gated, not an architecture-wide block) |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
 | `glm-5_2.yaml` | GLM-5.2 + GLM-5.3 (non-Flash), 1M + IndexShare/MTP | `glm-dsa` |
@@ -941,13 +945,20 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11063 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11105 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.5.5:** MiMo-V2.6 adds a b11102-gated profile for the new conversion
+  and corrected tool parser; its native 1M limit is not a local-memory
+  guarantee. FastContext 4B SFT/RL no longer falls through to generic 8k
+  settings. Xing4.0 and VoxCPM2 BaseLM are explicitly recognized **without
+  claiming standalone runtime support**. All nine language packs include
+  the new notes. [Sources, boundaries and audit](docs/llama-b11105-audit.md).
 
 - **v5.5.1:** **DFM Mimir 1B** (`hrm_text`, PR #27625, first tagged in
   b11003) is Danish Foundation Models' Danish/English instruction-tuned
@@ -990,9 +1001,9 @@ Notes on the new profiles:
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
   block named b10930; the **v5.4.8** b10948, **v5.5.0** b10977 and
-  **v5.5.1** b11030 and **v5.5.4** b11063 re-checks found it still open
-  (draft, last updated 2026-09-19) and the block now names b11063. Nothing
-  else in that profile changed.
+  **v5.5.1** b11030, **v5.5.4** b11063 and **v5.5.5** b11105 re-checks
+  found it still open (draft, updated 2026-09-22); the block now names
+  b11105. Conversion alone still does not provide an inference runtime.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1194,9 +1205,27 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11063)
+## Server features (audited through llama.cpp b11105)
 
-The **b11063** (`3d82ef62d`) [audit](docs/llama-b11063-audit.md) checks the
+The **b11105** (`348f853b7`) [audit](docs/llama-b11105-audit.md) covers
+42 commits after b11063. The CLI option set is unchanged (415 names / 328
+long options); new sampling environment defaults and multi-address `--host`
+change help/behaviour, not option names. AutoTuner now emits presence penalty
+**even at zero**, preventing an inherited environment value from overriding
+the chosen setting. The default remains single-loopback binding.
+
+New settings cover **MiMo-V2.6 Flash/Pro RL** (b11102+, official 1.0/0.95
+sampling, source/unit coverage without local weights) and **FastContext 4B
+SFT/RL** (local GGUF sampling, 262k ceiling). **Xing4.0** has no mainline
+loader; **VoxCPM2 BaseLM** is a Voice Lab TTS component: both are recognized
+but ordinary chat launch is blocked. Muse Glimmer's first-token tool-call
+parser is fixed in b11100; the existing `--jinja` flag selects it. Old
+issue states and local reproductions are recorded separately: stale-closed
+MTP/ngram-mod is not a proven fix, and the Qwen vision/DFlash2, DeepSeek-V4.1,
+Prism and ROCmFPX safeguards remain. See [validation](docs/v5.5.5-validation.md)
+for the two-backend runtime checks and release gates.
+
+The previous **b11063** (`3d82ef62d`) [audit](docs/llama-b11063-audit.md) checks the
 21 commits after b11042. No option was added or removed (415 names / 328
 long options, all 170 profile/mode commands parse on both backends); the
 only new `--help` byte is the timestamped `llama_server: initializing ...`
@@ -1313,7 +1342,7 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `-md` external drafter | ✅ Model/tensor-aware speculative path; `--spec-draft-device` pins the budgeted GPU. Multi-GPU HIP/CUDA/Vulkan ordering keeps shared target output heads on that GPU too. Unknown device identity fails safely. |
 | `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.). On broken b10741-b10748 runtimes, command preparation disables only MTP while preserving compatible ngram speculation; standalone MTP heads and array-backed NextN targets are rejected before launch. Full MTP resumes on b10749+. |
 | `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. Generic DSpark is emitted on b10164+; Nemotron3.5 uses its b10665 profile gate. DFlash2 reuses `draft-dflash` and accepts mainline b10658+ (reviewed PR #27342 builds remain a legacy fallback). |
-| `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154, still open as of b9442) |
+| `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154 was stale-closed, not confirmed fixed; rechecked at b11105) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Selectable via `ngram_method`; only the type token is emitted, sub-parameters are left to the llama.cpp defaults |
 | `--spec-draft-n-max` | ✅ Expert overrides remain authoritative. DFlash derives block-size minus its anchor (Qwen3.8 DFlash2: 8 → 7); performance tuning then increases depth one token at a time until decode speed regresses instead of stopping at a fixed list. |
@@ -1328,6 +1357,25 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.5 — llama.cpp b11105 audit, new profiles and parser fixes
+
+- **42 upstream commits audited:** same CLI flags; presence penalty zero is
+  now explicit despite the new environment defaults. No automatic network
+  exposure from the new multi-bind `--host` support.
+- **Profiles:** MiMo-V2.6 Flash/Pro RL, FastContext 1.0 4B SFT/RL, plus
+  recognition-only safeguards for unsupported Xing4.0 and the Voice Lab
+  VoxCPM2 BaseLM component. All nine language packs updated.
+- **Muse Glimmer:** recommend b11100+ for the first-token tool-call parser
+  fix (#29242), while retaining its b10353 loader minimum.
+- **Old issues rechecked:** safeguards retained unless a fix is evidenced;
+  the audit distinguishes open, stale-closed, candidate patches and actual
+  runtime results. DeepSeek-V4.1 and vision/DFlash2 wording names b11105.
+- Includes the refreshed `models_metadata.md` and previously unpublished
+  [Voice Lab Vulkan PS1](building%20llama.cpp/voicelab_voxcpm2_vulkan_build.ps1).
+  This builds the separate `voxcpm2-cli` / `llama-tts-server` pipeline; it
+  does not turn AutoTuner into a TTS server or modify existing llama builds.
+- [Audit](docs/llama-b11105-audit.md) · [Validation](docs/v5.5.5-validation.md).
 
 ### v5.5.4 — llama.cpp b11063 audit, Ling 3.0 (Bailing V3) parser
 

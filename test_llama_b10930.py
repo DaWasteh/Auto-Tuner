@@ -104,7 +104,7 @@ def test_vision_with_dflash2_stays_gated_through_b10930(
         tuner, "_probe_supported_flags", lambda _: {"--spec-type", "--mmproj"}
     )
     if blocked:
-        with pytest.raises(ValueError, match=rf"b{build}.*since b10896.*b11063"):
+        with pytest.raises(ValueError, match=rf"b{build}.*since b10896.*b11105"):
             tuner.build_command(model, config, profile, draft_model=draft)
     else:
         cmd = tuner.build_command(model, config, profile, draft_model=draft)
@@ -134,10 +134,10 @@ def test_gate_stays_narrow_on_a_gated_build(tmp_path, monkeypatch):
 
 def test_v41_block_names_the_audited_build(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11063" in profile.runtime_block_reason and "b10930" not in profile.notes
-    with pytest.raises(ValueError, match="b11063"):
+    assert "b11105" in profile.runtime_block_reason and "b10930" not in profile.notes
+    with pytest.raises(ValueError, match="b11105"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b11063 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11105 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))

@@ -52,3 +52,7 @@ notes: >
   "Reasoning strength: low|medium|high|xhigh". The Q4 model plus mmproj,
   KV cache, and drafter targets a 24-32 GB device; on this dual-AMD system
   benchmark the optional drafter because Vulkan overhead can offset gains.
+  For tool use, b11100+ is recommended: PR #29242 fixes a tool call emitted
+  as the first generated text being misclassified as content rather than
+  tool_calls. --jinja selects the corrected parser automatically; the
+  loader minimum remains b10353.

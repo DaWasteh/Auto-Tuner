@@ -714,9 +714,24 @@ def check_profile_build(
 
 
 def _model_runtime_block_reason(model: ModelEntry) -> str:
-    """Catch V4.1 GGUFs even if renamed or converted under the old V4 arch."""
+    """Reject recognized but unvalidated architectures and TTS components."""
     md = model.metadata or {}
     arch = str(md.get("general.architecture") or "").lower()
+    if arch == "xing4_0":
+        return (
+            "Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp "
+            "b11105 and no validated AutoTuner runtime. Do not substitute the "
+            "DeepSeek or Qwen architecture."
+        )
+    if any(
+        re.search(r"voxcpm[-_]?2(?=[\s._-]|$)", str(value), re.IGNORECASE)
+        for value in (model.name, md.get("general.name", ""))
+    ):
+        return (
+            "VoxCPM2-BaseLM is a Voice Lab TTS component, not a standalone "
+            "llama-server chat model. Use voxcpm2-cli or llama-tts-server "
+            "with the complete VoxCPM2 assets."
+        )
     is_v41_name = re.search(
         r"deepseek[-_]?v?4[._]?1(?=[\s._-]|$)", model.name, re.IGNORECASE
     )
@@ -730,7 +745,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11063 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11105 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -802,7 +817,7 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11063 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11105 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -1238,7 +1253,7 @@ def _memlock_limit_gb() -> Optional[float]:
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
 #: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977, b11030,
-#: b11042 and b11063 (HIP and Vulkan; upstream issue #27408);
+#: b11042, b11063 and b11105 (HIP and Vulkan; upstream issue #27408);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
@@ -5702,7 +5717,7 @@ def build_command(
       INTEGRATED MTP (Path B) coexistence: only ``ngram-mod`` conflicts with
       ``draft-mtp``. The pair ``draft-mtp,ngram-mod`` triggers random
       mid-generation crashes on MTP models such as Qwen3.6-27B-MTP — see
-      llama.cpp issue #23154 (open as of b9334; "issue not reproduced when
+      llama.cpp issue #23154 (stale-closed, no verified fix; "issue not reproduced when
       ngram-mod is removed"). So on an MTP model with ``ngram_method ==
       ngram-mod`` the redundant ngram-mod is suppressed and ``draft-mtp`` wins.
       The ``ngram-map-*`` family is different: ggerganov's MTP clean-up
@@ -5735,7 +5750,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b11063) image "
+                "with DFlash2: since b10896 (verified through b11105) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."
@@ -5954,7 +5969,7 @@ def build_command(
     # Only ngram-mod conflicts with integrated MTP. Combining draft-mtp,ngram-mod
     # in one --spec-type list causes random mid-generation crashes on MTP models
     # (e.g. Qwen3.6-27B-MTP): CUDA/Vulkan device error, or the model stalling
-    # mid-thought. That is llama.cpp issue #23154, still OPEN as of b9334 — the
+    # mid-thought. Issue #23154 was stale-closed, not fixed (b11105 audit); the
     # reporter confirms "issue not reproduced when ngram-mod is removed". Both
     # speculators write into the same decode graph and corrupt each other's
     # draft state.
@@ -6154,9 +6169,11 @@ def build_command(
         "--repeat-penalty",
         str(s["repeat_penalty"]),
     ]
-    pp = s.get("presence_penalty", 0.0)
-    if pp:
-        cmd += ["--presence-penalty", str(pp)]
+    # b11078 adds LLAMA_ARG_PRESENCE_PENALTY. Zero is an explicit profile/UI
+    # choice too: omitting it would silently inherit a nonzero environment
+    # value. Frequency penalty has no UI control and remains available via
+    # Extra CLI flags / llama.cpp's environment defaults.
+    cmd += ["--presence-penalty", str(s.get("presence_penalty", 0.0))]
 
     if model.mmproj is not None:
         cmd += ["--mmproj", str(model.mmproj)]

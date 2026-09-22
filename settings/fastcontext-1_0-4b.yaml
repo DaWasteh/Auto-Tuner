@@ -1,0 +1,36 @@
+display_name: "FastContext 1.0 4B SFT / RL (Microsoft)"
+patterns:
+  - fastcontext-1.0-4b
+  - fastcontext_1.0_4b
+  - fastcontext-1_0-4b
+# No qwen3 fallback: other Qwen3 checkpoints are not repository explorers.
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: balanced
+# Both local GGUF headers explicitly store general.sampling.temp=0.7,
+# top_p=0.8 and top_k=20. These are artifact defaults, not a claim that the
+# unavailable upstream generation_config was independently verified.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.8
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 0.7
+    top_k: 20
+    top_p: 0.8
+    min_p: 0.0
+    repeat_penalty: 1.0
+extra_args:
+  - --jinja
+notes: >
+  Microsoft FastContext 1.0 4B SFT/RL is a Qwen3-based repository explorer,
+  not a general coding agent. Both local GGUFs declare 262,144 context and
+  sampling temp 0.7 / top_p 0.8 / top_k 20; this profile follows those
+  artifact defaults. The planner still clamps context to available memory.
+  Use the embedded Jinja template and provide repository-search tools in
+  the client; AutoTuner does not grant filesystem access or run those tools.
+  No qwen3 architecture fallback is used, so unrelated Qwen3 models retain
+  their own settings. The 30B FastContext variant is not covered here.

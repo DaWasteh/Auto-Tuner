@@ -1,0 +1,47 @@
+display_name: "MiMo-V2.6 Flash / Pro RL (Xiaomi)"
+patterns:
+  - mimo-v2.6
+  - mimo_v2.6
+  - mimo-v2_6
+  - mimo_v2_6
+# Deliberately no mimo2 architecture fallback: V2-Flash/V2.5 use the same
+# architecture, but this profile's release gate and sampling concern V2.6.
+min_llama_build: 11102
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: balanced
+
+# https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL
+# https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL
+# Official recommendation: temperature 1.0, top_p 0.95. Disable additional
+# top-k/min-p truncation rather than inventing author-recommended values.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+extra_args:
+  - --jinja
+# Only an actually present GGUF NextN head enables draft-mtp. Do not derive
+# the draft length from the model card's separate five-layer DFlash decoder.
+draft_max: 3
+ngram_method: ngram-map-k4v
+notes: >
+  Xiaomi MiMo-V2.6 Flash/Pro RL uses the existing mimo2 MoE architecture.
+  llama.cpp b11102+ (PR #29257) adds MXFP4 expert conversion and correct
+  Jinja tool-parser selection; older builds can select the wrong Qwen3-Coder
+  parser. Official sampling is temp 1.0 / top_p 0.95 for chat and coding.
+  The 1,048,576 context ceiling is clamped to the GGUF and available memory;
+  it is not a promise that 1M fits locally. Text and vision use llama-server
+  plus the matching mmproj; the audio decoder is excluded by the converter,
+  so this is not a speech-output profile. MTP depends on actual GGUF head
+  tensors, not the model card alone. No local V2.6 weights were available
+  for this audit; profile, build gate and KV planning have unit coverage.
