@@ -6,6 +6,11 @@ it in the GUI:
 * Windows: ``HKCU\\...\\Run``
 * Linux: ``~/.config/autostart/AutoTuner.desktop``
 * macOS: ``~/Library/LaunchAgents/com.dawasteh.autotuner.plist``
+
+Every registration appends ``--autostart`` so the GUI can tell a login start
+from a manual launch (and honour "Start minimized after login"). Entries
+written by older versions without the marker are upgraded in place by
+:func:`refresh_autostart_registration` when they point at this installation.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from typing import List
 APP_NAME = "AutoTuner"
 _WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _MACOS_LABEL = "com.dawasteh.autotuner"
+AUTOSTART_ARGUMENT = "--autostart"
 
 
 class AutostartError(RuntimeError):
@@ -43,6 +49,11 @@ def launch_arguments() -> List[str]:
         return [str(Path(sys.executable).resolve())]
     launcher = Path(__file__).resolve().parent / "qt_launcher.py"
     return [str(Path(sys.executable).resolve()), str(launcher)]
+
+
+def registration_arguments() -> List[str]:
+    """Return the login command: this installation plus the autostart marker."""
+    return [*launch_arguments(), AUTOSTART_ARGUMENT]
 
 
 def is_autostart_enabled() -> bool:
@@ -79,6 +90,52 @@ def set_autostart_enabled(enabled: bool) -> None:
         ) from exc
 
 
+def refresh_autostart_registration() -> bool:
+    """Add the autostart marker to a legacy entry for this installation.
+
+    Only an entry that exactly matches this installation's pre-marker command
+    is rewritten; entries for another copy (e.g. a frozen EXE while running
+    from source) or already-current entries are left untouched. Returns
+    ``True`` when an entry was upgraded; errors are reported as ``False``.
+    """
+    legacy = launch_arguments()
+    try:
+        if sys.platform == "win32":
+            current = _windows_registered_command()
+            if current == subprocess.list2cmdline(legacy):
+                _set_windows_autostart(True)
+                return True
+        elif sys.platform == "linux":
+            path = _linux_autostart_path()
+            if path.is_file():
+                text = path.read_text(encoding="utf-8")
+                if f"Exec={_linux_exec_line(legacy)}\n" in text:
+                    _set_linux_autostart(True)
+                    return True
+        elif sys.platform == "darwin":
+            path = _macos_launch_agent_path()
+            if path.is_file():
+                with path.open("rb") as fh:
+                    payload = plistlib.load(fh)
+                if payload.get("ProgramArguments") == legacy:
+                    _set_macos_autostart(True)
+                    return True
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    return False
+
+
+def _windows_registered_command() -> str:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WINDOWS_RUN_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, APP_NAME)
+            return str(value)
+    except FileNotFoundError:
+        return ""
+
+
 def _windows_is_enabled() -> bool:
     import winreg
 
@@ -94,7 +151,7 @@ def _set_windows_autostart(enabled: bool) -> None:
     import winreg
 
     if enabled:
-        command = subprocess.list2cmdline(launch_arguments())
+        command = subprocess.list2cmdline(registration_arguments())
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WINDOWS_RUN_KEY) as key:
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
         return
@@ -129,6 +186,10 @@ def _desktop_exec_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _linux_exec_line(arguments: List[str]) -> str:
+    return " ".join(_desktop_exec_quote(arg) for arg in arguments)
+
+
 def _set_linux_autostart(enabled: bool) -> None:
     path = _linux_autostart_path()
     if not enabled:
@@ -139,7 +200,7 @@ def _set_linux_autostart(enabled: bool) -> None:
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    command = " ".join(_desktop_exec_quote(arg) for arg in launch_arguments())
+    command = _linux_exec_line(registration_arguments())
     content = (
         "[Desktop Entry]\n"
         "Type=Application\n"
@@ -169,7 +230,7 @@ def _set_macos_autostart(enabled: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "Label": _MACOS_LABEL,
-        "ProgramArguments": launch_arguments(),
+        "ProgramArguments": registration_arguments(),
         "RunAtLoad": True,
     }
     with path.open("wb") as fh:

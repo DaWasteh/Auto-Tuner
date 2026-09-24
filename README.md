@@ -247,6 +247,14 @@ Performance Test Result:
   per-user login autostart on Windows, Linux, and macOS, plus optional **X →
   notification area/system tray** behavior. Both options are disabled by
   default; the tray menu and the dedicated **Quit** button always exit normally.
+  **Start minimized after login** (below *Start after login*) opens a login
+  start without a window: in the notification area when *Hide on close* is
+  on, otherwise minimized on the taskbar. Until you save a choice it follows
+  *Hide on close*, so enabling both login options is enough. Only the login
+  entry passes `--autostart`; a manual start always shows the window, and a
+  second start restores a tray-hidden AutoTuner. Entries written by older
+  versions are upgraded in place on the next start when they point at the
+  same installation.
 - **One instance per user** — a second start of `AutoTuner.exe` (or
   `qt_launcher.py`) does not open a rival window: it brings the running
   AutoTuner to the front, also out of the notification area, and exits. The
@@ -931,7 +939,7 @@ matches. See `settings/_default.yaml`.
 | `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls | `muse-glimmer` |
 | `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+ | `mimo2` (filename-gated; no local weights tested) |
 | `fastcontext-1_0-4b.yaml` | Microsoft FastContext 1.0 4B SFT/RL repository explorer, 262k, GGUF sampling defaults | `qwen3` (filename-gated) |
-| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11105 loader** | `xing4_0` |
+| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11160 loader** | `xing4_0` |
 | `voxcpm2.yaml` | VoxCPM2 BaseLM: **Voice Lab TTS component, ordinary chat launch blocked** | `minicpm4` (filename-gated, not an architecture-wide block) |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
@@ -945,13 +953,22 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11105 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11160 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
+| `ling-3_0-vl.yaml` | Ling-3.0-flash-VL image/video model (ling3vl projector + M-RoPE), b11156+; older builds refused by metadata gate | `bailingmoe3` with `rope.dimension_sections` (filename-gated; no local weights tested) |
 | `kimi-linear.yaml` | Kimi Linear 48B-A3B, 1M hybrid KDA/MLA (corrected SSM state contract b10749+) | `kimi-linear` |
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.5.6:** Ling-3.0-flash-VL gets its own profile because the text
+  profile's `ling-3.0-flash` pattern would otherwise have claimed it; its
+  M-RoPE GGUFs load silently wrong before b11156 (PR #29151), so a
+  metadata gate also refuses renamed files there. Gemma 4 DSpark/DFlash
+  drafts (PR #29226) are refused below b11132. Chat sampling follows the
+  published generation config (1.0/0.95/20), coding the card's evaluation
+  default 0.6. [Audit](docs/llama-b11160-audit.md).
 
 - **v5.5.5:** MiMo-V2.6 adds a b11102-gated profile for the new conversion
   and corrected tool parser; its native 1M limit is not a local-memory
@@ -1001,9 +1018,10 @@ Notes on the new profiles:
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
   block named b10930; the **v5.4.8** b10948, **v5.5.0** b10977 and
-  **v5.5.1** b11030, **v5.5.4** b11063 and **v5.5.5** b11105 re-checks
-  found it still open (draft, updated 2026-09-22); the block now names
-  b11105. Conversion alone still does not provide an inference runtime.
+  **v5.5.1** b11030, **v5.5.4** b11063, **v5.5.5** b11105 and **v5.5.6**
+  b11160 re-checks found it still open (not merged, updated 2026-09-22); the
+  block now names b11160. Conversion alone still does not provide an
+  inference runtime.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
   128k/32k limits and multimodal caveats; Mistral Small 3.1/3.2 uses Mistral's
@@ -1171,6 +1189,12 @@ unchanged on b10930, b10948, b10977 and b11030; the clang `-fno-pch-timestamp`
 option (PR #28816) is still emitted but now idle. b11030's split of
 `ggml-vulkan.cpp` into buffer/debug sources plus shared headers (PR #28732)
 is picked up by upstream's CMake lists and needed no recipe change either.
+b11105…b11160 adds no CMake option; the user-built b11160 trees come from the
+unchanged recipes, and the stable recipes resolve `latest` to **v0.5.0**
+(= b11146); both stable recipes built and verified v0.5.0 unchanged. The new
+RDNA3/RDNA4 int8 cooperative-matrix MMQ path (PR #27952)
+is compiled in through the existing `GL_KHR_cooperative_matrix` detection and
+enabled automatically on both gfx1201 cards.
 MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
 benign: `src/models/llama.cpp` is folded into a unity source and only one
 `llama.obj` is produced.
@@ -1205,9 +1229,19 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11105)
+## Server features (audited through llama.cpp b11160)
 
-The **b11105** (`348f853b7`) [audit](docs/llama-b11105-audit.md) covers
+The **b11160** (`70c4e1582`, `0.5.0-dev`) [audit](docs/llama-b11160-audit.md)
+covers 55 commits after b11105. The option set **and** the `--help` text are
+unchanged (415 names / 328 long options); only `--version` reports the 0.5.0
+bump, which AutoTuner does not parse. New: **Ling-3.0-flash-VL** (b11156+,
+own profile plus an M-RoPE metadata gate), a b11132 floor for **Gemma 4
+DSpark** drafts, and the Vulkan **int8 cooperative-matrix MMQ** path for
+RDNA3/RDNA4 (on by default, no setting). The Qwen vision/DFlash2,
+DeepSeek-V4.1, Xing, Prism and ROCmFPX safeguards remain. See
+[validation](docs/v5.5.6-validation.md).
+
+The previous **b11105** (`348f853b7`) [audit](docs/llama-b11105-audit.md) covers
 42 commits after b11063. The CLI option set is unchanged (415 names / 328
 long options); new sampling environment defaults and multi-address `--host`
 change help/behaviour, not option names. AutoTuner now emits presence penalty
@@ -1342,7 +1376,7 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `-md` external drafter | ✅ Model/tensor-aware speculative path; `--spec-draft-device` pins the budgeted GPU. Multi-GPU HIP/CUDA/Vulkan ordering keeps shared target output heads on that GPU too. Unknown device identity fails safely. |
 | `--spec-type draft-mtp` | ✅ Integrated/sidecar MTP (Qwen3-Next, Qwen3.6-MTP, GLM-4.7/5.2, DeepSeek V3.2 etc.). On broken b10741-b10748 runtimes, command preparation disables only MTP while preserving compatible ngram speculation; standalone MTP heads and array-backed NextN targets are rejected before launch. Full MTP resumes on b10749+. |
 | `--spec-type draft-eagle3` / `draft-dflash` / `draft-dspark` | ✅ Architecture/tensor-aware sidecar detection. Generic DSpark is emitted on b10164+; Nemotron3.5 uses its b10665 profile gate. DFlash2 reuses `draft-dflash` and accepts mainline b10658+ (reviewed PR #27342 builds remain a legacy fallback). |
-| `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154 was stale-closed, not confirmed fixed; rechecked at b11105) |
+| `--spec-type ngram-mod` (draftless) | ✅ Via `ngram_method: ngram-mod` (default). Suppressed on MTP models because `draft-mtp,ngram-mod` crashes mid-generation (#23154 was stale-closed, not confirmed fixed; rechecked at b11160) |
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Selectable via `ngram_method`; only the type token is emitted, sub-parameters are left to the llama.cpp defaults |
 | `--spec-draft-n-max` | ✅ Expert overrides remain authoritative. DFlash derives block-size minus its anchor (Qwen3.8 DFlash2: 8 → 7); performance tuning then increases depth one token at a time until decode speed regresses instead of stopping at a fixed list. |
@@ -1357,6 +1391,25 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.6 — llama.cpp b11160 audit, start minimized at login, Ling-3.0-flash-VL
+
+- **Start minimized after login:** new option under *Start after login*. A
+  login start opens without a window — in the notification area when *Hide
+  on close* is on, otherwise minimized on the taskbar; until you choose it
+  follows *Hide on close*. The login entry now passes `--autostart`; older
+  entries for the same installation are upgraded automatically, manual starts
+  are unchanged and a second start still restores the window.
+- **55 upstream commits audited (b11105 → b11160, llama.cpp 0.5.0-dev):**
+  identical flags and help text; stable v0.5.0 = b11146. Build recipes stay
+  unchanged and optimal for the 285K + 2× gfx1201 system. The new Vulkan
+  int8 cooperative-matrix path (PR #27952) is on automatically and measured
+  **+13–15 % Q8_0 prompt processing** on the R9700 (Q4_K/IQ4_XS unchanged).
+- **Ling-3.0-flash-VL** profile (b11156+) and M-RoPE metadata gate; **Gemma 4
+  DSpark/DFlash** drafts need b11132+.
+- **Old blockers rechecked** (all still open): Qwen vision + DFlash2 (#27408),
+  DeepSeek-V4.1 (#28696), Xing, Prism PQ2_0/PTQ1_0, ROCmFPX; wording names b11160.
+- [Audit](docs/llama-b11160-audit.md) · [Validation](docs/v5.5.6-validation.md).
 
 ### v5.5.5 — llama.cpp b11105 audit, new profiles and parser fixes
 

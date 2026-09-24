@@ -60,6 +60,7 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QIcon,
     QMouseEvent,
+    QShowEvent,
     QStandardItemModel,
 )
 from PyQt6.QtWidgets import (
@@ -1143,6 +1144,39 @@ class _ApplicationSettingsDialog(QDialog):
         )
         layout.addWidget(self.autostart_checkbox)
 
+        self.start_minimized_checkbox = QCheckBox("Start minimized after login")
+        self.start_minimized_checkbox.setChecked(
+            app_settings.get_start_minimized_at_login()
+        )
+        # Until the user saves an explicit choice, the option mirrors
+        # "Hide on close" so both login options together start in the tray.
+        self.start_minimized_explicit = (
+            app_settings.start_minimized_at_login_is_explicit()
+        )
+        self.start_minimized_touched = False
+        self.start_minimized_checkbox.clicked.connect(self._mark_start_minimized)
+        self.start_minimized_checkbox.setEnabled(self.autostart_was_enabled)
+        self.autostart_checkbox.toggled.connect(
+            self.start_minimized_checkbox.setEnabled
+        )
+        self.start_minimized_checkbox.setToolTip(
+            _setting_tooltip(
+                "When AutoTuner starts because you signed in, it opens without a "
+                "window: in the notification area if Hide on close is on, "
+                "otherwise minimized on the taskbar.",
+                "Applies only to the login entry, which passes --autostart; manual "
+                "starts always show the window. Until you save a choice here it "
+                "follows Hide on close. Servers, the control API and background "
+                "scans start as usual; restore the window from the tray icon, the "
+                "taskbar, or by launching AutoTuner again.",
+            )
+        )
+        start_minimized_row = QHBoxLayout()
+        start_minimized_row.setContentsMargins(24, 0, 0, 0)
+        start_minimized_row.addWidget(self.start_minimized_checkbox)
+        start_minimized_row.addStretch(1)
+        layout.addLayout(start_minimized_row)
+
         self.minimize_checkbox = QCheckBox("Hide on close")
         tray_available = _system_tray_supported()
         self.minimize_checkbox.setChecked(
@@ -1173,6 +1207,7 @@ class _ApplicationSettingsDialog(QDialog):
                 )
             )
         layout.addWidget(self.minimize_checkbox)
+        self.minimize_checkbox.toggled.connect(self._follow_hide_on_close)
 
         self.debug_checkbox = QCheckBox("Debug mode (verbose AutoTuner log)")
         self.debug_checkbox.setChecked(app_settings.get_debug_mode())
@@ -1332,6 +1367,15 @@ class _ApplicationSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _mark_start_minimized(self, _checked: bool = False) -> None:
+        """Remember that the user chose the login-start option directly."""
+        self.start_minimized_touched = True
+
+    def _follow_hide_on_close(self, checked: bool) -> None:
+        """Mirror Hide on close until the login-start option is chosen."""
+        if not (self.start_minimized_explicit or self.start_minimized_touched):
+            self.start_minimized_checkbox.setChecked(checked)
 
     def _update_api_endpoint(self) -> None:
         self.control_api_endpoint.setText(
@@ -6149,6 +6193,7 @@ class MainWindow(QMainWindow):
         self._tray_menu: Optional[QMenu] = None
         self._tray_hint_shown = False
         self._tray_restore_maximized = False
+        self._native_window_setup_done = False
         app = cast(Optional[QApplication], QApplication.instance())
         if app is None:  # QMainWindow requires a QApplication in normal Qt use.
             raise RuntimeError("MainWindow requires a QApplication")
@@ -8056,6 +8101,10 @@ class MainWindow(QMainWindow):
 
         minimize_to_tray = dialog.minimize_checkbox.isChecked()
         app_settings.set_minimize_on_close(minimize_to_tray)
+        if dialog.start_minimized_explicit or dialog.start_minimized_touched:
+            app_settings.set_start_minimized_at_login(
+                dialog.start_minimized_checkbox.isChecked()
+            )
         debug_enabled = dialog.debug_checkbox.isChecked()
         app_settings.set_debug_mode(debug_enabled)
         self._set_internal_debug_mode(debug_enabled)
@@ -8195,6 +8244,35 @@ class MainWindow(QMainWindow):
                 )
             self._tray_hint_shown = True
         return True
+
+    def _start_in_notification_area(self) -> bool:
+        """Keep a login-started window hidden behind the tray icon."""
+        if not self._ensure_tray_icon():
+            return False
+        # restoreGeometry() already applied the saved maximized state.
+        self._tray_restore_maximized = self.isMaximized()
+        self._log(
+            "Started from the login entry; AutoTuner is waiting in the "
+            "notification area."
+        )
+        return True
+
+    def _finish_native_window_setup(self) -> None:
+        """Apply HWND icons and the system menu once a native window exists."""
+        if self._native_window_setup_done:
+            return
+        self._native_window_setup_done = True
+        _set_windows_native_window_icon(
+            self, _bundled_resource("assets", "AutoTuner.ico")
+        )
+        self._install_windows_system_menu()
+
+    def showEvent(self, a0: QShowEvent | None) -> None:  # noqa: N802
+        super().showEvent(a0)
+        # A tray-only login start skipped the post-show() native setup in
+        # main(); run it after the first real show has created the HWND.
+        if not self._native_window_setup_done:
+            QTimer.singleShot(0, self._finish_native_window_setup)
 
     def _restore_from_tray(self) -> None:
         """Restore and focus the main window from the notification area."""
@@ -15806,6 +15884,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        startup_manager.AUTOSTART_ARGUMENT,
+        dest="autostart",
+        action="store_true",
+        help="launched by the login entry; honours 'Start minimized after login'",
+    )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
     if args.model_tree_smoke_test:
@@ -15868,6 +15952,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             flush=True,
         )
     elif not guard.try_acquire():
+        if args.autostart:
+            # A login entry must never pop up an already running window.
+            print(
+                "[AutoTuner] AutoTuner is already running; login start ignored.",
+                flush=True,
+            )
+            return
         if guard.notify_running_instance():
             print(
                 "[AutoTuner] AutoTuner is already running — its window was "
@@ -15913,15 +16004,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     # and taskbar behavior across Windows, Linux window managers, and macOS.
     if not app.windowIcon().isNull():
         window.setWindowIcon(app.windowIcon())
-    window.show()
-    # The HWND is stable only after show(); native icon/system-menu calls made
-    # earlier can target an unrealized handle. WM_SETICON is explicit because
-    # Qt 6 + PyInstaller can otherwise show the icon visually while returning
-    # an empty WM_GETICON handle to Windows shell integrations.
-    _set_windows_native_window_icon(
-        window, _bundled_resource("assets", "AutoTuner.ico")
-    )
-    window._install_windows_system_menu()
+    # A login entry written before v5.5.6 lacks --autostart; upgrade it for the
+    # next login (only when it exactly matches this installation).
+    if startup_manager.refresh_autostart_registration():
+        window._log("[Autostart] Login entry updated with the --autostart marker.")
+    _show_initial_window(window, args.autostart)
     guard.activate_requested.connect(window._activate_from_other_instance)
     app.aboutToQuit.connect(guard.release)
 
@@ -15990,6 +16077,29 @@ def main(argv: Optional[List[str]] = None) -> None:
         _flush_std_streams()
         os._exit(exit_code)
     sys.exit(exit_code)
+
+
+def _show_initial_window(window: MainWindow, autostart: bool) -> str:
+    """Show the main window, or keep it out of the way for a login start.
+
+    Returns ``"tray"``, ``"minimized"`` or ``"normal"``. A tray start needs
+    "Hide on close" and a notification area; without them a minimized
+    taskbar window keeps AutoTuner reachable.
+    """
+    minimized = autostart and app_settings.get_start_minimized_at_login()
+    if minimized and app_settings.get_minimize_on_close():
+        if window._start_in_notification_area():
+            return "tray"
+    if minimized:
+        window.showMinimized()
+    else:
+        window.show()
+    # The HWND is stable only after show(); native icon/system-menu calls made
+    # earlier can target an unrealized handle. WM_SETICON is explicit because
+    # Qt 6 + PyInstaller can otherwise show the icon visually while returning
+    # an empty WM_GETICON handle to Windows shell integrations.
+    window._finish_native_window_setup()
+    return "minimized" if minimized else "normal"
 
 
 def _drain_background_work(window: MainWindow, timeout_s: float = 10.0) -> List[str]:

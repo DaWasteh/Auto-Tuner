@@ -43,6 +43,9 @@ Public API:
     regenerate_control_api_token() -> str
     get_minimize_on_close() -> bool
     set_minimize_on_close(bool)
+    get_start_minimized_at_login() -> bool
+    start_minimized_at_login_is_explicit() -> bool
+    set_start_minimized_at_login(bool)
     get_debug_mode() -> bool
     set_debug_mode(bool)
     get_base_port()        -> int
@@ -3902,6 +3905,29 @@ def get_minimize_on_close() -> bool:
 def set_minimize_on_close(enabled: bool) -> None:
     """Persist the opt-in X-to-notification-area behaviour."""
     _update("minimize_on_close", bool(enabled))
+
+
+def start_minimized_at_login_is_explicit() -> bool:
+    """Return whether the user saved an explicit login-start preference."""
+    return isinstance(_read_settings_shared().get("start_minimized_at_login"), bool)
+
+
+def get_start_minimized_at_login() -> bool:
+    """Return whether a login autostart should open without a visible window.
+
+    Until the user saves an explicit choice, this follows ``minimize_on_close``:
+    with both "Start after login" and "Hide on close" enabled, AutoTuner starts
+    in the notification area. Manual launches are never affected.
+    """
+    value = _read_settings_shared().get("start_minimized_at_login")
+    if isinstance(value, bool):
+        return value
+    return get_minimize_on_close()
+
+
+def set_start_minimized_at_login(enabled: bool) -> None:
+    """Persist the explicit login-start window preference."""
+    _update("start_minimized_at_login", bool(enabled))
 
 
 def get_debug_mode() -> bool:

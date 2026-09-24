@@ -1,0 +1,55 @@
+display_name: "Ling 3.0 Flash VL (InclusionAI, BailingMoE3 vision)"
+patterns:
+  - ling-3.0-flash-vl
+  - ling3.0-flash-vl
+  - ling-3-flash-vl
+  - ling3-flash-vl
+  - ling-3.0-vl
+
+# llama.cpp b11156 (PR #29151) adds the ling3vl projector and M-RoPE for
+# bailingmoe3. The longer filename patterns win over ling-3.yaml; renamed
+# files are caught by the rope.dimension_sections gate in tuner.py, because
+# older builds load the text weights with plain rope and answer incorrectly.
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: throughput
+min_llama_build: 11156
+
+# generation_config.json and the deployment examples: 1.0 / 0.95 / top_k 20.
+# The model card's evaluation default (0.6) is kept for the coding mode.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+draft_max: 3
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  InclusionAI Ling-3.0-flash-VL is the vision-language variant of Ling 3.0
+  Flash: the same 124B-A5.5B bailingmoe3 hybrid KDA/MLA MoE backbone plus a
+  27-block vision tower and projector for images and video. Pair it with its
+  own mmproj file. llama.cpp b11156 (PR #29151) is required: it adds the
+  ling3vl projector and M-RoPE; older builds load the text weights with plain
+  rope and answer incorrectly, so AutoTuner refuses them. Thinking is on by
+  default. Chat uses the generation config (temp 1.0 / top_p 0.95 / top_k 20),
+  coding the model card's evaluation default of temp 0.6. The native window is
+  131k; the 256k ceiling needs YaRN and is clamped to the GGUF metadata.
+  Video input via the OpenAI video_url field needs b11136+ and is covered by
+  b11156. Not tested locally (no weights installed).

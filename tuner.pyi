@@ -93,8 +93,11 @@ def check_profile_build(
 def check_model_build(
     model: ModelEntry, binary: str
 ) -> Tuple[bool, str, Optional[int]]: ...
+def is_gemma_backbone_dflash(draft_model: Optional[ModelEntry]) -> bool: ...
 def check_draft_model_build(
-    draft_model: Optional[ModelEntry], binary: str
+    draft_model: Optional[ModelEntry],
+    binary: str,
+    target: Optional[ModelEntry] = ...,
 ) -> Tuple[bool, str, Optional[int]]: ...
 def resolve_draft_n_max(
     profile: ModelProfile,

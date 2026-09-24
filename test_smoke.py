@@ -2986,6 +2986,7 @@ def test_settings_widgets_have_two_level_hover_help(tmp_path, monkeypatch) -> No
     widgets.extend(
         [
             app_dialog.autostart_checkbox,
+            app_dialog.start_minimized_checkbox,
             app_dialog.minimize_checkbox,
             app_dialog.theme_combo,
             app_dialog.reload_themes_button,
@@ -8814,7 +8815,10 @@ def test_linux_autostart_desktop_round_trip(tmp_path, monkeypatch) -> None:
     assert startup_manager.is_autostart_enabled() is False
     startup_manager.set_autostart_enabled(True)
     text = desktop.read_text(encoding="utf-8")
-    assert 'Exec="/opt/Auto Tuner/python3" "/opt/Auto Tuner/qt_launcher.py"' in text
+    assert (
+        'Exec="/opt/Auto Tuner/python3" "/opt/Auto Tuner/qt_launcher.py" "--autostart"'
+        in text
+    )
     assert startup_manager.is_autostart_enabled() is True
     startup_manager.set_autostart_enabled(False)
     assert desktop.exists() is False
@@ -8860,7 +8864,7 @@ def test_windows_autostart_registry_round_trip(monkeypatch) -> None:
 
     assert startup_manager.is_autostart_enabled() is False
     startup_manager.set_autostart_enabled(True)
-    assert values["AutoTuner"] == subprocess.list2cmdline(args)
+    assert values["AutoTuner"] == subprocess.list2cmdline([*args, "--autostart"])
     assert startup_manager.is_autostart_enabled() is True
     startup_manager.set_autostart_enabled(False)
     assert startup_manager.is_autostart_enabled() is False
@@ -8884,7 +8888,7 @@ def test_macos_autostart_launch_agent_round_trip(tmp_path, monkeypatch) -> None:
     with launch_agent.open("rb") as fh:
         payload = plistlib.load(fh)
     assert payload["Label"] == "com.dawasteh.autotuner"
-    assert payload["ProgramArguments"] == args
+    assert payload["ProgramArguments"] == [*args, "--autostart"]
     assert payload["RunAtLoad"] is True
     startup_manager.set_autostart_enabled(False)
     assert launch_agent.exists() is False

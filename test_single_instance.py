@@ -353,7 +353,14 @@ def _find_main_window(pids: set[int]):
 class _GuiProcess:
     """One real ``qt_launcher.py`` process with an isolated data folder."""
 
-    def __init__(self, data_dir: Path, *, hide_on_close: bool) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        hide_on_close: bool,
+        extra_args: tuple = (),
+        settings: dict | None = None,
+    ) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         models = data_dir / "models"
         models.mkdir(exist_ok=True)
@@ -363,6 +370,7 @@ class _GuiProcess:
                     "minimize_on_close": hide_on_close,
                     "control_api_enabled": False,
                     "models_path": str(models),
+                    **(settings or {}),
                 }
             ),
             encoding="utf-8",
@@ -377,7 +385,7 @@ class _GuiProcess:
         # scenarios against the frozen build instead of the source launcher.
         binary = os.environ.get("AUTOTUNER_GUI_PROCESS_BINARY", "").strip()
         if binary:
-            command = [binary, "--models-path", str(models)]
+            command = [binary, "--models-path", str(models), *extra_args]
         else:
             command = [
                 sys.executable,
@@ -386,6 +394,7 @@ class _GuiProcess:
                 str(ROOT / "qt_launcher.py"),
                 "--models-path",
                 str(models),
+                *extra_args,
             ]
         self.proc = subprocess.Popen(
             command,
@@ -489,3 +498,45 @@ def test_second_launch_restores_a_tray_hidden_instance_and_exits(tmp_path) -> No
         assert first.proc.poll() is None
     finally:
         first.kill()
+
+
+def _is_minimized(hwnd) -> bool:
+    import ctypes
+
+    return bool(ctypes.windll.user32.IsIconic(hwnd))
+
+
+@pytestmark_process
+def test_login_start_waits_in_tray_until_a_second_launch(tmp_path) -> None:
+    data_dir = tmp_path / "login-tray"
+    first = _GuiProcess(data_dir, hide_on_close=True, extra_args=("--autostart",))
+    try:
+        time.sleep(8)  # startup work runs; no window may appear meanwhile
+        assert first.proc.poll() is None, first.output()
+        assert _find_main_window(_process_tree(first.proc.pid)) is None
+
+        second = _GuiProcess(data_dir, hide_on_close=True)
+        try:
+            assert second.wait_exit(30) == 0, "second launch did not exit"
+        finally:
+            second.kill()
+        hwnd = first.wait_for_window(15)
+        assert first.window_visible(hwnd) and not _is_minimized(hwnd)
+    finally:
+        first.kill()
+
+
+@pytestmark_process
+def test_login_start_without_hide_on_close_is_minimized(tmp_path) -> None:
+    gui = _GuiProcess(
+        tmp_path / "login-min",
+        hide_on_close=False,
+        extra_args=("--autostart",),
+        settings={"start_minimized_at_login": True},
+    )
+    try:
+        hwnd = gui.wait_for_window()
+        time.sleep(1)
+        assert _is_minimized(hwnd), "login start should be minimized"
+    finally:
+        gui.kill()

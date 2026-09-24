@@ -498,6 +498,14 @@ _MIN_DSPARK_BUILD = 10164
 # compatible legacy fallbacks for users who deliberately keep an older fork.
 _DFLASH2_PR_COMMITS = ("5ecbe1ac", "1deefcca")
 _MIN_MAINLINE_DFLASH2_BUILD = 10658
+# b11132 (PR #29226) taught the shared dflash graph Gemma 4 backbones: GELU,
+# embedding scale, post norms, layer output scale and shared K/V. Older
+# builds reject those DSpark/DFlash sidecars (missing attn_v, extra tensors).
+_MIN_GEMMA_DFLASH_BUILD = 11132
+# b11156 (PR #29151) reads bailingmoe3 M-RoPE sections (Ling-3.0-flash-VL).
+# Older builds still load such a GGUF, but with plain NORM rope, so text and
+# image positions are silently wrong; refuse them instead.
+_MIN_LING3_VL_BUILD = 11156
 # b10741 hoisted NextN metadata before per-layer array loading, but the matching
 # array-length and all-NextN fixes did not land until b10749. Builds in between
 # abort on Qwen MTP graphs and Gemma 4 assistant heads (PRs #28173/#28183).
@@ -720,7 +728,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     if arch == "xing4_0":
         return (
             "Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp "
-            "b11105 and no validated AutoTuner runtime. Do not substitute the "
+            "b11160 and no validated AutoTuner runtime. Do not substitute the "
             "DeepSeek or Qwen architecture."
         )
     if any(
@@ -745,7 +753,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11105 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11160 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -817,7 +825,7 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11105 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11160 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -928,6 +936,26 @@ def _rocmfpx_block_reason(model: ModelEntry, binary: str) -> str:
     )
 
 
+def _ling3_vl_mrope_block_reason(model: ModelEntry, binary: str) -> str:
+    """Refuse M-RoPE BailingMoE3 (Ling-3.0-flash-VL) GGUFs before b11156."""
+    metadata = model.metadata or {}
+    if str(metadata.get("general.architecture", "")).strip() != "bailingmoe3":
+        return ""
+    sections = metadata.get("bailingmoe3.rope.dimension_sections")
+    if not isinstance(sections, (list, tuple)) or not any(
+        isinstance(v, (int, float)) and v > 0 for v in sections
+    ):
+        return ""
+    detected = probe_binary_build_number(binary)
+    if detected is None or detected >= _MIN_LING3_VL_BUILD:
+        return ""
+    return (
+        f"{model.name} is a Ling-3.0-flash-VL (M-RoPE bailingmoe3) GGUF. "
+        f"llama.cpp b{detected} would load it with plain rope and produce "
+        f"wrong output; use b{_MIN_LING3_VL_BUILD}+ (PR #29151)."
+    )
+
+
 def check_model_build(
     model: ModelEntry, binary: str
 ) -> Tuple[bool, str, Optional[int]]:
@@ -952,6 +980,9 @@ def check_model_build(
     rocmfpx_block = _rocmfpx_block_reason(model, binary)
     if rocmfpx_block:
         return False, rocmfpx_block, None
+    ling3_vl_block = _ling3_vl_mrope_block_reason(model, binary)
+    if ling3_vl_block:
+        return False, ling3_vl_block, None
     if not model.has_embedded_mtp:
         return True, "", None
 
@@ -1138,6 +1169,19 @@ def mtp_sidecar_missing_root_tensors(
     return sorted(required - draft_roots)
 
 
+def is_gemma_backbone_dflash(draft_model: Optional[ModelEntry]) -> bool:
+    """True for a DFlash/DSpark sidecar converted from a Gemma 4 backbone."""
+    if draft_model is None:
+        return False
+    metadata = draft_model.metadata or {}
+    if str(metadata.get("general.architecture", "")).strip().lower() != "dflash":
+        return False
+    act = str(metadata.get("dflash.hidden_activation", "") or "").strip().lower()
+    return act in {"gelu", "gelu_pytorch_tanh"} or bool(
+        metadata.get("dflash.embedding_scale")
+    )
+
+
 def check_draft_model_build(
     draft_model: Optional[ModelEntry],
     binary: str,
@@ -1185,6 +1229,19 @@ def check_draft_model_build(
                 "contain the upstream NextN loader regression from PR #28159. "
                 f"Use b{_FIXED_NEXTN_BUILD}+ or b{_BROKEN_NEXTN_BUILD_START - 1} "
                 "and earlier.",
+                detected,
+            )
+
+    if is_gemma_backbone_dflash(draft_model):
+        detected = probe_binary_build_number(binary)
+        if detected is not None and detected < _MIN_GEMMA_DFLASH_BUILD:
+            return (
+                False,
+                f"The Gemma 4 {draft_model.drafter_spec_type or 'DFlash'} draft "
+                f"{draft_model.path.name} needs llama.cpp "
+                f"b{_MIN_GEMMA_DFLASH_BUILD}+ (PR #29226); b{detected} only "
+                "builds Qwen-style DFlash/DSpark graphs. Update llama.cpp or "
+                "use the Gemma MTP assistant / n-gram speculation instead.",
                 detected,
             )
 
@@ -1253,7 +1310,7 @@ def _memlock_limit_gb() -> Optional[float]:
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
 #: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977, b11030,
-#: b11042, b11063 and b11105 (HIP and Vulkan; upstream issue #27408);
+#: b11042, b11063, b11105 and b11160 (HIP and Vulkan; upstream issue #27408);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
@@ -5750,7 +5807,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b11105) image "
+                "with DFlash2: since b10896 (verified through b11160) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."
