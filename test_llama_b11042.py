@@ -13,7 +13,9 @@ from test_kv_policy import _model
 from test_smoke import _fake_model_md, _fake_system
 
 ROOT = Path(__file__).resolve().parent
-PRISM_PIN = "5d80cff0b8cb9f2bf823cfc4e71e3abb97f290d6"
+# v5.5.7 moved the recipe pin to prism-b10743 (Vulkan PQ2_0 path); the
+# profile floor stays at b10687, the first fork build with both packings.
+PRISM_PIN = "adfffbe41b2cabcd51fff326ab045662265062bb"
 
 
 def _manifest(tag: str) -> dict:
@@ -239,7 +241,7 @@ def test_bonsai2_command_uses_the_fork_the_projector_and_the_thinking_sampling(
     assert "-md" not in cmd
 
 
-def test_ternary_bonsai_recipes_pin_prism_b10687_with_the_fork_build_number():
+def test_ternary_bonsai_recipes_pin_the_prism_fork_with_its_build_number():
     build_dir = ROOT / "building llama.cpp"
     for name in (
         "ternary_bonsai_vulkan_llama_build.ps1",
@@ -249,18 +251,18 @@ def test_ternary_bonsai_recipes_pin_prism_b10687_with_the_fork_build_number():
         assert f'-ExpectedCommit "{PRISM_PIN}"' in text, name
         # The mainline merge-base count (b10616) would collide with the old
         # tree; the folder carries the fork's own `--version` build number.
-        assert '-FixedIdentity "b10687"' in text, name
-        assert "prism-b10687-5d80cff" in text, name
+        assert '-FixedIdentity "b10743"' in text, name
+        assert "prism-b10743-adfffbe" in text, name
         assert 'FolderPrefix "2b_"' in text, name
 
 
 # ------------------------------------------------------------- carry-over ----
 
 
-def test_v41_block_and_vision_gate_now_name_b11160():
+def test_v41_block_and_vision_gate_now_name_b11195():
     # b11030..b11042 does not touch the server, the speculative helpers or
     # the recurrent memory; the image + DFlash2 request and the V4.1 block
-    # were re-run on b11160 (v5.5.6) and now carry that wording.
+    # were re-run on b11195 (v5.5.7) and now carry that wording.
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11160" in profile.runtime_block_reason
+    assert "b11195" in profile.runtime_block_reason
     assert tuner.QWEN35_VISION_DFLASH2_BROKEN_SINCE == 10896

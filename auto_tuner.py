@@ -1033,6 +1033,32 @@ def _fork_name_sort_key(name: str, preferred_backend: Optional[str] = None) -> t
     return (_fork_family(lower), backendless, backend_rank, lower)
 
 
+_FORK_BUILD_NUMBER_RE = re.compile(r"(?:^|_)b(\d+)(?=_|$)", re.IGNORECASE)
+_FORK_SEMVER_RE = re.compile(r"(?:^|_)v?(\d+)\.(\d+)\.(\d+)(?=_|$)", re.IGNORECASE)
+
+
+def _fork_newest_first_key(name: str, preferred_backend: Optional[str] = None) -> tuple:
+    """Choose among builds of one fork family: backend first, then newest.
+
+    The recipes never delete an older pinned tree, so e.g.
+    '2b_b10687_vulkan_llama.cpp' and '2b_b10743_vulkan_llama.cpp' coexist. A
+    backend-neutral profile hint must land on the newest build, not on the
+    lexicographically first one; the display order keeps _fork_name_sort_key.
+    """
+    family, _backendless, backend_rank, lower = _fork_name_sort_key(
+        name, preferred_backend=preferred_backend
+    )
+    build = _FORK_BUILD_NUMBER_RE.search(lower)
+    semver = _FORK_SEMVER_RE.search(lower)
+    if build:
+        version: tuple = (0, -int(build.group(1)))
+    elif semver:
+        version = (1, *(-int(part) for part in semver.groups()))
+    else:
+        version = (2,)
+    return (family, backend_rank, version, lower)
+
+
 def _resolve_server_binary(user_value: str) -> str:
     """Turn a user-provided server name/path into something runnable."""
     p = Path(user_value).expanduser()
@@ -1051,12 +1077,27 @@ def _resolve_server_binary(user_value: str) -> str:
         if inner is not None and fork_name:
             roots = _candidate_search_roots()
             requested_backend = _fork_backend(fork_name)
-            if requested_backend:
-                roots.sort(
-                    key=lambda root: _fork_name_sort_key(
-                        root.name, preferred_backend=requested_backend
-                    )
+            # An explicitly selected fork (LLAMA_CPP_DIR) keeps priority. Among
+            # the other builds of the family the selected backend, then the
+            # newest build wins (older pinned trees are never deleted).
+            selected: Optional[Path] = None
+            env_dir = os.environ.get("LLAMA_CPP_DIR")
+            if env_dir:
+                try:
+                    selected = Path(env_dir).expanduser().resolve()
+                except (OSError, RuntimeError):
+                    selected = None
+            preferred_backend = requested_backend or (
+                _fork_backend(selected.name) if selected is not None else None
+            )
+            roots.sort(
+                key=lambda root: (
+                    root != selected,
+                    _fork_newest_first_key(
+                        root.name, preferred_backend=preferred_backend
+                    ),
                 )
+            )
             for root in roots:
                 root_base = root.name.lower()
                 root_backend = _fork_backend(root_base)
@@ -1969,7 +2010,7 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
                     ]
                     selected_backend = _fork_backend(selected_name)
                     matching.sort(
-                        key=lambda item: _fork_name_sort_key(
+                        key=lambda item: _fork_newest_first_key(
                             item[0], preferred_backend=selected_backend
                         )
                     )

@@ -502,6 +502,10 @@ _MIN_MAINLINE_DFLASH2_BUILD = 10658
 # embedding scale, post norms, layer output scale and shared K/V. Older
 # builds reject those DSpark/DFlash sidecars (missing attn_v, extra tensors).
 _MIN_GEMMA_DFLASH_BUILD = 11132
+# b11195 (PR #29294) lets the mimo2 loader accept an MTP-only GGUF, the file
+# the converter's new ``--mtp`` export writes for MiMo-V2. Older builds
+# require every trunk block in each mimo2 file and abort on such a head.
+_MIN_MIMO2_MTP_SIDECAR_BUILD = 11195
 # b11156 (PR #29151) reads bailingmoe3 M-RoPE sections (Ling-3.0-flash-VL).
 # Older builds still load such a GGUF, but with plain NORM rope, so text and
 # image positions are silently wrong; refuse them instead.
@@ -728,7 +732,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     if arch == "xing4_0":
         return (
             "Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp "
-            "b11160 and no validated AutoTuner runtime. Do not substitute the "
+            "b11195 and no validated AutoTuner runtime. Do not substitute the "
             "DeepSeek or Qwen architecture."
         )
     if any(
@@ -753,7 +757,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11160 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11195 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -825,7 +829,7 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11160 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11195 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -1182,6 +1186,17 @@ def is_gemma_backbone_dflash(draft_model: Optional[ModelEntry]) -> bool:
     )
 
 
+def is_mimo2_mtp_sidecar(draft_model: Optional[ModelEntry]) -> bool:
+    """True for a separate MiMo-V2 NextN/MTP head used as ``-md`` draft."""
+    if draft_model is None:
+        return False
+    arch = str(draft_model.architecture or "").strip().lower()
+    if arch != "mimo2" or not _is_mtp_style_sidecar(draft_model):
+        return False
+    # A stale nextn key over a scan-proven trunk-only file is no MTP head.
+    return (draft_model.metadata or {}).get("__mtp_scan__") != "absent"
+
+
 def check_draft_model_build(
     draft_model: Optional[ModelEntry],
     binary: str,
@@ -1242,6 +1257,19 @@ def check_draft_model_build(
                 f"b{_MIN_GEMMA_DFLASH_BUILD}+ (PR #29226); b{detected} only "
                 "builds Qwen-style DFlash/DSpark graphs. Update llama.cpp or "
                 "use the Gemma MTP assistant / n-gram speculation instead.",
+                detected,
+            )
+
+    if is_mimo2_mtp_sidecar(draft_model):
+        detected = probe_binary_build_number(binary)
+        if detected is not None and detected < _MIN_MIMO2_MTP_SIDECAR_BUILD:
+            return (
+                False,
+                f"The MiMo-V2 MTP head {draft_model.path.name} needs llama.cpp "
+                f"b{_MIN_MIMO2_MTP_SIDECAR_BUILD}+ (PR #29294); b{detected} "
+                "requires the full trunk in every mimo2 file and aborts on an "
+                "MTP-only head. Update llama.cpp or use n-gram speculation "
+                "instead.",
                 detected,
             )
 
@@ -1310,7 +1338,8 @@ def _memlock_limit_gb() -> Optional[float]:
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
 #: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977, b11030,
-#: b11042, b11063, b11105 and b11160 (HIP and Vulkan; upstream issue #27408);
+#: b11042, b11063, b11105, b11160 and b11195 (HIP and Vulkan; upstream
+#: issue #27408);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
@@ -5807,7 +5836,7 @@ def build_command(
             # drafters; older builds keep the pre-#28587 behaviour.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b11160) image "
+                "with DFlash2: since b10896 (verified through b11195) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
                 "for text-only DFlash2."

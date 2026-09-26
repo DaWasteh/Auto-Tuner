@@ -32,6 +32,8 @@ extra_args:
   - --jinja
 # Only an actually present GGUF NextN head enables draft-mtp. Do not derive
 # the draft length from the model card's separate five-layer DFlash decoder.
+# A separate MTP-only mimo2 head (converter --mtp export, b11195+) loads only
+# on b11195+ (PR #29294); tuner.check_draft_model_build refuses older builds.
 draft_max: 3
 ngram_method: ngram-map-k4v
 notes: >
@@ -43,5 +45,7 @@ notes: >
   it is not a promise that 1M fits locally. Text and vision use llama-server
   plus the matching mmproj; the audio decoder is excluded by the converter,
   so this is not a speech-output profile. MTP depends on actual GGUF head
-  tensors, not the model card alone. No local V2.6 weights were available
-  for this audit; profile, build gate and KV planning have unit coverage.
+  tensors, not the model card alone. A separate MTP head from the
+  converter's --mtp export (b11195+) needs llama.cpp b11195+ (PR #29294).
+  No local V2.6 weights were available for this audit; profile, build gate
+  and KV planning have unit coverage.

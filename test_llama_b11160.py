@@ -124,18 +124,19 @@ def test_qwen_style_dflash_and_dspark_keep_old_floor(tmp_path, monkeypatch):
         assert tuner.check_draft_model_build(draft, "llama-server")[0]
 
 
-def test_v41_xing_and_vision_gates_name_b11160(tmp_path, monkeypatch):
+def test_v41_xing_and_vision_gates_name_b11195(tmp_path, monkeypatch):
+    # Re-checked on b11195 (v5.5.7): the wording moved on with the audit.
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11160" in profile.runtime_block_reason
+    assert "b11195" in profile.runtime_block_reason
     xing = _fake_model_md(tmp_path, "xing", 19, {"general.architecture": "xing4_0"})
-    assert "b11160" in tuner._model_runtime_block_reason(xing)
+    assert "b11195" in tuner._model_runtime_block_reason(xing)
     for pack in sorted((ROOT / "assets/languages").glob("*.json")):
         text = pack.read_text(encoding="utf-8")
-        assert text.count("b11160") >= 2 and "b11105" not in text, pack.name
+        assert text.count("b11195") >= 2 and "b11160" not in text, pack.name
         notes = json.loads(text)["profile_notes"]
         assert "b11156" in notes["ling-3_0-vl.yaml"], pack.name
     model, draft, profile, config = _qwen_vision_dflash2(tmp_path)
     monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _: 11160)
-    with pytest.raises(ValueError, match="since b10896 .verified through b11160"):
+    with pytest.raises(ValueError, match="since b10896 .verified through b11195"):
         tuner.build_command(model, config, profile, draft_model=draft)
     assert tuner.QWEN35_VISION_DFLASH2_BROKEN_SINCE == 10896

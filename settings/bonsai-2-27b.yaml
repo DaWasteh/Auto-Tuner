@@ -19,12 +19,14 @@ recommended_kv_quant: q8_0
 # und die Hadamard-Aktivierungstransformation (prism.hadamard.*) gibt es nur
 # im PrismML-Fork (Branch prism). Mainline llama.cpp (b11063) lehnt beide
 # Dateien als unbekannten Tensortyp ab. AutoTuner findet beide versionierten
-# Fork-Bäume, z.B. 2b_b10687_vulkan_llama.cpp und 2b_b10687_hip_llama.cpp.
+# Fork-Bäume, z.B. 2b_b10743_vulkan_llama.cpp und 2b_b10743_hip_llama.cpp.
 server_binary: "2b_llama/llama-server"
 
-# PTQ1_0 kam erst nach dem alten Pin (prism-b10660) in den Fork; der
-# Rezept-Pin prism-b10687-5d80cff ist der erste geprüfte Stand mit beiden
-# Packungen. Die Fork-Binärdateien melden ihre eigene Build-Nummer.
+# PTQ1_0 kam erst nach dem alten Pin (prism-b10660) in den Fork;
+# prism-b10687-5d80cff ist der erste geprüfte Stand mit beiden Packungen und
+# bleibt die Untergrenze. Der Rezept-Pin steht seit v5.5.7 auf
+# prism-b10743-adfffbe (Vulkan-PQ2_0-Pfad, schnellere HIP-/Vulkan-Kernel).
+# Die Fork-Binärdateien melden ihre eigene Build-Nummer.
 min_llama_build: 10687
 
 # Kein required_runtime_markers-Eintrag: match_profile würde ein Marker-
@@ -67,6 +69,7 @@ notes: >
   bpw, 7.21 GB). Both are Prism-private ggml types (143 / 142) with a
   Hadamard activation transform: they need the PrismML prism fork built by
   the Ternary/Bonsai recipes (2b_ builds, prism-b10687 or newer); mainline
-  llama.cpp rejects them as unknown tensor types. On this fork the Vulkan
-  backend has PTQ1_0 kernels but no PQ2_0 path, HIP/CUDA run both. Official
+  llama.cpp rejects them as unknown tensor types. The recipes pin
+  prism-b10743, whose Vulkan backend runs both packings on the GPU
+  (prism-b10687 had no Vulkan PQ2_0 path); HIP/CUDA run both. Official
   thinking-mode sampling (temperature 1.0, top-p 0.95, top-k 20).

@@ -194,7 +194,7 @@ def test_muse_parser_note_and_existing_loader_contract():
 def test_vision_dflash2_gate_reverified_b11105(tmp_path, monkeypatch):
     model, draft, profile, config = _qwen_vision_dflash2(tmp_path)
     monkeypatch.setattr(tuner, "_probe_binary_build_number", lambda _: 11105)
-    with pytest.raises(ValueError, match="verified through b11160"):
+    with pytest.raises(ValueError, match="verified through b11195"):
         tuner.build_command(model, config, profile, draft_model=draft)
 
 

@@ -788,7 +788,7 @@ L:\LAB\
     ├── llama.cpp\      ← standard build
     ├── tq_llama.cpp\   ← Turbo-Quant build
     ├── ik_llama.cpp\   ← Gemma 4 external drafter (fork still needed)
-    └── 2b_b10687_vulkan_llama.cpp\   ← PrismML prism fork (Ternary-Bonsai, Ternary-Bonsai 2)
+    └── 2b_b10743_vulkan_llama.cpp\   ← PrismML prism fork (Ternary-Bonsai, Ternary-Bonsai 2)
 I:\
 └── models\             ← your models
 ```
@@ -937,9 +937,9 @@ matches. See `settings/_default.yaml`.
 | `granite-4_2.yaml` | IBM Granite 4.2 3B/8B/30B dense reasoning + tools | `granite` (filename-gated) |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
 | `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls | `muse-glimmer` |
-| `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+ | `mimo2` (filename-gated; no local weights tested) |
+| `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+; separate `--mtp` heads b11195+ | `mimo2` (filename-gated; no local weights tested) |
 | `fastcontext-1_0-4b.yaml` | Microsoft FastContext 1.0 4B SFT/RL repository explorer, 262k, GGUF sampling defaults | `qwen3` (filename-gated) |
-| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11160 loader** | `xing4_0` |
+| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11195 loader** | `xing4_0` |
 | `voxcpm2.yaml` | VoxCPM2 BaseLM: **Voice Lab TTS component, ordinary chat launch blocked** | `minicpm4` (filename-gated, not an architecture-wide block) |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
@@ -953,7 +953,7 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11160 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11195 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
 | `ling-3_0-vl.yaml` | Ling-3.0-flash-VL image/video model (ling3vl projector + M-RoPE), b11156+; older builds refused by metadata gate | `bailingmoe3` with `rope.dimension_sections` (filename-gated; no local weights tested) |
@@ -961,6 +961,12 @@ matches. See `settings/_default.yaml`.
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.5.7:** MiMo-V2 can now be exported as trunk plus a separate MTP head
+  (converter `--mtp` / `--no-nextn`, PR #29294); such an MTP-only head loads
+  only on b11195+, so older builds refuse it as a draft before launch. The
+  Ternary-Bonsai 2 note names the new fork pin prism-b10743, whose Vulkan
+  backend runs PQ2_0 on the GPU. [Audit](docs/llama-b11195-audit.md).
 
 - **v5.5.6:** Ling-3.0-flash-VL gets its own profile because the text
   profile's `ling-3.0-flash` pattern would otherwise have claimed it; its
@@ -1018,9 +1024,9 @@ Notes on the new profiles:
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
   block named b10930; the **v5.4.8** b10948, **v5.5.0** b10977 and
-  **v5.5.1** b11030, **v5.5.4** b11063, **v5.5.5** b11105 and **v5.5.6**
-  b11160 re-checks found it still open (not merged, updated 2026-09-22); the
-  block now names b11160. Conversion alone still does not provide an
+  **v5.5.1** b11030, **v5.5.4** b11063, **v5.5.5** b11105, **v5.5.6** b11160
+  and **v5.5.7** b11195 re-checks found it still open (not merged, updated
+  2026-09-22); the block now names b11195. Conversion alone still does not provide an
   inference runtime.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
@@ -1160,7 +1166,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`llama_stable_vulkan_build.ps1`](building%20llama.cpp/llama_stable_vulkan_build.ps1) / [`llama_stable_hip_build.ps1`](building%20llama.cpp/llama_stable_hip_build.ps1) | Stable `X.Y.Z` siblings: `X.Y.Z_vulkan_llama.cpp` and `X.Y.Z_hip_llama.cpp`. |
 | [`llama_prerelease_vulkan_build.ps1`](building%20llama.cpp/llama_prerelease_vulkan_build.ps1) / [`llama_prerelease_hip_build.ps1`](building%20llama.cpp/llama_prerelease_hip_build.ps1) | Latest exact `bNNNN` siblings, or truthful `bNNNN_dev_COMMIT_{backend}_llama.cpp` folders with `-Tag master`. |
 | [`turboquant_vulkan_llama_build.ps1`](building%20llama.cpp/turboquant_vulkan_llama_build.ps1) / [`turboquant_hip_llama_build.ps1`](building%20llama.cpp/turboquant_hip_llama_build.ps1) | Pinned TurboQuant KV-cache fork (`tq_bNNNN_{backend}_llama.cpp`). |
-| [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork, release tag `prism-b10687-5d80cff` (2026-09-17, first pin with the Bonsai 2 `PTQ1_0` + `PQ2_0` kernels); the folder carries the fork's own build number: `2b_b10687_{backend}_llama.cpp`. |
+| [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork, release tag `prism-b10743-adfffbe` (2026-09-25; Bonsai 2 `PTQ1_0` + `PQ2_0` on Vulkan and HIP, first pin with a Vulkan `PQ2_0` path; prism-b10687 remains the profile floor); the folder carries the fork's own build number: `2b_b10743_{backend}_llama.cpp`. Older trees stay installed; AutoTuner picks the newest build of a fork family unless you select one explicitly. |
 | [`rocmfpx_vulkan_llama_build.ps1`](building%20llama.cpp/rocmfpx_vulkan_llama_build.ps1) / [`rocmfpx_hip_llama_build.ps1`](building%20llama.cpp/rocmfpx_hip_llama_build.ps1) | Pinned ROCmFPX fork (`ROCmFPX/ROCmFPX`, main commit `aed0d5fd9`, 2026-09-06; mainline base b10766), the only runtime for ROCmFP4 / ROCmFPX weights (ggml types 100–111, e.g. kingjones777's Agnes-3.0-Flash `MTP-ROCmFP4` GGUFs); regular Vulkan dequant shaders plus RDNA3+ HIP MMQ kernels, gfx1201. Both recipes apply `patches/rocmfpx-rdna4-mmq-fallback.patch` (the fork wires its ROCmFPX MMQ fallback table only into the RDNA3 selector; on gfx1201 every ROCmFP4 prompt batch otherwise aborts with `J_best=0`). The folder carries the fork's own build number: `fpx_b11544_{backend}_llama.cpp`. |
 | [`diffusion_vulkan_llama_build.ps1`](building%20llama.cpp/diffusion_vulkan_llama_build.ps1) / [`diffusion_hip_llama_build.ps1`](building%20llama.cpp/diffusion_hip_llama_build.ps1) | Pinned DiffusionGemma PR #24427 pair; HIP avoids Vulkan's ~1 GiB single-allocation limit. |
 | [`ocr_vulkan_llama_build.ps1`](building%20llama.cpp/ocr_vulkan_llama_build.ps1) / [`ocr_hip_llama_build.ps1`](building%20llama.cpp/ocr_hip_llama_build.ps1) | Reviewed legacy DeepSeek-OCR PR #17400 pair; both build server + MTMD CLI. |
@@ -1194,7 +1200,9 @@ unchanged recipes, and the stable recipes resolve `latest` to **v0.5.0**
 (= b11146); both stable recipes built and verified v0.5.0 unchanged. The new
 RDNA3/RDNA4 int8 cooperative-matrix MMQ path (PR #27952)
 is compiled in through the existing `GL_KHR_cooperative_matrix` detection and
-enabled automatically on both gfx1201 cards.
+enabled automatically on both gfx1201 cards. b11160…b11195 adds no CMake
+option either (only the ggml 0.25.3 bump and the tiled CPU matmul sources);
+the user-built b11195 trees carry exactly the b11160 option set.
 MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
 benign: `src/models/llama.cpp` is folded into a unity source and only one
 `llama.obj` is produced.
@@ -1229,9 +1237,19 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11160)
+## Server features (audited through llama.cpp b11195)
 
-The **b11160** (`70c4e1582`, `0.5.0-dev`) [audit](docs/llama-b11160-audit.md)
+The **b11195** (`d834d44e6`, `0.5.0-dev`) [audit](docs/llama-b11195-audit.md)
+covers 35 commits after b11160. Option set **and** `--help` text are
+unchanged (415 names / 328 long options). New for AutoTuner: separate
+**MiMo-V2 MTP heads** need b11195+ (PR #29294) and are refused as drafts on
+older builds. The new **tiled CPU matmul** (PR #27851) is on by default and
+has no server option; on this AVX2 CPU it is slower than b11160 for CPU-only
+IQ4_XS prompt processing (−14…−27 %), while hybrid GPU plans are unaffected.
+The Qwen vision/DFlash2, DeepSeek-V4.1, Xing, Prism and ROCmFPX safeguards
+remain. See [validation](docs/v5.5.7-validation.md).
+
+The previous **b11160** (`70c4e1582`, `0.5.0-dev`) [audit](docs/llama-b11160-audit.md)
 covers 55 commits after b11105. The option set **and** the `--help` text are
 unchanged (415 names / 328 long options); only `--version` reports the 0.5.0
 bump, which AutoTuner does not parse. New: **Ling-3.0-flash-VL** (b11156+,
@@ -1391,6 +1409,28 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.7 — llama.cpp b11195 audit, faster Ternary-Bonsai fork, newest fork wins
+
+- **35 upstream commits audited (b11160 → b11195):** identical flags and
+  help text on both backends; stable is still v0.5.0. The mainline build
+  recipes stay unchanged and optimal for the 285K + 2× gfx1201 system.
+- **MiMo-V2 MTP heads:** the converter can now write a separate MTP head
+  for MiMo-V2 (PR #29294); such a head needs b11195+, and AutoTuner refuses it
+  on older builds instead of letting llama-server abort.
+- **Ternary-Bonsai 2 fork pin → prism-b10743:** Vulkan now runs PQ2_0 on
+  the GPU (57.6 instead of 3.0 tok/s through AutoTuner's plan) and PTQ1_0
+  decodes 5.7× faster; on HIP PTQ1_0 decode +76 % and PQ2_0 prompt +37 %
+  (R9700, `llama-bench`). Includes the fix for the PQ2_0 CPU-repack crash
+  (Prism #180).
+- **Fix:** with an older and a newer pinned fork installed side by side,
+  AutoTuner picked the oldest tree for a profile such as Ternary-Bonsai 2.
+  It now takes the newest build (active backend first); an explicit fork
+  choice still wins.
+- **Measured:** the new tiled CPU matmul (PR #27851) is slower for
+  CPU-only IQ4_XS prompt processing on this AVX2 CPU; GPU and hybrid plans
+  are unaffected. Old blockers rechecked (all still open); wording names b11195.
+- [Audit](docs/llama-b11195-audit.md) · [Validation](docs/v5.5.7-validation.md).
 
 ### v5.5.6 — llama.cpp b11160 audit, start minimized at login, Ling-3.0-flash-VL
 

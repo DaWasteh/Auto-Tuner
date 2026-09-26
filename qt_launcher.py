@@ -10549,7 +10549,7 @@ class MainWindow(QMainWindow):
         if not profile.server_binary:
             return
 
-        from auto_tuner import _fork_backend, _fork_family, _fork_name_sort_key
+        from auto_tuner import _fork_backend, _fork_family, _fork_newest_first_key
 
         first = Path(profile.server_binary).parts[0]
         if not first.endswith(".cpp"):
@@ -10588,8 +10588,10 @@ class MainWindow(QMainWindow):
             return
 
         preferred_backend = required_backend or current_backend
+        # Older pinned trees stay installed next to a new pin: prefer the
+        # active backend, then the newest build of the required family.
         matching.sort(
-            key=lambda index: _fork_name_sort_key(
+            key=lambda index: _fork_newest_first_key(
                 self._fork_combo.itemText(index),
                 preferred_backend=preferred_backend,
             )
