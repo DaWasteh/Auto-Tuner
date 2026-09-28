@@ -6,8 +6,9 @@ import platform
 import os
 import shutil
 import subprocess
-from functools import lru_cache
-from dataclasses import dataclass, field
+import inspect
+from functools import lru_cache, wraps
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from hardware import SystemInfo, GPUInfo
@@ -46,6 +47,9 @@ MOE_PLACEMENT_CTX_TARGET = PERFORMANCE_TARGETS[
     DEFAULT_TARGET_NAME
 ].moe_placement_ctx_target
 MOE_KV_RESERVE_FRAC = 0.06
+# When MoE experts move to the GPU to avoid host-RAM overcommit, keep at
+# least this much device KV so the plan does not collapse to the 2k floor.
+MOE_MIN_WORKING_CTX = 8192
 
 # Q8_0 is the quality/memory default for long context and tool calling.
 # Plan placement for Q8, never upgrade Auto to F16/BF16 just to fill memory.
@@ -2392,6 +2396,10 @@ class TunedConfig:
     cache_v: str
     flash_attn: bool
     sampling: Dict[str, Any] = field(default_factory=dict)
+    adaptive_memory: bool = False
+    memory_disable_vision: bool = False
+    memory_disable_draft: bool = False
+    memory_adjustments: List[str] = field(default_factory=list)
 
     # Explicit llama.cpp model-loading strategy. ``auto`` leaves the binary's
     # runtime policy untouched (b10364+ avoids mmap on iGPUs). Legacy booleans
@@ -2689,13 +2697,16 @@ def _decide_moe_offload(
     n_parallel: int = 1,
     rope_scaling: bool = False,
     kv_quant_scale: Optional[float] = None,
+    kv_to_ram: bool = False,
+    expert_layer_gb: Optional[List[float]] = None,
+    fixed_cpu_gb: float = 0.0,
 ) -> Tuple[int, Optional[int], float, float, bool]:
     """Decide how to split an MoE model between GPU and CPU.
 
     Strategy:
-      1. Reserve VRAM for the KV cache up front (Vulkan requires KV to
-         live entirely in VRAM for MoE — RAM-resident KV crashes with
-         GGML_ASSERT(addr) on the AMD/Vulkan backend).
+      1. Reserve VRAM for GPU-resident KV up front. With kv_to_ram,
+         --no-kv-offload explicitly places KV/attention on CPU instead;
+         reserve only GPU compute/staging workspace in that case.
       2. Reserve VRAM for shared (non-expert) tensors.
       3. Pack as many expert layers as possible into the leftover VRAM;
          everything else goes to CPU via `--n-cpu-moe`.
@@ -2710,7 +2721,18 @@ def _decide_moe_offload(
     if base_kv_per_token_mb <= 0:
         base_kv_per_token_mb = kv_per_token_mb_f16(params_billion)
 
-    shared_overhead_gb = model_size_gb * 0.08
+    exact_experts = (
+        expert_layer_gb
+        if expert_layer_gb is not None
+        and len(expert_layer_gb) == n_layers
+        and 0 < sum(expert_layer_gb) <= model_size_gb
+        else None
+    )
+    shared_overhead_gb = (
+        model_size_gb - sum(exact_experts)
+        if exact_experts is not None
+        else model_size_gb * 0.08
+    )
     per_layer_expert_gb = max(0.001, (model_size_gb - shared_overhead_gb) / n_layers)
 
     # ---- KV reservation in VRAM (Q8 or explicit/compatible pair) --------
@@ -2740,9 +2762,41 @@ def _decide_moe_offload(
         max(1, n_parallel),
         rope_scaling,
     )
-    raw_kv_reserve_gb = (kv_reserve_gb + headroom_absolute_gb) / max(
-        0.01, 1.0 - headroom_fraction
+    raw_kv_reserve_gb = (
+        headroom_absolute_gb
+        if kv_to_ram
+        else (kv_reserve_gb + headroom_absolute_gb) / max(0.01, 1.0 - headroom_fraction)
     )
+    # --no-kv-offload moves KV to RAM, not GPU compute/staging buffers.
+    # Retain the latter, but do not reserve device KV as well as host KV.
+
+    if exact_experts is not None:
+        # --n-cpu-moe moves a PREFIX, not an arbitrary/equal-sized fraction.
+        # Keep exact shared weights on GPU, including shared experts and MTP.
+        choices = []
+        cpu_gb = fixed_cpu_gb
+        for count in range(n_layers + 1):
+            gpu_gb = model_size_gb - cpu_gb
+            spare = (
+                free_vram_gb
+                - moe_vram_safety_gb
+                - gpu_gb
+                - max(0.0, batch_vram_reserve_gb)
+            )
+            if cpu_gb <= free_ram_gb and spare >= headroom_absolute_gb:
+                choices.append((count, gpu_gb, cpu_gb, spare))
+            if count < n_layers:
+                cpu_gb += exact_experts[count]
+        preferred = [row for row in choices if row[3] >= raw_kv_reserve_gb]
+        if preferred or choices:
+            count, gpu_gb, cpu_gb, _ = (
+                min(preferred) if preferred else max(choices, key=lambda row: row[3])
+            )
+            return 999, count, gpu_gb, cpu_gb, count == 0
+        raise MemoryError(
+            "MoE weights and compute workspace do not fit the available RAM/VRAM "
+            "with the selected vision, draft and prompt-cache options."
+        )
 
     # If even the estimated non-expert/shared tensors cannot fit, --n-cpu-moe
     # cannot rescue the model: that flag moves experts only. Fall back to a
@@ -2774,6 +2828,32 @@ def _decide_moe_offload(
 
     layers_on_gpu = int(usable_for_experts / per_layer_expert_gb)
     layers_on_gpu = max(0, min(n_layers, layers_on_gpu))
+    # The caller supplies RAM already net of host safety/cache/runtime.
+    # A context target is a preference, not permission to overcommit RAM:
+    # move more experts to GPU if that removes the overcommit, sacrificing
+    # KV capacity first — but keep a short working context. Otherwise the
+    # historical RAM-overcommit warning beats a plan refused at the 2k floor.
+    min_gpu_layers = max(0, n_layers - int(max(0.0, free_ram_gb) / per_layer_expert_gb))
+    if min_gpu_layers > layers_on_gpu:
+        floor_ctx = min(kv_reservation_ctx, MOE_MIN_WORKING_CTX)
+        floor_absolute_gb, floor_fraction = _kv_headroom_reserve(
+            floor_ctx, max(1, n_parallel), rope_scaling
+        )
+        floor_raw_kv_gb = (
+            floor_absolute_gb
+            if kv_to_ram
+            else (kv_reserve_gb * floor_ctx / kv_reservation_ctx + floor_absolute_gb)
+            / max(0.01, 1.0 - floor_fraction)
+        )
+        physical_expert_budget = (
+            free_vram_gb
+            - moe_vram_safety_gb
+            - shared_overhead_gb
+            - floor_raw_kv_gb
+            - max(0.0, batch_vram_reserve_gb)
+        )
+        if min_gpu_layers * per_layer_expert_gb <= physical_expert_budget:
+            layers_on_gpu = min(n_layers, min_gpu_layers)
     n_cpu_moe = n_layers - layers_on_gpu
 
     model_vram = shared_overhead_gb + layers_on_gpu * per_layer_expert_gb
@@ -3250,7 +3330,7 @@ def veto_unsafe_mlock(
 # Main entry
 
 
-def compute_config(
+def _compute_config(
     model: ModelEntry,
     system: SystemInfo,
     profile: ModelProfile,
@@ -3370,6 +3450,31 @@ def compute_config(
     n_layers = model.n_layers
     model_arch = str((model.metadata or {}).get("general.architecture") or "").lower()
     placement_model_size_gb = model.placement_size_gb
+    expert_bytes = (model.metadata or {}).get("__moe_expert_bytes_by_layer__")
+    expert_layer_gb = None
+    # Exact prefix placement (and its hard RAM refusal) was validated only
+    # for the adaptive low-memory class; every other system keeps the
+    # historical heuristic, which warns about RAM overcommit instead.
+    if (
+        (model.metadata or {}).get("__exact_moe_placement__")
+        and isinstance(expert_bytes, list)
+        and len(expert_bytes) == n_layers
+        and all(isinstance(v, int) and v >= 0 for v in expert_bytes)
+        and 0 < sum(expert_bytes) <= model.size_bytes
+    ):
+        expert_layer_gb = [v / (1024**3) for v in expert_bytes]
+    input_ram_gb = 0.0
+    cpu_tied_output = False
+    if expert_layer_gb is not None and has_gpu:
+        input_ram_gb = (
+            max(0, int(model.metadata.get("__input_embedding_bytes__", 0))) / 1024**3
+        )
+        if model.metadata.get("__tied_output_embedding__"):
+            cpu_tied_output = bool(model.metadata.get("__prefer_cpu_tied_output__"))
+            if not cpu_tied_output:
+                # Input embeddings stay on CPU. A tied GPU output needs a
+                # second copy even though the GGUF contains only one tensor.
+                placement_model_size_gb += input_ram_gb
     read_lazy_table_gb = model.read_lazy_size_gb
     # The complete lazy tensor remains visible as a file-backed virtual map,
     # while only rows touched by inference need physical residency. Charging
@@ -3573,7 +3678,9 @@ def compute_config(
     runtime_vram_overhead_gb = (
         DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB if is_diffusion_gemma else 0.0
     )
-    runtime_ram_overhead_gb = 0.0
+    runtime_ram_overhead_gb = float(
+        (model.metadata or {}).get("__host_runtime_reserve_gb__", 0.0)
+    )
 
     flash_attn = (
         bool(profile.flash_attn)
@@ -3802,6 +3909,9 @@ def compute_config(
             target_ctx=target_ctx_for_placement,
             base_kv_per_token_mb=base_kv_mb,
             kv_quant_scale=placement_kv_scale,
+            kv_to_ram=perf_target.kv_to_ram,
+            expert_layer_gb=expert_layer_gb,
+            fixed_cpu_gb=input_ram_gb,
             ram_safety_gb=ram_safety_gb,
             moe_vram_safety_gb=moe_placement_safety_gb,
             moe_placement_ctx_target=perf_target.moe_placement_ctx_target,
@@ -3844,6 +3954,9 @@ def compute_config(
                 target_ctx=target_ctx_for_placement,
                 base_kv_per_token_mb=base_kv_mb,
                 kv_quant_scale=placement_kv_scale,
+                kv_to_ram=perf_target.kv_to_ram,
+                expert_layer_gb=expert_layer_gb,
+                fixed_cpu_gb=input_ram_gb,
                 ram_safety_gb=ram_safety_gb,
                 moe_vram_safety_gb=moe_placement_safety_gb,
                 moe_placement_ctx_target=shrunk_target,
@@ -3948,6 +4061,9 @@ def compute_config(
         layers_on_gpu = n_layers - new_cpu_moe
         model_vram = shared_overhead_gb + layers_on_gpu * per_layer_expert_gb
         model_ram = new_cpu_moe * per_layer_expert_gb
+        if expert_layer_gb is not None:
+            model_ram = input_ram_gb + sum(expert_layer_gb[:new_cpu_moe])
+            model_vram = placement_model_size_gb - model_ram
         n_cpu_moe = new_cpu_moe if new_cpu_moe > 0 else None
         full_off = new_cpu_moe == 0
         ngl = 999
@@ -3969,6 +4085,12 @@ def compute_config(
             residual_overhead = placement_model_size_gb * 0.02
             model_ram = (n_layers - new_ngl) * per_layer_gb + residual_overhead
             full_off = False
+
+    if cpu_tied_output and ngl > 0:
+        # All transformer blocks can stay on GPU while the tied output uses
+        # the existing CPU embedding. Avoid a second huge vocabulary tensor.
+        ngl = n_layers
+        full_off = False
 
     # Fixed recurrent state follows K/Q/V offload placement but does not grow
     # with context. Account for it separately from attention KV.
@@ -4409,6 +4531,16 @@ def compute_config(
     else:
         max_fit_ctx = profile_max
 
+    # A UI minimum is not a memory budget. Returning 2k when even that
+    # cannot allocate hides exhausted RAM behind an apparently valid config.
+    if actual_per_tok_mb > 0 and max_fit_ctx < 2048:
+        raise MemoryError(
+            "Insufficient KV/compute memory for the minimum 2,048-token "
+            f"context (estimated capacity: {max_fit_ctx:,} tokens). "
+            "Disable vision/drafting or the host prompt cache, free memory, "
+            "or use a smaller model; low_vram requires spare system RAM."
+        )
+
     if user_ctx is not None:
         # User-specified context — honour it, but apply TWO clamps so no
         # mode can drive the card into OOM:
@@ -4420,8 +4552,8 @@ def compute_config(
         ctx = user_ctx
         if model_ctx_limit > 0 and ctx > model_ctx_limit:
             ctx = model_ctx_limit
-        # A known per-token cost with an exhausted budget yields 0 here;
-        # that must clamp (to the 2048 floor below), not count as "unknown".
+        # A known per-token cost must clamp to the actual budget, never
+        # count an exhausted budget as "unknown" (rejected above).
         if actual_per_tok_mb > 0 and ctx > max_fit_ctx:
             pin_clamped_to_budget = ctx
             ctx = max_fit_ctx
@@ -5441,6 +5573,26 @@ def compute_config(
     )
 
 
+_COMPUTE_SIGNATURE = inspect.signature(_compute_config)
+
+
+@wraps(_compute_config)
+def compute_config(*args, **kwargs) -> TunedConfig:
+    """Plan Auto options consistently for GUI, CLI, API and benchmarks."""
+    from adaptive_memory import eligible, plan
+
+    bound = _COMPUTE_SIGNATURE.bind(*args, **kwargs)
+    bound.apply_defaults()
+    arguments = bound.arguments
+    if (
+        eligible(arguments["model"], arguments["system"])
+        and not arguments["force_mlock"]
+        and arguments["profile"].runner != "llama-diffusion-gemma-server"
+    ):
+        return plan(_compute_config, arguments)
+    return _compute_config(*args, **kwargs)
+
+
 def _has_integrated_mtp(model: ModelEntry) -> bool:
     """Detect models that ship an integrated MTP drafter inside the GGUF.
 
@@ -5812,6 +5964,22 @@ def build_command(
       ``ngram_method: ngram-map-k4v`` is the supported way to combine
       "MTP + ngram" on an MTP model.
     """
+    if config.adaptive_memory:
+        config = replace(
+            config,
+            batch=min(config.batch, 256),
+            ubatch=min(config.ubatch, 128),
+            load_mode="none",
+            no_mmap=True,
+            mlock=False,
+        )
+        # The plan wins over stale launch-option booleans/cache arguments.
+        prompt_cache_ram_mib = config.prompt_cache_ram_mib
+        if config.memory_disable_vision:
+            model = replace(model, mmproj=None)
+        if config.memory_disable_draft:
+            enable_speculative = enable_ngram = False
+            draft_model = None
     blocked = getattr(
         profile, "runtime_block_reason", ""
     ) or _model_runtime_block_reason(model)
@@ -6388,5 +6556,9 @@ def build_command(
     _append_unique(getattr(profile, "extra_args", None))
     _append_unique(config.extra_cli_flags)
     _append_unique(extra_args)
+    if config.adaptive_memory:
+        # Old Expert snapshots must not restore unbudgeted operation staging.
+        cmd = [arg for arg in cmd if arg not in {"--op-offload", "--no-op-offload"}]
+        cmd.append("--no-op-offload")
 
     return cmd

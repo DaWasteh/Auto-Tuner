@@ -3,6 +3,7 @@
 auto_tuner.py whitespace=cr-at-eol
 app_settings.py whitespace=cr-at-eol
 settings_loader.py whitespace=cr-at-eol
+performance_target.py whitespace=cr-at-eol
 diag_kv_v2.py whitespace=cr-at-eol
 modelstree.md whitespace=cr-at-eol
 

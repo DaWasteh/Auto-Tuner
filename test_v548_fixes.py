@@ -115,16 +115,14 @@ def _dense_14b(tmp_path, size_gb):
 
 
 @pytest.mark.parametrize("user_ctx", [None, 131072])
-def test_exhausted_kv_budget_clamps_to_floor(tmp_path, user_ctx):
+def test_exhausted_kv_budget_rejects_unsafe_floor(tmp_path, user_ctx):
     model = _dense_14b(tmp_path, 14.9)
     system = _fake_system(vram_total=16, vram_free=15.2, ram_total=64, ram_free=48)
     profile = ModelProfile(display_name="dense", max_context=131072)
-    cfg = tuner.compute_config(model, system, profile, user_ctx=user_ctx, force_ngl=999)
-    # Weights alone leave < 0.6 GiB of the card: the known per-token cost
-    # yields max_fit_ctx == 0, which is a clamp, not "unknown".
-    assert cfg.ctx == 2048, cfg
-    if user_ctx is not None:
-        assert "clamped" in (cfg.warning or "").lower()
+    # Weights alone leave < 0.6 GiB of the card. Neither the historical
+    # 32k fallback nor the later 2k floor can allocate from a zero budget.
+    with pytest.raises(MemoryError, match="minimum 2,048-token"):
+        tuner.compute_config(model, system, profile, user_ctx=user_ctx, force_ngl=999)
 
 
 # ---------------------------------------------------------------------------

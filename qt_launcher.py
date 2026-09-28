@@ -4372,6 +4372,7 @@ def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
     Cascading fields (ctx, KV quants, ngl, n_cpu_moe, rope) are left
     untouched — those belong to compute_config.
     """
+    planned_parallel = cfg.n_parallel
     try:
         if vals.get("threads"):
             cfg.threads = int(vals["threads"]) or cfg.threads
@@ -4419,6 +4420,16 @@ def apply_expert_values(cfg: TunedConfig, vals: dict) -> TunedConfig:
             cfg.n_parallel_forced = False
     except Exception:
         pass
+    if cfg.adaptive_memory:
+        cfg.batch, cfg.ubatch = min(cfg.batch, 256), min(cfg.ubatch, 128)
+        cfg.load_mode, cfg.no_mmap, cfg.mlock = "none", True, False
+        cfg.n_parallel = planned_parallel
+        cfg.extra_cli_flags = [
+            arg
+            for arg in cfg.extra_cli_flags
+            if arg not in {"--op-offload", "--no-op-offload"}
+        ]
+        cfg.extra_cli_flags.append("--no-op-offload")
     return cfg
 
 
@@ -10768,6 +10779,7 @@ class MainWindow(QMainWindow):
         # force_* parameter is fine (compute_config handles it), but
         # being explicit makes the call site easier to read in logs.
         kwargs = dict(force_overrides or {})
+        self._config_error = ""
 
         try:
             return compute_config(
@@ -10787,6 +10799,7 @@ class MainWindow(QMainWindow):
                 **kwargs,
             )
         except Exception as exc:
+            self._config_error = str(exc)
             self._log(f"[Warning] compute_config failed: {exc}")
             return None
 
@@ -10918,6 +10931,13 @@ class MainWindow(QMainWindow):
         assert self._system is not None
         eff = self._effective_config(entry, profile)
         if eff is None:
+            self._config_preview.setPlainText(
+                f"Model: {entry.name}\nNo safe automatic configuration.\n"
+                + (
+                    getattr(self, "_config_error", "")
+                    or "Insufficient memory or hardware information."
+                )
+            )
             return
         self._render_cfg_to_preview(entry, profile, eff)
         # When Expert mode is open, keep the panel in sync with checkbox /
@@ -10935,11 +10955,17 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Format ``cfg`` into the read-only preview QTextEdit."""
         assert self._system is not None
-        use_vision = self._vision_enabled()
-        use_draft = self._draft_enabled()
-        use_ngram = self._chk_ngram.isChecked() and self._chk_ngram.isEnabled()
+        use_vision = self._vision_enabled() and not cfg.memory_disable_vision
+        use_draft = self._draft_enabled() and not cfg.memory_disable_draft
+        use_ngram = (
+            self._chk_ngram.isChecked()
+            and self._chk_ngram.isEnabled()
+            and not cfg.memory_disable_draft
+        )
         use_prompt_cache = (
-            self._chk_prompt_cache.isChecked() and self._chk_prompt_cache.isEnabled()
+            self._chk_prompt_cache.isChecked()
+            and self._chk_prompt_cache.isEnabled()
+            and cfg.prompt_cache_ram_mib != 0
         )
 
         W = 64
@@ -14489,10 +14515,26 @@ class MainWindow(QMainWindow):
             # runtime's freshly detected capacity/backend inventory.
             self._expert_panel.flush_pending_save()
         cfg: Optional[TunedConfig] = self._effective_config(entry, profile)
-        # cfg is always non-None here: either the expert panel provided it
-        # or compute_config just returned one.  The assert narrows the type
-        # for static checkers (Pylance / mypy) that cannot prove this.
-        assert cfg is not None
+        if cfg is None:
+            # launch_warning keeps API/headless launches non-modal and records
+            # the planner's reason as the control API's launch error.
+            launch_warning(
+                "Cannot fit model",
+                getattr(self, "_config_error", "")
+                or "No safe automatic configuration.",
+            )
+            return None
+
+        if cfg.adaptive_memory:
+            if cfg.memory_disable_vision:
+                entry = copy.copy(entry)
+                entry.mmproj = None
+                use_vision = False
+            if cfg.memory_disable_draft:
+                use_draft = use_ngram = False
+                draft_for_launch = None
+            use_prompt_cache = use_prompt_cache and cfg.prompt_cache_ram_mib != 0
+            self._log("[Adaptive memory] " + "; ".join(cfg.memory_adjustments))
 
         # ── Diffusion routing ────────────────────────────────────────
         # llama-diffusion-gemma-server (PR #24427) is a REAL persistent

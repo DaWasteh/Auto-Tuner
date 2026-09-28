@@ -138,6 +138,7 @@ def main() -> int:
         "scanner",
         "hardware",
         "tuner",
+        "adaptive_memory",
         "app_settings",
         "startup_manager",
         "autotuner_version",

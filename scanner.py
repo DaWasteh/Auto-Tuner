@@ -126,6 +126,36 @@ def _read_lazy_tensor_span_bytes(
     return total
 
 
+def _moe_expert_spans(
+    tensor_offsets: List[Tuple[str, int]],
+    data_start: int,
+    file_size: int,
+    n_layers: int,
+) -> List[int]:
+    """Storage moved by --n-cpu-moe, indexed by block; no tensor data read.
+
+    Include alignment padding conservatively. Shared experts, attention and
+    embeddings are NOT movable with --n-cpu-moe. Invalid spans disable the
+    precise estimate rather than silently falling back to zero-sized weights.
+    """
+    if not 0 < n_layers <= 4096:
+        return []
+    ordered = sorted(tensor_offsets, key=lambda item: item[1])
+    data_bytes = file_size - data_start
+    result = [0] * n_layers
+    for index, (name, offset) in enumerate(ordered):
+        end = ordered[index + 1][1] if index + 1 < len(ordered) else data_bytes
+        if not 0 <= offset < end <= data_bytes:
+            return []
+        # Same tensor family as llama.cpp's LLM_FFN_EXPS_REGEX (incl. chexps).
+        match = re.match(
+            r"^blk\.(\d+)\.ffn_(?:gate|up|down|gate_up)_(?:ch)?exps\.", name
+        )
+        if match and int(match.group(1)) < n_layers:
+            result[int(match.group(1))] += end - offset
+    return result if any(result) else []
+
+
 def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
     """Read GGUF header KV pairs and scan tensor info for MTP detection.
 
@@ -319,6 +349,30 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
                 )
                 if lazy_bytes > 0:
                     md["__read_lazy_tensor_bytes__"] = lazy_bytes
+                # A partial shard is not a complete placement map. Keep the
+                # heuristic for split files until all shard maps are merged.
+                if not is_sharded:
+                    expert_bytes = _moe_expert_spans(
+                        tensor_offsets,
+                        data_start,
+                        os.fstat(f.fileno()).st_size,
+                        block_count,
+                    )
+                    if expert_bytes:
+                        md["__moe_expert_bytes_by_layer__"] = expert_bytes
+                        ordered = sorted(tensor_offsets, key=lambda item: item[1])
+                        for i, (name, start) in enumerate(ordered):
+                            if name == "token_embd.weight":
+                                end = (
+                                    ordered[i + 1][1]
+                                    if i + 1 < len(ordered)
+                                    else os.fstat(f.fileno()).st_size - data_start
+                                )
+                                md["__input_embedding_bytes__"] = max(0, end - start)
+                                md["__tied_output_embedding__"] = (
+                                    "output.weight" not in root_tensors
+                                )
+                                break
 
             return md
     except (OSError, struct.error, EOFError, ValueError, UnicodeDecodeError):
@@ -328,8 +382,8 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Metadata cache + bounded parallel reader
 
-# Schema 4 adds ``__root_tensors__`` for the MTP sidecar preflight.
-_METADATA_CACHE_SCHEMA = 4
+# Schema 6 adds MoE expert spans and input/tied-output storage accounting.
+_METADATA_CACHE_SCHEMA = 6
 _METADATA_CACHE_MAX_ENTRIES = 2048
 _METADATA_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _METADATA_CACHE_LOCK = threading.RLock()

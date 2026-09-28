@@ -206,11 +206,10 @@ PERFORMANCE_TARGETS: Dict[str, PerformanceTarget] = {
     "low_vram": PerformanceTarget(
         name="low_vram",
         moe_vram_safety_gb=0.15,
-        # KV lives in system RAM (kv_to_ram below), so we do NOT reserve
-        # VRAM for it during MoE placement — only a token 4k reservation
-        # so the placement heuristic's formula stays positive. Every
-        # spare MB of VRAM goes to expert weights instead, maximising
-        # how many experts run on the GPU before spilling to CPU.
+        # KV lives in system RAM (kv_to_ram below). The MoE planner skips
+        # device KV reservation explicitly; this legacy context target no
+        # longer creates a second KV reservation. GPU compute/staging
+        # workspace is still retained before placing expert weights.
         moe_placement_ctx_target=4096,
         dense_vram_safety_gb=0.15,
         ram_safety_gb=1.00,

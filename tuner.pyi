@@ -27,6 +27,7 @@ DEFAULT_RAM_SAFETY_GB: float
 MOE_VRAM_SAFETY_GB: float
 MOE_PLACEMENT_CTX_TARGET: int
 MOE_KV_RESERVE_FRAC: float
+MOE_MIN_WORKING_CTX: int
 PROMPT_CACHE_RAM_MIB_DEFAULT: int
 PROMPT_CACHE_UNLIMITED_RESERVE_GB: float
 DIFFUSION_GEMMA_RUNTIME_VRAM_OVERHEAD_GB: float
@@ -69,7 +70,18 @@ def _decide_moe_offload(
     moe_vram_safety_gb: float = ...,
     moe_placement_ctx_target: int = ...,
     batch_vram_reserve_gb: float = ...,
+    n_parallel: int = ...,
+    rope_scaling: bool = ...,
+    kv_quant_scale: Optional[float] = ...,
+    kv_to_ram: bool = ...,
+    expert_layer_gb: Optional[List[float]] = ...,
+    fixed_cpu_gb: float = ...,
 ) -> Tuple[int, Optional[int], float, float, bool]: ...
+def _kv_headroom_reserve(
+    target_ctx: int,
+    n_parallel: int,
+    rope_scaling: bool,
+) -> Tuple[float, float]: ...
 def _pick_kv_quant(
     profile_recommended: str,
     target_ctx: int,
@@ -134,6 +146,10 @@ class TunedConfig:
     cache_v: str
     flash_attn: bool
     sampling: Dict[str, Any] = field(default_factory=dict)
+    adaptive_memory: bool = False
+    memory_disable_vision: bool = False
+    memory_disable_draft: bool = False
+    memory_adjustments: List[str] = field(default_factory=list)
 
     load_mode: str = ...
     mlock: bool = ...

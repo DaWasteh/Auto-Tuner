@@ -2172,22 +2172,28 @@ def main(argv: Optional[List[str]] = None) -> int:  # noqa: C901  (complex but i
             profile_choice=getattr(profile, "performance_target", "") or None,
         )
 
-        cfg = compute_config(
-            model,
-            system,
-            profile,
-            draft_model=effective_draft,
-            user_ctx=args.ctx,
-            force_mlock=getattr(args, "force_mlock", False),
-            perf_target=perf_target,
-            no_mmproj_offload=bool(
-                getattr(args, "no_mmproj_offload", False) and model.mmproj is not None
-            ),
-            prompt_cache_ram_mib=_effective_prompt_cache_mib(args),
-            mode=_effective_mode(args),
-            gpu_priorities=app_settings.get_gpu_priorities(),
-            force_gpu=getattr(args, "gpu", None) or app_settings.get_forced_gpu(),
-        )
+        try:
+            cfg = compute_config(
+                model,
+                system,
+                profile,
+                draft_model=effective_draft,
+                user_ctx=args.ctx,
+                force_mlock=getattr(args, "force_mlock", False),
+                perf_target=perf_target,
+                no_mmproj_offload=bool(
+                    getattr(args, "no_mmproj_offload", False)
+                    and model.mmproj is not None
+                ),
+                prompt_cache_ram_mib=_effective_prompt_cache_mib(args),
+                mode=_effective_mode(args),
+                gpu_priorities=app_settings.get_gpu_priorities(),
+                force_gpu=getattr(args, "gpu", None) or app_settings.get_forced_gpu(),
+            )
+        except MemoryError as exc:
+            # An exhausted budget is refused, never turned into a 2k plan.
+            print(f"[AutoTuner] Error: {exc}")
+            return 2
 
         print(f"\n  [mlock] decision: model={model.name}")
         print(

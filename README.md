@@ -694,6 +694,35 @@ GPU where they fit (`--n-cpu-moe`), so only attention is paid for in
 speed. Opt-in only — `safe`/`balanced`/`throughput` are completely
 unaffected.
 
+`low_vram` trades VRAM for **system RAM**; it cannot help a machine that is
+short of both. When the estimated KV/compute budget cannot hold even the
+2,048-token minimum, every tier now refuses the plan and says why (GUI
+preview and launch dialog, control-API launch error, CLI exit code 2)
+instead of presenting a 2k context that could not allocate.
+
+#### Small Windows systems: adaptive low-memory Auto
+
+On Windows with **one discrete Vulkan GPU of at most 12 GiB and at most
+32 GiB RAM**, a single-file MoE model that does not fit the free VRAM gets a
+bounded plan that was validated on a real RX Vega 8 GiB / 16 GiB RAM machine
+([issue #6](https://github.com/DaWasteh/Auto-Tuner/issues/6)):
+
+- `--n-cpu-moe` is chosen from the exact per-block expert sizes in the GGUF
+  tensor table (the prefix llama.cpp really moves), input embeddings are
+  counted in RAM, and a tied output embedding stays on the CPU
+  (`-ngl <blocks>`) instead of loading a second copy on the GPU.
+- 256/128 batches, `--load-mode none`, `--no-op-offload` and a 0.5 GiB host
+  runtime reserve keep Vulkan staging from pushing RAM over the edge.
+- Optional features are dropped in order — host prompt cache, then
+  drafting, then vision — and the plan with the largest context wins (ties
+  keep more features). Every dropped feature is named in the warning,
+  preview and launch log; your saved options are not changed.
+
+Everything else — multi-GPU, Linux, larger systems, split GGUFs, UMA — keeps
+the existing planner. `inspect_context_capacity.py` prints a read-only
+capacity estimate and `verify_auto_matrix.py` repeats the reporter's
+sequential real-runtime check.
+
 **Resolution priority** (highest wins): explicit CLI flag → GUI dropdown
 → `performance_target:` in the model's YAML profile → `balanced` default.
 Unknown values are silently ignored, so a typo in a YAML never breaks
@@ -1409,6 +1438,24 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.8 — honest low-memory planning, adaptive Auto for 8 GB GPUs
+
+- **No more fake 2k contexts:** when memory cannot hold even the 2,048-token
+  minimum, Auto and pinned contexts are refused with the reason instead of a
+  2k plan that could not allocate. On the development machine every default
+  plan (64 local models × 4 tiers × 2 backends) is byte-identical to v5.5.7.
+- **Adaptive low-memory Auto** for Windows + one Vulkan GPU ≤ 12 GiB + RAM
+  ≤ 32 GiB (see [Performance targets](#small-windows-systems-adaptive-low-memory-auto)):
+  on the reporter's RX Vega 8 GiB / 16 GiB RAM machine Gemma-4-26B Q4_0 and
+  Qwen3.6-35B-A3B IQ3_XXS now load and answer in all four tiers with
+  60k–210k context; reproduced here on b11195 with the same budget.
+- **low_vram MoE placement** no longer reserves GPU KV although the KV lives
+  in RAM, so more expert blocks fit on the GPU.
+- **RAM-aware MoE placement:** if CPU experts would overcommit free RAM and
+  moving experts to the GPU removes that while keeping an 8k working
+  context, Auto moves them; otherwise the previous plan and warning stay.
+- [Validation](docs/v5.5.8-validation.md).
 
 ### v5.5.7 — llama.cpp b11195 audit, faster Ternary-Bonsai fork, newest fork wins
 
