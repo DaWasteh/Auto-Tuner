@@ -1059,6 +1059,56 @@ def _fork_newest_first_key(name: str, preferred_backend: Optional[str] = None) -
     return (family, backend_rank, version, lower)
 
 
+#: Family of plain mainline/stable builds ('b11249_vulkan_llama.cpp',
+#: '0.5.0_hip_llama.cpp'); the default runtime when no saved choice applies.
+_MAINLINE_FORK_FAMILY = "llama"
+
+
+def _default_fork_index(
+    forks: List[Tuple[str, Path]], preferred: Optional[Path] = None
+) -> int:
+    """Index of the build to select when no saved choice is available.
+
+    The display order groups builds by family name, and the Ternary/Bonsai
+    family '2b_llama' sorts before plain 'llama'. Falling back to index 0
+    therefore selected the special-purpose Prism fork whenever the saved build
+    had been replaced (e.g. b11224 deleted after building b11249), and the
+    oldest mainline build otherwise. An existing ``preferred`` build still
+    wins; a missing one keeps its family and backend and takes that family's
+    newest build. Without a preference a bare legacy 'llama.cpp' checkout
+    stays the default, else the newest mainline build (Vulkan before HIP,
+    numbered builds before stable releases).
+    """
+    if not forks:
+        return 0
+    names = [name for name, _path in forks]
+    family, backend = _MAINLINE_FORK_FAMILY, None
+    if preferred is not None:
+        try:
+            wanted = os.path.normcase(str(Path(preferred).resolve(strict=False)))
+        except (OSError, RuntimeError):
+            wanted = os.path.normcase(str(preferred))
+        for index, (_name, path) in enumerate(forks):
+            try:
+                if os.path.normcase(str(Path(path).resolve(strict=False))) == wanted:
+                    return index
+            except (OSError, RuntimeError):
+                continue
+        family = _fork_family(Path(preferred).name)
+        backend = _fork_backend(Path(preferred).name)
+    else:
+        for index, name in enumerate(names):
+            if name.lower() == "llama.cpp":
+                return index
+    for wanted_family in (family, _MAINLINE_FORK_FAMILY):
+        members = [
+            i for i, name in enumerate(names) if _fork_family(name) == wanted_family
+        ]
+        if members:
+            return min(members, key=lambda i: _fork_newest_first_key(names[i], backend))
+    return 0
+
+
 def _resolve_server_binary(user_value: str) -> str:
     """Turn a user-provided server name/path into something runnable."""
     p = Path(user_value).expanduser()
@@ -1440,14 +1490,15 @@ def _pick_fork(
 
     Returns ``None`` only when no forks were discovered at all.
     Handles ``EOFError`` gracefully (non-TTY / CI context) by defaulting to
-    the first (standard) fork.
+    the standard build (see ``_default_fork_index``).
     """
     if not forks:
         return None
 
+    default = forks[_default_fork_index(forks)]
     if len(forks) == 1 or non_interactive:
-        print(f"[AutoTuner] Using default llama.cpp fork: {forks[0][0]}")
-        return forks[0][1]
+        print(f"[AutoTuner] Using default llama.cpp fork: {default[0]}")
+        return default[1]
 
     print("\n" + _BAR)
     print("  LLAMA.CPP FORK SELECTION")
@@ -1460,14 +1511,15 @@ def _pick_fork(
     print(_BAR)
 
     try:
-        raw = input(f"Select fork [1-{len(forks)}] (default 1): ").strip()
+        raw = input(
+            f"Select fork [1-{len(forks)}] (default {forks.index(default) + 1}): "
+        ).strip()
     except EOFError:
         raw = ""
 
     if not raw:
-        selected = forks[0]
-        print(f"[AutoTuner] Using fork: {selected[0]}")
-        return selected[1]
+        print(f"[AutoTuner] Using fork: {default[0]}")
+        return default[1]
 
     if raw.isdigit():
         n = int(raw)
@@ -1476,8 +1528,8 @@ def _pick_fork(
             print(f"[AutoTuner] Using fork: {selected[0]}")
             return selected[1]
 
-    print(f"[AutoTuner] Invalid choice '{raw}' — using default: {forks[0][0]}")
-    return forks[0][1]
+    print(f"[AutoTuner] Invalid choice '{raw}' — using default: {default[0]}")
+    return default[1]
 
 
 def _required_fork_name(profile: ModelProfile) -> Optional[str]:

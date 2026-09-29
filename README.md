@@ -965,10 +965,11 @@ matches. See `settings/_default.yaml`.
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
 | `granite-4_2.yaml` | IBM Granite 4.2 3B/8B/30B dense reasoning + tools | `granite` (filename-gated) |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
-| `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls | `muse-glimmer` |
+| `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls, b11249+ for `json_schema` output | `muse-glimmer` |
 | `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+; separate `--mtp` heads b11195+ | `mimo2` (filename-gated; no local weights tested) |
+| `mimo-v2_6-distill.yaml` | Xiaomi MiMo-V2.6-Distill-Qwen-9B (Qwen3.5-9B SFT, not the MoE): official 0.6/20/0.95 sampling, 262k, thinking + Qwen3-Coder XML tools, vision via Qwen3.5 mmproj | `qwen35` (filename-gated; tested locally) |
 | `fastcontext-1_0-4b.yaml` | Microsoft FastContext 1.0 4B SFT/RL repository explorer, 262k, GGUF sampling defaults | `qwen3` (filename-gated) |
-| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11195 loader** | `xing4_0` |
+| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11249 loader** | `xing4_0` |
 | `voxcpm2.yaml` | VoxCPM2 BaseLM: **Voice Lab TTS component, ordinary chat launch blocked** | `minicpm4` (filename-gated, not an architecture-wide block) |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
@@ -982,7 +983,7 @@ matches. See `settings/_default.yaml`.
 | `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11195 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11249 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
 | `ling-3_0-vl.yaml` | Ling-3.0-flash-VL image/video model (ling3vl projector + M-RoPE), b11156+; older builds refused by metadata gate | `bailingmoe3` with `rope.dimension_sections` (filename-gated; no local weights tested) |
@@ -990,6 +991,12 @@ matches. See `settings/_default.yaml`.
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.5.9:** Muse Glimmer's `--jinja` parser enforces `response_format`
+  `json_schema` only from b11249 (PR #29615); older builds answer in prose.
+  Nemotron Labs 3 Puzzle's 96-channel Mamba-2 scan runs on the GPU with HIP
+  b11249+ (PR #28717); Vulkan still schedules it on the CPU, so the note
+  recommends HIP. Loader floors are unchanged. [Audit](docs/llama-b11249-audit.md).
 
 - **v5.5.7:** MiMo-V2 can now be exported as trunk plus a separate MTP head
   (converter `--mtp` / `--no-nextn`, PR #29294); such an MTP-only head loads
@@ -1053,9 +1060,9 @@ Notes on the new profiles:
   Qwen and GLM profiles are unchanged. [Sources and limits](docs/llama-b10901-audit.md).
   The **v5.4.7** b10930 re-check found PR #28696 still open, so the V4.1
   block named b10930; the **v5.4.8** b10948, **v5.5.0** b10977 and
-  **v5.5.1** b11030, **v5.5.4** b11063, **v5.5.5** b11105, **v5.5.6** b11160
-  and **v5.5.7** b11195 re-checks found it still open (not merged, updated
-  2026-09-22); the block now names b11195. Conversion alone still does not provide an
+  **v5.5.1** b11030, **v5.5.4** b11063, **v5.5.5** b11105, **v5.5.6** b11160,
+  **v5.5.7** b11195 and **v5.5.9** b11249 re-checks found it still open (not
+  merged, updated 2026-09-28); the block now names b11249. Conversion alone still does not provide an
   inference runtime.
 
 - **b10760 coverage refresh:** Gemma 3 and Gemma 3n now retain their distinct
@@ -1196,7 +1203,7 @@ repo keeps the build recipes in separate scripts so this README stays short:
 | [`llama_prerelease_vulkan_build.ps1`](building%20llama.cpp/llama_prerelease_vulkan_build.ps1) / [`llama_prerelease_hip_build.ps1`](building%20llama.cpp/llama_prerelease_hip_build.ps1) | Latest exact `bNNNN` siblings, or truthful `bNNNN_dev_COMMIT_{backend}_llama.cpp` folders with `-Tag master`. |
 | [`turboquant_vulkan_llama_build.ps1`](building%20llama.cpp/turboquant_vulkan_llama_build.ps1) / [`turboquant_hip_llama_build.ps1`](building%20llama.cpp/turboquant_hip_llama_build.ps1) | Pinned TurboQuant KV-cache fork (`tq_bNNNN_{backend}_llama.cpp`). |
 | [`ternary_bonsai_vulkan_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_vulkan_llama_build.ps1) / [`ternary_bonsai_hip_llama_build.ps1`](building%20llama.cpp/ternary_bonsai_hip_llama_build.ps1) | Pinned PrismML Ternary/Bonsai fork, release tag `prism-b10743-adfffbe` (2026-09-25; Bonsai 2 `PTQ1_0` + `PQ2_0` on Vulkan and HIP, first pin with a Vulkan `PQ2_0` path; prism-b10687 remains the profile floor); the folder carries the fork's own build number: `2b_b10743_{backend}_llama.cpp`. Older trees stay installed; AutoTuner picks the newest build of a fork family unless you select one explicitly. |
-| [`rocmfpx_vulkan_llama_build.ps1`](building%20llama.cpp/rocmfpx_vulkan_llama_build.ps1) / [`rocmfpx_hip_llama_build.ps1`](building%20llama.cpp/rocmfpx_hip_llama_build.ps1) | Pinned ROCmFPX fork (`ROCmFPX/ROCmFPX`, main commit `aed0d5fd9`, 2026-09-06; mainline base b10766), the only runtime for ROCmFP4 / ROCmFPX weights (ggml types 100–111, e.g. kingjones777's Agnes-3.0-Flash `MTP-ROCmFP4` GGUFs); regular Vulkan dequant shaders plus RDNA3+ HIP MMQ kernels, gfx1201. Both recipes apply `patches/rocmfpx-rdna4-mmq-fallback.patch` (the fork wires its ROCmFPX MMQ fallback table only into the RDNA3 selector; on gfx1201 every ROCmFP4 prompt batch otherwise aborts with `J_best=0`). The folder carries the fork's own build number: `fpx_b11544_{backend}_llama.cpp`. |
+| [`rocmfpx_vulkan_llama_build.ps1`](building%20llama.cpp/rocmfpx_vulkan_llama_build.ps1) / [`rocmfpx_hip_llama_build.ps1`](building%20llama.cpp/rocmfpx_hip_llama_build.ps1) | Pinned ROCmFPX fork (`ROCmFPX/ROCmFPX`, main commit `aed0d5fd9`, 2026-09-06; mainline base b10766), the only runtime for ROCmFP4 / ROCmFPX weights (ggml types 100–111, e.g. kingjones777's Agnes-3.0-Flash `MTP-ROCmFP4` GGUFs); regular Vulkan dequant shaders plus RDNA3+ HIP MMQ kernels, gfx1201. Both recipes apply `patches/rocmfpx-rdna4-mmq-fallback.patch` (the fork wires its ROCmFPX MMQ fallback table only into the RDNA3 selector; on gfx1201 every ROCmFP4 prompt batch otherwise aborts with `J_best=0`). The folder carries the fork's own build number: `fpx_b11544_{backend}_llama.cpp`. The fork's newer main `721db4193` (fork build 11898, 2026-09-28) does not compile with MSVC (`llama_lazy_reader::prefetch` exists only in the POSIX reader), so the pin stays. |
 | [`diffusion_vulkan_llama_build.ps1`](building%20llama.cpp/diffusion_vulkan_llama_build.ps1) / [`diffusion_hip_llama_build.ps1`](building%20llama.cpp/diffusion_hip_llama_build.ps1) | Pinned DiffusionGemma PR #24427 pair; HIP avoids Vulkan's ~1 GiB single-allocation limit. |
 | [`ocr_vulkan_llama_build.ps1`](building%20llama.cpp/ocr_vulkan_llama_build.ps1) / [`ocr_hip_llama_build.ps1`](building%20llama.cpp/ocr_hip_llama_build.ps1) | Reviewed legacy DeepSeek-OCR PR #17400 pair; both build server + MTMD CLI. |
 | [`diffusion_vulkan_llama_build_ubuntu.sh`](building%20llama.cpp/diffusion_vulkan_llama_build_ubuntu.sh) | Ubuntu DiffusionGemma Vulkan recipe with an explicit `_ubuntu_vulkan_` output. |
@@ -1232,6 +1239,8 @@ is compiled in through the existing `GL_KHR_cooperative_matrix` detection and
 enabled automatically on both gfx1201 cards. b11160…b11195 adds no CMake
 option either (only the ggml 0.25.3 bump and the tiled CPU matmul sources);
 the user-built b11195 trees carry exactly the b11160 option set.
+b11195…b11249 changes CMake only for Windows ARM64/ARM64EC with MSVC; the
+user-built b11249 trees again carry the identical option set.
 MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
 benign: `src/models/llama.cpp` is folded into a unity source and only one
 `llama.obj` is produced.
@@ -1266,9 +1275,23 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11195)
+## Server features (audited through llama.cpp b11249)
 
-The **b11195** (`d834d44e6`, `0.5.0-dev`) [audit](docs/llama-b11195-audit.md)
+The **b11249** (`6d78fb072`, `0.5.0-dev`) [audit](docs/llama-b11249-audit.md)
+covers 54 commits after b11195. The only CLI change is **`--rpc`**, which is
+now listed on every build (PR #29537) and rejected at parse time by builds
+without RPC; AutoTuner never plans RPC, and a user-supplied `--rpc` extra is
+no longer pruned silently but fails with llama.cpp's own message (416 names /
+329 long options). New for AutoTuner: **Muse Glimmer** `json_schema` output
+needs b11249+ (PR #29615, measured) and **Nemotron 3 Puzzle** runs its
+96-channel Mamba-2 scan on the GPU with HIP b11249+ (PR #28717). Speculative
+decoding, mtmd and server batches moved to `llama_batch_ext` (PR #29385);
+text DFlash2, MTP, lazy PLE and Ling 3.0 plans pass on both backends. The
+Qwen vision/DFlash2, DeepSeek-V4.1, Xing, Prism and ROCmFPX safeguards
+remain; the ROCmFPX pin stays because the fork's new main does not compile
+with MSVC. See [validation](docs/v5.5.9-validation.md).
+
+The previous **b11195** (`d834d44e6`, `0.5.0-dev`) [audit](docs/llama-b11195-audit.md)
 covers 35 commits after b11160. Option set **and** `--help` text are
 unchanged (415 names / 328 long options). New for AutoTuner: separate
 **MiMo-V2 MTP heads** need b11195+ (PR #29294) and are refused as drafts on
@@ -1438,6 +1461,35 @@ rather than letting llama-server abort during model or draft-context loading. Th
 | `--no-context-shift` | ✅ No longer duplicated (dedup via a seen-set) |
 | `--tools-runtime docker:…` | ✅ Correct value parsing/capability pruning through Extra CLI flags; never auto-enabled because it executes tools across a Docker/host trust boundary |
 | Unlimited-OCR / DeepSeek-OCR MTMD | ✅ Separate prompt/profile handling despite their shared `deepseek2-ocr` architecture; b10287+ Unlimited gate and stale-projector warning; shared GUI/TUI image/PDF/Office workflow; F16 compatibility KV when `-fa off`, manual precision override, DRY guard, and normal `/v1/chat/completions` API |
+
+### v5.5.9 — llama.cpp b11249 audit, MiMo-V2.6-Distill profile, Muse Glimmer JSON output
+
+- **54 upstream commits audited (b11195 → b11249):** the only CLI change is
+  `--rpc`, which every build now lists (RPC-less builds reject it at parse
+  time; AutoTuner never plans RPC). Stable is still v0.5.0, the mainline
+  build recipes stay unchanged and optimal for the 285K + 2× gfx1201 system.
+- **New profile: MiMo-V2.6-Distill-Qwen-9B.** Xiaomi's Qwen3.5-9B fine-tune
+  used to fall into the MiMo-V2.6 Flash/Pro MoE profile because of its file
+  name (temp 1.0 / top_k 0, MoE notes). It now gets the official
+  0.6 / 20 / 0.95 sampling; thinking, tool calls and images were tested
+  locally on both backends.
+- **Fix: default llama.cpp build.** When the saved build no longer existed
+  (for example b11224 replaced by b11249) or on a fresh install, AutoTuner
+  selected the first listed family — the Ternary/Bonsai Prism fork — instead
+  of mainline. It now keeps the saved family and backend and takes its newest
+  build, otherwise the newest mainline build; explicit choices are unchanged.
+- **Muse Glimmer structured output:** `response_format` `json_schema` is
+  enforced from b11249 on (PR #29615); on b11195 the same request came back
+  as prose. **Nemotron 3 Puzzle:** HIP b11249+ runs its 96-channel Mamba-2
+  scan on the GPU (PR #28717); the note recommends HIP.
+- **Old blockers rechecked:** Qwen3.5/3.8 vision + DFlash2 still fails with
+  HTTP 500 on b11249 (HIP and Vulkan), DeepSeek-V4.1 and Xing 4.0 still have
+  no loader, Prism and ROCmFPX weights still need their forks; wording names
+  b11249. The ROCmFPX pin stays because the fork's new main does not compile
+  on Windows.
+- **Measured:** `llama-bench` A/B on the R9700 (dense 27B and MoE 35B-A3B,
+  Vulkan and HIP): throughput unchanged within ±1 %.
+- [Audit](docs/llama-b11249-audit.md) · [Validation](docs/v5.5.9-validation.md).
 
 ### v5.5.8 — honest low-memory planning, adaptive Auto for 8 GB GPUs
 

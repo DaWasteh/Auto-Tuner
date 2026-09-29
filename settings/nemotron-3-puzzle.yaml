@@ -54,4 +54,7 @@ notes: >
   channels. The profile requires llama.cpp b10786 because that build first
   reads the per-layer expert arrays; AutoTuner refuses older binaries before
   launch instead of letting tensor creation abort. Sampling, thinking
-  control, and MTP settings follow the Super profile.
+  control, and MTP settings follow the Super profile. On HIP, llama.cpp
+  b11249+ (PR #28717) runs the 96-channel Mamba-2 scan on the GPU; Vulkan
+  and older HIP builds only have 128/256-channel scan kernels and schedule
+  that operation on the CPU in every Mamba layer, so prefer HIP b11249+.

@@ -1,0 +1,54 @@
+display_name: "MiMo-V2.6-Distill-Qwen-9B (Xiaomi)"
+patterns:
+  - mimo-v2.6-distill
+  - mimo_v2.6_distill
+  - mimo-v2_6-distill
+  - mimo_v2_6_distill
+
+# Xiaomi's SFT of Qwen3.5-9B on MiMo-V2.6 data: qwen35 architecture, not the
+# mimo2 MoE of mimo-v2_6.yaml. The longer filename patterns win over that
+# profile's "mimo-v2.6"; no arch_fallback, qwen35 belongs to the Qwen profile.
+# https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: balanced
+
+# generation_config.json (and the GGUF general.sampling.* keys):
+# temperature 0.6, top_k 20, top_p 0.95 — one setting for chat and coding.
+sampling:
+  chat:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+# The MiMo v2.6 template renders reasoning_content of every assistant turn and
+# emits Qwen3-Coder-style <tool_call><function=...> calls.
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# The checkpoint has no NextN/MTP head; draftless n-gram only.
+draft_max: 2
+draft_p_min: 0.75
+ngram_method: ngram-mod
+
+notes: >
+  Xiaomi MiMo-V2.6-Distill-Qwen-9B is a supervised fine-tune of Qwen3.5-9B on
+  MiMo-V2.6-generated data for coding, agent tasks, visual coding and
+  cybersecurity (qwen35 architecture, 262,144 context, Qwen3.5 mmproj for
+  images). It is not the MiMo-V2.6 Flash/Pro MoE, so it gets its own profile:
+  official sampling is temp 0.6 / top_k 20 / top_p 0.95 for chat and coding.
+  Thinking is on by default (chat_template_kwargs enable_thinking=false turns
+  it off); the MiMo v2.6 template keeps reasoning history and emits
+  Qwen3-Coder-style XML tool calls, which --jinja parses. No MTP head is
+  included, so only draftless n-gram speculation applies.

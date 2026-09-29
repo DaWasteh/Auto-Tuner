@@ -55,4 +55,6 @@ notes: >
   For tool use, b11100+ is recommended: PR #29242 fixes a tool call emitted
   as the first generated text being misclassified as content rather than
   tool_calls. --jinja selects the corrected parser automatically; the
-  loader minimum remains b10353.
+  loader minimum remains b10353. Structured output (response_format
+  json_schema) needs b11249+: PR #29615 makes the --jinja parser enforce
+  the schema, which older builds ignored.

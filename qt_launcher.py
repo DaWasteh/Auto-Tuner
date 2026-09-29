@@ -8687,22 +8687,14 @@ class MainWindow(QMainWindow):
             self._fork_combo.blockSignals(False)
             return
 
-        preferred_resolved: Optional[Path] = None
-        if preferred is not None:
-            try:
-                preferred_resolved = preferred.resolve(strict=False)
-            except (OSError, RuntimeError):
-                preferred_resolved = preferred
+        from auto_tuner import _default_fork_index
 
-        selected_idx = 0
-        for i, (name, path) in enumerate(forks):
+        for name, path in forks:
             self._fork_combo.addItem(name, userData=path)
-            if preferred_resolved is not None:
-                try:
-                    if path.resolve(strict=False) == preferred_resolved:
-                        selected_idx = i
-                except (OSError, RuntimeError):
-                    pass
+        # A saved build that no longer exists (replaced by a newer build)
+        # falls back to the newest build of its family, not to the first
+        # listed family (the Ternary/Bonsai '2b_' fork sorts first).
+        selected_idx = _default_fork_index(forks, preferred)
         self._fork_combo.setCurrentIndex(selected_idx)
         self._fork_path = forks[selected_idx][1]
         self._fork_combo.blockSignals(False)
@@ -8957,17 +8949,11 @@ class MainWindow(QMainWindow):
                 self._fork_combo.addItem(name, userData=fork_path)
             os.environ["LLAMA_CPP_DIR"] = str(manual_path)
             # Restore previously active selection inside the container,
-            # if persisted_active points at one of these children.
-            initial_idx = 0
-            if persisted_active is not None:
-                try:
-                    pa = persisted_active.resolve()
-                    for i, (_n, p) in enumerate(container_children):
-                        if p.resolve() == pa:
-                            initial_idx = i
-                            break
-                except OSError:
-                    pass
+            # if persisted_active points at one of these children; a
+            # replaced build falls back to the newest of its family.
+            from auto_tuner import _default_fork_index
+
+            initial_idx = _default_fork_index(container_children, persisted_active)
             self._fork_combo.setCurrentIndex(initial_idx)
             self._fork_path = container_children[initial_idx][1]
             self._apply_fork(initial_idx)
@@ -8984,13 +8970,20 @@ class MainWindow(QMainWindow):
             )
             self._log(f"[Fork] Using manual path from {src_label}: {manual_path}")
         elif self._forks:
-            # No manual choice — auto-discovered forks.
+            # No manual choice — auto-discovered forks; default to the newest
+            # mainline build rather than the first listed family.
+            from auto_tuner import _default_fork_index
+
             for name, path in self._forks:
                 self._fork_combo.addItem(name, userData=path)
-            self._fork_combo.setCurrentIndex(0)
-            self._fork_path = self._forks[0][1] if self._forks else None
-            self._log(f"Found {len(self._forks)} fork(s). Using: {self._forks[0][0]}")
-            self._apply_fork(0)
+            default_idx = _default_fork_index(self._forks)
+            self._fork_combo.setCurrentIndex(default_idx)
+            self._fork_path = self._forks[default_idx][1]
+            self._log(
+                f"Found {len(self._forks)} fork(s). "
+                f"Using: {self._forks[default_idx][0]}"
+            )
+            self._apply_fork(default_idx)
         else:
             self._fork_combo.addItem("not found", userData=None)
             self._fork_path = None
