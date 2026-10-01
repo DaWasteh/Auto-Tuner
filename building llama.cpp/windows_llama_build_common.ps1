@@ -1086,13 +1086,26 @@ function Get-LlamaFlashAttentionArgs {
     }
 }
 
+function Invoke-LlamaRdna4MoePatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][ValidateSet("apply", "record", "verify")][string]$Mode
+    )
+    Assert-CommandAvailable "python"
+    $patcher = Join-Path $PSScriptRoot "patch_rdna4_moe.py"
+    Invoke-NativeChecked "RDNA4 MoE workaround $Mode" {
+        python $patcher $Mode $Repo
+    }
+}
+
 function Invoke-LlamaPrereleaseBuild {
     param(
         [Parameter(Mandatory = $true)][ValidateSet("Vulkan", "HIP")][string]$Backend,
         [string]$Tag = "latest",
         [string]$Workspace = "L:\LAB\ai-local",
         [string]$RocmPath = "",
-        [ValidateRange(1, 256)][int]$Parallel = 20
+        [ValidateRange(1, 256)][int]$Parallel = 20,
+        [switch]$Rdna4MoeWorkaround
     )
 
     if ($Tag -eq "latest") {
@@ -1100,6 +1113,9 @@ function Invoke-LlamaPrereleaseBuild {
     }
     if ($Tag -notmatch '^b\d+$' -and $Tag -ne "master") {
         throw "Tag must be 'latest', 'master', or an exact bNNNN tag"
+    }
+    if ($Rdna4MoeWorkaround -and ($Backend -ne "Vulkan" -or $Tag -ne "b11319")) {
+        throw "RDNA4 MoE workaround is qualified only for Vulkan -Tag b11319; no unqualified source will be patched"
     }
     $backendToken = $Backend.ToLowerInvariant()
     $tmp = Join-Path $Workspace "_tmp_${backendToken}_prerelease_llama_$PID"
@@ -1135,7 +1151,11 @@ function Invoke-LlamaPrereleaseBuild {
     }
     $isExact = $exactTag -eq $buildTag
     $folderVersion = if ($isExact) { $buildTag } else { "${buildTag}_dev_${shortCommit}" }
-    $dir = "${folderVersion}_${backendToken}_llama.cpp"
+    $dir = if ($Rdna4MoeWorkaround) {
+        "rdna4moe_${folderVersion}_${backendToken}_llama.cpp"
+    } else {
+        "${folderVersion}_${backendToken}_llama.cpp"
+    }
     $repo = Join-Path $Workspace $dir
     $semantic = Get-LlamaRuntimeSemanticVersion -Repo $tmp
     $expectedRuntime = "$semantic-dev"
@@ -1144,11 +1164,19 @@ function Invoke-LlamaPrereleaseBuild {
         Remove-Item $tmp -Recurse -Force
         $stagingHandled = $true
         try {
+            if ($Rdna4MoeWorkaround) {
+                Invoke-LlamaRdna4MoePatch -Repo $repo -Mode verify
+            }
             Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedBuild $build -ExpectedVersion $expectedRuntime -ExpectedCommit $commit | Out-Null
             Write-Host "Success (existing): $repo ($expectedRuntime, $buildTag, $Backend)"
             return
         } catch {
             if ($_.Exception.Message -like "Source commit mismatch:*") { throw }
+            if ($Rdna4MoeWorkaround -and (Test-Path (Join-Path $repo "autotuner-rdna4-moe-workaround.json"))) {
+                # A qualified receipt mismatch is not an incomplete first build.
+                # Preserve changed user source/binaries instead of restamping them.
+                throw
+            }
             Write-Warning "Existing output is incomplete; resume its clean source/build tree: $($_.Exception.Message)"
         }
     } else {
@@ -1162,8 +1190,20 @@ function Invoke-LlamaPrereleaseBuild {
     }
 
     Write-Host "==> Build directory: $repo ($buildTag, $Backend, commit $commit)"
+    if ($Rdna4MoeWorkaround) {
+        Invoke-LlamaRdna4MoePatch -Repo $repo -Mode apply
+        if (Test-Path (Join-Path $repo "build\CMakeCache.txt")) {
+            Invoke-NativeChecked "Clean incomplete RDNA4 variant before receipt creation" {
+                cmake --build (Join-Path $repo "build") --config Release --target clean
+            }
+        }
+    }
     Invoke-LlamaCMakeBuild -Repo $repo -Backend $Backend -Workspace $Workspace -RocmPath $RocmPath -BuildIsDev "ON" -Parallel $Parallel
     Test-LlamaBuildOutput -Repo $repo -Backend $Backend -ExpectedBuild $build -ExpectedVersion $expectedRuntime -ExpectedCommit $commit | Out-Null
+    if ($Rdna4MoeWorkaround) {
+        Invoke-LlamaRdna4MoePatch -Repo $repo -Mode record
+        Invoke-LlamaRdna4MoePatch -Repo $repo -Mode verify
+    }
     Write-Host "Success: $repo ($expectedRuntime, $buildTag, $Backend)"
 }
 

@@ -299,6 +299,10 @@ You can disable vision (mmproj) support in two ways:
 
 ### OCR documents
 
+The shared GUI/TUI presets use the publishers' task prompts: GLM-OCR
+`Text Recognition:`, PaddleOCR-VL `OCR:`, and dots.ocr
+`Extract the text content from this image.` You can still override the prompt.
+
 Select an OCR model with its matching mmproj (for example
 `Unlimited-OCR-BF16.gguf` + `mmproj-Unlimited-OCR-F16.gguf`). In the Qt GUI,
 click **📄 OCR…** or double-click the OCR model. Choose one or more files/folders,
@@ -991,6 +995,20 @@ matches. See `settings/_default.yaml`.
 | `kimi-k3.yaml` | Kimi-K3 text path (loader b10448; corrected SSM state contract b10749+) | `kimi-k3` |
 
 Notes on the new profiles:
+
+- **v5.6.0:** A complete tensor scan proving MTP weights absent now overrides
+  `MTP` in the filename as well as stale metadata; separately attached heads
+  and inconclusive/legacy scans keep working. Shared OCR presets use the
+  documented GLM, Paddle and dots tasks. b11302 HIP/Vulkan expose the same
+  416 flags as b11249; no new tuning flag or build-recipe change is needed.
+  Real image+DFlash2 requests now pass on b11319 HIP/Vulkan with accepted
+  drafts; only b10896–b11318 remains gated. Stock b11319 still has the Vulkan
+  MoE prompt slowdown, isolated to upstream PR #29182. An opt-in, exact-version
+  [RDNA4 build workaround](docs/rdna4-moe-workaround.md) restores throughput on
+  the qualified AMD boards without replacing stock builds or saved selections.
+  [b11302 audit](docs/llama-b11302-audit.md),
+  [b11319 follow-up](docs/llama-b11319-audit.md),
+  [validation](docs/v5.6.0-validation.md).
 
 - **v5.5.9:** Muse Glimmer's `--jinja` parser enforces `response_format`
   `json_schema` only from b11249 (PR #29615); older builds answer in prose.

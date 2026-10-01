@@ -97,14 +97,20 @@ _PRESETS = {
     "paddleocr-vl": OcrModelPreset(
         family="paddleocr-vl",
         label="PaddleOCR-VL",
-        prompt="OCR markdown:",
+        prompt="OCR:",
         max_tokens=4096,
     ),
     "glm-ocr": OcrModelPreset(
-        family="glm-ocr", label="GLM-OCR", prompt="OCR", max_tokens=4096
+        family="glm-ocr",
+        label="GLM-OCR",
+        prompt="Text Recognition:",
+        max_tokens=4096,
     ),
     "dots-ocr": OcrModelPreset(
-        family="dots-ocr", label="Dots.OCR", prompt="OCR", max_tokens=4096
+        family="dots-ocr",
+        label="Dots.OCR",
+        prompt="Extract the text content from this image.",
+        max_tokens=4096,
     ),
     "hunyuan-ocr": OcrModelPreset(
         family="hunyuan-ocr", label="HunyuanOCR", prompt="OCR", max_tokens=4096

@@ -91,7 +91,8 @@ def _qwen_vision_dflash2(tmp_path):
         (10903, True),
         (10906, True),
         (10930, True),
-        (11500, True),
+        # The b11319 qualification now bounds the historical open-ended gate.
+        (11500, False),
         (None, False),
     ],
 )

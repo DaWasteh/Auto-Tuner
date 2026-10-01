@@ -98,7 +98,8 @@ def _qwen_vision_dflash2(tmp_path):
 
 @pytest.mark.parametrize(
     "build,blocked",
-    [(10895, False), (10896, True), (10930, True), (10948, True), (12000, True)],
+    # b11319 is now qualified; historical broken builds remain protected.
+    [(10895, False), (10896, True), (10930, True), (10948, True), (12000, False)],
 )
 def test_vision_with_dflash2_stays_gated_through_b10948(
     tmp_path, monkeypatch, build, blocked

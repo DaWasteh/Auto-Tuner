@@ -1342,11 +1342,13 @@ def _memlock_limit_gb() -> Optional[float]:
 #: batches (PR #28587). The recurrent DFlash2 draft memory then rejects the
 #: position gap after an image, so Qwen3.5/3.8 vision plus DFlash2 fails with
 #: HTTP 500. Reproduced on b10901, b10903, b10930, b10948, b10977, b11030,
-#: b11042, b11063, b11105, b11160, b11195 and b11249 (HIP and Vulkan;
+#: b11042, b11063, b11105, b11160, b11195, b11249 and b11302 (HIP and Vulkan;
 #: upstream issue #27408);
 #: PR #28715 (b10906) changed the handed-over position but did not fix this.
 #: Lower the gate only after an actual image+DFlash2 request succeeds.
 QWEN35_VISION_DFLASH2_BROKEN_SINCE = 10896
+# First locally qualified build (HIP/Vulkan, repeated images + accepted drafts).
+QWEN35_VISION_DFLASH2_FIXED_SINCE = 11319
 
 # Removed from mainline in b10875 (PR #28334). These are value-less
 # switches, not aliases: each selected a complete load mode, last one wins
@@ -5996,18 +5998,23 @@ def build_command(
             and draft_model.is_dflash2_drafter
             else None
         )
-        if build is not None and build >= QWEN35_VISION_DFLASH2_BROKEN_SINCE:
-            # Actual HIP and Vulkan image requests fail since PR #28587 skips
-            # pinned M-RoPE rows: the recurrent draft memory then rejects the
-            # position gap (X = 3, Y = 18). Text-only DFlash2 and vision
-            # without it both work. Gate only this combination, not other
-            # drafters; older builds keep the pre-#28587 behaviour.
+        if (
+            build is not None
+            and QWEN35_VISION_DFLASH2_BROKEN_SINCE
+            <= build
+            < QWEN35_VISION_DFLASH2_FIXED_SINCE
+        ):
+            # Pinned M-RoPE rows caused draft position gaps/HTTP 500, reproduced
+            # through b11302. Real b11319 HIP/Vulkan image and follow-up requests
+            # pass with accepted drafts. Use the first qualified build as the
+            # upper bound; do not infer support for untested intermediate tags.
             raise ValueError(
                 f"llama.cpp b{build} cannot reliably combine Qwen3.5/3.8 vision "
-                "with DFlash2: since b10896 (verified through b11249) image "
+                "with DFlash2: since b10896 (verified through b11249; "
+                "rechecked on b11302) image "
                 "requests fail with inconsistent draft cache positions "
                 "(HTTP 500). Disable Draft to use images, or disable Vision "
-                "for text-only DFlash2."
+                "for text-only DFlash2, or upgrade to b11319 or newer."
             )
     cmd: List[str] = [
         server_binary,

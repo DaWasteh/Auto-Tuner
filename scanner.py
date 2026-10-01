@@ -1566,6 +1566,11 @@ class ModelEntry:
         # Primary: authoritative GGUF metadata
         if self.metadata and metadata_has_embedded_mtp(self.metadata):
             return True
+        # A complete scan proving absence outranks the filename as well as
+        # stale nextn metadata. Otherwise an MTP-named trunk re-enables the
+        # head that metadata_has_embedded_mtp deliberately rejected.
+        if self.metadata and self.metadata.get("__mtp_scan__") == "absent":
+            return False
         # Fallback: filename-based for GGUFs missing the standard key. Guard
         # the "mtp" token so it does NOT fire on a standalone drafter named
         # with an "mtp-" prefix / "-MTP-" infix (e.g. mtp-gemma-4-12B-it-qat-UD,

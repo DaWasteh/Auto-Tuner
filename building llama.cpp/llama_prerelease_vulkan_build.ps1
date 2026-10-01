@@ -6,9 +6,11 @@ param(
     [ValidatePattern('^(latest|master|b\d+)$')]
     [string]$Tag = "latest",
     [string]$Workspace = "L:\LAB\ai-local",
-    [ValidateRange(1, 256)][int]$Parallel = 20
+    [ValidateRange(1, 256)][int]$Parallel = 20,
+    # Opt-in b11319-only output; never patches/replaces the stock build.
+    [switch]$Rdna4MoeWorkaround
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows_llama_build_common.ps1")
-Invoke-LlamaPrereleaseBuild -Backend Vulkan -Tag $Tag -Workspace $Workspace -Parallel $Parallel
+Invoke-LlamaPrereleaseBuild -Backend Vulkan -Tag $Tag -Workspace $Workspace -Parallel $Parallel -Rdna4MoeWorkaround:$Rdna4MoeWorkaround
