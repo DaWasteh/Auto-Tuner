@@ -82,5 +82,7 @@ the diagnostic binary. Fresh b11249 comparisons on both cards show only
 
 AutoTuner's MTP/OCR corrections remain local. Stock b11319 is not a
 regression-free Vulkan baseline, despite its working image+DFlash2 path.
-The opt-in scoped runtime supplies the qualified local basis; frozen and
-CI/release gates still apply. No v5.6.0 tag/push/publication is claimed here. See [validation and remaining gates](v5.6.0-validation.md).
+The opt-in scoped runtime supplies the qualified local basis. Frozen,
+main-CI, release/distro and published-asset gates now passed for v5.6.0;
+see the [final validation record](v5.6.0-validation.md). Stock binaries
+were not relabeled as the workaround. See [validation and remaining gates](v5.6.0-validation.md).
