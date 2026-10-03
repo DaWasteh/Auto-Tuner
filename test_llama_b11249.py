@@ -164,16 +164,16 @@ def test_vision_dflash2_gate_stays_and_names_b11249(tmp_path, monkeypatch, build
     assert tuner.QWEN35_VISION_DFLASH2_BROKEN_SINCE == 10896
 
 
-def test_v41_and_xing_blocks_name_b11249_while_mimo_floor_stays(tmp_path):
+def test_v41_and_xing_blocks_name_b11371_while_mimo_floor_stays(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11249" in profile.runtime_block_reason
+    assert "b11371" in profile.runtime_block_reason
     xing = _fake_model_md(tmp_path, "xing", 19, {"general.architecture": "xing4_0"})
-    assert "b11249" in tuner._model_runtime_block_reason(xing)
+    assert "b11371" in tuner._model_runtime_block_reason(xing)
     # The MiMo-V2 MTP-head requirement is a fixed floor, not an audit marker.
     assert tuner._MIN_MIMO2_MTP_SIDECAR_BUILD == 11195
     for name, notes in _pack_notes():
-        assert "b11249" in notes["deepseek-v4_1.yaml"], name
-        assert "b11249" in notes["xing-4_0.yaml"], name
+        assert "b11371" in notes["deepseek-v4_1.yaml"], name
+        assert "b11371" in notes["xing-4_0.yaml"], name
         assert "b11195" not in notes["deepseek-v4_1.yaml"] + notes["xing-4_0.yaml"]
         assert notes["mimo-v2_6.yaml"].count("b11195") == 2, name
 

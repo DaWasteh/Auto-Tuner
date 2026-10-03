@@ -236,6 +236,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--spec-draft-ngl",
     "--spec-draft-p-min",
     "--spec-draft-p-split",
+    "--spec-draft-sampling",
     "--spec-ngram-simple-min-hits",
     "--spec-ngram-simple-size-m",
     "--spec-ngram-simple-size-n",
@@ -736,7 +737,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     if arch == "xing4_0":
         return (
             "Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp "
-            "b11249 and no validated AutoTuner runtime. Do not substitute the "
+            "b11371 and no validated AutoTuner runtime. Do not substitute the "
             "DeepSeek or Qwen architecture."
         )
     if any(
@@ -761,7 +762,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11249 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11371 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -800,6 +801,50 @@ def _nemotron_latent_mtp_block_reason(
     )
 
 
+#: PR #29761 (first tagged in b11330) adds the ``qwen4exp`` NextN block
+#: (``blk.N.nextn.{eh_proj,enorm,hnorm,hc_head_*}``) and its MTP draft graph.
+#: Older builds register no NextN tensor for the architecture: a Qwen3.8
+#: Flash Next GGUF that embeds the block aborts with "wrong number of
+#: tensors", and a separate head fails ``check_tensor_dims`` on the trunk
+#: tensors it does not carry.
+_MIN_QWEN4EXP_MTP_BUILD = 11330
+
+#: ``draft-mtp`` itself still cannot be used with qwen4exp: b11371 (HIP and
+#: Vulkan, one and two GPUs) loads the model and its NextN block, reserves the
+#: MTP graph and then aborts in ``ggml-backend.cpp`` with
+#: ``GGML_ASSERT(buffer)`` while the draft context is initialised. This holds
+#: for a separate ``mtp-*.gguf`` head and for the same block embedded with
+#: ``merge_mtp_head.py``; ``--ctx-checkpoints 0``, F16 KV and
+#: ``--no-spec-draft-backend-sampling`` do not avoid it. The embedded GGUF
+#: runs normally without speculation. Lift this only after a real request
+#: with accepted drafts on a newer build.
+_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD = 11371
+
+
+def qwen4exp_mtp_draft_unusable(model: ModelEntry) -> bool:
+    """True when ``model`` is a qwen4exp GGUF whose embedded MTP head must
+    stay unused (see ``_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD``)."""
+    return (
+        str(model.architecture or "").strip().lower() == "qwen4exp"
+        and model.has_embedded_mtp
+    )
+
+
+def _qwen4exp_mtp_block_reason(model: ModelEntry, detected: Optional[int]) -> str:
+    """Explain why a qwen4exp GGUF with an embedded MTP block needs b11330+."""
+    if detected is None or detected >= _MIN_QWEN4EXP_MTP_BUILD:
+        return ""
+    if str(model.architecture or "").strip().lower() != "qwen4exp":
+        return ""
+    return (
+        f"{model.name} cannot load on llama.cpp b{detected}: its qwen4exp MTP "
+        f"block is registered only from b{_MIN_QWEN4EXP_MTP_BUILD} on "
+        "(PR #29761); older builds abort with 'wrong number of tensors' even "
+        f"with speculation disabled. Use b{_MIN_QWEN4EXP_MTP_BUILD}+ or a "
+        "Qwen3.8 Flash Next GGUF without the MTP block."
+    )
+
+
 #: PrismML Ternary-Bonsai 2 GGUFs (PTQ1_0 = ggml type 143, PQ2_0 = type 142)
 #: fold a Hadamard transform into their weights and describe it with
 #: ``prism.hadamard.*`` metadata that only the PrismML ``prism`` fork loads
@@ -833,7 +878,7 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11249 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11371 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -998,6 +1043,19 @@ def check_model_build(
     latent_block = _nemotron_latent_mtp_block_reason(model, detected)
     if latent_block:
         return False, latent_block, detected
+    qwen4exp_block = _qwen4exp_mtp_block_reason(model, detected)
+    if qwen4exp_block:
+        return False, qwen4exp_block, detected
+    if qwen4exp_mtp_draft_unusable(model):
+        return (
+            True,
+            f"{model.name}: the embedded qwen4exp MTP head is not used. "
+            "llama.cpp aborts with GGML_ASSERT(buffer) while the draft-mtp "
+            "context is initialised (reproduced on "
+            f"b{_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD} HIP and Vulkan); the model "
+            "runs without MTP and n-gram speculation stays available.",
+            detected,
+        )
     if (
         detected is None
         or detected < _BROKEN_NEXTN_BUILD_START
@@ -1201,6 +1259,17 @@ def is_mimo2_mtp_sidecar(draft_model: Optional[ModelEntry]) -> bool:
     return (draft_model.metadata or {}).get("__mtp_scan__") != "absent"
 
 
+def is_qwen4exp_mtp_sidecar(draft_model: Optional[ModelEntry]) -> bool:
+    """True for a separate Qwen3.8 Flash Next NextN/MTP head (``-md``)."""
+    if draft_model is None:
+        return False
+    arch = str(draft_model.architecture or "").strip().lower()
+    if arch != "qwen4exp" or not _is_mtp_style_sidecar(draft_model):
+        return False
+    # A stale nextn key over a scan-proven trunk-only file is no MTP head.
+    return (draft_model.metadata or {}).get("__mtp_scan__") != "absent"
+
+
 def check_draft_model_build(
     draft_model: Optional[ModelEntry],
     binary: str,
@@ -1222,6 +1291,31 @@ def check_draft_model_build(
         return True, "", None
 
     missing = mtp_sidecar_missing_root_tensors(target, draft_model)
+    if is_qwen4exp_mtp_sidecar(draft_model):
+        qwen4exp_head_build = probe_binary_build_number(binary)
+        if qwen4exp_head_build is not None:
+            if qwen4exp_head_build < _MIN_QWEN4EXP_MTP_BUILD:
+                why = (
+                    f"b{qwen4exp_head_build} has no qwen4exp MTP graph "
+                    f"(added in b{_MIN_QWEN4EXP_MTP_BUILD}, PR #29761) and "
+                    "aborts while loading the head"
+                )
+            else:
+                why = (
+                    f"b{qwen4exp_head_build} loads the head through its "
+                    "MTP-only mode but aborts with GGML_ASSERT(buffer) while "
+                    "the draft-mtp context is initialised (reproduced on "
+                    f"b{_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD} HIP and Vulkan)"
+                )
+            return (
+                False,
+                "The separate Qwen3.8 Flash Next MTP head "
+                f"{draft_model.path.name} cannot be used: {why}. Use a "
+                "Qwen3.8 Flash Next GGUF with the MTP block embedded "
+                f"(llama.cpp b{_MIN_QWEN4EXP_MTP_BUILD}+) or n-gram "
+                "speculation instead.",
+                qwen4exp_head_build,
+            )
     if missing:
         shown = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
         return (
@@ -1558,6 +1652,7 @@ def _adapt_spec_types_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
         "--spec-draft-n-min",
         "--spec-draft-p-min",
         "--spec-draft-p-split",
+        "--spec-draft-sampling",
     }
     cleaned: List[str] = [adapted[0]]
     i = 1
@@ -1643,6 +1738,7 @@ def _adapt_nextn_regression_for_binary(cmd: List[str]) -> Tuple[List[str], List[
         "--spec-draft-n-min",
         "--spec-draft-p-min",
         "--spec-draft-p-split",
+        "--spec-draft-sampling",
     }
     cleaned: List[str] = [adapted[0]]
     i = 1
@@ -2042,8 +2138,34 @@ def _kv_per_token_total_mb_from_metadata(md: Dict[str, Any]) -> float:
     if n_kv_heads <= 0:
         n_kv_heads = n_heads if n_heads > 0 else 1
 
+    # gpt-oss alternates sliding-window and dense layers (llama.cpp hardcodes
+    # ``load_swa_pattern(ml, 2)``; the GGUF stores only the window). Only the
+    # dense half scales with the context: b11371 logs "131072 cells, 12
+    # layers" for the 24-block 20B model plus a 1280-cell SWA cache.
+    if (
+        arch.lower() == "gpt-oss"
+        and _int("attention.sliding_window") > 0
+        and _metadata_arch_value(md, arch, ("attention.sliding_window_pattern",))
+        is None
+    ):
+        n_layers = (n_layers + 1) // 2
+
+    # MLA (DeepSeek2 family, GLM-4.7-Flash, ...): llama.cpp stores the
+    # compressed latent in K only and creates no V tensor (``has_v =
+    # !is_mla``). b11371 logs "K (q8_0): 5561.79 MiB, V (q8_0): 0.00 MiB".
+    if _metadata_is_mla(md, arch):
+        value_length = 0
+
     bytes_per_token = n_layers * n_kv_heads * (key_length + value_length) * 2
     return bytes_per_token / (1024.0 * 1024.0)
+
+
+def _metadata_is_mla(md: Dict[str, Any], arch: str) -> bool:
+    """Mirror ``llama_hparams::is_mla()``: both MLA head sizes are set."""
+    return (
+        _metadata_arch_int(md, arch, "attention.key_length_mla") > 0
+        and _metadata_arch_int(md, arch, "attention.value_length_mla") > 0
+    )
 
 
 def kv_per_token_parts_mb_from_metadata(
@@ -2058,6 +2180,9 @@ def kv_per_token_parts_mb_from_metadata(
     if total <= 0:
         return 0.0, 0.0
     arch = str(md.get("general.architecture") or "")
+    if _metadata_is_mla(md, arch):
+        # MLA keeps everything in K; there is no V tensor to quantize.
+        return total, 0.0
     key_length = _metadata_arch_int(md, arch, "attention.key_length")
     value_length = _metadata_arch_int(md, arch, "attention.value_length")
     if key_length <= 0 or value_length <= 0:
@@ -2486,6 +2611,11 @@ class TunedConfig:
     # Additional MoE op-offload batch workspace beyond the generic KV/FA
     # headroom. Included in GPU footprint/preflight reporting.
     batch_vram_overhead_gb: float = 0.0
+    # llama.cpp scheduler compute buffers (attention mask + activations) and
+    # the small host side of a GPU plan. Reported on top of the placement
+    # components by every footprint total (preview, preflight, registry).
+    compute_vram_gb: float = 0.0
+    compute_ram_gb: float = 0.0
     # KV split between VRAM and RAM (set by compute_config). For
     # full-offload / MoE-on-GPU the entire KV cache lives in VRAM and
     # `kv_ram_gb == 0`. For dense-hybrid placement the small RAM share
@@ -4443,6 +4573,11 @@ def _compute_config(
     # honours it instead of being overridden by native_ctx (262144).
     if is_diffusion_gemma and user_ctx is None:
         model_ctx_limit = min(model_ctx_limit, profile_max)
+    # Decision models answer one short typed prompt per request and generate
+    # nothing; a 262k window inherited from the Qwen/Gemma backbone would only
+    # allocate KV that /v1/systemone never fills.
+    if decision_model_type(model) and user_ctx is None:
+        model_ctx_limit = min(model_ctx_limit, profile_max)
 
     # Pick precision against the context Auto will actually attempt. The old
     # target used profile_max even when the final auto branch aimed at a larger
@@ -4881,7 +5016,12 @@ def _compute_config(
     #
     #   3. Everything else (small-to-mid dense, short ctx): 2048/512 —
     #      the historical default that's optimal for pure GPU inference.
-    if is_qwen4exp:
+    if single_batch_prompt_tokens(model) > 0:
+        # Non-causal encoders and joint decision heads read their outputs from
+        # one physical batch: llama-server rejects a prompt longer than
+        # --ubatch-size instead of splitting it.
+        batch = ubatch = max(512, min(ctx, single_batch_prompt_tokens(model)))
+    elif is_qwen4exp:
         # QSA's ctx×ubatch graph dominates both host and device memory. Use
         # 64/128/256 for Safe/Balanced/Throughput so long requested contexts
         # consume batch throughput before they consume the context window.
@@ -4901,6 +5041,14 @@ def _compute_config(
         batch, ubatch = 1024, 1024
     else:
         batch, ubatch = 2048, 512
+
+    # Non-causal projectors (Gemma 4) decode an image in ONE physical batch.
+    # b11327+ (PR #29773) silently caps the projector's image budget to
+    # --ubatch-size, older builds reject the image; keep the full budget.
+    vision_ubatch = noncausal_vision_token_budget(model.mmproj)
+    if vision_ubatch > ubatch and not is_qwen4exp:
+        ubatch = vision_ubatch
+        batch = max(batch, ubatch)
 
     # ---- (4c) mlock + no_mmap (Windows Admin Check)
     ram_resident_gb = model_ram
@@ -5592,7 +5740,279 @@ def compute_config(*args, **kwargs) -> TunedConfig:
         and arguments["profile"].runner != "llama-diffusion-gemma-server"
     ):
         return plan(_compute_config, arguments)
-    return _compute_config(*args, **kwargs)
+    config = _compute_config(*args, **kwargs)
+    if arguments["profile"].runner == "llama-diffusion-gemma-server":
+        return config
+    model, system = arguments["model"], arguments["system"]
+    overflow = _finalize_runtime_buffers(config, model, system)
+    # Auto context only: a split plan whose compute buffers still do not fit
+    # at the smallest physical batch gives up context instead of letting the
+    # driver move several GiB into shared (host) memory.
+    original_ctx = config.ctx
+    for _ in range(6):
+        if overflow <= 0 or arguments["user_ctx"] is not None or config.ctx <= 16384:
+            break
+        per_token_gb = (
+            config.kv_vram_gb
+            + compute_buffer_estimate_gb(config.ctx, config.ubatch, True)[0]
+        ) / max(1, config.ctx)
+        if per_token_gb <= 0:
+            break
+        target = config.ctx - int((overflow + 0.25) / per_token_gb)
+        target = max(16384, min(int(config.ctx * 0.97), target) // 1024 * 1024)
+        try:
+            candidate = _compute_config(**{**arguments, "user_ctx": target})
+        except (MemoryError, ValueError):
+            break
+        overflow = _finalize_runtime_buffers(candidate, model, system)
+        config = candidate
+    if config.ctx != original_ctx:
+        config.memory_adjustments.append(
+            f"context {original_ctx} -> {config.ctx}: multi-GPU compute buffers "
+            "would not fit beside the weights and KV cache"
+        )
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Scheduler compute buffers and host footprint of a GPU plan
+#
+# Measured on llama.cpp b11371 (Vulkan and HIP, RX 9070 XT + R9700) with
+# ``-lv 4`` buffer reports against Windows per-process GPU/host counters:
+# the scheduler reserves the attention mask (n_ctx x n_ubatch, F16) about
+# twice on a single device and about ten times once the layers are split
+# across devices, plus activations that grow with the physical batch. The
+# host keeps roughly one mask (single) or four (split) as pinned staging
+# memory, the CPU-side input embeddings and a small fixed runtime. None of
+# this was part of the displayed estimate, and on dual-GPU plans at 262k+
+# context it exceeded the generic KV headroom and spilled into shared GPU
+# memory.
+_COMPUTE_MASK_COPIES_VRAM = (2.0, 10.0)  # (single device, split devices)
+_COMPUTE_MASK_COPIES_RAM = (1.1, 4.3)
+#: Activation workspace per (ubatch token x embedding dimension); 46 bytes
+#: reproduce the 8192-token batches of Clef-Flash and the small encoders.
+_COMPUTE_ACTIVATION_BYTES = 46
+_COMPUTE_DEFAULT_EMBD = 4096
+_HOST_RUNTIME_BASE_GB = 0.4
+#: VRAM kept free per participating card before a split plan gives up
+#: physical batch size (the mask lands unevenly on the devices).
+_SPLIT_COMPUTE_RESERVE_GB_PER_GPU = 3.0
+_MIN_SPLIT_UBATCH = 256
+
+
+def compute_buffer_estimate_gb(
+    ctx: int,
+    ubatch: int,
+    split_devices: bool,
+    gpu: bool = True,
+    n_embd: int = _COMPUTE_DEFAULT_EMBD,
+) -> Tuple[float, float]:
+    """Return llama.cpp's ``(VRAM, host RAM)`` compute buffers in GiB."""
+    mask_gb = max(0, int(ctx)) * max(1, int(ubatch)) * 2 / (1024.0**3)
+    width = int(n_embd) if int(n_embd or 0) > 0 else _COMPUTE_DEFAULT_EMBD
+    activation_gb = (
+        max(1, int(ubatch)) * width * _COMPUTE_ACTIVATION_BYTES / (1024.0**3)
+    )
+    index = 1 if split_devices else 0
+    if not gpu:
+        # CPU-only: every buffer is host memory.
+        return 0.0, (_COMPUTE_MASK_COPIES_VRAM[0] + 1.0) * mask_gb + activation_gb
+    return (
+        _COMPUTE_MASK_COPIES_VRAM[index] * mask_gb + activation_gb,
+        _COMPUTE_MASK_COPIES_RAM[index] * mask_gb,
+    )
+
+
+def _split_device_count(config: "TunedConfig") -> int:
+    count = 0
+    for part in str(config.tensor_split or "").split(","):
+        try:
+            count += float(part) > 0
+        except ValueError:
+            continue
+    return count
+
+
+def _finalize_runtime_buffers(
+    config: "TunedConfig", model: ModelEntry, system: SystemInfo
+) -> float:
+    """Add compute buffers / host footprint to a finished plan, in place.
+
+    Returns the GiB by which a multi-GPU plan still exceeds its budget after
+    the physical batch was lowered (0.0 when it fits or does not apply).
+
+    Also applies the two launch choices that follow from the measurement:
+    a split plan whose compute buffers would not fit keeps its context and
+    lowers ``-ub`` instead, and a fully offloaded Windows plan reads the
+    weights without mmap so the model file does not stay in the working set.
+    """
+    if config.adaptive_memory or str(model.architecture or "").lower() == "qwen4exp":
+        # Adaptive plans carry their own host reserve; qwen4exp models its
+        # context x ubatch QSA graph explicitly.
+        return 0.0
+    overflow_gb = 0.0
+    on_gpu = config.ngl > 0 and bool(system.gpus)
+    devices = _split_device_count(config)
+    split = devices > 1
+    n_embd = _metadata_arch_int(
+        model.metadata or {}, str(model.architecture or ""), "embedding_length"
+    )
+    fully_on_gpu = on_gpu and config.full_offload and not config.n_cpu_moe
+
+    if split and fully_on_gpu and single_batch_prompt_tokens(model) == 0:
+        free_gb = sum(
+            sorted((g.free_vram_mb / 1024.0 for g in system.gpus), reverse=True)[
+                :devices
+            ]
+        )
+        fixed_gb = (
+            config.estimated_model_vram_gb
+            + config.vision_vram_gb
+            + config.draft_vram_gb
+            + config.kv_vram_gb
+            + config.recurrent_state_vram_gb
+            + config.runtime_vram_overhead_gb
+            + config.batch_vram_overhead_gb
+        )
+        budget_gb = free_gb - _SPLIT_COMPUTE_RESERVE_GB_PER_GPU * devices
+        floor = max(_MIN_SPLIT_UBATCH, noncausal_vision_token_budget(model.mmproj))
+        ubatch = config.ubatch
+        while (
+            ubatch // 2 >= floor
+            and fixed_gb
+            + compute_buffer_estimate_gb(config.ctx, ubatch, True, True, n_embd)[0]
+            > budget_gb
+        ):
+            ubatch //= 2
+        config.ubatch = ubatch
+        overflow_gb = max(
+            0.0,
+            fixed_gb
+            + compute_buffer_estimate_gb(config.ctx, ubatch, True, True, n_embd)[0]
+            - budget_gb,
+        )
+
+    # The ten-mask factor belongs to fully offloaded split plans. Hybrid plans
+    # (CPU-resident layers or experts) measured like a single device: 3.1-4.0
+    # GiB at ubatch 4096 including their op-offload batch reserve.
+    compute_vram, compute_ram = compute_buffer_estimate_gb(
+        config.ctx, config.ubatch, split and fully_on_gpu, on_gpu, n_embd
+    )
+    host_gb = compute_ram
+    if on_gpu:
+        host_gb += _HOST_RUNTIME_BASE_GB
+        if fully_on_gpu and config.estimated_model_ram_gb < 0.05:
+            # The input embedding table stays on the host even at -ngl all.
+            # Only MoE scans record its exact size; otherwise assume 5 % of
+            # the file, capped at the 0.6 GiB seen on 27-35B models.
+            try:
+                embedding_bytes = int(
+                    (model.metadata or {}).get("__input_embedding_bytes__", 0) or 0
+                )
+            except (TypeError, ValueError):
+                embedding_bytes = 0
+            if embedding_bytes > 0:
+                host_gb += embedding_bytes / (1024.0**3)
+            else:
+                host_gb += min(0.6, 0.05 * model.size_bytes / (1024.0**3))
+    config.compute_vram_gb = round(compute_vram, 3)
+    config.compute_ram_gb = round(host_gb, 3)
+
+    if (
+        str(system.os_name or "").lower().startswith("windows")
+        and fully_on_gpu
+        and not config.unified_memory
+        and config.load_mode == "auto"
+        and not config.mlock
+        and not config.no_mmap
+        and config.mapped_model_ram_gb <= 0
+        and int(getattr(model, "read_lazy_size_bytes", 0) or 0) == 0
+    ):
+        # With mmap Windows keeps every page that was read for the upload in
+        # the server's working set: a 26 GiB GPU-resident model also showed
+        # 16 GiB of host RAM in use. Plain reads load faster here and leave
+        # only the real host footprint (measured 16.4 -> 1.8 GiB, same speed).
+        config.load_mode = "none"
+        config.no_mmap = True
+    return overflow_gb
+
+
+#: Largest prompt AutoTuner sizes ``-b``/``-ub`` for when a model must see its
+#: whole prompt in a single physical batch.
+SINGLE_BATCH_PROMPT_TOKENS = 8192
+
+
+def decision_model_type(model: ModelEntry) -> str:
+    """Return ``<arch>.decision.type`` of a TypeSafe decision GGUF, else ``""``.
+
+    b11361+ (PR #29818) serves these models through ``/v1/systemone`` only;
+    the type selects the prompt/readout scheme (openjev, lev, kev, nimble,
+    laya, clef).
+    """
+    metadata = model.metadata or {}
+    arch = str(model.architecture or "").strip()
+    value = metadata.get(f"{arch}.decision.type") if arch else None
+    return str(value or "").strip().lower()
+
+
+def single_batch_prompt_tokens(model: ModelEntry) -> int:
+    """Prompt budget for models that cannot split a prompt across ubatches.
+
+    Applies to non-causal encoders (``<arch>.attention.causal = false``:
+    BERT-style embedding models and the laya/julia decision models) and to
+    the joint clef decision head. Returns 0 for ordinary causal models.
+    """
+    metadata = model.metadata or {}
+    arch = str(model.architecture or "").strip()
+    non_causal = bool(arch) and metadata.get(f"{arch}.attention.causal") is False
+    if non_causal or decision_model_type(model) in {"laya", "clef"}:
+        return SINGLE_BATCH_PROMPT_TOKENS
+    return 0
+
+
+#: Upper image-token budget of llama.cpp's Gemma 4 projectors
+#: (``set_limit_image_tokens(70, 1120)`` in tools/mtmd/clip.cpp).
+GEMMA4_IMAGE_MAX_TOKENS = 1120
+
+
+@lru_cache(maxsize=64)
+def _noncausal_vision_token_budget_cached(path: str, mtime_ns: int, size: int) -> int:
+    try:
+        from scanner import read_gguf_metadata
+
+        metadata = read_gguf_metadata(Path(path)) or {}
+    except Exception:
+        return 0
+    projector = str(metadata.get("clip.vision.projector_type") or "").lower()
+    if projector == "gemma4uv":
+        return GEMMA4_IMAGE_MAX_TOKENS
+    if projector == "gemma4v":
+        # E2B (1536) and E4B (2560) decode images causally and may split them.
+        try:
+            width = int(metadata.get("clip.vision.projection_dim") or 0)
+        except (TypeError, ValueError):
+            width = 0
+        return 0 if width in (1536, 2560) else GEMMA4_IMAGE_MAX_TOKENS
+    return 0
+
+
+def noncausal_vision_token_budget(mmproj: Optional[Path]) -> int:
+    """Image tokens a non-causal projector may emit for one image, else 0.
+
+    llama.cpp evaluates such an image with non-causal attention, so the whole
+    image must fit into ``--ubatch-size`` (``mtmd_decode_use_non_causal``).
+    Only the Gemma 4 projectors have a variable budget above AutoTuner's
+    smallest ubatch; Gemma 3 uses a fixed 256 tokens.
+    """
+    if not isinstance(mmproj, (str, os.PathLike)):
+        return 0
+    try:
+        stat = Path(mmproj).stat()
+    except OSError:
+        return 0
+    return _noncausal_vision_token_budget_cached(
+        str(mmproj), stat.st_mtime_ns, stat.st_size
+    )
 
 
 def _has_integrated_mtp(model: ModelEntry) -> bool:
@@ -6215,7 +6635,11 @@ def build_command(
     # lives inside the same GGUF as the main model; llama.cpp loads it as part
     # of the same graph so there is no second-model-load conflict.
     use_integrated = (
-        enable_speculative and _has_integrated_mtp(model) and draft_model is None
+        enable_speculative
+        and _has_integrated_mtp(model)
+        and draft_model is None
+        # qwen4exp draft-mtp aborts at context creation through b11371.
+        and not qwen4exp_mtp_draft_unusable(model)
     )
 
     # ---- Draftless ("ngram") method selection (b9334) ------------------

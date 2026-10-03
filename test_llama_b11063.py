@@ -194,22 +194,22 @@ def test_mainline_b11063_still_lacks_the_prism_and_rocmfpx_types(tmp_path, monke
 # ------------------------------------------------------------- carry-over ----
 
 
-def test_v41_block_names_b11249(tmp_path):
+def test_v41_block_names_b11371(tmp_path):
     # PR #28696 is still an open draft (last updated 2026-09-19): the block
-    # now names the b11249 re-check.
+    # now names the b11371 re-check.
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11249" in profile.runtime_block_reason
+    assert "b11371" in profile.runtime_block_reason
     assert "b11030" not in profile.runtime_block_reason
     assert "b11030" not in profile.notes
-    with pytest.raises(ValueError, match="b11249"):
+    with pytest.raises(ValueError, match="b11371"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b11249 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11371 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))
     for pack in sorted((ROOT / "assets/languages").glob("*.json")):
         notes = json.loads(pack.read_text(encoding="utf-8"))["profile_notes"]
-        assert "b11249" in notes["deepseek-v4_1.yaml"], pack.name
+        assert "b11371" in notes["deepseek-v4_1.yaml"], pack.name
         assert "b11030" not in notes["deepseek-v4_1.yaml"], pack.name
 
 

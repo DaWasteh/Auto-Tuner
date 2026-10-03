@@ -1,0 +1,51 @@
+display_name: "Decision models (TypeSafe /v1/systemone)"
+patterns:
+  - openjev
+  - laya-
+  - julia-1
+  - kev-4b
+  - lev-q
+  - lev-bf16
+  - lev-f16
+  - bespoke-nimble
+  - nimble-9b
+
+# llama.cpp b11361 (PR #29818) serves openjev, lev, laya, julia-1 and kev
+# through POST /v1/systemone; b11364 (PR #29844) adds nimble. The floor is the
+# newer tag so one profile covers the whole family.
+min_llama_build: 11364
+
+# Questions and state are short classification prompts, not chat history.
+# laya/julia-1 are ModernBERT encoders with 8192 native context; the Qwen/Gemma
+# based heads inherit a 262k window they never need.
+max_context: 32768
+recommended_kv_quant: q8_0
+draft_max: 0
+
+# Formal only: a decision is one forward pass, no token is sampled.
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  TypeSafe-style decision models (OpenJev, lev, Laya, Julia-1, Kev, Nimble):
+  they answer typed choice/score/noul questions about a state in one forward
+  pass through POST /v1/systemone and generate no text, so chat, sampling,
+  reasoning and speculation settings have no effect. Needs llama.cpp b11364+
+  (b11361 for all but Nimble). The encoder variants (Laya, Julia-1) must fit
+  the whole prompt into one physical batch; AutoTuner therefore raises
+  batch/ubatch to the context size for them. OpenJev accepts images when its
+  mmproj is attached. Probabilities use the temperatures stored in the GGUF
+  and are not guaranteed to be calibrated for your data.

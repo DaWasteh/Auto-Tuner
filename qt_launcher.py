@@ -11074,6 +11074,7 @@ class MainWindow(QMainWindow):
             + cfg.kv_vram_gb
             + cfg.recurrent_state_vram_gb
             + cfg.runtime_vram_overhead_gb
+            + float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
             + cfg.batch_vram_overhead_gb
         )
         mapped_resident_gb = float(
@@ -11086,6 +11087,7 @@ class MainWindow(QMainWindow):
             + cfg.kv_ram_gb
             + cfg.recurrent_state_ram_gb
             + cfg.runtime_ram_overhead_gb
+            + float(getattr(cfg, "compute_ram_gb", 0.0) or 0.0)
             + cfg.prompt_cache_ram_gb
         )
         lines += [bar, "Memory estimate (with current options):"]
@@ -11120,6 +11122,12 @@ class MainWindow(QMainWindow):
             lines.append(f"  Runtime RAM: ~{cfg.runtime_ram_overhead_gb:5.1f} GB")
         if cfg.batch_vram_overhead_gb > 0.05:
             lines.append(f"  Batch GPU : ~{cfg.batch_vram_overhead_gb:5.1f} GB")
+        compute_vram_gb = float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
+        compute_ram_gb = float(getattr(cfg, "compute_ram_gb", 0.0) or 0.0)
+        if compute_vram_gb > 0.05:
+            lines.append(f"  Compute GPU: ~{compute_vram_gb:5.1f} GB")
+        if compute_ram_gb > 0.05:
+            lines.append(f"  Compute RAM: ~{compute_ram_gb:5.1f} GB")
         lines.append(f"  Model CPU : ~{cfg.estimated_model_ram_gb:5.1f} GB")
         if cfg.mapped_model_ram_gb > 0.05:
             lines.append(
@@ -13826,6 +13834,7 @@ class MainWindow(QMainWindow):
             + float(cfg.vision_vram_gb)
             + float(cfg.draft_vram_gb)
             + float(cfg.runtime_vram_overhead_gb)
+            + float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
             + float(cfg.batch_vram_overhead_gb)
             + float(cfg.recurrent_state_vram_gb)
         )
@@ -13872,6 +13881,7 @@ class MainWindow(QMainWindow):
                     + float(cfg.vision_vram_gb)
                     + float(cfg.draft_vram_gb)
                     + float(cfg.runtime_vram_overhead_gb)
+                    + float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
                     + float(cfg.batch_vram_overhead_gb)
                     + float(cfg.recurrent_state_vram_gb)
                 )
@@ -14578,6 +14588,7 @@ class MainWindow(QMainWindow):
                 + float(cfg.vision_vram_gb)
                 + float(cfg.draft_vram_gb)
                 + float(cfg.runtime_vram_overhead_gb)
+                + float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
                 + float(cfg.batch_vram_overhead_gb)
                 + float(cfg.recurrent_state_vram_gb)
             )
@@ -14851,6 +14862,7 @@ class MainWindow(QMainWindow):
                 + float(cfg.vision_vram_gb)
                 + float(cfg.draft_vram_gb)
                 + float(cfg.runtime_vram_overhead_gb)
+                + float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
                 + float(cfg.batch_vram_overhead_gb)
                 + float(cfg.recurrent_state_vram_gb)
             ),

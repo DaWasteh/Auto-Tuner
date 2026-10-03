@@ -1,0 +1,44 @@
+display_name: "Clef decision model (Cloudflare)"
+patterns:
+  - clef-flash
+  - cloudflare_clef
+  - clef-q
+  - clef-bf16
+  - clef-f16
+arch_fallback:
+  - clef
+
+# The clef architecture (Qwen3.5 backbone evaluated without memory plus a
+# joint decision head) landed in b11371 (PR #29831).
+min_llama_build: 11371
+
+# All questions of a request are decided in ONE prompt that must fit into
+# --ubatch-size; AutoTuner sizes batch/ubatch for 8192 tokens.
+max_context: 16384
+recommended_kv_quant: q8_0
+draft_max: 0
+
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  Cloudflare Clef / Clef-Flash: a joint decision model on a Qwen3.5 backbone
+  (architecture clef, llama.cpp b11371+). A server running Clef serves only
+  POST /v1/systemone; text generation is unavailable, so chat, sampling,
+  reasoning and speculation settings have no effect. All questions of a
+  request are read in one prompt and decided jointly; that prompt must fit
+  into one physical batch, which AutoTuner sizes for 8192 tokens. Up to 255
+  options per choice question. Image input is not supported yet.

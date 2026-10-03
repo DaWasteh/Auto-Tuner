@@ -131,13 +131,13 @@ def test_documented_alternatives_still_build_on_b10948(tmp_path, monkeypatch):
     assert "-md" in tuner.build_command(model, config, profile, draft_model=draft)
 
 
-def test_v41_block_names_b11249(tmp_path):
+def test_v41_block_names_b11371(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11249" in profile.runtime_block_reason
+    assert "b11371" in profile.runtime_block_reason
     assert "b10930" not in profile.runtime_block_reason
-    with pytest.raises(ValueError, match="b11249"):
+    with pytest.raises(ValueError, match="b11371"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b11249 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11371 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))

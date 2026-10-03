@@ -2349,6 +2349,20 @@ def scan_models(
             )
         )
 
+    # A target whose own tensors already contain the NextN/MTP block must not
+    # default to a separate ``mtp-*`` head lying next to it (for example after
+    # merge_mtp_head.py): the embedded head is the path llama.cpp tests, and
+    # an external draft would take precedence over it at launch. The head
+    # stays selectable through ``folder_drafts``.
+    for entry in entries:
+        if (
+            entry.draft is not None
+            and (entry.metadata or {}).get("__mtp_scan__") == "found"
+            and entry.has_embedded_mtp
+            and entry.draft.name.lower().startswith(("mtp-", "mtp_", "mtp."))
+        ):
+            entry.draft = None
+
     if read_metadata:
         flush_gguf_metadata_cache()
     return entries

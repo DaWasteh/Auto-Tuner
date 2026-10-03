@@ -1,0 +1,44 @@
+display_name: "LLM-jp-4.1 (NII)"
+patterns:
+  - llm-jp-4.1
+  - llm-jp-4_1
+  - llm-jp-41
+
+# b11320 (PR #29681) adds the llm-jp-harmony-v1 chat handler. Older builds
+# route the template to the GPT-OSS Harmony parser, which rejects the
+# tokenizer's space after every special token (HTTP 500) and cannot build the
+# tool grammar.
+min_llama_build: 11320
+
+max_context: 65536
+recommended_kv_quant: q8_0
+
+# NII cookbook (llm-jp-4-cookbook, example_basic.py): do_sample, temperature
+# 0.7, top_p 0.9; no top_k / repetition penalty.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 0
+    top_p: 0.9
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 0.7
+    top_k: 0
+    top_p: 0.9
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  LLM-jp-4.1 thinking models from Japan's National Institute of Informatics
+  (8B and 33B dense, 32B-A3B MoE; Japanese/English, 65,536 context). They use
+  an OpenAI-Harmony-compatible template with their own tokenizer; llama.cpp
+  b11320+ ships the matching llm-jp-harmony-v1 handler, so --jinja separates
+  reasoning from content and parses single and parallel tool calls. Older
+  builds fail chat parsing. Sampling follows the NII cookbook (temp 0.7 /
+  top_p 0.9, no top_k, no repetition penalty). Reasoning effort is selected
+  through the template (reasoning_effort low/medium/high). LLM-jp-4.0 has no
+  handler marker and is not covered.

@@ -7,7 +7,7 @@ param(
     [string]$Tag = "latest",
     [string]$Workspace = "L:\LAB\ai-local",
     [ValidateRange(1, 256)][int]$Parallel = 20,
-    # Opt-in b11319-only output; never patches/replaces the stock build.
+    # Opt-in b11319/b11371-only output; never patches/replaces the stock build.
     [switch]$Rdna4MoeWorkaround
 )
 

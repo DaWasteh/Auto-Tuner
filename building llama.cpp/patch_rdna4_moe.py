@@ -1,4 +1,4 @@
-"""Opt-in, fail-closed b11319 Windows RDNA4 MoE tile workaround.
+"""Opt-in, fail-closed b11319/b11371 Windows RDNA4 MoE tile workaround.
 
 Only AMD proprietary-driver PCI 7550/7551 devices change dispatch; other
 platforms/devices retain upstream PR #29182 behavior. No model weights changed.
@@ -16,6 +16,14 @@ BUILD = 11319
 COMMIT = "3ec4df42d9c1d4de896c886ebc65fad2e6e29fa4"
 SOURCE = "ggml/src/ggml-vulkan/ggml-vulkan.cpp"
 ORIGINAL_SHA256 = "a793c78d67f755c81fe861b2a9d145654055fe8ac351a974b6e6bae95bdde730"
+#: Later exact tags whose Vulkan source was re-audited: the dispatch hunk is
+#: byte-identical and the regression (upstream issue #29892) persists.
+LATER_QUALIFIED = {
+    "99b95488cac0f00ce3f05af113a8c1e287753f87": (
+        11371,
+        "e43a39ce1e9443f7c1c00e7bb9f13d56ab5a01e2355973ee740d4324e0e0698b",
+    ),
+}
 RECEIPT = "autotuner-rdna4-moe-workaround.json"
 PATCH_ID = "autotuner-rdna4-moe-v1"
 
@@ -57,10 +65,23 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
-def _validate_checkout(repo: Path) -> None:
-    if _git(repo, "rev-parse", "HEAD") != COMMIT:
+def _qualified() -> dict[str, tuple[int, str]]:
+    """Map each qualified upstream commit to its build and LF source digest."""
+    return {COMMIT: (BUILD, ORIGINAL_SHA256), **LATER_QUALIFIED}
+
+
+def _validate_checkout(repo: Path) -> tuple[str, int, str]:
+    head = _git(repo, "rev-parse", "HEAD")
+    qualified = _qualified()
+    if head not in qualified:
         raise ValueError(
-            "RDNA4 workaround is qualified only for exact b11319 commit " + COMMIT
+            "RDNA4 workaround is qualified only for exact "
+            + " or ".join(
+                f"b{build} commit {commit}"
+                for commit, (build, _) in sorted(
+                    qualified.items(), key=lambda item: item[1][0]
+                )
+            )
         )
     for args in [("diff", "--name-only"), ("diff", "--cached", "--name-only")]:
         changes = set(_git(repo, *args).splitlines()) - {SOURCE}
@@ -69,17 +90,18 @@ def _validate_checkout(repo: Path) -> None:
                 "Refusing unrelated tracked source changes: "
                 + ", ".join(sorted(changes))
             )
+    return (head, *qualified[head])
 
 
 def validate_source(repo: Path) -> tuple[Path, str, bool]:
-    _validate_checkout(repo)
+    _, _, original_sha256 = _validate_checkout(repo)
     path = repo / SOURCE
     # Git core.autocrlf varies by workstation; normalize only newline encoding.
     text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
     is_patched = text.count(PATCHED) == 1
     original = text.replace(PATCHED, ORIGINAL, 1) if is_patched else text
     if (
-        _digest(original.encode("utf-8")) != ORIGINAL_SHA256
+        _digest(original.encode("utf-8")) != original_sha256
         or original.count(ORIGINAL) != 1
     ):
         raise ValueError(
@@ -116,10 +138,11 @@ def _receipt_data(repo: Path) -> dict:
     _, text, patched = validate_source(repo)
     if not patched:
         raise ValueError("RDNA4 workaround is not present in this source")
+    commit, build, _ = _validate_checkout(repo)
     return {
         "patch": PATCH_ID,
-        "build": BUILD,
-        "upstream_commit": COMMIT,
+        "build": build,
+        "upstream_commit": commit,
         "platform": "Windows",
         "driver": "AMD proprietary",
         "vendor_id": "1002",

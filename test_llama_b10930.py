@@ -135,10 +135,10 @@ def test_gate_stays_narrow_on_a_gated_build(tmp_path, monkeypatch):
 
 def test_v41_block_names_the_audited_build(tmp_path):
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11249" in profile.runtime_block_reason and "b10930" not in profile.notes
-    with pytest.raises(ValueError, match="b11249"):
+    assert "b11371" in profile.runtime_block_reason and "b10930" not in profile.notes
+    with pytest.raises(ValueError, match="b11371"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b11249 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11371 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))

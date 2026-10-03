@@ -423,6 +423,12 @@ def _print_config(
         print(f"    Runtime RAM      : ~ {runtime_ram_overhead_gb:5.1f} GB")
     if cfg.batch_vram_overhead_gb:
         print(f"    Batch workspace  : ~ {cfg.batch_vram_overhead_gb:5.1f} GB")
+    compute_vram_gb = float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
+    compute_ram_gb = float(getattr(cfg, "compute_ram_gb", 0.0) or 0.0)
+    if compute_vram_gb:
+        print(f"    Compute GPU      : ~ {compute_vram_gb:5.1f} GB")
+    if compute_ram_gb:
+        print(f"    Compute RAM      : ~ {compute_ram_gb:5.1f} GB")
     print(f"    KV cache         : ~ {cfg.estimated_kv_gb:5.1f} GB")
     recurrent_total = cfg.recurrent_state_vram_gb + cfg.recurrent_state_ram_gb
     if recurrent_total:
@@ -441,7 +447,9 @@ def _print_config(
             + cfg.recurrent_state_vram_gb
             + cfg.recurrent_state_ram_gb
             + cfg.runtime_vram_overhead_gb
+            + float(getattr(cfg, "compute_vram_gb", 0.0) or 0.0)
             + runtime_ram_overhead_gb
+            + float(getattr(cfg, "compute_ram_gb", 0.0) or 0.0)
             + cfg.batch_vram_overhead_gb
             + cfg.prompt_cache_ram_gb
         )

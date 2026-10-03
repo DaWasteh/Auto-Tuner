@@ -1,0 +1,39 @@
+display_name: "GLM-OCR (Z.ai)"
+patterns:
+  - glm-ocr
+  - glm_ocr
+  - glmocr
+
+max_context: 16384
+recommended_kv_quant: q8_0
+performance_target: balanced
+
+# generation_config.json: do_sample false.
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  Z.ai GLM-OCR: a 0.9B document OCR model (CogViT encoder, GLM-0.5B decoder
+  with a native MTP head). Decoding is deterministic as published
+  (do_sample false); a repetition penalty would damage tables and repeated
+  characters. Official task prompts are "Text Recognition:", "Formula
+  Recognition:" and "Table Recognition:". AutoTuner attaches a compatible
+  sibling mmproj when present. This exposes element recognition through
+  llama-server; it does not reproduce the separate PP-DocLayout page-layout
+  stage of the full pipeline.

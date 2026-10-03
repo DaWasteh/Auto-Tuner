@@ -1114,8 +1114,8 @@ function Invoke-LlamaPrereleaseBuild {
     if ($Tag -notmatch '^b\d+$' -and $Tag -ne "master") {
         throw "Tag must be 'latest', 'master', or an exact bNNNN tag"
     }
-    if ($Rdna4MoeWorkaround -and ($Backend -ne "Vulkan" -or $Tag -ne "b11319")) {
-        throw "RDNA4 MoE workaround is qualified only for Vulkan -Tag b11319; no unqualified source will be patched"
+    if ($Rdna4MoeWorkaround -and ($Backend -ne "Vulkan" -or $Tag -notin @("b11319", "b11371"))) {
+        throw "RDNA4 MoE workaround is qualified only for Vulkan -Tag b11319 or b11371; no unqualified source will be patched"
     }
     $backendToken = $Backend.ToLowerInvariant()
     $tmp = Join-Path $Workspace "_tmp_${backendToken}_prerelease_llama_$PID"

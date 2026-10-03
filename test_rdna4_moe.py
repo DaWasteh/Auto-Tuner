@@ -160,3 +160,48 @@ def test_wrapper_exposes_opt_in_without_changing_stock_default():
     assert '"${folderVersion}_${backendToken}_llama.cpp"' in common
     assert "Mode verify" in common and "Mode record" in common
     assert "receipt mismatch" in common
+
+
+def test_b11371_checkout_is_qualified_with_its_own_digest(
+    tmp_path, patcher, monkeypatch
+):
+    commit = "99b95488cac0f00ce3f05af113a8c1e287753f87"
+    build, digest = patcher.LATER_QUALIFIED[commit]
+    assert build == 11371
+    assert digest == "e43a39ce1e9443f7c1c00e7bb9f13d56ab5a01e2355973ee740d4324e0e0698b"
+    assert digest != patcher.ORIGINAL_SHA256
+
+    text = "// synthetic b11371 fixture\n" + patcher.ORIGINAL + "\n"
+    monkeypatch.setitem(
+        patcher.LATER_QUALIFIED,
+        commit,
+        (11371, hashlib.sha256(text.encode()).hexdigest()),
+    )
+    monkeypatch.setattr(
+        patcher,
+        "_git",
+        lambda repo, *args: commit if args == ("rev-parse", "HEAD") else "",
+    )
+    path = tmp_path / patcher.SOURCE
+    path.parent.mkdir(parents=True)
+    path.write_bytes(text.encode("utf8"))
+    assert patcher.apply(tmp_path)
+    binary = patcher._binary(tmp_path)
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"synthetic b11371 binary")
+    patcher.record(tmp_path)
+    patcher.verify(tmp_path)
+    receipt = json.loads((tmp_path / patcher.RECEIPT).read_text())
+    assert receipt["build"] == 11371
+    assert receipt["upstream_commit"] == commit
+
+    # A b11371 source must match the b11371 digest, not merely any known one.
+    path.write_bytes(("// drift\n" + patcher.PATCHED + "\n").encode("utf8"))
+    with pytest.raises(ValueError, match="Unrecognized Vulkan source"):
+        patcher.verify(tmp_path)
+
+
+def test_recipe_accepts_exactly_the_two_qualified_tags():
+    common = (ROOT / "building llama.cpp/windows_llama_build_common.ps1").read_text()
+    assert '$Tag -notin @("b11319", "b11371")' in common
+    assert "qualified only for Vulkan -Tag b11319 or b11371" in common
