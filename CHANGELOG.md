@@ -3,6 +3,44 @@
 Release history of AutoTuner. Each llama.cpp audit and each release
 validation has its own file under [docs/](docs/).
 
+### v5.6.2 — llama.cpp b11538 audit, Escha W2 models (issue #7), new upstream models
+
+- **167 upstream commits audited (b11371 → b11538):** the only CLI addition is
+  `--moe-cache-mib` (418 names / 331 long options). AutoTuner knows it as a
+  value flag but does not set it: measured on RDNA4, the cache made decoding
+  slower on Vulkan and on HIP traded +3…16 % decode for −13…32 % prompt
+  speed in a realistic hybrid plan. The new default port 9931 does not matter
+  because AutoTuner always passes `--port`.
+- **EschaLabs W2 models ([#7](https://github.com/DaWasteh/Auto-Tuner/issues/7)):**
+  `Escha-Qwen3.8-27B-W2` and its MTP head start on the Escha fork of
+  llama.cpp. The fork is recognised by its loader in the selected runtime
+  (like Prism and ROCmFPX), not by its folder name, and only the tensors the
+  fork's MTP-only loader really skips are exempt. Mainline llama.cpp cannot
+  load these files at all; AutoTuner now says so before launch instead of
+  letting llama-server abort. The head is also recognised under its original
+  Hugging Face name (no `mtp-` prefix) and paired automatically instead of
+  appearing as a separate model. Thanks to Freak288 for the report and patch.
+- **K2 Horizon** runs on mainline b11454+ (dense and MoVA-36B-A4B, tested on
+  HIP and Vulkan); the profile no longer says a fork is required.
+- **New decision models:** Perplexity pplx-decider and LiquidAI d1-3B /
+  d1-omni-600M use the decision profile instead of a chat profile; each
+  decision type needs the llama.cpp build that added it. Clef accepts images
+  from b11418 on; AutoTuner warns when an older Clef GGUF (template without
+  an image slot, HTTP 500 on every image) is used with its mmproj.
+- **EmbeddingGemma 2:** new embedding profile (8K context in one batch instead
+  of a 262K chat plan).
+- **DFlash drafts with embeddings but no LM head** get a warning on
+  b11132–b11511, where they accept almost no tokens; **PLaMo-3** GGUFs need
+  b11455+.
+- **RDNA4 Vulkan MoE regression fixed upstream:** b11423 reverted #29182;
+  stock b11538 matches the opt-in RDNA4 build (+15…43 % MoE prompt speed
+  against stock b11371), so the workaround build is no longer needed. HIP
+  prompt processing is 4–7 % faster than on b11371.
+- **Blockers rechecked on b11538:** Qwen3.8 Flash Next `draft-mtp`,
+  DeepSeek-V4.1, Xing 4.0, Prism PQ2_0/PTQ1_0 and ROCmFPX stay blocked; image +
+  DFlash2 keeps working (152/168 drafts).
+- [Audit](docs/llama-b11538-audit.md) · [Validation](docs/v5.6.2-validation.md).
+
 ### v5.6.1 — llama.cpp b11371 audit, measured memory estimates, new model profiles
 
 - **52 upstream commits audited (b11319 → b11371):** the only CLI change is

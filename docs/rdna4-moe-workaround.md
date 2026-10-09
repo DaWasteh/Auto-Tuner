@@ -1,5 +1,14 @@
 # Opt-in Windows RDNA4 MoE build workaround
 
+> **No longer needed from b11423 on.** Upstream
+> [PR #29936](https://github.com/ggml-org/llama.cpp/pull/29936) reverted the
+> `mul_mat_id` tile selection from #29182. Measured on the R9700 (v5.6.2,
+> mirrored order): stock **b11538** reaches the same Vulkan MoE prompt speed
+> as `rdna4moe_b11371` (pp128 1779 vs 1783, pp512 3210 vs 3219 tok/s; stock
+> b11371: 1247 / 2763). Use a current stock build; the recipe switch stays
+> limited to b11319/b11371 for existing installations. See the
+> [b11538 audit](llama-b11538-audit.md).
+
 Stock llama.cpp b11302/b11319/b11371 regresses Vulkan MoE prompt throughput
 on the locally tested R9700 and RX 9070 XT. Controlled source isolation
 identified [PR #29182](https://github.com/ggml-org/llama.cpp/pull/29182);

@@ -206,6 +206,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--models-dir",
     "--models-max",
     "--models-preset",
+    "--moe-cache-mib",
     "--mtmd-batch-max-tokens",
     "--model",
     "--model-draft",
@@ -507,6 +508,11 @@ _MIN_MAINLINE_DFLASH2_BUILD = 10658
 # embedding scale, post norms, layer output scale and shared K/V. Older
 # builds reject those DSpark/DFlash sidecars (missing attn_v, extra tensors).
 _MIN_GEMMA_DFLASH_BUILD = 11132
+# The same PR made the shared dflash loader fall back to ``token_embd`` as the
+# LM head when a draft ships embeddings but no ``output.weight``. Such drafts
+# (Nemotron-3.5-Lightning DFlash, for example) then accept ~0 % of their
+# tokens; b11512 (PR #30111) borrows the target's head instead.
+_DFLASH_EMBD_AS_HEAD_BUILDS = range(11132, 11512)
 # b11195 (PR #29294) lets the mimo2 loader accept an MTP-only GGUF, the file
 # the converter's new ``--mtp`` export writes for MiMo-V2. Older builds
 # require every trunk block in each mimo2 file and abort on such a head.
@@ -737,7 +743,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     if arch == "xing4_0":
         return (
             "Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp "
-            "b11371 and no validated AutoTuner runtime. Do not substitute the "
+            "b11538 and no validated AutoTuner runtime. Do not substitute the "
             "DeepSeek or Qwen architecture."
         )
     if any(
@@ -762,7 +768,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11371 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11538 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -809,16 +815,17 @@ def _nemotron_latent_mtp_block_reason(
 #: tensors it does not carry.
 _MIN_QWEN4EXP_MTP_BUILD = 11330
 
-#: ``draft-mtp`` itself still cannot be used with qwen4exp: b11371 (HIP and
-#: Vulkan, one and two GPUs) loads the model and its NextN block, reserves the
+#: ``draft-mtp`` itself still cannot be used with qwen4exp: b11371 and b11538
+#: (HIP and Vulkan, one and two GPUs) loads the model and its NextN block, reserves the
 #: MTP graph and then aborts in ``ggml-backend.cpp`` with
 #: ``GGML_ASSERT(buffer)`` while the draft context is initialised. This holds
 #: for a separate ``mtp-*.gguf`` head and for the same block embedded with
 #: ``merge_mtp_head.py``; ``--ctx-checkpoints 0``, F16 KV and
 #: ``--no-spec-draft-backend-sampling`` do not avoid it. The embedded GGUF
-#: runs normally without speculation. Lift this only after a real request
-#: with accepted drafts on a newer build.
-_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD = 11371
+#: runs normally without speculation. b11538 reworked the NextN flags and
+#: row cropping (PRs #30017/#30020/#30097) and still aborts the same way.
+#: Lift this only after a real request with accepted drafts on a newer build.
+_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD = 11538
 
 
 def qwen4exp_mtp_draft_unusable(model: ModelEntry) -> bool:
@@ -878,7 +885,7 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11371 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11538 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -989,6 +996,183 @@ def _rocmfpx_block_reason(model: ModelEntry, binary: str) -> str:
     )
 
 
+#: EschaLabs W2 checkpoints (Qwen3.8-27B-Escha-W2, Qwen3.6-35B-A3B-Escha-W2)
+#: keep their native 2/3-bit Escha code in ``blk.N.<proj>.escha_{code,rin,
+#: rout}`` tensors next to the root codec tables ``escha_lut`` /
+#: ``escha_dep_k2`` / ``escha_dep_k3`` and declare ``<arch>.escha.version``.
+#: Only the Escha fork of llama.cpp (github.com/Ajay9o9/llama.cpp-escha,
+#: branch ``escha-w2-dense`` for the dense 27B, ``escha-w2`` for the MoE)
+#: implements the matching GGML_OP_ESCHA_MUL_MAT / GGML_OP_ESCHA_MOE ops;
+#: mainline llama.cpp (b11538) has no Escha loader. The fork's llama library
+#: names the codec table, so the check keys on that loader string exactly
+#: like the prism.hadamard and ROCmFPX gates.
+_ESCHA_MARKER = "escha_lut"
+_ESCHA_CODEC_TENSORS = frozenset({"escha_lut", "escha_dep_k2", "escha_dep_k3"})
+#: Root tensors the Escha fork's loader creates as optional for an MTP-only
+#: GGUF (no ``blk.0`` trunk block), per architecture. Its qwen35 loader marks
+#: ``token_embd`` and ``output_norm`` ``TENSOR_NOT_REQUIRED`` there (the head's
+#: own ``nextn.shared_head_norm`` replaces the final norm); its qwen35moe
+#: loader still requires both. Mainline requires both for every head.
+_ESCHA_MTP_ONLY_OPTIONAL_ROOTS: Dict[str, frozenset] = {
+    "qwen35": frozenset({"token_embd.weight", "output_norm.weight"}),
+}
+
+
+def _escha_codec_version(metadata: Dict[str, Any]) -> int:
+    arch = str(metadata.get("general.architecture", "") or "").strip()
+    if not arch:
+        return 0
+    try:
+        return int(metadata.get(f"{arch}.escha.version", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_escha_model(model: Optional[ModelEntry]) -> bool:
+    """True for an EschaLabs W2 GGUF that keeps the native Escha code."""
+    if model is None:
+        return False
+    metadata = model.metadata or {}
+    if _escha_codec_version(metadata) != 0:
+        return True
+    roots = metadata.get("__root_tensors__")
+    return isinstance(roots, (list, tuple)) and _ESCHA_MARKER in roots
+
+
+def runtime_has_escha_loader(binary: str) -> bool:
+    """True when ``binary`` (or its llama library) carries the Escha loader."""
+    return _runtime_has_required_markers(binary, [_ESCHA_MARKER])
+
+
+def _escha_block_reason(model: ModelEntry, binary: str) -> str:
+    """Explain why an Escha W2 GGUF cannot load on ``binary``."""
+    if not is_escha_model(model):
+        return ""
+    if runtime_has_escha_loader(binary):
+        return ""
+    metadata = model.metadata or {}
+    arch = str(metadata.get("general.architecture", "") or "").strip()
+    try:
+        moe = int(metadata.get(f"{arch}.expert_count", 0) or 0) > 0
+    except (TypeError, ValueError):
+        moe = False
+    branch = "escha-w2" if moe else "escha-w2-dense"
+    return (
+        f"{model.name} is an EschaLabs W2 checkpoint: its native 2/3-bit "
+        "Escha code (escha_lut codec table, escha_code weight tensors, "
+        f"{arch or '<arch>'}.escha.version) loads only on the Escha fork of "
+        "llama.cpp (github.com/Ajay9o9/llama.cpp-escha, branch "
+        f"{branch}). The selected binary and its llama library carry no "
+        "Escha loader; mainline llama.cpp stops at the first Escha-coded "
+        'projection (b11538: "check_tensor_dims: tensor '
+        "'blk.0.ssm_out.weight' not found\"). Select an Escha llama-server "
+        "build; the fork ships CUDA GPU kernels and a CPU reference path."
+    )
+
+
+def _escha_runtime_missing_root_tensors(
+    draft_model: ModelEntry, missing: List[str]
+) -> List[str]:
+    """Drop the root tensors an Escha runtime does not need from a head.
+
+    A head without its own ``<arch>.escha.version`` never loads the codec
+    tables (its MTP layer is plain F16), and the fork's MTP-only loader mode
+    makes the trunk tensors in :data:`_ESCHA_MTP_ONLY_OPTIONAL_ROOTS`
+    optional. Anything else a head lacks still aborts the fork's loader.
+    """
+    from scanner import metadata_is_mtp_only_head
+
+    metadata = draft_model.metadata or {}
+    optional: Set[str] = set()
+    if _escha_codec_version(metadata) == 0:
+        optional |= _ESCHA_CODEC_TENSORS
+    if metadata_is_mtp_only_head(metadata):
+        arch = str(draft_model.architecture or "").strip().lower()
+        optional |= _ESCHA_MTP_ONLY_OPTIONAL_ROOTS.get(arch, frozenset())
+    return [name for name in missing if name not in optional]
+
+
+#: First llama.cpp build that serves each ``<arch>.decision.type`` through
+#: ``/v1/systemone``. The newer types reuse existing architectures (qwen35,
+#: lfm2), so an older build loads the backbone and then fails on the unknown
+#: decision type. Unknown future types are not gated.
+_DECISION_TYPE_MIN_BUILD: Dict[str, Tuple[int, str]] = {
+    "openjev": (11361, "PR #29818"),
+    "lev": (11361, "PR #29818"),
+    "laya": (11361, "PR #29818"),  # also Julia-1 (modern-bert encoder)
+    "kev": (11361, "PR #29818"),
+    "nimble": (11364, "PR #29844"),
+    "clef": (11371, "PR #29831"),
+    "pplx-decider": (11447, "PR #30044"),
+    "lfm2-d1": (11483, "PR #30110"),
+    "lfm2-d1-omni": (11488, "PR #30114"),
+}
+#: ``tokenizer.ggml.model`` values a build must know before it can load the
+#: vocabulary at all (b11455 / PR #30045 added the PLaMo-3 pre-segmentation).
+_TOKENIZER_MODEL_MIN_BUILD: Dict[str, Tuple[int, str]] = {
+    "plamo3": (11455, "PR #30045"),
+}
+
+
+def _metadata_build_floor_reason(model: ModelEntry, binary: str) -> str:
+    """Refuse decision types and tokenizers the selected build predates."""
+    metadata = model.metadata or {}
+    floors: List[Tuple[int, str, str]] = []
+    decision = decision_model_type(model)
+    if decision in _DECISION_TYPE_MIN_BUILD:
+        build, pr = _DECISION_TYPE_MIN_BUILD[decision]
+        floors.append((build, pr, f"decision type '{decision}'"))
+    tokenizer = str(metadata.get("tokenizer.ggml.model", "") or "").strip().lower()
+    if tokenizer in _TOKENIZER_MODEL_MIN_BUILD:
+        build, pr = _TOKENIZER_MODEL_MIN_BUILD[tokenizer]
+        floors.append((build, pr, f"tokenizer '{tokenizer}'"))
+    if not floors:
+        return ""
+    detected = probe_binary_build_number(binary)
+    if detected is None:
+        return ""
+    for build, pr, what in floors:
+        if detected < build:
+            return (
+                f"{model.name} needs llama.cpp b{build}+ for its {what} "
+                f"({pr}); the selected binary reports b{detected}."
+            )
+    return ""
+
+
+#: b11418 (PR #29969) reads images for Clef. ggml-org re-converted the Clef
+#: GGUFs on 2026-10-05 so their ``tokenizer.chat_template.systemone`` has an
+#: image slot; the earlier conversions render no media marker, and b11538
+#: answers every image request with HTTP 500 "unexpected layout of the
+#: decision prompt". Older builds load the mmproj but ignore the images.
+_MIN_CLEF_VISION_BUILD = 11418
+
+
+def _clef_image_note(model: ModelEntry, binary: str) -> str:
+    """Warn when a Clef mmproj cannot take part in decisions."""
+    if model.mmproj is None:
+        return ""
+    if str(model.architecture or "").strip().lower() != "clef":
+        return ""
+    template = str((model.metadata or {}).get("tokenizer.chat_template.systemone", ""))
+    if template and "images" not in template:
+        return (
+            f"{model.name}: this Clef GGUF predates image input; its systemone "
+            "template has no image slot, so image requests fail with HTTP 500 "
+            "('unexpected layout of the decision prompt'). Text questions work. "
+            "Download the current conversion (ggml-org/Clef-Flash-GGUF, "
+            "2026-10-05 or later) for images."
+        )
+    detected = probe_binary_build_number(binary)
+    if detected is not None and detected < _MIN_CLEF_VISION_BUILD:
+        return (
+            f"{model.name}: llama.cpp b{detected} loads the Clef mmproj but "
+            f"ignores images; image input needs b{_MIN_CLEF_VISION_BUILD}+ "
+            "(PR #29969)."
+        )
+    return ""
+
+
 def _ling3_vl_mrope_block_reason(model: ModelEntry, binary: str) -> str:
     """Refuse M-RoPE BailingMoE3 (Ling-3.0-flash-VL) GGUFs before b11156."""
     metadata = model.metadata or {}
@@ -1014,7 +1198,8 @@ def check_model_build(
 ) -> Tuple[bool, str, Optional[int]]:
     """Reject unimplemented architectures, PrismML Hadamard-folded GGUFs on
     runtimes without the prism loader, ROCmFPX-quantized GGUFs on runtimes
-    without the ROCmFP loader, latent-MoE Nemotron MTP GGUFs on
+    without the ROCmFP loader, EschaLabs W2 GGUFs on runtimes without the
+    Escha loader, latent-MoE Nemotron MTP GGUFs on
     pre-b11025 builds and unsafe b10741-b10748 GGUFs.
 
     PR #28159 made ``n_layer()`` exclude NextN before the generic per-layer
@@ -1033,9 +1218,18 @@ def check_model_build(
     rocmfpx_block = _rocmfpx_block_reason(model, binary)
     if rocmfpx_block:
         return False, rocmfpx_block, None
+    escha_block = _escha_block_reason(model, binary)
+    if escha_block:
+        return False, escha_block, None
     ling3_vl_block = _ling3_vl_mrope_block_reason(model, binary)
     if ling3_vl_block:
         return False, ling3_vl_block, None
+    floor_block = _metadata_build_floor_reason(model, binary)
+    if floor_block:
+        return False, floor_block, probe_binary_build_number(binary)
+    clef_note = _clef_image_note(model, binary)
+    if clef_note:
+        return True, clef_note, probe_binary_build_number(binary)
     if not model.has_embedded_mtp:
         return True, "", None
 
@@ -1285,12 +1479,20 @@ def check_draft_model_build(
     existing warning-only behavior for wrappers whose version cannot be read.
 
     When *target* is given, a same-architecture MTP sidecar is additionally
-    checked for the root tensors the architecture loader requires.
+    checked for the root tensors the architecture loader requires. An
+    EschaLabs W2 target on a runtime without the Escha loader is left to
+    :func:`check_model_build`, which names the fork it needs; on an Escha
+    runtime the head only has to carry what the fork's loader requires.
     """
     if draft_model is None:
         return True, "", None
 
+    if target is not None and _escha_block_reason(target, binary):
+        return True, "", None
     missing = mtp_sidecar_missing_root_tensors(target, draft_model)
+    escha_runtime = bool(missing) and runtime_has_escha_loader(binary)
+    if escha_runtime:
+        missing = _escha_runtime_missing_root_tensors(draft_model, missing)
     if is_qwen4exp_mtp_sidecar(draft_model):
         qwen4exp_head_build = probe_binary_build_number(binary)
         if qwen4exp_head_build is not None:
@@ -1318,10 +1520,11 @@ def check_draft_model_build(
             )
     if missing:
         shown = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
+        runtime_name = "the Escha fork of" if escha_runtime else "mainline"
         return (
             False,
-            f"The MTP sidecar {draft_model.path.name} cannot load on mainline "
-            f"llama.cpp: it lacks {shown}. llama-server loads a standalone MTP "
+            f"The MTP sidecar {draft_model.path.name} cannot load on "
+            f"{runtime_name} llama.cpp: it lacks {shown}. llama-server loads a standalone MTP "
             f"head with the full {draft_model.architecture} loader, so the "
             "sidecar must carry the same root tensors as the target model "
             "(only output.weight may be omitted). Re-convert the head with a "
@@ -1370,6 +1573,28 @@ def check_draft_model_build(
                 "instead.",
                 detected,
             )
+
+    # Gemma backbones tie the head to the embeddings, so reusing them was right.
+    if draft_model.drafter_spec_type in {
+        "dflash",
+        "dspark",
+    } and not is_gemma_backbone_dflash(draft_model):
+        draft_roots = _entry_root_tensors(draft_model) or set()
+        if "token_embd.weight" in draft_roots and "output.weight" not in draft_roots:
+            detected = probe_binary_build_number(binary)
+            if detected is not None and detected in _DFLASH_EMBD_AS_HEAD_BUILDS:
+                return (
+                    True,
+                    f"The {draft_model.drafter_spec_type} draft "
+                    f"{draft_model.path.name} carries its own token_embd but no "
+                    f"output.weight. llama.cpp b{detected} reuses those "
+                    "embeddings as the draft's LM head, so almost no drafted "
+                    "token is accepted; b"
+                    f"{_DFLASH_EMBD_AS_HEAD_BUILDS.stop}+ (PR #30111) uses the "
+                    "target's head instead. Update llama.cpp for a real "
+                    "speed-up.",
+                    detected,
+                )
 
     if not draft_model.is_dflash2_drafter:
         if target is not None and target.architecture.lower() == "kimi-k3":
@@ -4576,7 +4801,12 @@ def _compute_config(
     # Decision models answer one short typed prompt per request and generate
     # nothing; a 262k window inherited from the Qwen/Gemma backbone would only
     # allocate KV that /v1/systemone never fills.
-    if decision_model_type(model) and user_ctx is None:
+    # Non-causal encoders (embedding models) read every input in one physical
+    # batch, so a native window beyond the profile's limit is unusable too
+    # (EmbeddingGemma 2 reports 262144 but encodes at most 8192 tokens).
+    if (
+        decision_model_type(model) or single_batch_prompt_tokens(model)
+    ) and user_ctx is None:
         model_ctx_limit = min(model_ctx_limit, profile_max)
 
     # Pick precision against the context Auto will actually attempt. The old
@@ -6638,7 +6868,7 @@ def build_command(
         enable_speculative
         and _has_integrated_mtp(model)
         and draft_model is None
-        # qwen4exp draft-mtp aborts at context creation through b11371.
+        # qwen4exp draft-mtp aborts at context creation through b11538.
         and not qwen4exp_mtp_draft_unusable(model)
     )
 

@@ -9,6 +9,12 @@ patterns:
   - lev-f16
   - bespoke-nimble
   - nimble-9b
+  # Perplexity pplx-decider (qwen35 backbone, b11447+) and LiquidAI d1
+  # (lfm2 backbone, d1-3B b11483+, d1-omni-600M b11488+). Their per-type
+  # floors are checked from <arch>.decision.type in tuner.check_model_build.
+  - pplx-decider
+  - d1-3b
+  - d1-omni
 
 # llama.cpp b11361 (PR #29818) serves openjev, lev, laya, julia-1 and kev
 # through POST /v1/systemone; b11364 (PR #29844) adds nimble. The floor is the
@@ -40,12 +46,15 @@ sampling:
     presence_penalty: 0.0
 
 notes: >
-  TypeSafe-style decision models (OpenJev, lev, Laya, Julia-1, Kev, Nimble):
-  they answer typed choice/score/noul questions about a state in one forward
-  pass through POST /v1/systemone and generate no text, so chat, sampling,
-  reasoning and speculation settings have no effect. Needs llama.cpp b11364+
-  (b11361 for all but Nimble). The encoder variants (Laya, Julia-1) must fit
-  the whole prompt into one physical batch; AutoTuner therefore raises
-  batch/ubatch to the context size for them. OpenJev accepts images when its
-  mmproj is attached. Probabilities use the temperatures stored in the GGUF
-  and are not guaranteed to be calibrated for your data.
+  TypeSafe-style decision models (OpenJev, lev, Laya, Julia-1, Kev, Nimble,
+  Perplexity pplx-decider, LiquidAI d1-3B and d1-omni-600M): they answer typed
+  choice/score/noul questions about a state in one forward pass through POST
+  /v1/systemone and generate no text, so chat, sampling, reasoning and
+  speculation settings have no effect. Needs llama.cpp b11364+ (b11361 for
+  all but Nimble); AutoTuner reads the GGUF's decision type and requires
+  b11447+ for pplx-decider, b11483+ for d1-3B and b11488+ for d1-omni-600M.
+  The encoder variants (Laya, Julia-1, d1-omni-600M) must fit the whole prompt
+  into one physical batch, which AutoTuner sizes for up to 8192 tokens.
+  OpenJev, pplx-decider and the d1 models accept images when their mmproj is
+  attached (d1-omni-600M also audio). Probabilities use the temperatures
+  stored in the GGUF and are not guaranteed to be calibrated for your data.

@@ -908,6 +908,19 @@ The tuner intelligently selects the best binary based on your model and settings
   about 67 tok/s on HIP (R9700) and 29 tok/s on Vulkan with the in-file MTP
   head, COHERENT matches on HIP but drops to 5 tok/s on Vulkan, and image
   requests work with the MTP head loaded on both backends.
+- **EschaLabs W2 GGUFs (e.g. `Escha-Qwen3.8-27B-W2`, `-Q8E`)** $\rightarrow$ need the
+  Escha fork of llama.cpp (`github.com/Ajay9o9/llama.cpp-escha`, branch
+  `escha-w2-dense` for the dense 27B, `escha-w2` for the 35B-A3B MoE). Their
+  native 2/3-bit Escha code (`escha_lut` codec table, `escha_code` weight
+  tensors, `<arch>.escha.version`) has no mainline loader: b11538 stops with
+  `check_tensor_dims: tensor 'blk.0.ssm_out.weight' not found`, so AutoTuner
+  refuses the model before launch unless the selected runtime's llama library
+  carries the Escha loader. On that fork the separate MTP head
+  (`Escha-Qwen3.8-27B-W2-MTP-F16-headQ4.gguf`, with or without an `mtp-`
+  prefix) is paired automatically and starts with `-md` +
+  `--spec-type draft-mtp`: the fork's MTP-only loader makes `token_embd` /
+  `output_norm` optional and the head carries no codec of its own. The fork's
+  GPU kernels are CUDA; AutoTuner has not validated it on AMD hardware.
 - **Turbo-Quant Mode** $\rightarrow$ uses `tq_llama.cpp`.
 
 Example — run Devstral, override context, and pass an extra flag
@@ -980,14 +993,15 @@ matches. See `settings/_default.yaml`.
 | `step35.yaml` | StepFun Step 3.5 Flash + Step 3.7-Flash (MoE ~196–198B/11B, MTP-3) | `step35` |
 | `granite-4_2.yaml` | IBM Granite 4.2 3B/8B/30B dense reasoning + tools | `granite` (filename-gated) |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
-| `decision-systemone.yaml` | TypeSafe decision models OpenJev / lev / Laya / Julia-1 / Kev / Nimble (**`/v1/systemone` only**, b11364+) | filename only; `<arch>.decision.type` drives batch/context |
-| `clef.yaml` | Cloudflare Clef / Clef-Flash joint decision model (**`/v1/systemone` only**, b11371+) | `clef` |
+| `embeddinggemma-2.yaml` | Google EmbeddingGemma 2 (**embedding**, not chat; 8K, one physical batch), b11452+ | `gemma-embedding2` |
+| `decision-systemone.yaml` | TypeSafe decision models OpenJev / lev / Laya / Julia-1 / Kev / Nimble / Perplexity pplx-decider / LiquidAI d1-3B and d1-omni-600M (**`/v1/systemone` only**, b11364+; per-type floors b11447 / b11483 / b11488 from `<arch>.decision.type`) | filename only; `<arch>.decision.type` drives batch/context and build floor |
+| `clef.yaml` | Cloudflare Clef / Clef-Flash joint decision model (**`/v1/systemone` only**, b11371+; images b11418+ with a 2026-10-05+ GGUF) | `clef` |
 | `llm-jp-4_1.yaml` | NII LLM-jp-4.1 thinking 8B / 33B / 32B-A3B, Harmony dialect parser b11320+ | filename only; generic `llama` |
 | `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls, b11249+ for `json_schema` output | `muse-glimmer` |
 | `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+; separate `--mtp` heads b11195+ | `mimo2` (filename-gated; no local weights tested) |
 | `mimo-v2_6-distill.yaml` | Xiaomi MiMo-V2.6-Distill-Qwen-9B (Qwen3.5-9B SFT, not the MoE): official 0.6/20/0.95 sampling, 262k, thinking + Qwen3-Coder XML tools, vision via Qwen3.5 mmproj | `qwen35` (filename-gated; tested locally) |
 | `fastcontext-1_0-4b.yaml` | Microsoft FastContext 1.0 4B SFT/RL repository explorer, 262k, GGUF sampling defaults | `qwen3` (filename-gated) |
-| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11371 loader** | `xing4_0` |
+| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11538 loader** | `xing4_0` |
 | `voxcpm2.yaml` | VoxCPM2 BaseLM: **Voice Lab TTS component, ordinary chat launch blocked** | `minicpm4` (filename-gated, not an architecture-wide block) |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
@@ -998,10 +1012,10 @@ matches. See `settings/_default.yaml`.
 | `hy4-mainline.yaml` | Tencent HY4 Preview, official mainline GGUF, b10813+ | `hy_v4` |
 | `spark2_5.yaml` | Spark X2.5 1.7B / 4B, 1M native context, b10828+ | `spark2_5` |
 | `minicpm5.yaml` / `minicpm5-2b.yaml` | MiniCPM5 1B / 2B (GGUF: 2.6B), distinct official sampling, 128K context | filename only; generic `llama` |
-| `k2-horizon.yaml` | IFM K2 Horizon / MoVA-36B-A4B, 512K; **requires IFM fork, not mainline b10863** | `k2-horizon` |
+| `k2-horizon.yaml` | IFM K2 Horizon dense 1B–32B and MoVA-36B-A4B, 512K; mainline b11454+ (PR #29535) or the IFM fork, checked by runtime marker | `k2-horizon` |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11371 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11538 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
 | `ling-3_0-vl.yaml` | Ling-3.0-flash-VL image/video model (ling3vl projector + M-RoPE), b11156+; older builds refused by metadata gate | `bailingmoe3` with `rope.dimension_sections` (filename-gated; no local weights tested) |
@@ -1155,21 +1169,26 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11371)
+## Server features (audited through llama.cpp b11538)
 
-The **b11371** (`99b95488c`, `0.5.0-dev`) [audit](docs/llama-b11371-audit.md)
-covers 52 commits after b11319. The only CLI change is
-**`--spec-draft-sampling`** (417 names / 330 long options); AutoTuner knows
-the flag and keeps the upstream default. New for AutoTuner: non-causal
-**Gemma 4 images** keep their full 1120-token budget (b11327+ would cap it to
-`--ubatch-size`), **decision models** (`/v1/systemone`), **LLM-jp-4.1**,
-GLM-OCR and dots.ocr have profiles, and a Qwen3.8 Flash Next GGUF with an
-embedded MTP block needs b11330+ (its `draft-mtp` context still aborts on
-b11371, so it stays off). The Vulkan MoE prompt regression persists; the
-opt-in [RDNA4 build](docs/rdna4-moe-workaround.md) is re-qualified for
-b11371. See [validation](docs/v5.6.1-validation.md). Summaries of earlier
-audits are in [CHANGELOG.md](CHANGELOG.md#earlier-llamacpp-audit-summaries);
-every audit has its own file under [docs/](docs/).
+The **b11538** (`79e2e74eb`, `0.6.0-dev`) [audit](docs/llama-b11538-audit.md)
+covers 167 commits after b11371. The only CLI addition is
+**`--moe-cache-mib`** (418 names / 331 long options); the default port moved
+to 9931, which does not matter because AutoTuner always passes `--port`. New
+for AutoTuner: **EschaLabs W2** GGUFs are refused on runtimes without the
+Escha loader and start with their MTP head on the Escha fork (issue #7),
+same-architecture MTP heads are recognised by their tensors whatever their
+file name, **K2 Horizon** runs on mainline, **pplx-decider / LiquidAI d1** use
+the decision profile with per-type build floors, **EmbeddingGemma 2** has an
+embedding profile, Clef images need a 2026-10-05+ GGUF, and DFlash drafts with
+embeddings but no head get a warning on b11132–b11511. Qwen3.8 Flash Next
+`draft-mtp` still aborts upstream and stays off. The Vulkan MoE prompt
+regression is gone (upstream revert in b11423): stock b11538 matches the
+opt-in [RDNA4 build](docs/rdna4-moe-workaround.md), which is no longer
+needed. See
+[validation](docs/v5.6.2-validation.md). Summaries of earlier audits are in
+[CHANGELOG.md](CHANGELOG.md#earlier-llamacpp-audit-summaries); every audit
+has its own file under [docs/](docs/).
 
 | Flag | Support |
 |------|---------|
@@ -1199,6 +1218,7 @@ every audit has its own file under [docs/](docs/).
 | `--spec-ngram-map-k4v-size-n/-size-m/-min-hits` | ✅ Via `ngram_k4v_size_n` / `ngram_k4v_size_m` / `ngram_k4v_min_hits` in the YAML (defaults 16/24/1 from PR #23269) |
 | `--spec-draft-ngl` | ✅ Always 99 (keep the MTP head on GPU) |
 | `--n-cpu-moe` / `--override-tensor` | ✅ `--n-cpu-moe` active; `-ot` prepared for targeted expert placement |
+| `--moe-cache-mib N` | ✅ b11480+: known value flag for Extra CLI flags (pruned on older builds). **Not set automatically:** on hybrid MoE plans it decoded 38…62 % slower or failed to allocate on Vulkan (RDNA4) and traded +3…16 % decode for −13…32 % prefill on HIP; AutoTuner reserves no VRAM for a cache you add yourself |
 | `--tensor-split` / `--main-gpu` | ✅ Priority-weighted for dense, **capacity-fill for MoE**, with single-GPU pinning; for multi-server the 2nd/3rd model is pinned to the emptier card via `HIP_/GGML_VK_VISIBLE_DEVICES`. A manual hard-pin to one card is available three ways — CLI `--gpu NAME`, the toolbar **GPU** dropdown, or the `forced_gpu` key in the settings JSON — all resolving through `compute_config(force_gpu=…)` |
 | `-mmdev, --mmproj-device DEVICE` | ✅ b10541+: automatically pins the complete multimodal projector to AutoTuner's selected post-visibility-remap `main_gpu`, matching the VRAM budget. Safely pruned for older/forked binaries that do not advertise the flag. |
 | `--rope-scaling yarn` | ✅ Already present |

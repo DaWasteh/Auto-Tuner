@@ -122,7 +122,8 @@ def test_separate_flash_next_mtp_head_stays_blocked(tmp_path, monkeypatch, build
         assert "#29761" in reason and "GGML_ASSERT" not in reason
     else:
         # b11371 HIP/Vulkan: the head loads, then the draft context aborts.
-        assert "GGML_ASSERT(buffer)" in reason and "b11371" in reason
+        assert "GGML_ASSERT(buffer)" in reason
+        assert f"b{tuner._QWEN4EXP_MTP_HEAD_VERIFIED_BUILD}" in reason
 
 
 def test_unprobeable_runtime_keeps_the_root_tensor_preflight(tmp_path):

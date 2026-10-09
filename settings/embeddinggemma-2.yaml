@@ -1,0 +1,44 @@
+display_name: "EmbeddingGemma 2 (Google)"
+patterns:
+  - embeddinggemma-2
+  - embeddinggemma2
+  - embedding-gemma-2
+arch_fallback:
+  - gemma-embedding2
+
+# llama.cpp arch string "gemma-embedding2" (PR #30054, b11452): ein nicht-
+# kausaler Gemma-4-Encoder (270M Text) mit 512->768-Projektion und Mean-
+# Pooling (gemma-embedding2.pooling_type = 1 im GGUF). Kein KV-Cache, kein
+# Chat. Das GGUF meldet 262144 Kontext, die Modellkarte nennt 8192 Token;
+# ein nicht-kausales Modell muss die ganze Eingabe in EINEN physischen Batch
+# nehmen, AutoTuner setzt batch = ubatch = Kontext (<= 8192).
+min_llama_build: 11452
+max_context: 8192
+recommended_kv_quant: q8_0
+
+# Embedding-Endpoint (POST /v1/embeddings). Pooling kommt aus dem GGUF.
+extra_args:
+  - --embeddings
+
+performance_target: ""
+
+# Formal: im --embeddings-Betrieb wird nicht gesampelt.
+sampling:
+  chat:
+    temperature: 0.0
+    top_k: 0
+    top_p: 1.0
+    min_p: 0.0
+    repeat_penalty: 1.0
+draft_max: 0
+
+notes: >
+  Google EmbeddingGemma 2 (architecture gemma-embedding2, llama.cpp b11452+):
+  a multimodal embedding model with a 270M non-causal text encoder, mean
+  pooling and 768-dimensional output (Matryoshka truncation to 512/256/128;
+  re-normalize after truncating). NO chat/completion: the profile starts an
+  embedding endpoint (--embeddings, pooling from the GGUF). Context is 8,192
+  tokens, read in one physical batch. Prefix queries with the model card's
+  task instruction, e.g. "task: search result | query: ...", and documents
+  with "title: none | text: ...". The vision/audio projector (mmproj) is a
+  separate file; text embeddings are what AutoTuner validates.

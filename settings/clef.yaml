@@ -41,4 +41,6 @@ notes: >
   reasoning and speculation settings have no effect. All questions of a
   request are read in one prompt and decided jointly; that prompt must fit
   into one physical batch, which AutoTuner sizes for 8192 tokens. Up to 255
-  options per choice question. Image input is not supported yet.
+  options per choice question. Images need b11418+, the Clef mmproj and a
+  GGUF converted on 2026-10-05 or later; AutoTuner warns about older
+  conversions, whose template has no image slot.

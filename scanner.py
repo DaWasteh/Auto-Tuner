@@ -250,6 +250,9 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             has_mtp_tensors = False
             has_dspark_tensors = False
             max_block_index = -1
+            # Lowest ``blk.N`` index; an MTP-only head (no trunk) starts at
+            # the NextN block instead of blk.0.
+            min_block_index = -1
             scan_complete = False
             tensor_offsets: List[Tuple[str, int]] = []
             # Root (non-``blk.N``) tensor names. llama.cpp loads a standalone
@@ -291,9 +294,10 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
                     block_match = _BLK_IDX_RE.match(tname)
                     if block_match:
                         try:
-                            max_block_index = max(
-                                max_block_index, int(block_match.group(1))
-                            )
+                            block_index = int(block_match.group(1))
+                            max_block_index = max(max_block_index, block_index)
+                            if min_block_index < 0 or block_index < min_block_index:
+                                min_block_index = block_index
                         except (TypeError, ValueError):
                             pass
                     if not has_mtp_tensors:
@@ -333,6 +337,7 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
             # last-shard MTP block from stale ``nextn_predict_layers`` metadata.
             md["__tensor_scan_complete__"] = scan_complete
             md["__max_block_index__"] = max_block_index
+            md["__min_block_index__"] = min_block_index
             md["__root_tensors__"] = root_tensors
             md["__ggml_types__"] = sorted(ggml_types)
 
@@ -383,7 +388,8 @@ def _read_gguf_metadata_uncached(path: Path) -> Dict[str, Any]:
 # Metadata cache + bounded parallel reader
 
 # Schema 6 adds MoE expert spans and input/tied-output storage accounting.
-_METADATA_CACHE_SCHEMA = 6
+# Schema 7 adds the lowest block index (MTP-only head detection).
+_METADATA_CACHE_SCHEMA = 7
 _METADATA_CACHE_MAX_ENTRIES = 2048
 _METADATA_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _METADATA_CACHE_LOCK = threading.RLock()
@@ -648,17 +654,55 @@ def metadata_is_standalone_drafter(md: Dict[str, Any]) -> bool:
 _DRAFTER_ARCHS = frozenset({"eagle3", "dflash", "dspark"})
 
 
+def metadata_is_mtp_only_head(md: Dict[str, Any]) -> bool:
+    """True for a same-architecture MTP/NextN head GGUF without a trunk.
+
+    Converters write separate MTP heads with the target's architecture
+    (``qwen35``, ``qwen4exp``, ``mimo2``) and ``<arch>.block_count`` of the
+    full model plus ``<arch>.nextn_predict_layers``, but store only the
+    NextN block(s) and a few root tensors. Such a file cannot serve requests
+    by itself; it is a ``-md`` draft for its target. The tensor layout is
+    the evidence, independent of the file name: the original EschaLabs head
+    ``Escha-Qwen3.8-27B-W2-MTP-F16-headQ4.gguf`` (2.9 GB, ``blk.64`` only)
+    carries no ``mtp-`` prefix and exceeds the infix-name size guard.
+
+    Only a complete scan of a single-file GGUF qualifies; a shard or an
+    unreadable tensor section never does.
+    """
+    if not md or not md.get("__tensor_scan_complete__"):
+        return False
+    try:
+        if int(md.get("split.count", 0) or 0) > 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    arch = str(md.get("general.architecture", "") or "").strip()
+    if not arch:
+        return False
+    try:
+        block_count = int(md.get(f"{arch}.block_count", 0) or 0)
+        nextn = int(md.get(f"{arch}.nextn_predict_layers", 0) or 0)
+        min_block = int(md.get("__min_block_index__", -1))
+    except (TypeError, ValueError):
+        return False
+    if nextn <= 0 or block_count <= nextn or min_block < 0:
+        return False
+    return min_block >= block_count - nextn
+
+
 def metadata_is_drafter_file(md: Dict[str, Any]) -> bool:
     """True if *md* marks a standalone speculative-draft GGUF of ANY kind.
 
     This is the union of :func:`metadata_is_standalone_drafter` (Gemma 4
-    MTP ``*-assistant`` heads) and the EAGLE-3 / DFlash draft architectures
-    (``general.architecture == 'eagle3'`` / ``'dflash'``). All of these are
-    attached to a target via ``-md`` and never listed as a choosable model.
+    MTP ``*-assistant`` heads), same-architecture MTP-only heads
+    (:func:`metadata_is_mtp_only_head`) and the EAGLE-3 / DFlash draft
+    architectures (``general.architecture == 'eagle3'`` / ``'dflash'``). All
+    of these are attached to a target via ``-md`` and never listed as a
+    choosable model.
     """
     if not md:
         return False
-    if metadata_is_standalone_drafter(md):
+    if metadata_is_standalone_drafter(md) or metadata_is_mtp_only_head(md):
         return True
     arch = str(md.get("general.architecture", "") or "").lower().strip()
     return arch in _DRAFTER_ARCHS
@@ -1561,7 +1605,10 @@ class ModelEntry:
         # it, or the launcher would try to run the bare drafter as a model
         # with --spec-type draft-mtp (it can't run alone). It is handled as a
         # draft attached to its target instead.
-        if self.metadata and metadata_is_standalone_drafter(self.metadata):
+        if self.metadata and (
+            metadata_is_standalone_drafter(self.metadata)
+            or metadata_is_mtp_only_head(self.metadata)
+        ):
             return False
         # Primary: authoritative GGUF metadata
         if self.metadata and metadata_has_embedded_mtp(self.metadata):
@@ -1587,8 +1634,12 @@ class ModelEntry:
         """True if this GGUF is a separate speculative-draft head (Gemma 4
         ``gemma4-assistant`` MTP drafter and similar). Such files attach to a
         target via :attr:`draft` and are launched with ``-md`` +
-        ``--spec-type draft-mtp``; they are never choosable on their own."""
-        return metadata_is_standalone_drafter(self.metadata)
+        ``--spec-type draft-mtp``; they are never choosable on their own.
+        Same-architecture MTP-only heads (:func:`metadata_is_mtp_only_head`)
+        count as well, whatever their file name."""
+        return metadata_is_standalone_drafter(
+            self.metadata
+        ) or metadata_is_mtp_only_head(self.metadata)
 
     @property
     def is_dflash2_drafter(self) -> bool:
