@@ -15,6 +15,15 @@ patterns:
   - pplx-decider
   - d1-3b
   - d1-omni
+  # b11571/b11572 (PRs #30378/#30383): vLLM Decision 2 and D3. The vllm-sr
+  # "Decision-2.0-*" GGUFs are a fork format (decision type decision2);
+  # tuner.check_model_build names the fork they need.
+  - vllm-decision2
+  - vllm-d3
+  - decision-2.0
+  - decision-2_0
+arch_fallback:
+  - vllm-decision2
 
 # llama.cpp b11361 (PR #29818) serves openjev, lev, laya, julia-1 and kev
 # through POST /v1/systemone; b11364 (PR #29844) adds nimble. The floor is the
@@ -47,14 +56,21 @@ sampling:
 
 notes: >
   TypeSafe-style decision models (OpenJev, lev, Laya, Julia-1, Kev, Nimble,
-  Perplexity pplx-decider, LiquidAI d1-3B and d1-omni-600M): they answer typed
+  Perplexity pplx-decider, LiquidAI d1-3B and d1-omni-600M, vLLM Decision 2
+  and D3): they answer typed
   choice/score/noul questions about a state in one forward pass through POST
   /v1/systemone and generate no text, so chat, sampling, reasoning and
   speculation settings have no effect. Needs llama.cpp b11364+ (b11361 for
   all but Nimble); AutoTuner reads the GGUF's decision type and requires
-  b11447+ for pplx-decider, b11483+ for d1-3B and b11488+ for d1-omni-600M.
-  The encoder variants (Laya, Julia-1, d1-omni-600M) must fit the whole prompt
+  b11447+ for pplx-decider, b11483+ for d1-3B, b11488+ for d1-omni-600M,
+  b11571+ for vllm-decision2 and b11577+ for vllm-d3. The vllm-sr
+  Decision-2.0 GGUFs use the fork-only type decision2, which mainline
+  rejects; AutoTuner names the fork they need.
+  The encoder variants (Laya, Julia-1, d1-omni-600M, vLLM Decision 2 and D3)
+  must fit the whole prompt
   into one physical batch, which AutoTuner sizes for up to 8192 tokens.
   OpenJev, pplx-decider and the d1 models accept images when their mmproj is
   attached (d1-omni-600M also audio). Probabilities use the temperatures
   stored in the GGUF and are not guaranteed to be calibrated for your data.
+  The prompt cache stays off, as in llama.cpp b11642+: decision states
+  seldom repeat.

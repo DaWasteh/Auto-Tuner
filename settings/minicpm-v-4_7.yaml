@@ -1,0 +1,47 @@
+display_name: "MiniCPM-V 4.7 (OpenBMB, vision)"
+# Text-Backbone ist qwen35 (1B) bzw. qwen35moe (35B-A3B). Ohne eigenes
+# Profil fielen die Dateien per arch_fallback auf qwen3_5-3_6.yaml.
+patterns:
+  - minicpm-v-4_7
+  - minicpm-v-4.7
+  - minicpm-v4.7
+  - minicpm-v4_7
+  - minicpmv4_7
+  - minicpmv-4.7
+
+# Text läuft auch auf älteren Builds; der Projektor minicpmv4_7 braucht
+# b11551+ (PR #29416) und ist per tuner._MMPROJ_PROJECTOR_MIN_BUILD gesichert.
+max_context: 262144
+recommended_kv_quant: q8_0
+
+# OpenBMB-Modellkarte, Instruct-Modus: temperature 0.7, top_p 0.95,
+# top_k 100, min_p 0, presence 0, repetition_penalty 1.03.
+sampling:
+  chat:
+    temperature: 0.7
+    top_k: 100
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.03
+    presence_penalty: 0.0
+  coding:
+    temperature: 0.7
+    top_k: 100
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.03
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  OpenBMB MiniCPM-V 4.7 (1B dense and 35B-A3B MoE on Qwen3.5-style
+  backbones, 262,144 tokens of context): image and video understanding.
+  Image input needs llama.cpp b11551+ (PR #29416) for the minicpmv4_7
+  projector; text works on older builds. The official GGUF projector is
+  named generically (mmproj-model-f16.gguf), so attach it by hand if
+  AutoTuner does not pair it. DSpark drafters (dspark-MiniCPM-V-4_7-*) pair
+  automatically. Official instruct sampling: temperature 0.7, top-p 0.95,
+  top-k 100, repetition penalty 1.03; thinking can be switched per request
+  with enable_thinking.

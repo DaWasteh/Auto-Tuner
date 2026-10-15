@@ -234,6 +234,7 @@ _ARG_FLAGS_WITH_VALUES: Set[str] = {
     "--spec-draft-model",
     "--spec-draft-n-max",
     "--spec-draft-n-min",
+    "--spec-draft-n-ubatch",
     "--spec-draft-ngl",
     "--spec-draft-p-min",
     "--spec-draft-p-split",
@@ -743,7 +744,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     if arch == "xing4_0":
         return (
             "Xing 4.0's xing4_0 architecture has no loader in mainline llama.cpp "
-            "b11538 and no validated AutoTuner runtime. Do not substitute the "
+            "b11669 and no validated AutoTuner runtime. Do not substitute the "
             "DeepSeek or Qwen architecture."
         )
     if any(
@@ -768,7 +769,7 @@ def _model_runtime_block_reason(model: ModelEntry) -> str:
     ):
         return (
             "DeepSeek-V4.1-Flash has no validated llama.cpp inference runtime "
-            "in AutoTuner (b11538 / conversion-only PR #28696). The V4 loader "
+            "in AutoTuner (b11669 / conversion-only PR #28696). The V4 loader "
             "and memory plan are not compatible; GGUF conversion alone is "
             "not inference support."
         )
@@ -815,7 +816,7 @@ def _nemotron_latent_mtp_block_reason(
 #: tensors it does not carry.
 _MIN_QWEN4EXP_MTP_BUILD = 11330
 
-#: ``draft-mtp`` itself still cannot be used with qwen4exp: b11371 and b11538
+#: ``draft-mtp`` itself still cannot be used with qwen4exp: b11371, b11538 and b11669
 #: (HIP and Vulkan, one and two GPUs) loads the model and its NextN block, reserves the
 #: MTP graph and then aborts in ``ggml-backend.cpp`` with
 #: ``GGML_ASSERT(buffer)`` while the draft context is initialised. This holds
@@ -823,9 +824,10 @@ _MIN_QWEN4EXP_MTP_BUILD = 11330
 #: ``merge_mtp_head.py``; ``--ctx-checkpoints 0``, F16 KV and
 #: ``--no-spec-draft-backend-sampling`` do not avoid it. The embedded GGUF
 #: runs normally without speculation. b11538 reworked the NextN flags and
-#: row cropping (PRs #30017/#30020/#30097) and still aborts the same way.
+#: row cropping (PRs #30017/#30020/#30097) and still aborts the same way;
+#: b11669 (image embeddings for the MTP head, PRs #30257/#30397) too.
 #: Lift this only after a real request with accepted drafts on a newer build.
-_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD = 11538
+_QWEN4EXP_MTP_HEAD_VERIFIED_BUILD = 11669
 
 
 def qwen4exp_mtp_draft_unusable(model: ModelEntry) -> bool:
@@ -852,15 +854,50 @@ def _qwen4exp_mtp_block_reason(model: ModelEntry, detected: Optional[int]) -> st
     )
 
 
-#: PrismML Ternary-Bonsai 2 GGUFs (PTQ1_0 = ggml type 143, PQ2_0 = type 142)
-#: fold a Hadamard transform into their weights and describe it with
-#: ``prism.hadamard.*`` metadata that only the PrismML ``prism`` fork loads
-#: (recipes ``ternary_bonsai_{vulkan,hip}_llama_build.ps1``, ``2b_`` trees).
-#: Mainline llama.cpp rejects the tensors as unknown types (upstream issue
-#: #29058), and a runtime that lacked the Hadamard fold would decode garbage
-#: even if it accepted the types, so the check keys on the loader string in
-#: the selected binary's llama library rather than on a build number.
+#: PrismML Ternary-Bonsai 2 GGUFs fold a Hadamard transform into their
+#: weights and describe it with ``prism.hadamard.*`` metadata. Mainline
+#: llama.cpp loads that transform since b11556 (PR #29600), but only for the
+#: mainline Q1_0/Q2_0 tensor types (41/42). The GGUFs PrismML published first
+#: use the Prism-private types PTQ1_0 (143) and PQ2_0 (142), which only the
+#: PrismML ``prism`` fork loads (recipes ``ternary_bonsai_*``, ``2b_`` trees);
+#: mainline rejects them as unknown types (upstream issue #29058). A runtime
+#: without the Hadamard fold would decode garbage even if it accepted the
+#: types, so the check keys on loader strings in the selected binary's llama
+#: library rather than on a build number: ``prism.hadamard`` for the
+#: transform, plus the fork's file-type name for each private tensor type.
 _PRISM_HADAMARD_MARKER = "prism.hadamard"
+_MIN_MAINLINE_PRISM_HADAMARD_BUILD = 11556
+#: Prism-private ggml tensor types -> (name, loader marker). The marker is the
+#: fork's ``llama_model_ftype_name`` text, which mainline does not contain.
+_PRISM_FORK_TENSOR_TYPES: Dict[int, Tuple[str, str]] = {
+    142: ("PQ2_0", "PQ2_0 - 2.13 bpw"),
+    143: ("PTQ1_0", "PTQ1_0 - 1.75 bpw"),
+}
+#: Fork file types (141 = PQ2_0, 142 = its pre-rename value, 143 = PTQ1_0) ->
+#: tensor type, for a header-only read without the tensor-type scan.
+_PRISM_FORK_FILE_TYPES: Dict[int, int] = {141: 142, 142: 142, 143: 143}
+
+
+def _prism_fork_tensor_types(metadata: Dict[str, Any]) -> List[int]:
+    """Return the Prism-private tensor types a GGUF uses (sorted)."""
+    seen: Set[int] = set()
+    raw = metadata.get("__ggml_types__") or []
+    if isinstance(raw, (list, tuple)):
+        for value in raw:
+            try:
+                type_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if type_id in _PRISM_FORK_TENSOR_TYPES:
+                seen.add(type_id)
+    if not raw:
+        try:
+            file_type = int(metadata.get("general.file_type"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            file_type = None
+        if file_type in _PRISM_FORK_FILE_TYPES:
+            seen.add(_PRISM_FORK_FILE_TYPES[file_type])
+    return sorted(seen)
 
 
 def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
@@ -868,24 +905,40 @@ def _prism_hadamard_block_reason(model: ModelEntry, binary: str) -> str:
     metadata = model.metadata or {}
     if not any(str(key).startswith(_PRISM_HADAMARD_MARKER + ".") for key in metadata):
         return ""
-    if _runtime_has_required_markers(binary, [_PRISM_HADAMARD_MARKER]):
+    fork_types = _prism_fork_tensor_types(metadata)
+    markers = [_PRISM_HADAMARD_MARKER] + [
+        _PRISM_FORK_TENSOR_TYPES[type_id][1] for type_id in fork_types
+    ]
+    if _runtime_has_required_markers(binary, markers):
         return ""
-    file_type = metadata.get("general.file_type")
-    packing = {141: "PQ2_0", 143: "PTQ1_0"}.get(file_type, "PTQ1_0/PQ2_0")
+    if not fork_types:
+        return (
+            f"{model.name} carries PrismML Hadamard-folded weights "
+            "(prism.hadamard.* metadata). Mainline llama.cpp loads them from "
+            f"b{_MIN_MAINLINE_PRISM_HADAMARD_BUILD} on (PR #29600), the PrismML "
+            "prism fork (Ternary/Bonsai recipes, 2b_ builds) as well; the "
+            "selected binary and its llama library have no prism.hadamard "
+            "loader."
+        )
+    packing = "/".join(
+        f"{_PRISM_FORK_TENSOR_TYPES[type_id][0]} (ggml type {type_id})"
+        for type_id in fork_types
+    )
     return (
-        f"{model.name} carries PrismML Hadamard-folded ternary weights "
-        f"({packing}, prism.hadamard.* metadata) that only the PrismML prism "
-        "fork of llama.cpp loads (Ternary/Bonsai recipes, 2b_ builds, "
-        "prism-b10687 or newer). The selected binary and its llama library "
-        "have no prism.hadamard loader: mainline llama.cpp rejects these "
-        "tensors as unknown ggml types 142/143 (upstream issue #29058)."
+        f"{model.name} uses the Prism-private tensor type {packing} with "
+        "Hadamard-folded weights. Only the PrismML prism fork of llama.cpp "
+        "loads it (Ternary/Bonsai recipes, 2b_ builds, prism-b10687 or "
+        "newer). Mainline llama.cpp rejects these types as unknown (upstream "
+        "issue #29058); its prism.hadamard loader (b"
+        f"{_MIN_MAINLINE_PRISM_HADAMARD_BUILD}+, PR #29600) covers only GGUFs "
+        "converted to the mainline Q1_0/Q2_0 types."
     )
 
 
 #: ROCmFPX (charlie12345/ROCmFPX, continued as ROCmFPX/ROCmFPX) keeps its AMD
 #: FP4/FPx weight formats in a reserved ggml type range (100..111 at its
 #: main-b11100 tag) and numbers their file types 100..124 so upstream can keep
-#: appending to its own compact sequence. Mainline llama.cpp b11538 knows
+#: appending to its own compact sequence. Mainline llama.cpp b11669 knows
 #: types 0..42 only and aborts in ``gguf_init_from_reader`` with "invalid
 #: ggml type 100. should be in [0, 43)"; the CPU-only upstream PR #24185 is
 #: still open. kingjones777's Agnes-3.0-Flash / Qwen3.8 "MTP-ROCmFP4" and
@@ -1106,6 +1159,23 @@ _DECISION_TYPE_MIN_BUILD: Dict[str, Tuple[int, str]] = {
     "pplx-decider": (11447, "PR #30044"),
     "lfm2-d1": (11483, "PR #30110"),
     "lfm2-d1-omni": (11488, "PR #30114"),
+    "vllm-decision2": (11571, "PR #30378"),
+    # b11572 (PR #30383) adds vllm-d3; b11577 (PR #30408) keeps each
+    # non-causal sequence in one ubatch, which -np > 1 needs.
+    "vllm-d3": (11577, "PR #30383/#30408"),
+}
+#: The vllm-sr "Decision-2.0-*" GGUFs use a fork format (decision type
+#: ``decision2``, ``decision2.*`` tensors) that only the converter's fork
+#: (github.com/Xunzhuo/llama.cpp, branch decision2-gguf) serves; mainline
+#: answers "unsupported decision model type: decision2".
+_FORK_ONLY_DECISION_TYPES: Dict[str, str] = {
+    "decision2": "github.com/Xunzhuo/llama.cpp (branch decision2-gguf)",
+}
+#: Multimodal projector types a build must know before the mmproj loads at
+#: all; an older build aborts while reading the projector.
+_MMPROJ_PROJECTOR_MIN_BUILD: Dict[str, Tuple[int, str]] = {
+    "minicpmv4_7": (11551, "PR #29416"),
+    "nemotron_omni": (11668, "PR #30520"),
 }
 #: ``tokenizer.ggml.model`` values a build must know before it can load the
 #: vocabulary at all (b11455 / PR #30045 added the PLaMo-3 pre-segmentation).
@@ -1114,8 +1184,25 @@ _TOKENIZER_MODEL_MIN_BUILD: Dict[str, Tuple[int, str]] = {
 }
 
 
+def _mmproj_projector_type(model: ModelEntry) -> str:
+    """Return the attached mmproj's ``clip.projector_type`` (lower case)."""
+    if model.mmproj is None:
+        return ""
+    try:
+        from scanner import read_gguf_metadata
+
+        metadata = read_gguf_metadata(Path(model.mmproj)) or {}
+    except Exception:
+        return ""
+    for key in ("clip.projector_type", "clip.vision.projector_type"):
+        value = str(metadata.get(key) or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
 def _metadata_build_floor_reason(model: ModelEntry, binary: str) -> str:
-    """Refuse decision types and tokenizers the selected build predates."""
+    """Refuse decision types, tokenizers and projectors the build predates."""
     metadata = model.metadata or {}
     floors: List[Tuple[int, str, str]] = []
     decision = decision_model_type(model)
@@ -1126,6 +1213,10 @@ def _metadata_build_floor_reason(model: ModelEntry, binary: str) -> str:
     if tokenizer in _TOKENIZER_MODEL_MIN_BUILD:
         build, pr = _TOKENIZER_MODEL_MIN_BUILD[tokenizer]
         floors.append((build, pr, f"tokenizer '{tokenizer}'"))
+    projector = _mmproj_projector_type(model)
+    if projector in _MMPROJ_PROJECTOR_MIN_BUILD:
+        build, pr = _MMPROJ_PROJECTOR_MIN_BUILD[projector]
+        floors.append((build, pr, f"vision projector '{projector}'"))
     if not floors:
         return ""
     detected = probe_binary_build_number(binary)
@@ -1146,6 +1237,15 @@ def _metadata_build_floor_reason(model: ModelEntry, binary: str) -> str:
 #: answers every image request with HTTP 500 "unexpected layout of the
 #: decision prompt". Older builds load the mmproj but ignore the images.
 _MIN_CLEF_VISION_BUILD = 11418
+#: Physical batch of the draft context for external DFlash-family drafters
+#: (DFlash, DFlash2, LiLiCorr) and standalone MTP heads (``--spec-draft-n-
+#: ubatch``, b11629+). Plain sibling drafters keep the target's -ub because
+#: they process the whole prompt themselves; EAGLE-3/DSpark are unmeasured.
+_SMALL_DRAFT_UBATCH_TYPES = frozenset({"dflash", "mtp"})
+_DRAFT_CONTEXT_UBATCH = 64
+#: NVIDIA LiLiCorr drafters: added in b11641 (PR #30506), lattice walk and
+#: n_tokens condition fixed in b11668 (PR #30520).
+_MIN_LILICORR_BUILD = 11668
 
 
 def _clef_image_note(model: ModelEntry, binary: str) -> str:
@@ -1227,6 +1327,17 @@ def check_model_build(
     floor_block = _metadata_build_floor_reason(model, binary)
     if floor_block:
         return False, floor_block, probe_binary_build_number(binary)
+    fork_decision = _FORK_ONLY_DECISION_TYPES.get(decision_model_type(model))
+    if fork_decision:
+        return (
+            True,
+            f"{model.name} uses the fork-only decision type "
+            f"'{decision_model_type(model)}'; mainline llama.cpp answers "
+            "'unsupported decision model type'. It needs the converter's fork, "
+            f"{fork_decision}. The mainline format is 'vllm-decision2' "
+            "(b11571+, PR #30378).",
+            probe_binary_build_number(binary),
+        )
     clef_note = _clef_image_note(model, binary)
     if clef_note:
         return True, clef_note, probe_binary_build_number(binary)
@@ -1545,6 +1656,19 @@ def check_draft_model_build(
                 "contain the upstream NextN loader regression from PR #28159. "
                 f"Use b{_FIXED_NEXTN_BUILD}+ or b{_BROKEN_NEXTN_BUILD_START - 1} "
                 "and earlier.",
+                detected,
+            )
+
+    if draft_model.is_lilicorr_drafter:
+        detected = probe_binary_build_number(binary)
+        if detected is not None and detected < _MIN_LILICORR_BUILD:
+            return (
+                False,
+                f"The LiLiCorr draft {draft_model.path.name} needs llama.cpp "
+                f"b{_MIN_LILICORR_BUILD}+: b11641 (PR #30506) added the "
+                "lilicorr drafter and b11668 fixed its lattice walk; "
+                f"b{detected} cannot use it. Update llama.cpp or use n-gram "
+                "speculation instead.",
                 detected,
             )
 
@@ -1875,6 +1999,7 @@ def _adapt_spec_types_for_binary(cmd: List[str]) -> Tuple[List[str], List[str]]:
         "--spec-draft-ngl",
         "--spec-draft-n-max",
         "--spec-draft-n-min",
+        "--spec-draft-n-ubatch",
         "--spec-draft-p-min",
         "--spec-draft-p-split",
         "--spec-draft-sampling",
@@ -1961,6 +2086,7 @@ def _adapt_nextn_regression_for_binary(cmd: List[str]) -> Tuple[List[str], List[
         "--spec-draft-ngl",
         "--spec-draft-n-max",
         "--spec-draft-n-min",
+        "--spec-draft-n-ubatch",
         "--spec-draft-p-min",
         "--spec-draft-p-split",
         "--spec-draft-sampling",
@@ -4099,6 +4225,12 @@ def _compute_config(
     # -1 (legacy "unlimited") is planned conservatively as a bounded
     # PROMPT_CACHE_UNLIMITED_RESERVE_GB so the budget never under-
     # provisions against an unbounded host cache.
+    # llama.cpp b11642 (PR #30498) keeps the prompt cache off for decision
+    # models unless --cache-ram is given, because their typed states seldom
+    # repeat. AutoTuner always sends --cache-ram, which would count as that
+    # opt-in, so it applies the default itself and reserves no host RAM.
+    if decision_model_type(model):
+        prompt_cache_ram_mib = 0
     if prompt_cache_ram_mib > 0:
         prompt_cache_ram_gb = prompt_cache_ram_mib / 1024.0
     elif prompt_cache_ram_mib == -1:
@@ -6195,7 +6327,7 @@ def single_batch_prompt_tokens(model: ModelEntry) -> int:
     metadata = model.metadata or {}
     arch = str(model.architecture or "").strip()
     non_causal = bool(arch) and metadata.get(f"{arch}.attention.causal") is False
-    if non_causal or decision_model_type(model) in {"laya", "clef"}:
+    if non_causal or decision_model_type(model) in {"laya", "clef", "vllm-decision2"}:
         return SINGLE_BATCH_PROMPT_TOKENS
     return 0
 
@@ -6820,7 +6952,8 @@ def build_command(
     # cannot accidentally apply MTP confidence tuning to the external drafter.
     draft_p_min = (
         0.0
-        if draft_model is not None and draft_model.is_dflash2_drafter
+        if draft_model is not None
+        and (draft_model.is_dflash2_drafter or draft_model.is_lilicorr_drafter)
         else _profile_draft_p_min(profile)
     )
     vision_loaded = model.mmproj is not None
@@ -6976,6 +7109,16 @@ def build_command(
         cmd += ["--spec-draft-ngl", "99"]
         cmd += ["--spec-draft-n-max", str(draft_val)]
         cmd += ["--spec-draft-p-min", str(draft_p_min)]
+        if draft_model.drafter_spec_type in _SMALL_DRAFT_UBATCH_TYPES:
+            # b11629+ (PR #30459): these drafters only see the drafted tokens,
+            # so their context does not need the target's -ub. Measured on
+            # b11669: -1.26 GiB VRAM for Qwen3.8-27B + DFlash2 on Vulkan,
+            # -0.22 GiB for Gemma 4 31B + MTP head, same prefill, decode and
+            # accepted drafts. Older builds drop the flag with its value.
+            cmd += [
+                "--spec-draft-n-ubatch",
+                str(min(_DRAFT_CONTEXT_UBATCH, max(1, int(config.ubatch or 0)))),
+            ]
     elif use_integrated:
         # Path B — integrated MTP drafter inside the main GGUF.
         # `--spec-draft-ngl 99` keeps the MTP head on GPU; without it the

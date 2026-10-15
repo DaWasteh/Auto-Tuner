@@ -174,7 +174,7 @@ def test_mainline_b11063_still_lacks_the_prism_and_rocmfpx_types(tmp_path, monke
     )
     ok, message, detected = tuner.check_model_build(bonsai, "llama-server")
     assert not ok and detected is None
-    assert "142/143" in message and "#29058" in message
+    assert "ggml type 142" in message and "#29058" in message
     agnes = _fake_model_md(
         tmp_path,
         "Agnes-3.0-Flash-Preview-MTP-imatrix-Q4_0-ROCmFP4-STRIX_LEAN",
@@ -194,22 +194,22 @@ def test_mainline_b11063_still_lacks_the_prism_and_rocmfpx_types(tmp_path, monke
 # ------------------------------------------------------------- carry-over ----
 
 
-def test_v41_block_names_b11538(tmp_path):
+def test_v41_block_names_b11669(tmp_path):
     # PR #28696 is still an open draft (last updated 2026-09-19): the block
-    # now names the b11538 re-check.
+    # now names the b11669 re-check.
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11538" in profile.runtime_block_reason
+    assert "b11669" in profile.runtime_block_reason
     assert "b11030" not in profile.runtime_block_reason
     assert "b11030" not in profile.notes
-    with pytest.raises(ValueError, match="b11538"):
+    with pytest.raises(ValueError, match="b11669"):
         tuner.build_command(_model(tmp_path), _config(), profile)
     renamed = _model(tmp_path)
     renamed.metadata = {"general.architecture": "deepseek41"}
-    with pytest.raises(ValueError, match="b11538 / conversion-only PR #28696"):
+    with pytest.raises(ValueError, match="b11669 / conversion-only PR #28696"):
         tuner.build_command(renamed, _config(), ModelProfile("custom"))
     for pack in sorted((ROOT / "assets/languages").glob("*.json")):
         notes = json.loads(pack.read_text(encoding="utf-8"))["profile_notes"]
-        assert "b11538" in notes["deepseek-v4_1.yaml"], pack.name
+        assert "b11669" in notes["deepseek-v4_1.yaml"], pack.name
         assert "b11030" not in notes["deepseek-v4_1.yaml"], pack.name
 
 

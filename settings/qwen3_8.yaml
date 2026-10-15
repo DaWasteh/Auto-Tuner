@@ -3,6 +3,9 @@ patterns:
   - qwen3.8
   - qwen3_8
   - qwen38
+  # Qwen3.8-27B finetune whose file name does not say so (base_model
+  # Qwen/Qwen3.8-27B); it otherwise fell back to qwen3_5-3_6.yaml.
+  - orcasaq-2-27b
 
 # Qwen3.8 reuses the Qwen3.5 dense/MoE architecture identifiers in its
 # official Transformers configs. Do not claim qwen35/qwen35moe as architecture

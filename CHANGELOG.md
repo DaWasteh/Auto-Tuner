@@ -3,6 +3,48 @@
 Release history of AutoTuner. Each llama.cpp audit and each release
 validation has its own file under [docs/](docs/).
 
+### v5.6.3 — llama.cpp b11669 / v0.7.0 audit, Bonsai 2 on mainline, new NVIDIA and OpenBMB models
+
+- **131 upstream commits audited (b11538 → b11669, = stable v0.7.0):** the only
+  CLI addition is `--spec-draft-n-ubatch` (420 names / 333 long options).
+  AutoTuner now sends `--spec-draft-n-ubatch 64` for external DFlash, DFlash2
+  and LiLiCorr drafts and for MTP heads: measured on RDNA4 this frees
+  1.26 GiB of VRAM for Qwen3.8-27B + DFlash2 on Vulkan and 0.22 GiB for
+  Gemma 4 31B + MTP head, with unchanged prompt speed, decode speed and
+  accepted drafts. Plain draft models keep the full batch.
+- **Decision models without prompt cache:** llama.cpp b11642 turns the prompt
+  cache off for decision models unless `--cache-ram` is given; AutoTuner
+  always sent it, so it now applies that default itself and reserves no RAM
+  for it.
+- **Prism Bonsai 2 on mainline:** b11556 loads the Hadamard fold for mainline
+  conversions (`Q2_0`, `F16`). The PrismML `PTQ1_0`/`PQ2_0` files still need
+  the prism fork, but b11669 contains the `prism.hadamard` loader string that
+  AutoTuner's gate looked for, so it would have started them and failed while
+  loading. The gate now also requires the fork's own type names. New profile
+  `bonsai-2.yaml` for Bonsai 2 2B/4B/9B (they used the first-generation
+  profile with 64K context).
+- **New profiles:** NVIDIA Nemotron 3.5 Super VL and Nemotron 3.5 Bolt (both
+  b11668+, previously the generic profile with 8K context), OpenBMB MiniCPM-V
+  4.7, Poolside Laguna XS 2.1 (b11598+), Aleph Alpha Kolibri 1 (needs the
+  hob-llama.cpp patch; refused on mainline instead of failing with "unknown
+  model architecture"). `OrcaSAQ-2-27B` now uses the Qwen3.8 profile.
+- **New model checks:** image projectors `minicpmv4_7` (b11551+) and
+  `nemotron_omni` (b11668+) are refused on older builds; vLLM Decision 2 and
+  D3 use the decision profile with their build floors, and the fork-format
+  vllm-sr Decision-2.0 GGUFs name the fork they need; NVIDIA LiLiCorr drafters
+  pair with their target and need b11668+.
+- **Build recipes:** HIP builds now link OpenSSL — ROCm clang's GNU driver
+  never found the Windows OpenSSL install, so every HIP `llama-server` was
+  built without HTTPS. Re-running the HIP recipe rebuilds an existing tree
+  with it (verified with a ROCm-clang build: `libssl`/`libcrypto` linked). The
+  stable recipe no
+  longer accepts a `0.7.0-dev` binary as stable `0.7.0`. No CMake option
+  changed upstream; the b11669 caches equal b11538's.
+- **Rechecked on b11669:** Qwen3.8 Flash Next `draft-mtp`, DeepSeek-V4.1,
+  Xing 4.0, Prism PQ2_0/PTQ1_0 on mainline and ROCmFPX stay blocked; image +
+  DFlash2 keeps 152/168 accepted drafts. Throughput is within ±2 % of b11538.
+- [Audit](docs/llama-b11669-audit.md) · [Validation](docs/v5.6.3-validation.md).
+
 ### v5.6.2 — llama.cpp b11538 audit, Escha W2 models (issue #7), new upstream models
 
 - **167 upstream commits audited (b11371 → b11538):** the only CLI addition is
@@ -967,7 +1009,23 @@ Notes on individual profiles, newest first.
 ## Earlier llama.cpp audit summaries
 
 
-The **b11249** (`6d78fb072`, `0.5.0-dev`) [audit](docs/llama-b11249-audit.md)
+The **b11538** (`79e2e74eb`, `0.6.0-dev`) [audit](docs/llama-b11538-audit.md)
+covers 167 commits after b11371. The only CLI addition is
+**`--moe-cache-mib`** (418 names / 331 long options); the default port moved
+to 9931, which does not matter because AutoTuner always passes `--port`. New
+for AutoTuner: **EschaLabs W2** GGUFs are refused on runtimes without the
+Escha loader and start with their MTP head on the Escha fork (issue #7),
+same-architecture MTP heads are recognised by their tensors whatever their
+file name, **K2 Horizon** runs on mainline, **pplx-decider / LiquidAI d1** use
+the decision profile with per-type build floors, **EmbeddingGemma 2** has an
+embedding profile, Clef images need a 2026-10-05+ GGUF, and DFlash drafts with
+embeddings but no head get a warning on b11132–b11511. Qwen3.8 Flash Next
+`draft-mtp` still aborts upstream and stays off. The Vulkan MoE prompt
+regression is gone (upstream revert in b11423): stock b11538 matches the
+opt-in [RDNA4 build](docs/rdna4-moe-workaround.md), which is no longer
+needed. See [validation](docs/v5.6.2-validation.md).
+
+The previous **b11249** (`6d78fb072`, `0.5.0-dev`) [audit](docs/llama-b11249-audit.md)
 covers 54 commits after b11195. The only CLI change is **`--rpc`**, which is
 now listed on every build (PR #29537) and rejected at parse time by builds
 without RPC; AutoTuner never plans RPC, and a user-supplied `--rpc` extra is

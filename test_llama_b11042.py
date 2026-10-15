@@ -178,12 +178,16 @@ def test_hadamard_folded_gguf_is_refused_without_the_prism_loader(
     monkeypatch.setattr(tuner, "_runtime_has_required_markers", markers)
     ok, message, detected = tuner.check_model_build(model, "llama-server")
     assert not ok and detected is None
-    assert seen == [("llama-server", ("prism.hadamard",))]
+    # b11669 (v5.6.3): the private tensor type also needs the fork's own
+    # file-type name, because mainline b11556+ carries prism.hadamard too.
+    fork_marker = {"PTQ1_0": "PTQ1_0 - 1.75 bpw", "PQ2_0": "PQ2_0 - 2.13 bpw"}[packing]
+    assert seen == [("llama-server", ("prism.hadamard", fork_marker))]
     # Mainline b11042 (Vulkan and HIP) really answers
     # "tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)".
     assert model.name in message and packing in message
     assert "prism.hadamard" in message and "prism-b10687" in message
-    assert "142/143" in message and "#29058" in message
+    type_id = {"PTQ1_0": 143, "PQ2_0": 142}[packing]
+    assert f"ggml type {type_id}" in message and "#29058" in message
     # check_model_build is the shared GUI / TUI / OCR pre-launch gate; the
     # same wording reaches the user before llama-server is even started.
 
@@ -259,10 +263,10 @@ def test_ternary_bonsai_recipes_pin_the_prism_fork_with_its_build_number():
 # ------------------------------------------------------------- carry-over ----
 
 
-def test_v41_block_and_vision_gate_now_name_b11538():
+def test_v41_block_and_vision_gate_now_name_b11669():
     # b11030..b11042 does not touch the server, the speculative helpers or
     # the recurrent memory; the image + DFlash2 request and the V4.1 block
-    # were re-run on b11538 (v5.6.2) and now carry that wording.
+    # were re-run on b11669 (v5.6.3) and now carry that wording.
     profile = match_profile("DeepSeek-V4.1-Flash", _profiles())
-    assert "b11538" in profile.runtime_block_reason
+    assert "b11669" in profile.runtime_block_reason
     assert tuner.QWEN35_VISION_DFLASH2_BROKEN_SINCE == 10896

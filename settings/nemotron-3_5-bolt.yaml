@@ -1,0 +1,52 @@
+display_name: "Nemotron 3.5 Bolt 74B-A9B (NVIDIA)"
+patterns:
+  - nemotron-3.5-bolt
+  - nemotron-3_5-bolt
+  - nemotron3.5-bolt
+  - nemotron-35-bolt
+  - bolt-74b-a9b
+
+# Bolt legt pro Layer unterschiedlich viele Experten an (Router 240...496,
+# expert_used_count als Array). Erst b11668 (PR #30520) liest die Größen
+# aus den Tensoren; ältere Builds brechen mit falscher Tensorform ab.
+min_llama_build: 11668
+
+max_context: 262144
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+# NVIDIA-Rezepte: --temp 1.0 --top-p 0.95 (top_k = llama.cpp-Standard 40).
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+
+# NVIDIAs llama.cpp-Rezepte nutzen den LiLiCorr-Drafter mit 6 (28-GB-Rezept)
+# bzw. 7 (32-GB-Rezept) Draft-Tokens; AutoTuner setzt dafür p-min 0.
+draft_max: 6
+
+notes: >
+  NVIDIA Nemotron 3.5 Bolt: a 74B-total/9B-active compression of Nemotron
+  3.5 Super VL (nemotron_h_moe, 88 blocks, 240-496 experts per layer, 9
+  active) with image input and up to 262,144 tokens of context. Needs
+  llama.cpp b11668+ (PR #30520, first release b11669): older builds create
+  the expert tensors with the wrong shape and abort. The mmproj uses the
+  nemotron_omni projector. NVIDIA's llama.cpp recipes pair the model with
+  its LiLiCorr drafter (draft-dflash, 6-7 draft tokens, q8_0 KV for the
+  28 GB recipe); AutoTuner pairs a lilicorr-*.gguf / *-LiLiCorr.gguf draft
+  automatically. Sampling: temperature 1.0, top-p 0.95. Thinking is
+  controlled through the chat template (enable_thinking).

@@ -71,5 +71,8 @@ notes: >
   the Ternary/Bonsai recipes (2b_ builds, prism-b10687 or newer); mainline
   llama.cpp rejects them as unknown tensor types. The recipes pin
   prism-b10743, whose Vulkan backend runs both packings on the GPU
-  (prism-b10687 had no Vulkan PQ2_0 path); HIP/CUDA run both. Official
-  thinking-mode sampling (temperature 1.0, top-p 0.95, top-k 20).
+  (prism-b10687 had no Vulkan PQ2_0 path); HIP/CUDA run both. Mainline
+  llama.cpp b11556+ (PR #29600) loads the Hadamard fold too, but only for
+  mainline conversions (Q2_0, F16); for PTQ1_0/PQ2_0 AutoTuner still requires
+  the fork. Official thinking-mode sampling (temperature 1.0, top-p 0.95,
+  top-k 20).

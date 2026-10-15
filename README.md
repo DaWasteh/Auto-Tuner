@@ -884,19 +884,22 @@ Turbo mapping used by compatible terminal/fork flows:
 
 The tuner intelligently selects the best binary based on your model and settings:
 
-- **Gemma 4 (with external draft)** $\rightarrow$ uses `ik_llama.cpp` (external sibling drafter still requires the fork).
-- **Gemma 4 (without draft)** $\rightarrow$ uses standard `llama.cpp`.
+- **Gemma 4 (with or without draft)** $\rightarrow$ uses the selected `llama.cpp` build. Mainline runs the `gemma4-assistant` MTP head (`--spec-type draft-mtp`) and sibling drafters natively since b9190 (PR #23398); only a build too old to advertise `--spec-type` still falls back to a legacy `ik_llama.cpp` tree if one is installed.
 - **Integrated MTP (e.g. Qwen3.6-27B-MTP)** $\rightarrow$ uses standard `llama.cpp` (native since b9190+; PR #22673 in mainline since 16 May 2026; no fork needed).
 - **Ternary-Bonsai / Ternary-Bonsai 2** $\rightarrow$ uses the PrismML prism fork
-  (`2b_bNNNN_{vulkan,hip}_llama.cpp`). Bonsai 2's `PTQ1_0` / `PQ2_0` packings and
-  their Hadamard fold are fork-only; mainline llama.cpp (b11042) rejects them as
-  unknown ggml types 143 / 142, and AutoTuner refuses such GGUFs before launch on
-  a runtime whose llama library has no `prism.hadamard` loader.
+  (`2b_bNNNN_{vulkan,hip}_llama.cpp`) for the `PTQ1_0` / `PQ2_0` packings: mainline
+  llama.cpp (still b11669) rejects them as unknown ggml types 143 / 142. Since
+  b11556 (PR #29600) mainline loads the Hadamard fold (`prism.hadamard.*`) for
+  mainline conversions (`Q2_0`, `F16`; e.g. Ternary-Bonsai-2 2B/4B/9B `Q2_0`).
+  AutoTuner therefore checks two loader strings in the selected runtime: the
+  `prism.hadamard` loader, and for the private types also the fork's own
+  `PTQ1_0` / `PQ2_0` file-type names. Without that second check b11669 would
+  have accepted the PrismML `PTQ1_0` / `PQ2_0` GGUFs and failed while loading.
 - **Agnes-3.0-Flash Preview, kingjones777 `MTP-ROCmFP4` / `ROCmFPX` GGUFs** $\rightarrow$
   need the ROCmFPX fork (`github.com/ROCmFPX/ROCmFPX`, legacy
   `charlie12345/ROCmFPX`). Their weights use the fork's reserved ggml types
   100–111 (`Q4_0_ROCMFP4` = 100, `Q8_0_ROCMFPX` = 103; file types 100–124, e.g.
-  106 = *ROCmFP4 Strix Lean*), which mainline llama.cpp (b11042) rejects as
+  106 = *ROCmFP4 Strix Lean*), which mainline llama.cpp (still b11669) rejects as
   `invalid ggml type 100. should be in [0, 43)`; the CPU-only upstream PR #24185
   is still open. AutoTuner records the tensor types during the header scan
   and refuses such a GGUF before launch on a runtime whose llama library has
@@ -987,6 +990,8 @@ matches. See `settings/_default.yaml`.
 | `agnes-3_0-flash.yaml` | Agnes-3.0-Flash Preview 33B hybrid multimodal reasoning (folded `qwen35` GGUFs load on mainline; kingjones777's MTP-ROCmFP4 / ROCmFPX files need the ROCmFPX fork), 256k, in-file MTP | `qwen35` (filename-gated) |
 | `qwen3_8_flash_next.yaml` | Qwen3.8 Flash Next, PLE + QSA hybrid MoE (b10666+ safety gate) | `qwen4exp` |
 | `nemotron-3_5.yaml` | NVIDIA Nemotron 3.5 Lightning 30B-A3B + MTP/DSpark | `nemotron_h` |
+| `nemotron-3_5-super-vl.yaml` | NVIDIA Nemotron 3.5 Super VL 120B-A12B, image/video (`nemotron_omni` mmproj), separate MTP head, 1M context; b11668+ | `nemotron_h_moe` (filename) |
+| `nemotron-3_5-bolt.yaml` | NVIDIA Nemotron 3.5 Bolt 74B-A9B (per-layer expert counts), image input, LiLiCorr drafter; b11668+ | `nemotron_h_moe` (filename) |
 | `nanbeige-4_2.yaml` | Nanbeige 4.2 3B, 256k agent/reasoning model | `nanbeige` |
 | `mellum.yaml` | JetBrains Mellum2-12B-A2.5B (Base/Instruct/Thinking), MoE | `mellum` |
 | `exaone-4_5.yaml` | LG EXAONE 4.5 33B VLM (dense, non-commercial license) | `exaone4` |
@@ -994,14 +999,14 @@ matches. See `settings/_default.yaml`.
 | `granite-4_2.yaml` | IBM Granite 4.2 3B/8B/30B dense reasoning + tools | `granite` (filename-gated) |
 | `granite-embedding-r2.yaml` | IBM Granite Embedding Multilingual R2 97m/311m (**embedding**, not chat) | `modern-bert` |
 | `embeddinggemma-2.yaml` | Google EmbeddingGemma 2 (**embedding**, not chat; 8K, one physical batch), b11452+ | `gemma-embedding2` |
-| `decision-systemone.yaml` | TypeSafe decision models OpenJev / lev / Laya / Julia-1 / Kev / Nimble / Perplexity pplx-decider / LiquidAI d1-3B and d1-omni-600M (**`/v1/systemone` only**, b11364+; per-type floors b11447 / b11483 / b11488 from `<arch>.decision.type`) | filename only; `<arch>.decision.type` drives batch/context and build floor |
+| `decision-systemone.yaml` | TypeSafe decision models OpenJev / lev / Laya / Julia-1 / Kev / Nimble / Perplexity pplx-decider / LiquidAI d1-3B and d1-omni-600M / vLLM Decision 2 and D3 (**`/v1/systemone` only**, b11364+; per-type floors b11447 / b11483 / b11488 / b11571 / b11577 from `<arch>.decision.type`; no prompt cache) | `vllm-decision2`; otherwise filename; `<arch>.decision.type` drives batch/context and build floor |
 | `clef.yaml` | Cloudflare Clef / Clef-Flash joint decision model (**`/v1/systemone` only**, b11371+; images b11418+ with a 2026-10-05+ GGUF) | `clef` |
 | `llm-jp-4_1.yaml` | NII LLM-jp-4.1 thinking 8B / 33B / 32B-A3B, Harmony dialect parser b11320+ | filename only; generic `llama` |
 | `muse-glimmer.yaml` | Meta Muse Glimmer 30B + optional vision/DFlash; b11100+ recommended for tool calls, b11249+ for `json_schema` output | `muse-glimmer` |
 | `mimo-v2_6.yaml` | MiMo-V2.6 Flash/Pro RL, 1M ceiling, official 1.0/0.95 sampling, b11102+; separate `--mtp` heads b11195+ | `mimo2` (filename-gated; no local weights tested) |
 | `mimo-v2_6-distill.yaml` | Xiaomi MiMo-V2.6-Distill-Qwen-9B (Qwen3.5-9B SFT, not the MoE): official 0.6/20/0.95 sampling, 262k, thinking + Qwen3-Coder XML tools, vision via Qwen3.5 mmproj | `qwen35` (filename-gated; tested locally) |
 | `fastcontext-1_0-4b.yaml` | Microsoft FastContext 1.0 4B SFT/RL repository explorer, 262k, GGUF sampling defaults | `qwen3` (filename-gated) |
-| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11538 loader** | `xing4_0` |
+| `xing-4_0.yaml` | Xing 4.0 29B-A4B: **recognition only, launch blocked; no b11669 loader** | `xing4_0` |
 | `voxcpm2.yaml` | VoxCPM2 BaseLM: **Voice Lab TTS component, ordinary chat launch blocked** | `minicpm4` (filename-gated, not an architecture-wide block) |
 | `minimax-m3.yaml` | MiniMax-M3 428B-A23B multimodal MSA MoE | `minimax-m3` |
 | `glm-5.yaml` | GLM-5/5.1 | `glm5` |
@@ -1012,10 +1017,14 @@ matches. See `settings/_default.yaml`.
 | `hy4-mainline.yaml` | Tencent HY4 Preview, official mainline GGUF, b10813+ | `hy_v4` |
 | `spark2_5.yaml` | Spark X2.5 1.7B / 4B, 1M native context, b10828+ | `spark2_5` |
 | `minicpm5.yaml` / `minicpm5-2b.yaml` | MiniCPM5 1B / 2B (GGUF: 2.6B), distinct official sampling, 128K context | filename only; generic `llama` |
+| `minicpm-v-4_7.yaml` | OpenBMB MiniCPM-V 4.7 1B / 35B-A3B, image and video; images need b11551+ (`minicpmv4_7` mmproj) | filename (`qwen35` / `qwen35moe`) |
 | `k2-horizon.yaml` | IFM K2 Horizon dense 1B–32B and MoVA-36B-A4B, 512K; mainline b11454+ (PR #29535) or the IFM fork, checked by runtime marker | `k2-horizon` |
+| `kolibri-1.yaml` | Aleph Alpha Kolibri 1 78B-A3.5B (German/English reasoning): **needs the hob-llama.cpp patch**, refused on mainline by runtime marker | `kolibri1` |
+| `bonsai-2.yaml` | PrismML Ternary-Bonsai 2 2B / 4B / 9B Q2_0 + Hadamard fold: mainline b11556+ or the prism fork | filename (`qwen35`) |
+| `laguna-xs-2_1.yaml` | Poolside Laguna XS 2.1 / XS.2 33B-A3B agentic coding; b11598+ (YaRN beta) | filename (`laguna`) |
 | `granite-switch-4_1.yaml` | IBM Granite Switch 4.1 adapters | `graniteswitch` |
 | `deepseek-v4.yaml` | DeepSeek-V4 Pro / Flash, 1M context | `deepseek4` |
-| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11538 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
+| `deepseek-v4_1.yaml` | DeepSeek-V4.1-Flash: **recognition only, launch blocked; no b11669 runtime** | proposed `deepseek41`, not compatible with `deepseek4` |
 | `shieldstral.yaml` | Shieldstral 1.0 3B safety classifier | Ministral 3-derived |
 | `ling-3.yaml` | Ling 3.0 Flash/Tiny (loader b10460; corrected SSM state contract b10749+; dedicated Bailing V3 chat parser b11063+) | `bailingmoe3` |
 | `ling-3_0-vl.yaml` | Ling-3.0-flash-VL image/video model (ling3vl projector + M-RoPE), b11156+; older builds refused by metadata gate | `bailingmoe3` with `rope.dimension_sections` (filename-gated; no local weights tested) |
@@ -1135,6 +1144,24 @@ option either (only the ggml 0.25.3 bump and the tiled CPU matmul sources);
 the user-built b11195 trees carry exactly the b11160 option set.
 b11195…b11249 changes CMake only for Windows ARM64/ARM64EC with MSVC; the
 user-built b11249 trees again carry the identical option set.
+b11538…b11669 adds no CMake option and changes no default (only the version
+bumps to llama.cpp 0.7.0 / ggml 0.27.0, s390x and ARM KleidiAI lines, and
+hidden symbol visibility for *shared* ggml builds, which the static recipes
+do not produce); the user-built b11669 `CMakeCache.txt` files equal b11538's.
+**Stable v0.7.0 is the b11669 commit** (`620d2225c`; v0.6.0 was b11429), so a
+stable 0.7.0 build is the same source and differs only in its version string
+(`0.7.0` instead of `0.7.0-dev`). The stable recipes now insist on exactly
+that string: the old check also accepted `0.7.0-dev` for a stable build.
+HIP builds now find OpenSSL: ROCm `clang` uses the GNU driver, so CMake's
+FindOpenSSL never searched the Windows installer layout and every HIP
+`llama-server` through b11669 was built without HTTPS (`-hf` downloads,
+https MCP servers). The recipes pass `C:\Program Files\OpenSSL-Win64` (or
+`OPENSSL_ROOT_DIR`) explicitly. A HIP tree without OpenSSL now counts as
+incomplete when OpenSSL-Win64 is installed, so re-running the HIP recipe on an
+existing tree (e.g. `-Tag b11669`) rebuilds it with HTTPS; the Vulkan/MSVC
+trees always had it. F16C/FMA are active on both backends (MSVC's `/arch:AVX2`
+implies them), so b11669's F16C fixes for AVX2 CPUs (PRs #30270/#30343) apply
+without a recipe change.
 MSBuild's MSB8027 "two files named llama.cpp" warning in the Vulkan tree is
 benign: `src/models/llama.cpp` is folded into a unity source and only one
 `llama.obj` is produced.
@@ -1169,24 +1196,25 @@ same CMake flags from the recipes. The only AutoTuner requirement is that the
 resulting binary is discoverable, e.g. `LLAMA_CPP_DIR=/opt/ai-local/b9888_llama.cpp`
 with `build/bin/llama-server` inside.
 
-## Server features (audited through llama.cpp b11538)
+## Server features (audited through llama.cpp b11669)
 
-The **b11538** (`79e2e74eb`, `0.6.0-dev`) [audit](docs/llama-b11538-audit.md)
-covers 167 commits after b11371. The only CLI addition is
-**`--moe-cache-mib`** (418 names / 331 long options); the default port moved
-to 9931, which does not matter because AutoTuner always passes `--port`. New
-for AutoTuner: **EschaLabs W2** GGUFs are refused on runtimes without the
-Escha loader and start with their MTP head on the Escha fork (issue #7),
-same-architecture MTP heads are recognised by their tensors whatever their
-file name, **K2 Horizon** runs on mainline, **pplx-decider / LiquidAI d1** use
-the decision profile with per-type build floors, **EmbeddingGemma 2** has an
-embedding profile, Clef images need a 2026-10-05+ GGUF, and DFlash drafts with
-embeddings but no head get a warning on b11132–b11511. Qwen3.8 Flash Next
-`draft-mtp` still aborts upstream and stays off. The Vulkan MoE prompt
-regression is gone (upstream revert in b11423): stock b11538 matches the
-opt-in [RDNA4 build](docs/rdna4-moe-workaround.md), which is no longer
-needed. See
-[validation](docs/v5.6.2-validation.md). Summaries of earlier audits are in
+The **b11669** (`620d2225c`, `0.7.0-dev`, = stable **v0.7.0**)
+[audit](docs/llama-b11669-audit.md) covers 131 commits after b11538. The only
+CLI addition is **`--spec-draft-n-ubatch`** (420 names / 333 long options);
+AutoTuner sends `--spec-draft-n-ubatch 64` for external DFlash/DFlash2/
+LiLiCorr drafts and MTP heads (measured: −1.26 GiB VRAM for Qwen3.8-27B +
+DFlash2 on Vulkan, −0.22 GiB for Gemma 4 + MTP, same speed and acceptance).
+Decision models run without prompt cache, as llama.cpp now defaults. Mainline
+loads **Prism Bonsai 2** Q2_0/F16 conversions from b11556; the Prism gate now
+also checks the fork's own `PTQ1_0`/`PQ2_0` loader, which b11669 would
+otherwise have let through. New profiles: **Nemotron 3.5 Super VL / Bolt**,
+**MiniCPM-V 4.7**, **Bonsai 2 2B/4B/9B**, **Laguna XS 2.1**, **Kolibri 1**
+(fork-only); new vision projectors and the vLLM decision types have build
+floors, and LiLiCorr drafters pair automatically. The HIP build recipes now
+link OpenSSL (HTTPS was missing) and the stable recipe rejects a `-dev`
+build. Qwen3.8 Flash Next `draft-mtp` still aborts upstream and stays off.
+Throughput is within ±2 % of b11538. See
+[validation](docs/v5.6.3-validation.md). Summaries of earlier audits are in
 [CHANGELOG.md](CHANGELOG.md#earlier-llamacpp-audit-summaries); every audit
 has its own file under [docs/](docs/).
 
@@ -1199,7 +1227,7 @@ has its own file under [docs/](docs/).
 | `--perf` | ✅ Explicitly asserts performance timings so fork defaults cannot hide prompt/eval tokens/s; users can append `--no-perf` |
 | `--metrics` | ✅ Prometheus endpoint `GET /metrics`, including b10282+ speculative draft/accept counters (see "Monitoring") |
 | `--slots` / `--no-slots` | ✅ Emitted explicitly so the Expert toggle remains authoritative even though current mainline defaults `/slots` on |
-| `--cache-ram` / `-cram` | ✅ Host-memory prompt caching (PR #16391), auto-on with a 2048 MiB bounded default, adjustable in GUI/CLI and included in RAM planning. Vision caching is enabled for b10045+ and forced to `0` for older/unprobeable builds. |
+| `--cache-ram` / `-cram` | ✅ Host-memory prompt caching (PR #16391), auto-on with a 2048 MiB bounded default, adjustable in GUI/CLI and included in RAM planning. Vision caching is enabled for b10045+ and forced to `0` for older/unprobeable builds. Decision models always get `0` (llama.cpp b11642+ default; their states seldom repeat). |
 | `--reasoning on/off/auto` | ✅ Via dropdown |
 | `--reasoning-budget N` | ✅ Via spin-box. **Renamed from `--think-budget` at b9625** (the old spelling is gone, not an alias); AutoTuner emits the new name and still reads the legacy one back from older persisted settings |
 | `--reasoning-preserve` | ✅ Optional Expert checkbox; omitted leaves the llama.cpp default (template default before b10786, **enabled by default since b10786** for templates that support it). Add `--no-reasoning-preserve` to the Extra CLI flags to force it off. |
@@ -1213,7 +1241,8 @@ has its own file under [docs/](docs/).
 | `--spec-type ngram-map-k4v` (draftless) | ✅ The MTP-**compatible** ngram method from ggerganov's MTP cleanup (PR #23269). Via `ngram_method: ngram-map-k4v` it runs together with `draft-mtp` → this is how you combine "MTP + ngram" |
 | `--spec-type ngram-map-k / ngram-simple / ngram-cache` | ✅ Selectable via `ngram_method`; only the type token is emitted, sub-parameters are left to the llama.cpp defaults |
 | `--spec-draft-n-max` | ✅ Expert overrides remain authoritative. DFlash derives block-size minus its anchor (Qwen3.8 DFlash2: 8 → 7); performance tuning then increases depth one token at a time until decode speed regresses instead of stopping at a fixed list. |
-| `--spec-draft-p-min` | ✅ Via `draft_p_min` for ordinary external/integrated MTP (explicit 0.75). Qwen3.8 DFlash2 keeps its model-card value 0.0 because its candidate selector performs the lattice pruning. |
+| `--spec-draft-p-min` | ✅ Via `draft_p_min` for ordinary external/integrated MTP (explicit 0.75). Qwen3.8 DFlash2 and LiLiCorr drafters keep the upstream value 0.0 because their candidate selector performs the lattice pruning. |
+| `--spec-draft-n-ubatch` | ✅ b11629+: `64` for external DFlash / DFlash2 / LiLiCorr drafts and standalone MTP heads (measured −1.26 GiB VRAM for Qwen3.8-27B + DFlash2 on Vulkan, −0.22 GiB for Gemma 4 + MTP, unchanged speed and acceptance). Plain draft models keep the target `-ub`; pruned on older builds |
 | `--spec-draft-sampling {greedy,probabilistic}` | ✅ b11368+: known value flag for Extra CLI flags (pruned on older builds, removed with a withdrawn draft). Not set by default: with AutoTuner's p-min 0.75 plans both modes measured within run variation |
 | `--spec-ngram-map-k4v-size-n/-size-m/-min-hits` | ✅ Via `ngram_k4v_size_n` / `ngram_k4v_size_m` / `ngram_k4v_min_hits` in the YAML (defaults 16/24/1 from PR #23269) |
 | `--spec-draft-ngl` | ✅ Always 99 (keep the MTP head on GPU) |

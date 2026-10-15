@@ -1,0 +1,57 @@
+display_name: "Nemotron 3.5 Super VL 120B-A12B (NVIDIA)"
+# Längere Muster als nemotron-3-super.yaml: "...-3.5-Super-VL-120B-A12B..."
+# enthält "super-120b-a12b" nicht und fiel bis v5.6.2 auf _default.yaml.
+patterns:
+  - nemotron-3.5-super
+  - nemotron-3_5-super
+  - nemotron3.5-super
+  - nemotron-35-super
+  - super-vl-120b-a12b
+
+# Mainline lädt Text, Vision-Projektor (clip.projector_type nemotron_omni)
+# und den separaten MTP-Kopf seit b11668 (PR #30520, Release b11669). Der
+# Projektor ist zusätzlich per tuner._MMPROJ_PROJECTOR_MIN_BUILD gesichert.
+min_llama_build: 11668
+
+max_context: 1048576
+recommended_kv_quant: q8_0
+performance_target: throughput
+
+# NVIDIA-Modellkarte: Text temperature 1.0 / top_p 0.95, Vision 0.6 / 0.95.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 40
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+extra_args:
+  - --jinja
+  - --reasoning-preserve
+
+# NVIDIA serviert den MTP-Kopf mit drei Draft-Tokens (4x H100).
+draft_max: 3
+draft_p_min: 0.75
+ngram_method: ngram-map-k4v
+
+notes: >
+  NVIDIA Nemotron 3.5 Super VL: a 120B-total/12B-active Mamba-2 + latent-MoE
+  + attention hybrid (nemotron_h_moe, 88 blocks, 512 experts with 22 active)
+  with a C-RADIO image/video encoder and up to 1,048,576 tokens of context.
+  Needs llama.cpp b11668+ (PR #30520, first release b11669); the mmproj uses
+  the nemotron_omni projector, which older builds cannot load. The MTP head
+  ships as a separate mtp-*.gguf and is paired automatically (three draft
+  tokens as NVIDIA serves it); ggml-org also publishes a LiLiCorr drafter.
+  Official sampling: temperature 1.0 / top-p 0.95 for text, 0.6 / 0.95 for
+  vision tasks. Thinking is controlled through the chat template
+  (enable_thinking). At roughly 65 GB in Q4 this is a two-GPU or
+  CPU-expert-offload model.

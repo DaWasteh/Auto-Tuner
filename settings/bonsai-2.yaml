@@ -1,0 +1,45 @@
+display_name: "Ternary-Bonsai 2 2B / 4B / 9B (PrismML)"
+# Länger als "ternary-bonsai" (Bonsai-1-Familie), kürzer als
+# "ternary-bonsai-2-27b": die 27B-Dateien behalten bonsai-2-27b.yaml.
+patterns:
+  - ternary-bonsai-2-
+  - ternary-bonsai-2_
+  - ternary_bonsai_2
+
+# Qwen3.8-Backbones (qwen35), 262,144 Tokens nativ.
+max_context: 262144
+recommended_kv_quant: q8_0
+
+# Kein server_binary-Pin: Die Q2_0-Dateien (ggml-Typ 42) mit
+# prism.hadamard.* laden auf mainline b11556+ (PR #29600) und auf dem
+# PrismML-Fork. PQ2_0/PTQ1_0 bleiben Fork-only; beides prüft
+# tuner._prism_hadamard_block_reason anhand der Loader-Strings.
+
+extra_args:
+  - --jinja
+
+# Wie Bonsai 2 27B (offizielle Thinking-Werte).
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+  coding:
+    temperature: 1.0
+    top_k: 20
+    top_p: 0.95
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.0
+
+notes: >
+  PrismML Ternary-Bonsai 2 2B, 4B and 9B on Qwen3.8 backbones with
+  Hadamard-folded ternary weights and 262,144 tokens of context. The Q2_0
+  GGUFs run on mainline llama.cpp b11556+ (PR #29600) and on the PrismML
+  prism fork; an older mainline build lacks the prism.hadamard loader and
+  would decode garbage, so AutoTuner refuses it. PQ2_0/PTQ1_0 packings and
+  the separate MTP/DFlash2 files still need the prism fork. Thinking-mode
+  sampling as for Bonsai 2 27B: temperature 1.0, top-p 0.95, top-k 20.

@@ -1664,6 +1664,21 @@ class ModelEntry:
         )
 
     @property
+    def is_lilicorr_drafter(self) -> bool:
+        """True for an NVIDIA LiLiCorr drafter (``dflash`` + ``lilicorr.*``).
+
+        llama.cpp recognises it by ``lilicorr.candidate_topk`` and runs it as
+        ``draft-dflash`` from b11641 (PR #30506); b11668 fixes its lattice
+        walk, so launch preflight requires that build.
+        """
+        if self.architecture.lower().strip() != "dflash":
+            return False
+        try:
+            return int((self.metadata or {}).get("lilicorr.candidate_topk") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    @property
     def drafter_spec_type(self) -> Optional[str]:
         """The ``--spec-type`` token this drafter needs, or ``None``.
 
@@ -1915,6 +1930,9 @@ _DRAFT_FILENAME_TOKENS = (
     "eagle",
     "dflash",
     "dspark",
+    # NVIDIA's LiLiCorr drafters (b11641, PR #30506) are ``dflash`` GGUFs
+    # named ``lilicorr-<target>-…`` / ``<target>-LiLiCorr.gguf``.
+    "lilicorr",
 )
 
 # Maximum size for an ambiguously named GGUF to be treated as a standalone
@@ -1949,7 +1967,7 @@ _QUANT_CORE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DRAFT_MARKER_RE = re.compile(
-    r"(?:^|[-_.])(?:assistant|draft|mtp|eagle3|eagle|dflash|dspark)(?=[-_.]|$)",
+    r"(?:^|[-_.])(?:assistant|draft|mtp|eagle3|eagle|dflash|dspark|lilicorr)(?=[-_.]|$)",
     re.IGNORECASE,
 )
 

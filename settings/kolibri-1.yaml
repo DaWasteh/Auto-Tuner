@@ -1,0 +1,47 @@
+display_name: "Kolibri 1 78B-A3.5B (Aleph Alpha)"
+patterns:
+  - kolibri-1
+  - kolibri_1
+  - kolibri1
+arch_fallback:
+  - kolibri1
+
+# Mainline llama.cpp (b11669) hat keinen kolibri1-Loader (Issue #29922
+# offen). Die GGUFs laden nur mit dem Patch aus Hob-forge/Kolibri-1-GGUF
+# bzw. dem hob-llama.cpp-Release hob-b11434. Fail-closed über den
+# Architektur-String in der llama-Bibliothek, wie bei K2 Horizon.
+required_runtime_markers:
+  - kolibri1
+
+max_context: 262144
+recommended_kv_quant: q8_0
+
+# general.sampling.* im GGUF und Konverter-README: temp 1.0, top_p 0.97,
+# top_k 128.
+sampling:
+  chat:
+    temperature: 1.0
+    top_k: 128
+    top_p: 0.97
+    min_p: 0.0
+    repeat_penalty: 1.0
+  coding:
+    temperature: 1.0
+    top_k: 128
+    top_p: 0.97
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+extra_args:
+  - --jinja
+
+notes: >
+  Aleph Alpha Kolibri 1: a 78B-total/3.5B-active MoE reasoning model for
+  German and English (kolibri1 architecture, 384 experts with 6 active plus
+  a shared expert, sliding-window attention, 262,144 tokens of context).
+  Mainline llama.cpp has no kolibri1 loader yet (upstream issue #29922), so
+  AutoTuner only starts it on a runtime whose llama library carries the
+  architecture: the patch in Hob-forge/Kolibri-1-GGUF or the hob-llama.cpp
+  release hob-b11434. Reasoning effort none/low/medium/high is set through
+  the chat template; sampling from the GGUF: temperature 1.0, top-p 0.97,
+  top-k 128.

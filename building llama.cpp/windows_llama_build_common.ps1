@@ -465,17 +465,17 @@ function Get-ExactRemotePrereleaseTag {
     if ($LASTEXITCODE -ne 0) {
         throw "Could not query $Remote b-tags"
     }
-    $matches = @(
+    $exactTags = @(
         foreach ($row in $rows) {
             if ($row -match "^$([regex]::Escape($sha))\s+refs/tags/(b\d+)$") {
                 $Matches[1]
             }
         }
     )
-    if ($matches.Count -eq 0) {
+    if ($exactTags.Count -eq 0) {
         return $null
     }
-    return ($matches | Sort-Object { [int]($_ -replace '^b', '') } -Descending | Select-Object -First 1)
+    return ($exactTags | Sort-Object { [int]($_ -replace '^b', '') } -Descending | Select-Object -First 1)
 }
 
 function Get-LlamaRuntimeSemanticVersion {
@@ -870,7 +870,9 @@ function Test-LlamaBuildOutput {
             throw "Expected runtime build $ExpectedBuild, got:`n$versionOutput"
         }
     }
-    if ($ExpectedVersion -and $versionOutput -notmatch "(?im)^\s*version:\s*$([regex]::Escape($ExpectedVersion))\b") {
+    # The version must end at whitespace or "(": a plain \b would also accept
+    # "0.7.0-dev" for a stable 0.7.0 build that was configured as dev.
+    if ($ExpectedVersion -and $versionOutput -notmatch "(?im)^\s*version:\s*$([regex]::Escape($ExpectedVersion))(?=\s|\(|$)") {
         throw "Expected runtime version $ExpectedVersion, got:`n$versionOutput"
     }
 
@@ -900,6 +902,15 @@ function Test-LlamaBuildOutput {
         $cacheText = Get-Content $cache -Raw
         if ($cacheText -notmatch '(?m)^GGML_CUDA_NO_PEER_COPY:BOOL=ON\s*$') {
             throw "Unsafe HIP build: GGML_CUDA_NO_PEER_COPY must be ON to prevent silent Windows multi-GPU output corruption"
+        }
+        if ($cacheText -notmatch '(?m)^SSL_EAY:FILEPATH=.*libssl\.lib\s*$') {
+            if (@(Get-WindowsOpenSslArgs 3>$null).Count -gt 0) {
+                # OpenSSL is installed, so this tree predates the recipe fix
+                # (or the fix failed): treat it as incomplete so an existing
+                # output is reconfigured and rebuilt with HTTPS.
+                throw "HIP build has no OpenSSL although OpenSSL-Win64 is installed: HTTPS (-hf downloads, https MCP servers) would be disabled"
+            }
+            Write-Warning "HIP build has no OpenSSL: HTTPS (-hf downloads, https MCP servers) is disabled. Install OpenSSL-Win64 or set OPENSSL_ROOT_DIR, then rebuild."
         }
         $validationModel = Resolve-HipSemanticValidationModel
         Test-HipMultiGpuSemanticOutput -Server $server -Model $validationModel
@@ -1050,9 +1061,11 @@ function Invoke-LlamaCMakeBuild {
             # deterministic decoded text on an actual two-GPU layer split.
             "-DGGML_CUDA_NO_PEER_COPY=ON",
             "-DGGML_CUDA_FA=ON",
+            # Pins only: both are already ON with GGML_NATIVE=OFF, and MSVC
+            # (the Vulkan tree) has no such options at all.
             "-DGGML_FMA=ON",
             "-DGGML_F16C=ON"
-        ) + $resourceFlags + $commonArgs + @(Get-LlamaFlashAttentionArgs -Repo $Repo) + $ExtraCMakeArgs
+        ) + $resourceFlags + $commonArgs + @(Get-LlamaFlashAttentionArgs -Repo $Repo) + @(Get-WindowsOpenSslArgs) + $ExtraCMakeArgs
         Invoke-NativeChecked "$Backend configure" {
             cmake -S $Repo -B $buildDir @cmakeArgs
         }
@@ -1069,6 +1082,28 @@ function Invoke-LlamaCMakeBuild {
     if ($Backend -eq "HIP") {
         Copy-HipRuntimeDependencies -Repo $Repo -RocmPath $environment.RocmPath
     }
+}
+
+function Get-WindowsOpenSslArgs {
+    # ROCm clang uses the GNU driver (CMake sees MSVC=FALSE), so FindOpenSSL
+    # never searches the Windows installer layout (lib/VC/x64/MD) and the HIP
+    # server silently built without HTTPS through b11669. Point it at the same
+    # OpenSSL the Visual Studio (Vulkan) tree finds on its own.
+    $root = if ($env:OPENSSL_ROOT_DIR) { $env:OPENSSL_ROOT_DIR } else { "C:\Program Files\OpenSSL-Win64" }
+    $include = Join-Path $root "include"
+    $ssl = Join-Path $root "lib\VC\x64\MD\libssl.lib"
+    $crypto = Join-Path $root "lib\VC\x64\MD\libcrypto.lib"
+    if (-not ((Test-Path (Join-Path $include "openssl\ssl.h") -PathType Leaf) -and
+              (Test-Path $ssl -PathType Leaf) -and (Test-Path $crypto -PathType Leaf))) {
+        Write-Warning "OpenSSL-Win64 not found under '$root'; the HIP build will have no HTTPS support"
+        return
+    }
+    # FindOpenSSL's non-MSVC, non-MinGW Windows branch derives
+    # OPENSSL_{SSL,CRYPTO}_LIBRARY from the cached SSL_EAY / LIB_EAY.
+    "-DOPENSSL_ROOT_DIR=$($root.Replace('\', '/'))"
+    "-DOPENSSL_INCLUDE_DIR=$($include.Replace('\', '/'))"
+    "-DSSL_EAY=$($ssl.Replace('\', '/'))"
+    "-DLIB_EAY=$($crypto.Replace('\', '/'))"
 }
 
 function Get-LlamaFlashAttentionArgs {
